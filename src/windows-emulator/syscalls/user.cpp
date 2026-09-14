@@ -4475,6 +4475,49 @@ namespace sogen
                    c.emu.try_read_memory(slot, &target, sizeof(target)) && target == syscall;
         }
 
+        bool is_cursor_position_operation(const syscall_context& c, const uint32_t code)
+        {
+            const auto* user32 = c.win_emu.mod_manager.find_by_name("user32.dll");
+            const auto* win32u = c.win_emu.mod_manager.find_by_name("win32u.dll");
+            if (!user32 || !win32u)
+            {
+                return false;
+            }
+            const auto address = user32->find_export("GetCursorPos");
+            const auto syscall = win32u->find_export("NtUserCallTwoParam");
+            std::array<uint8_t, 16> wrapper{};
+            if (address == 0 || syscall == 0 || !c.emu.try_read_memory(address, wrapper.data(), wrapper.size()) || wrapper[0] != 0xba ||
+                wrapper[5] != 0x44 || wrapper[6] != 0x8d || wrapper[7] != 0x42 || wrapper[9] != 0x48 || wrapper[10] != 0xff ||
+                wrapper[11] != 0x25)
+            {
+                return false;
+            }
+            uint32_t parameter{};
+            int32_t displacement{};
+            memcpy(&parameter, wrapper.data() + 1, sizeof(parameter));
+            memcpy(&displacement, wrapper.data() + 12, sizeof(displacement));
+            const auto selector = parameter + static_cast<uint32_t>(static_cast<int8_t>(wrapper[8]));
+            const auto slot = address + wrapper.size() + static_cast<uint64_t>(displacement);
+            uint64_t target{};
+            return parameter == 1 && selector == code && user32->contains(slot) && user32->contains(slot + sizeof(target) - 1) &&
+                   c.emu.try_read_memory(slot, &target, sizeof(target)) && target == syscall;
+        }
+
+        emulator_pointer handle_NtUserCallTwoParam(const syscall_context& c, const uint64_t first, const uint64_t second,
+                                                   const uint32_t code)
+        {
+            if (second == 1 && is_cursor_position_operation(c, code))
+            {
+                return handle_NtUserGetCursorPos(c, first);
+            }
+            c.win_emu.log.error("Unsupported NtUserCallTwoParam operation: 0x%X (parameters: 0x%" PRIx64 ", 0x%" PRIx64 ")\n", code, first,
+                                second);
+            c.win_emu.record_stop(stop_reason::unimplemented_syscall,
+                                  "NtUserCallTwoParam operation 0x" + utils::string::to_hex_number(code));
+            c.win_emu.stop();
+            return 0;
+        }
+
         emulator_pointer handle_NtUserCallOneParam(const syscall_context& c, const uint64_t parameter, const uint32_t code)
         {
             if (is_message_beep_operation(c, code))

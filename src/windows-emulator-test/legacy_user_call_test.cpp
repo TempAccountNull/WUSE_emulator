@@ -3,6 +3,8 @@
 
 namespace sogen::syscalls
 {
+    bool is_cursor_position_operation(const syscall_context&, uint32_t);
+    emulator_pointer handle_NtUserCallTwoParam(const syscall_context&, uint64_t, uint64_t, uint32_t);
     bool is_message_beep_operation(const syscall_context&, uint32_t);
     bool is_update_window_operation(const syscall_context&, uint32_t);
     emulator_pointer handle_NtUserCallOneParam(const syscall_context&, uint64_t, uint32_t);
@@ -22,6 +24,10 @@ namespace sogen::test
             settings.path_mappings[R"(C:\test-sample.exe)"] = std::filesystem::current_path() / "test-sample.exe";
             return create_sample_emulator(std::move(settings));
         }();
+        uint64_t cursor{};
+        uint64_t cursor_slot{};
+        uint64_t two_param{};
+        uint32_t cursor_selector{};
         uint64_t beep{};
         uint64_t update{};
         uint64_t beep_slot{};
@@ -47,6 +53,15 @@ namespace sogen::test
             emu.setup_process_if_necessary();
             const auto* user32 = emu.mod_manager.map_module_or_throw(R"(c:\windows\system32\user32.dll)", emu.log);
             const auto* win32u = emu.mod_manager.map_module_or_throw(R"(c:\windows\system32\win32u.dll)", emu.log);
+            cursor = user32->find_export("GetCursorPos");
+            two_param = win32u->find_export("NtUserCallTwoParam");
+            ASSERT_NE(cursor, 0u);
+            ASSERT_NE(two_param, 0u);
+            ASSERT_EQ(emu.emu().read_memory<uint8_t>(cursor), 0xba);
+            ASSERT_EQ(emu.emu().read_memory<uint32_t>(cursor + 1), 1u);
+            cursor_selector = 1 + static_cast<uint32_t>(emu.emu().read_memory<int8_t>(cursor + 8));
+            cursor_slot = cursor + 16 + static_cast<uint64_t>(emu.emu().read_memory<int32_t>(cursor + 12));
+            emu.emu().write_memory<uint64_t>(cursor_slot, two_param);
             beep = user32->find_export("MessageBeep");
             update = user32->find_export("UpdateWindow");
             one_param = win32u->find_export("NtUserCallOneParam");
@@ -82,6 +97,43 @@ namespace sogen::test
             emu.emu().reg(x86_register::rsp, stack + 0xff00);
         }
     };
+
+    TEST_F(LegacyUserCallTest, CursorUsesGuestSelectorAndVerifiedImport)
+    {
+        EXPECT_TRUE(syscalls::is_cursor_position_operation(context(), cursor_selector));
+        const auto displacement = emu.emu().read_memory<uint8_t>(cursor + 8);
+        emu.emu().write_memory<uint8_t>(cursor + 8, displacement - 5);
+        EXPECT_FALSE(syscalls::is_cursor_position_operation(context(), cursor_selector));
+        EXPECT_TRUE(syscalls::is_cursor_position_operation(context(), cursor_selector - 5));
+        emu.emu().write_memory<uint64_t>(cursor_slot, two_param + 1);
+        EXPECT_FALSE(syscalls::is_cursor_position_operation(context(), cursor_selector - 5));
+    }
+
+    TEST_F(LegacyUserCallTest, CursorWritesTrackedScreenCoordinatesAndPreservesAdjacentBytes)
+    {
+        const auto buffer = emu.memory.allocate_memory(0x1000, memory_permission::read_write);
+        const std::array<int32_t, 4> sentinel{0x11223344, 0x11223344, 0x11223344, 0x11223344};
+        emu.memory.write_memory(buffer, sentinel.data(), sizeof(sentinel));
+        emu.process.cursor_x = -1920;
+        emu.process.cursor_y = 1080;
+        const auto c = context();
+        EXPECT_EQ(syscalls::handle_NtUserCallTwoParam(c, buffer + 4, 1, cursor_selector), TRUE);
+        std::array<int32_t, 4> result{};
+        emu.memory.read_memory(buffer, result.data(), sizeof(result));
+        EXPECT_EQ(result, (std::array<int32_t, 4>{0x11223344, -1920, 1080, 0x11223344}));
+        EXPECT_EQ(syscalls::handle_NtUserCallTwoParam(c, 0, 1, cursor_selector), FALSE);
+        EXPECT_EQ(emu.last_stop_reason(), stop_reason::none);
+    }
+
+    TEST_F(LegacyUserCallTest, UnsupportedCursorModeAndSelectorRemainExplicitStops)
+    {
+        const auto buffer = emu.memory.allocate_memory(0x1000, memory_permission::read_write);
+        emu.emu().write_memory<uint64_t>(buffer, 0x123456789abcdef0);
+        EXPECT_EQ(syscalls::handle_NtUserCallTwoParam(context(), buffer, 0, cursor_selector), 0u);
+        EXPECT_EQ(emu.last_stop_reason(), stop_reason::unimplemented_syscall);
+        EXPECT_EQ(syscalls::handle_NtUserCallTwoParam(context(), buffer, 1, cursor_selector + 1), 0u);
+        EXPECT_EQ(emu.emu().read_memory<uint64_t>(buffer), 0x123456789abcdef0u);
+    }
 
     TEST_F(LegacyUserCallTest, BeepUsesGuestSelectorAndVerifiedImport)
     {
@@ -185,6 +237,7 @@ namespace sogen::test
         utils::buffer_deserializer input{output.get_buffer()};
         emu.deserialize(input);
         ASSERT_TRUE(emu.mod_manager.find_by_name("user32.dll")->imports.empty());
+        EXPECT_TRUE(syscalls::is_cursor_position_operation(context(), cursor_selector));
         EXPECT_TRUE(syscalls::is_message_beep_operation(context(), beep_selector));
         EXPECT_TRUE(syscalls::is_enable_window_operation(context(), enable_selector));
         EXPECT_TRUE(syscalls::is_update_window_operation(context(), update_selector));
