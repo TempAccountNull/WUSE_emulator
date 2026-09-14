@@ -638,6 +638,7 @@ namespace sogen
         BOOL handle_NtUserSetDialogSystemMenu(const syscall_context& c, hwnd hwnd);
         BOOL handle_NtUserSetMsgBox(const syscall_context& c, hwnd hwnd);
         BOOL handle_NtUserEnableWindow(const syscall_context& c, hwnd hwnd, BOOL enable);
+        BOOL handle_NtUserCallHwndParamLockSafe(const syscall_context& c, hwnd hwnd, uint64_t parameter, uint32_t code);
         BOOL handle_NtUserDeleteMenu(const syscall_context& c, uint64_t menu, UINT position, UINT flags);
         uint64_t handle_NtUserGetSystemMenu(const syscall_context& c, hwnd hwnd, BOOL revert);
         BOOL handle_NtUserAllowSetForegroundWindow();
@@ -1688,6 +1689,7 @@ namespace sogen
         add_handler(NtUserSetDialogSystemMenu);
         add_handler(NtUserSetMsgBox);
         add_handler(NtUserEnableWindow);
+        add_handler(NtUserCallHwndParamLockSafe);
         add_handler(NtUserDeleteMenu);
         add_handler(NtUserGetSystemMenu);
         add_handler(NtCallbackReturn);

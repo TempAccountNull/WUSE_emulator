@@ -5352,6 +5352,46 @@ namespace sogen
             return handle_NtUserRemoveMenu(c, static_cast<hmenu>(menu), position, flags);
         }
 
+        bool is_enable_window_operation(const syscall_context& c, const uint32_t code)
+        {
+            const auto* user32 = c.win_emu.mod_manager.find_by_name("user32.dll");
+            const auto* win32u = c.win_emu.mod_manager.find_by_name("win32u.dll");
+            if (!user32 || !win32u)
+            {
+                return false;
+            }
+            const auto address = user32->find_export("EnableWindow");
+            const auto syscall = win32u->find_export("NtUserCallHwndParamLockSafe");
+            std::array<uint8_t, 16> wrapper{};
+            if (address == 0 || syscall == 0 || !c.emu.try_read_memory(address, wrapper.data(), wrapper.size()) || wrapper[0] != 0x48 ||
+                wrapper[1] != 0x63 || wrapper[2] != 0xd2 || wrapper[3] != 0x41 || wrapper[4] != 0xb8 || wrapper[9] != 0x48 ||
+                wrapper[10] != 0xff || wrapper[11] != 0x25)
+            {
+                return false;
+            }
+            uint32_t selector{};
+            int32_t displacement{};
+            memcpy(&selector, wrapper.data() + 5, sizeof(selector));
+            memcpy(&displacement, wrapper.data() + 12, sizeof(displacement));
+            const auto slot = address + wrapper.size() + static_cast<uint64_t>(displacement);
+            uint64_t target{};
+            return selector == code && user32->contains(slot) && user32->contains(slot + sizeof(target) - 1) &&
+                   c.emu.try_read_memory(slot, &target, sizeof(target)) && target == syscall;
+        }
+
+        BOOL handle_NtUserCallHwndParamLockSafe(const syscall_context& c, const hwnd hwnd, const uint64_t parameter, const uint32_t code)
+        {
+            if (is_enable_window_operation(c, code))
+            {
+                return handle_NtUserEnableWindow(c, hwnd, static_cast<BOOL>(parameter));
+            }
+            c.win_emu.log.error("Unsupported NtUserCallHwndParamLockSafe operation: 0x%X (hwnd: 0x%" PRIx64 ")\n", code, hwnd);
+            c.win_emu.record_stop(stop_reason::unimplemented_syscall,
+                                  "NtUserCallHwndParamLockSafe operation 0x" + utils::string::to_hex_number(code));
+            c.win_emu.stop();
+            return FALSE;
+        }
+
         uint64_t handle_NtUserGetSystemMenu(const syscall_context& c, const hwnd hwnd, const BOOL revert)
         {
             auto* win = c.proc.windows.get(hwnd);

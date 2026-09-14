@@ -8,6 +8,8 @@ namespace sogen::syscalls
     emulator_pointer handle_NtUserCallOneParam(const syscall_context&, uint64_t, uint32_t);
     BOOL handle_NtUserCallHwndLock(const syscall_context&, hwnd, uint32_t);
     BOOL completion_NtUserUpdateWindow(const syscall_context&, hwnd);
+    bool is_enable_window_operation(const syscall_context&, uint32_t);
+    BOOL handle_NtUserCallHwndParamLockSafe(const syscall_context&, hwnd, uint64_t, uint32_t);
 }
 
 namespace sogen::test
@@ -29,6 +31,10 @@ namespace sogen::test
         uint32_t beep_selector{};
         uint32_t update_selector{};
         hwnd target{};
+        uint64_t enable{};
+        uint64_t enable_slot{};
+        uint64_t hwnd_param_safe{};
+        uint32_t enable_selector{};
 
         syscall_context context()
         {
@@ -57,6 +63,15 @@ namespace sogen::test
             update_slot = update + 0x4a + static_cast<uint64_t>(emu.emu().read_memory<int32_t>(update + 0x46));
             emu.emu().write_memory<uint64_t>(beep_slot, one_param);
             emu.emu().write_memory<uint64_t>(update_slot, hwnd_lock);
+            enable = user32->find_export("EnableWindow");
+            hwnd_param_safe = win32u->find_export("NtUserCallHwndParamLockSafe");
+            ASSERT_NE(enable, 0u);
+            ASSERT_NE(hwnd_param_safe, 0u);
+            ASSERT_EQ(emu.emu().read_memory<uint8_t>(enable + 4), 0xb8);
+            enable_selector = emu.emu().read_memory<uint32_t>(enable + 5);
+            enable_slot = enable + 16 + static_cast<uint64_t>(emu.emu().read_memory<int32_t>(enable + 12));
+            emu.emu().write_memory<uint64_t>(enable_slot, hwnd_param_safe);
+
             auto [handle, win] = emu.process.windows.create(emu.memory);
             target = handle.bits;
             win.handle = target;
@@ -127,6 +142,42 @@ namespace sogen::test
         EXPECT_TRUE(state->pending.empty());
     }
 
+    TEST_F(LegacyUserCallTest, EnableUsesGuestSelectorAndVerifiedImport)
+    {
+        EXPECT_TRUE(syscalls::is_enable_window_operation(context(), enable_selector));
+        emu.emu().write_memory<uint32_t>(enable + 5, enable_selector + 4);
+        EXPECT_FALSE(syscalls::is_enable_window_operation(context(), enable_selector));
+        EXPECT_TRUE(syscalls::is_enable_window_operation(context(), enable_selector + 4));
+        emu.emu().write_memory<uint64_t>(enable_slot, hwnd_param_safe + 1);
+        EXPECT_FALSE(syscalls::is_enable_window_operation(context(), enable_selector + 4));
+    }
+
+    TEST_F(LegacyUserCallTest, EnableDispatchUpdatesGuestStyleAndReturnsPreviousDisabledState)
+    {
+        auto* win = emu.process.windows.get(target);
+        const auto c = context();
+        EXPECT_EQ(syscalls::handle_NtUserCallHwndParamLockSafe(c, target, FALSE, enable_selector), FALSE);
+        EXPECT_NE(win->style & WS_DISABLED, 0u);
+        EXPECT_NE(win->guest.read().dwStyle & WS_DISABLED, 0u);
+        EXPECT_EQ(syscalls::handle_NtUserCallHwndParamLockSafe(c, target, FALSE, enable_selector), TRUE);
+        EXPECT_EQ(syscalls::handle_NtUserCallHwndParamLockSafe(c, target, TRUE, enable_selector), TRUE);
+        EXPECT_EQ(win->style & WS_DISABLED, 0u);
+        EXPECT_EQ(win->guest.read().dwStyle & WS_DISABLED, 0u);
+        EXPECT_EQ(syscalls::handle_NtUserCallHwndParamLockSafe(c, target, TRUE, enable_selector), FALSE);
+        EXPECT_EQ(emu.last_stop_reason(), stop_reason::none);
+    }
+
+    TEST_F(LegacyUserCallTest, InvalidWindowAndUnknownOperationDoNotChangeStyle)
+    {
+        const auto c = context();
+        EXPECT_EQ(syscalls::handle_NtUserCallHwndParamLockSafe(c, 0, FALSE, enable_selector), FALSE);
+        EXPECT_EQ(emu.last_stop_reason(), stop_reason::none);
+        const auto before = emu.process.windows.get(target)->style;
+        EXPECT_EQ(syscalls::handle_NtUserCallHwndParamLockSafe(c, target, FALSE, enable_selector + 1), FALSE);
+        EXPECT_EQ(emu.process.windows.get(target)->style, before);
+        EXPECT_EQ(emu.last_stop_reason(), stop_reason::unimplemented_syscall);
+    }
+
     TEST_F(LegacyUserCallTest, DispatchRecognitionSurvivesSnapshotWithoutImportMetadata)
     {
         utils::buffer_serializer output{};
@@ -135,6 +186,7 @@ namespace sogen::test
         emu.deserialize(input);
         ASSERT_TRUE(emu.mod_manager.find_by_name("user32.dll")->imports.empty());
         EXPECT_TRUE(syscalls::is_message_beep_operation(context(), beep_selector));
+        EXPECT_TRUE(syscalls::is_enable_window_operation(context(), enable_selector));
         EXPECT_TRUE(syscalls::is_update_window_operation(context(), update_selector));
     }
 }
