@@ -31,7 +31,22 @@ and other DLLs during certificate processing. These captures establish
 progress past the old stop; they do not provide a direct before/after
 byte comparison for that initial 10 MiB call.
 
-Both actual-game runs use Icicle JIT, explicit -e and -v, and the existing
+A later MapIt2 call in file-view-verified maps the guest-root ntoskrnl.exe.
+NtMapViewOfSection returns STATUS_SUCCESS, ViewSize 0xA00000 and base
+0xBAAA0D0000. Its return reaches kernelbase.dll+0x47F66 with RSP advanced
+by eight bytes. Three 4 KiB samples at offsets 0, 0x500000 and 0x9FF000
+match the original guest-root file. The measured syscall interval,
+including debugger observation overhead, is 0.113 seconds.
+
+The initial probe compared this later mapping against destiny2.exe and
+stopped on a source-file mismatch. The raw file-view-proof.json preserves
+that failed comparison. file-view-source-verification.json records the
+correct source, its SHA-256, the preceding NtCreateSection log evidence,
+and matching sample hashes. The guest then resumes from the saved return
+point in file-view-return-continued. This is a probe correction, not a
+guest mapping failure or evidence that every byte was compared.
+
+All actual-game runs use Icicle JIT, explicit -e and -v, and the existing
 game directory mapping. Sunrise boot is not yet confirmed.
 
 ## Validation
