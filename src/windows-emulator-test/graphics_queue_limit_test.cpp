@@ -4,6 +4,7 @@
 namespace sogen::syscalls
 {
     NTSTATUS handle_NtGdiDdDDISetQueuedLimit(const syscall_context&, emulator_object<EMU_D3DKMT_SETQUEUEDLIMIT>);
+    NTSTATUS handle_NtGdiDdDDIGetDeviceState(const syscall_context&, emulator_object<EMU_D3DKMT_GETDEVICESTATE>);
     NTSTATUS handle_NtGdiDdDDICreateDevice(const syscall_context&, emulator_object<EMU_D3DKMT_CREATEDEVICE>);
 }
 
@@ -86,6 +87,33 @@ namespace sogen::test
         ASSERT_EQ(syscalls::handle_NtGdiDdDDICreateDevice(context(), {emu.memory, memory + 0x100}), STATUS_SUCCESS);
         ASSERT_EQ(run(2, 0), STATUS_SUCCESS);
         EXPECT_EQ(result().QueuedPresentLimit, 3u);
+    }
+
+    TEST_F(GraphicsQueueLimitTest, ExecutionStateIsActiveAndDoesNotOverwriteQueryOrUnionTail)
+    {
+        std::array<uint8_t, 56> bytes{};
+        bytes.fill(0xa5);
+        emu.memory.write_memory(memory, bytes.data(), bytes.size());
+        const EMU_D3DKMT_GETDEVICESTATE request{.hDevice = 0x5000, .StateType = 1, .State = 0xcccccccc};
+        emu.memory.write_memory(memory, &request, sizeof(request));
+        ASSERT_EQ(syscalls::handle_NtGdiDdDDIGetDeviceState(context(), {emu.memory, memory}), STATUS_SUCCESS);
+        const auto result = emu.memory.read_memory<EMU_D3DKMT_GETDEVICESTATE>(memory);
+        EXPECT_EQ(result.hDevice, request.hDevice);
+        EXPECT_EQ(result.StateType, request.StateType);
+        EXPECT_EQ(result.DeviceExecutionState, 1u);
+        emu.memory.read_memory(memory, bytes.data(), bytes.size());
+        for (size_t index = sizeof(request); index < bytes.size(); ++index)
+        {
+            EXPECT_EQ(bytes[index], 0xa5u);
+        }
+    }
+
+    TEST_F(GraphicsQueueLimitTest, ResetQueryDoesNotUseExecutionStateEnumeration)
+    {
+        const EMU_D3DKMT_GETDEVICESTATE request{.hDevice = 0x5000, .StateType = 3, .State = 0xcccccccc};
+        emu.memory.write_memory(memory, &request, sizeof(request));
+        ASSERT_EQ(syscalls::handle_NtGdiDdDDIGetDeviceState(context(), {emu.memory, memory}), STATUS_SUCCESS);
+        EXPECT_EQ(emu.memory.read_memory<EMU_D3DKMT_GETDEVICESTATE>(memory).ResetState, 0u);
     }
 
     TEST_F(GraphicsQueueLimitTest, LimitSurvivesFullSnapshotRestore)

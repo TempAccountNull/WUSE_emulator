@@ -4798,7 +4798,9 @@ namespace sogen
                     dxgk_warn(c, "NtGdiDdDDIGetDeviceState: Unknown device 0x%X", state.hDevice);
                 }
 
-                state.State = 0;
+                constexpr UINT32 execution_query = 1;
+                constexpr UINT32 execution_active = 1;
+                state.State = state.StateType == execution_query ? execution_active : 0;
             });
 
             return STATUS_SUCCESS;
