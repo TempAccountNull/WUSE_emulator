@@ -16,6 +16,11 @@ namespace sogen
             return std::make_unique<socket_wrapper>(af, type, protocol);
         }
 
+        uint32_t socket_factory::query_network_store(network_store_query& query)
+        {
+            return query_host_network_store(query);
+        }
+
         int socket_factory::poll_sockets(const std::span<poll_entry> entries)
         {
             std::vector<pollfd> poll_data{};

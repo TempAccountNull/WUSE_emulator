@@ -56,6 +56,11 @@ namespace sogen
 
             struct static_socket_factory_impl : socket_factory
             {
+                uint32_t query_network_store(network_store_query&) override
+                {
+                    return 50;
+                }
+
                 std::shared_ptr<shared_state> state = std::make_shared<shared_state>();
                 uint16_t port{0};
 
