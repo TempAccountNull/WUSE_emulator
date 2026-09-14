@@ -364,7 +364,8 @@ namespace sogen
                 emulator_allocator allocator(c.emu, object_information, object_information_length);
                 const auto info = allocator.reserve<OBJECT_TYPE_INFORMATION>();
                 info.access([&](OBJECT_TYPE_INFORMATION& i) {
-                    allocator.make_unicode_string(i.TypeName, name); //
+                    allocator.make_unicode_string(i.TypeName, name);
+                    i.TypeIndex = static_cast<UCHAR>(effective_handle.value.type);
                 });
 
                 return STATUS_SUCCESS;
@@ -393,7 +394,8 @@ namespace sogen
 
                 const auto info = allocator.reserve<OBJECT_TYPE_INFORMATION>();
                 info.access([&](OBJECT_TYPE_INFORMATION& i) {
-                    allocator.make_unicode_string(i.TypeName, name); //
+                    allocator.make_unicode_string(i.TypeName, name);
+                    i.TypeIndex = static_cast<UCHAR>(effective_handle.value.type);
                 });
 
                 return STATUS_SUCCESS;

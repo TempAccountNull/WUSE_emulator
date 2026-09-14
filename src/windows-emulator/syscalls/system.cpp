@@ -1,6 +1,7 @@
-﻿#include "../std_include.hpp"
+#include "../std_include.hpp"
 #include "../emulator_utils.hpp"
 #include "../syscall_utils.hpp"
+#include "../system_handle_information.hpp"
 
 namespace sogen
 {
@@ -9,6 +10,82 @@ namespace sogen
     {
         namespace
         {
+            NTSTATUS handle_system_extended_handle_information(const syscall_context& c, const uint64_t output, const uint32_t length,
+                                                               const emulator_object<uint32_t> return_length)
+            {
+                return_length.write_if_valid(0);
+                if (length < sizeof(system_handle_information_header))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+
+                std::vector<handle> handles{GUEST_PROCESS_HANDLE};
+                const auto append = [&](const auto& store) {
+                    for (const auto& [index, object] : store)
+                    {
+                        if (object.ref_count != 0)
+                        {
+                            handles.push_back(store.make_handle(index));
+                        }
+                    }
+                };
+                append(c.proc.threads);
+                append(c.proc.events);
+                append(c.proc.files);
+                append(c.proc.devices);
+                append(c.proc.semaphores);
+                append(c.proc.io_completions);
+                append(c.proc.wait_completion_packets);
+                append(c.proc.worker_factories);
+                append(c.proc.registry_keys);
+                append(c.proc.mutants);
+                append(c.proc.timers);
+                append(c.proc.desktops);
+                append(c.proc.ports);
+                append(c.proc.sections);
+                append(c.proc.private_namespaces);
+
+                const auto required = sizeof(system_handle_information_header) + handles.size() * sizeof(system_handle_information_entry);
+                if (required > UINT32_MAX)
+                {
+                    return STATUS_INTEGER_OVERFLOW;
+                }
+
+                const system_handle_information_header header{.number_of_handles = handles.size(), .reserved = 0};
+                if (!c.emu.try_write_memory(output, &header, sizeof(header)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+
+                uint64_t written = sizeof(header);
+                for (const auto h : handles)
+                {
+                    if (written + sizeof(system_handle_information_entry) > length)
+                    {
+                        break;
+                    }
+
+                    // Guest object identities occupy an unmapped kernel address range; host pointers never enter the guest table.
+                    const system_handle_information_entry entry{
+                        .object = 0xffffb00000000000ULL | (h.bits << 4),
+                        .process_id = process_context::process_id,
+                        .handle_value = h.bits,
+                        .granted_access = GENERIC_ALL,
+                        .creator_backtrace_index = 0,
+                        .object_type_index = static_cast<uint16_t>(h.value.type),
+                        .handle_attributes = 0,
+                        .reserved = 0,
+                    };
+                    if (!c.emu.try_write_memory(output + written, &entry, sizeof(entry)))
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    written += sizeof(entry);
+                }
+                return_length.write_if_valid(static_cast<uint32_t>(required));
+                return length < required ? STATUS_INFO_LENGTH_MISMATCH : STATUS_SUCCESS;
+            }
+
             NTSTATUS handle_system_memory_usage_information(const syscall_context& c, const uint32_t info_class,
                                                             const uint64_t system_information, const uint32_t system_information_length,
                                                             const emulator_object<uint32_t> return_length)
@@ -486,6 +563,9 @@ namespace sogen
         {
             switch (info_class)
             {
+            case SystemExtendedHandleInformation:
+                return handle_system_extended_handle_information(c, system_information, system_information_length, return_length);
+
             case SystemBasicProcessInformation:
                 return handle_system_basicprocess_information(c, system_information, system_information_length, return_length);
 
