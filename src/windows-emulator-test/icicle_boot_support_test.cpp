@@ -177,4 +177,24 @@ namespace sogen::test
         emu.start(200000);
         EXPECT_EQ(events, expected);
     }
+
+    TEST_F(IcicleBootSupport, HostWritesToReadOnlyZeroPagesDoNotAlias)
+    {
+        const auto first = memory->allocate_memory(0x2000, memory_permission::read);
+        const auto second = memory->allocate_memory(0x1000, memory_permission::read);
+        EXPECT_EQ(emu->read_memory<uint64_t>(first), 0u);
+        EXPECT_EQ(emu->read_memory<uint64_t>(first + 0x1000), 0u);
+        EXPECT_EQ(emu->read_memory<uint64_t>(second), 0u);
+        emu->write_memory<uint64_t>(first, 0x123456789abcdef0);
+        EXPECT_EQ(emu->read_memory<uint64_t>(first), 0x123456789abcdef0u);
+        EXPECT_EQ(emu->read_memory<uint64_t>(first + 0x1000), 0u);
+        EXPECT_EQ(emu->read_memory<uint64_t>(second), 0u);
+        const std::array<uint8_t, 32> bytes{1, 2, 3, 4};
+        emu->write_memory(first + 0xff8, bytes.data(), bytes.size());
+        EXPECT_EQ(emu->read_memory<uint64_t>(second + 0xff8), 0u);
+        EXPECT_EQ(emu->read_memory<uint64_t>(second), 0u);
+        const auto third = memory->allocate_memory(0x1000, memory_permission::read);
+        EXPECT_EQ(emu->read_memory<uint64_t>(third), 0u);
+    }
+
 }

@@ -966,11 +966,28 @@ impl IcicleEmulator {
     }
 
     pub fn write_memory(&mut self, address: u64, data: &[u8]) -> bool {
+        let Some(end) = address.checked_add(data.len() as u64) else {
+            return false;
+        };
         self.invalidate_code_range(address, data.len() as u64);
-        let res = self
-            .get_mem()
-            .write_bytes(address, data, icicle_vm::cpu::mem::perm::NONE);
-        return res.is_ok();
+        let mem = self.get_mem();
+        let mut page = mem.page_aligned(address);
+        while page < end {
+            if let Some(index) = mem.get_physical_index(page) {
+                if index.is_zero_page() {
+                    // Host writes bypass guest permissions; Icicle's read-only zero page is shared
+                    // without COW because permission-checked guest writes cannot modify it.
+                    mem.get_physical_mut(index).copy_on_write = true;
+                    mem.tlb.remove_write(page);
+                }
+            }
+            let Some(next) = page.checked_add(mem.page_size()) else {
+                break;
+            };
+            page = next;
+        }
+        mem.write_bytes(address, data, icicle_vm::cpu::mem::perm::NONE)
+            .is_ok()
     }
 
     pub fn read_memory(&mut self, address: u64, data: &mut [u8]) -> bool {
