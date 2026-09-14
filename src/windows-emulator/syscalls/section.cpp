@@ -5,6 +5,8 @@
 #include "../module/module_mapping.hpp"
 
 #include <utils/io.hpp>
+#include <fstream>
+#include <utils/finally.hpp>
 
 namespace sogen
 {
@@ -15,6 +17,8 @@ namespace sogen
 
         namespace
         {
+            constexpr NTSTATUS invalid_view_size = static_cast<NTSTATUS>(0xc000001f);
+
             // From syswow64 kernel32:
             // - _BaseDllInitialize reads ReadOnlyStaticServerData[2]
             // - _BaseDllInitializeIniFileMappings / BaseDllCaptureIniFileParameters read +0x170 and +0x9e8
@@ -458,7 +462,10 @@ namespace sogen
             if (section_offset)
             {
                 offset = section_offset.read().QuadPart;
-                offset = std::max<int64_t>(offset, 0);
+                if (offset < 0)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
             }
 
             const auto protection = map_nt_to_emulator_protection(section_entry->section_page_protection);
@@ -501,38 +508,69 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            // File-backed section: map a fresh copy of the file contents.
-            std::vector<std::byte> file_data{};
-            if (!utils::io::read_file(c.win_emu.file_sys.translate(section_entry->file_name), &file_data))
+            std::ifstream file(c.win_emu.file_sys.translate(section_entry->file_name), std::ios::binary | std::ios::ate);
+            const auto file_end = file.tellg();
+            if (!file || file_end < 0)
             {
                 return STATUS_INVALID_PARAMETER;
             }
-
-            // The guest fully controls the mapping offset. Reject anything past the file so the
-            // subtraction below cannot underflow into a huge copy that reads past file_data.
-            if (static_cast<uint64_t>(offset) > file_data.size())
+            const auto file_size = static_cast<uint64_t>(file_end);
+            const auto section_size = section_entry->maximum_size ? section_entry->maximum_size : file_size;
+            const auto file_offset = align_down(static_cast<uint64_t>(offset), ALLOCATION_GRANULARITY);
+            if (section_size == 0 || section_size > MAX_ALLOCATION_END_EXCL || file_offset >= section_size)
             {
-                return STATUS_INVALID_PARAMETER;
+                return invalid_view_size;
             }
-
-            const auto size = static_cast<size_t>(file_data.size() - offset);
-            const auto aligned_size = static_cast<size_t>(page_align_up(size));
+            const auto remaining = section_size - file_offset;
+            const auto requested = view_size ? view_size.read() : 0;
+            if (requested > page_align_up(remaining))
+            {
+                return invalid_view_size;
+            }
+            const auto aligned_size = static_cast<size_t>(page_align_up(requested ? requested : remaining));
             const auto reserve_only = section_entry->allocation_attributes == SEC_RESERVE;
             const auto address =
                 c.win_emu.memory.allocate_memory(aligned_size, protection, reserve_only, 0, memory_region_kind::file_section_view);
+            if (!address)
+            {
+                return STATUS_NO_MEMORY;
+            }
+            auto release_on_failure = utils::finally([&] { c.win_emu.memory.release_memory(address, 0); });
             c.win_emu.memory.set_region_mapped_filename(address, section_entry->file_name);
 
-            if (!reserve_only && !file_data.empty())
+            const auto available = file_offset < file_size ? file_size - file_offset : 0;
+            const auto copy_size = std::min({static_cast<uint64_t>(aligned_size), remaining, available});
+            if (!reserve_only && copy_size)
             {
-                c.emu.write_memory(address, file_data.data() + offset, size);
+                file.seekg(static_cast<std::streamoff>(file_offset));
+                std::array<char, 0x10000> buffer{};
+                for (uint64_t copied = 0; copied < copy_size;)
+                {
+                    const auto count = static_cast<size_t>(std::min<uint64_t>(buffer.size(), copy_size - copied));
+                    if (!file.read(buffer.data(), static_cast<std::streamsize>(count)))
+                    {
+                        return STATUS_FILE_INVALID;
+                    }
+                    if (!c.emu.try_write_memory(address + copied, buffer.data(), count))
+                    {
+                        throw std::runtime_error("File view write failed at 0x" + utils::string::to_hex_number(address + copied) +
+                                                 " after " + std::to_string(copied) + " of " + std::to_string(copy_size) + " bytes");
+                    }
+                    copied += count;
+                }
             }
 
+            if (section_offset)
+            {
+                section_offset.write(LARGE_INTEGER{.QuadPart = static_cast<int64_t>(file_offset)});
+            }
             if (view_size)
             {
                 view_size.write(aligned_size);
             }
-
             base_address.write(address);
+            release_on_failure.cancel();
+
             return STATUS_SUCCESS;
         }
 
