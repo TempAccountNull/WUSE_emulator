@@ -36,6 +36,59 @@ namespace sogen
             reply_bind_service = 0x001E0000,
         };
 
+        registrar_method decode_method(const registrar_method wire_method, const bool windows10)
+        {
+            if (!windows10)
+            {
+                return wire_method;
+            }
+
+            switch (static_cast<uint32_t>(wire_method))
+            {
+            case 0x00010001:
+                return registrar_method::register_thread;
+            case 0x00030001:
+                return registrar_method::query_coreui_port;
+            case 0x000A0001:
+                return registrar_method::open_endpoint;
+            case 0x000D0001:
+                return registrar_method::register_port;
+            case 0x000E0001:
+                return registrar_method::unregister_port;
+            case 0x000F0001:
+                return registrar_method::make_identity;
+            case 0x00160001:
+                return registrar_method::resolve_service;
+            case 0x00170001:
+                return registrar_method::bind_service;
+            default:
+                return static_cast<registrar_method>(0);
+            }
+        }
+
+        uint32_t encode_reply(const registrar_reply method, const bool windows10)
+        {
+            if (windows10)
+            {
+                switch (method)
+                {
+                case registrar_reply::reply_register_port:
+                    return 0x00100000;
+                case registrar_reply::reply_unregister_port:
+                    return 0x00110000;
+                case registrar_reply::reply_make_identity:
+                    return 0x00120000;
+                case registrar_reply::reply_resolve_service:
+                    return 0x001B0000;
+                case registrar_reply::reply_bind_service:
+                    return 0x001C0000;
+                default:
+                    break;
+                }
+            }
+            return static_cast<uint32_t>(method);
+        }
+
         constexpr ULONG o_kind = 0x10;
         constexpr ULONG o_id = 0x14;
         constexpr ULONG o_flags = 0x18;
@@ -75,9 +128,9 @@ namespace sogen
                 return nested_size >= 0x08 && length >= 0x30;
             }
 
-            bool matches(const registrar_method method, const uint32_t min_nested, const ULONG min_length) const
+            bool matches(const uint32_t min_nested, const ULONG min_length) const
             {
-                return body1 == method && nested_size >= min_nested && length >= min_length;
+                return nested_size >= min_nested && length >= min_length;
             }
 
             bool bootstrap() const
@@ -204,33 +257,47 @@ namespace sogen
             return out.finish();
         }
 
-        std::vector<uint8_t> make_bootstrap_reply(const uint32_t request_id)
+        std::vector<uint8_t> make_bootstrap_reply(const uint32_t request_id, const bool windows10)
         {
             packet out(0x60, request_id, 0x38);
-            out.u32s(o_body0, {0x0E, static_cast<unsigned>(registrar_reply::reply_bootstrap), 0x04, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
-                               0x08, 0x7B, 0x00, 0x04, 0x01});
+            if (windows10)
+            {
+                out.u32s(o_body0, {0x0E, static_cast<unsigned>(registrar_reply::reply_bootstrap), 0x04, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
+                                   0x08, 0x7B, 0x00, 0x04, 0x01});
+            }
+            else
+            {
+                out.u32s(o_body0, {0x0E, static_cast<unsigned>(registrar_reply::reply_bootstrap), 0x04, 0x00, 0x08, 0x7B, 0x00, 0x10, 0x00,
+                                   0x00, 0x00, 0x00, 0x04, 0x01});
+            }
             return out.finish();
         }
 
-        std::vector<uint8_t> make_open_endpoint_reply(const uint32_t request_id)
+        std::vector<uint8_t> make_open_endpoint_reply(const uint32_t request_id, const bool windows10)
         {
+            if (windows10)
+            {
+                packet out(0x38, request_id, 0x10);
+                out.u32s(o_body0, {0x04, encode_reply(registrar_reply::reply_open_endpoint, true), 0x04, 0x00});
+                return out.finish();
+            }
             packet out(0x4C, request_id, 0x24);
             out.u32s(o_body0, {0x09, static_cast<unsigned>(registrar_reply::reply_open_endpoint), 0x04, 0x00, 0x10});
             return out.finish();
         }
 
-        std::vector<uint8_t> make_identity_reply(const uint32_t request_id)
+        std::vector<uint8_t> make_identity_reply(const uint32_t request_id, const bool windows10)
         {
             packet out(0x44, request_id, 0x1C);
-            out.u32s(o_body0, {0x07, static_cast<unsigned>(registrar_reply::reply_make_identity), 0x10});
+            out.u32s(o_body0, {0x07, encode_reply(registrar_reply::reply_make_identity, windows10), 0x10});
             out.guid(0x34, guid_generated_identity);
             return out.finish();
         }
 
-        std::vector<uint8_t> make_bind_service_reply(const uint32_t request_id)
+        std::vector<uint8_t> make_bind_service_reply(const uint32_t request_id, const bool windows10)
         {
             packet out(0x38, request_id, 0x10);
-            out.u32s(o_body0, {0x04, static_cast<unsigned>(registrar_reply::reply_bind_service), 0x04, 0x00});
+            out.u32s(o_body0, {0x04, encode_reply(registrar_reply::reply_bind_service, windows10), 0x04, 0x00});
             return out.finish();
         }
 
@@ -249,15 +316,16 @@ namespace sogen
             out.u32s(0x8C, {0x00200011, 0x8000, 0x01, 0x280});
         }
 
-        std::vector<uint8_t> make_resolve_service_reply(const request& req)
+        std::vector<uint8_t> make_resolve_service_reply(const request& req, const bool windows10)
         {
             packet out(0x9C, req.id, 0x74);
-            out.u32s(o_body0, {0x1D, static_cast<unsigned>(registrar_reply::reply_resolve_service), 0x04, 0x00, 0x04});
+            out.u32s(o_body0, {0x1D, encode_reply(registrar_reply::reply_resolve_service, windows10), 0x04, 0x00, 0x04});
             append_resolve_payload(out, req.body0 >= 0x35);
             return out.finish();
         }
 
-        std::vector<uint8_t> make_coreui_port_reply(windows_emulator& win_emu, const lpc_request_context& c, const request& req)
+        std::vector<uint8_t> make_coreui_port_reply(windows_emulator& win_emu, const lpc_request_context& c, const request& req,
+                                                    const bool windows10)
         {
             std::array<uint8_t, 16> requested_guid{};
             win_emu.emu().read_memory(c.send_buffer + 0x4C, requested_guid.data(), requested_guid.size());
@@ -275,17 +343,19 @@ namespace sogen
             };
 
             const auto name_size = static_cast<uint32_t>(utf16z_size(name));
-            const auto tail_size = static_cast<uint32_t>(sizeof(tail));
+            const auto tail_start = windows10 ? 5U : 0U;
+            const auto tail_size = static_cast<uint32_t>((tail.size() - tail_start) * sizeof(uint32_t));
             const auto data_size = static_cast<uint32_t>(0x3C + name_size + tail_size);
 
             packet out(data_size, req.id, data_size - o_body0);
-            out.u32s(o_body0, {0x48, static_cast<unsigned>(registrar_reply::reply_coreui_port), 0x04, 0x00, name_size});
+            out.u32s(o_body0, {static_cast<uint32_t>((data_size - o_body0) / sizeof(uint32_t)),
+                               static_cast<unsigned>(registrar_reply::reply_coreui_port), 0x04, 0x00, name_size});
             out.utf16z(0x3C, name);
 
             auto tail_offset = 0x3C + name_size;
-            for (const auto value : tail)
+            for (size_t index = tail_start; index < tail.size(); ++index)
             {
-                out.u32(tail_offset, value);
+                out.u32(tail_offset, tail[index]);
                 tail_offset += static_cast<ULONG>(sizeof(uint32_t));
             }
 
@@ -317,61 +387,62 @@ namespace sogen
                     return STATUS_NOT_SUPPORTED;
                 }
 
-                switch (req.body1)
+                const bool windows10 = win_emu.version.is_build_after_or_equal(19041) && win_emu.version.is_build_before_or_equal(19045);
+                switch (decode_method(req.body1, windows10))
                 {
                 case registrar_method::register_thread:
                     if (req.bootstrap())
                     {
-                        return {STATUS_SUCCESS, make_bootstrap_reply(req.id)};
+                        return {STATUS_SUCCESS, make_bootstrap_reply(req.id, windows10)};
                     }
                     break;
 
                 case registrar_method::register_port:
-                    if (req.matches(registrar_method::register_port, 0x1C, 0x44))
+                    if (req.matches(0x1C, 0x44))
                     {
-                        return {STATUS_SUCCESS, make_simple_reply(req.id, static_cast<uint32_t>(registrar_reply::reply_register_port))};
+                        return {STATUS_SUCCESS, make_simple_reply(req.id, encode_reply(registrar_reply::reply_register_port, windows10))};
                     }
                     break;
 
                 case registrar_method::resolve_service:
-                    if (req.matches(registrar_method::resolve_service, 0x40, 0x68))
+                    if (req.matches(0x40, 0x68))
                     {
-                        return {STATUS_SUCCESS, make_resolve_service_reply(req)};
+                        return {STATUS_SUCCESS, make_resolve_service_reply(req, windows10)};
                     }
                     break;
 
                 case registrar_method::open_endpoint:
-                    if (req.matches(registrar_method::open_endpoint, 0x24, 0x5C))
+                    if (req.matches(0x24, 0x5C))
                     {
-                        return {STATUS_SUCCESS, make_open_endpoint_reply(req.id)};
+                        return {STATUS_SUCCESS, make_open_endpoint_reply(req.id, windows10)};
                     }
                     break;
 
                 case registrar_method::query_coreui_port:
-                    if (req.matches(registrar_method::query_coreui_port, 0x44, 0x6C))
+                    if (req.matches(0x44, 0x6C))
                     {
-                        return {STATUS_SUCCESS, make_coreui_port_reply(win_emu, c, req)};
+                        return {STATUS_SUCCESS, make_coreui_port_reply(win_emu, c, req, windows10)};
                     }
                     break;
 
                 case registrar_method::make_identity:
-                    if (req.matches(registrar_method::make_identity, 0x1C, 0x44))
+                    if (req.matches(0x1C, 0x44))
                     {
-                        return {STATUS_SUCCESS, make_identity_reply(req.id)};
+                        return {STATUS_SUCCESS, make_identity_reply(req.id, windows10)};
                     }
                     break;
 
                 case registrar_method::bind_service:
-                    if (req.matches(registrar_method::bind_service, 0x10, 0x38))
+                    if (req.matches(0x10, 0x38))
                     {
-                        return {STATUS_SUCCESS, make_bind_service_reply(req.id)};
+                        return {STATUS_SUCCESS, make_bind_service_reply(req.id, windows10)};
                     }
                     break;
 
                 case registrar_method::unregister_port:
-                    if (req.matches(registrar_method::unregister_port, 0x1C, 0x44))
+                    if (req.matches(0x1C, 0x44))
                     {
-                        return {STATUS_SUCCESS, make_simple_reply(req.id, static_cast<uint32_t>(registrar_reply::reply_unregister_port))};
+                        return {STATUS_SUCCESS, make_simple_reply(req.id, encode_reply(registrar_reply::reply_unregister_port, windows10))};
                     }
                     break;
                 }
