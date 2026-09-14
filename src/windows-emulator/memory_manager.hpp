@@ -180,6 +180,18 @@ namespace sogen
             this->default_allocation_address_ = address;
         }
 
+        void initialize_aslr_policy(bool high_entropy, bool is_32bit, bool deterministic = false);
+        NTSTATUS set_aslr_policy(uint32_t flags);
+
+        uint32_t get_aslr_policy() const
+        {
+            return this->aslr_policy_;
+        }
+
+        uint64_t find_randomized_image_base(size_t size, bool is_32bit);
+        void serialize_aslr_state(utils::buffer_serializer& buffer) const;
+        void deserialize_aslr_state(utils::buffer_deserializer& buffer, bool high_entropy, bool is_32bit, bool deterministic = false);
+
         void serialize_memory_state(utils::buffer_serializer& buffer, bool is_snapshot) const;
         void deserialize_memory_state(utils::buffer_deserializer& buffer, bool is_snapshot);
 
@@ -198,6 +210,9 @@ namespace sogen
         std::atomic<std::uint64_t> layout_version_{0};
         std::uint64_t default_allocation_address_{0x100000000ULL};
         bool dep_enabled_{true};
+        uint32_t aslr_policy_{};
+        uint64_t aslr_random_state_{};
+        uint64_t next_aslr_random();
         std::vector<uint64_t> host_reserved_addresses_{};
 
         void map_mmio(uint64_t address, size_t size, mmio_read_callback read_cb, mmio_write_callback write_cb) final;

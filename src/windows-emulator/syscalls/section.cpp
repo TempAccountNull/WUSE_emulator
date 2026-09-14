@@ -2,6 +2,7 @@
 #include "../emulator_utils.hpp"
 #include "../syscall_utils.hpp"
 #include "../memory_manager.hpp"
+#include "../module/module_mapping.hpp"
 
 #include <utils/io.hpp>
 
@@ -414,8 +415,15 @@ namespace sogen
                     }
                 }
 
-                const auto* binary =
-                    c.win_emu.mod_manager.map_module(section_entry->file_name, c.win_emu.log, false, true, relocation_base);
+                const mapped_module* binary{};
+                try
+                {
+                    binary = c.win_emu.mod_manager.map_module(section_entry->file_name, c.win_emu.log, false, true, relocation_base);
+                }
+                catch (const image_relocation_error&)
+                {
+                    return STATUS_ILLEGAL_DLL_RELOCATION;
+                }
                 if (!binary)
                 {
                     return STATUS_FILE_INVALID;
@@ -437,7 +445,8 @@ namespace sogen
                     return STATUS_IMAGE_MACHINE_TYPE_MISMATCH;
                 }
 
-                if (c.win_emu.mod_manager.get_module_load_count_by_path(section_entry->file_name) > 1)
+                if (binary->image_base != binary->image_base_file ||
+                    c.win_emu.mod_manager.get_module_load_count_by_path(section_entry->file_name) > 1)
                 {
                     return STATUS_IMAGE_NOT_AT_BASE;
                 }

@@ -793,6 +793,8 @@ namespace sogen
         const auto* ntdll = this->mod_manager.ntdll;
         const auto* win32u = this->mod_manager.win32u;
 
+        this->memory.initialize_aslr_policy((executable->dll_characteristics & IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) != 0,
+                                            context.is_wow64_process, this->uses_relative_time());
         const auto apiset_data = apiset::obtain(this->emulation_root);
 
         this->process.setup(*this, this->application_settings_, *executable, *ntdll, apiset_data, this->mod_manager.wow64_modules_.ntdll32);
@@ -1798,6 +1800,7 @@ namespace sogen
         this->mod_manager.serialize(buffer);
         this->dispatcher.serialize(buffer);
         this->process.serialize(buffer, this->vcpus_[0]->active_thread);
+        this->memory.serialize_aslr_state(buffer);
     }
 
     void windows_emulator::deserialize(utils::buffer_deserializer& buffer)
@@ -1833,6 +1836,10 @@ namespace sogen
         this->install_section_first_execution_hooks();
         this->dispatcher.deserialize(buffer);
         this->process.deserialize(buffer, this->vcpus_[0]->active_thread);
+        this->memory.deserialize_aslr_state(buffer,
+                                            this->mod_manager.executable && (this->mod_manager.executable->dll_characteristics &
+                                                                             IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) != 0,
+                                            this->process.is_wow64_process, this->uses_relative_time());
         this->process.restore_after_state_restore(*this);
     }
 
@@ -1854,6 +1861,7 @@ namespace sogen
         this->mod_manager.serialize(buffer);
         this->dispatcher.serialize(buffer);
         this->process.serialize(buffer, this->vcpus_[0]->active_thread);
+        this->memory.serialize_aslr_state(buffer);
 
         this->process_snapshot_ = buffer.move_buffer();
     }
@@ -1888,6 +1896,10 @@ namespace sogen
         this->install_section_first_execution_hooks();
         this->dispatcher.deserialize(buffer);
         this->process.deserialize(buffer, this->vcpus_[0]->active_thread);
+        this->memory.deserialize_aslr_state(buffer,
+                                            this->mod_manager.executable && (this->mod_manager.executable->dll_characteristics &
+                                                                             IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) != 0,
+                                            this->process.is_wow64_process, this->uses_relative_time());
         this->process.restore_after_state_restore(*this);
     }
 

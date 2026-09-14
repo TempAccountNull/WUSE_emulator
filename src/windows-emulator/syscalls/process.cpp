@@ -86,32 +86,28 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
             case ProcessMitigationPolicy: {
-                // ProcessMitigationPolicy requires special handling because the caller
-                // specifies which policy to query via the Policy field in the input buffer.
-                // We need to read this field first to determine what's being queried.
-
-                // Ensure we have at least enough space to read the Policy field
-                if (process_information_length < sizeof(PROCESS_MITIGATION_POLICY))
+                if (process_information_length != sizeof(PROCESS_MITIGATION_POLICY_RAW_DATA))
                 {
-                    return STATUS_BUFFER_TOO_SMALL;
+                    return STATUS_INFO_LENGTH_MISMATCH;
                 }
-
-                // Read the policy type from the input buffer using safe emulator memory access
-                const emulator_object<PROCESS_MITIGATION_POLICY> policy_obj{c.emu, process_information};
-                const auto policy = policy_obj.read();
-
-                // We only support querying ProcessDynamicCodePolicy
-                if (policy != ProcessDynamicCodePolicy)
+                if (process_information % alignof(ULONG))
+                {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                PROCESS_MITIGATION_POLICY_RAW_DATA input{};
+                if (!c.win_emu.memory.try_read_memory(process_information, &input, sizeof(input)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if (input.Policy != ProcessASLRPolicy && input.Policy != ProcessDynamicCodePolicy)
                 {
                     return STATUS_NOT_SUPPORTED;
                 }
-
-                return handle_query<PROCESS_MITIGATION_POLICY_RAW_DATA>(c.emu, process_information, process_information_length,
-                                                                        return_length,
-                                                                        [policy](PROCESS_MITIGATION_POLICY_RAW_DATA& policy_data) {
-                                                                            policy_data.Policy = policy;
-                                                                            policy_data.Value = 0;
-                                                                        });
+                return handle_query<PROCESS_MITIGATION_POLICY_RAW_DATA>(
+                    c.emu, process_information, process_information_length, return_length, [&](PROCESS_MITIGATION_POLICY_RAW_DATA& output) {
+                        output.Policy = input.Policy;
+                        output.Value = input.Policy == ProcessASLRPolicy ? c.win_emu.memory.get_aslr_policy() : 0;
+                    });
             }
             case ProcessEnclaveInformation:
             case ProcessTelemetryIdInformation:
@@ -364,6 +360,38 @@ namespace sogen
         NTSTATUS handle_NtSetInformationProcess(const syscall_context& c, const handle process_handle, const uint32_t info_class,
                                                 const uint64_t process_information, const uint32_t process_information_length)
         {
+            if (info_class == ProcessMitigationPolicy)
+            {
+                if (process_information_length != sizeof(PROCESS_MITIGATION_POLICY_RAW_DATA))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                if (process_information % alignof(ULONG))
+                {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                PROCESS_MITIGATION_POLICY_RAW_DATA input{};
+                if (!c.win_emu.memory.try_read_memory(process_information, &input, sizeof(input)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if (process_handle.bits != UINT64_MAX)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                if (input.Policy != ProcessASLRPolicy)
+                {
+                    c.win_emu.log.error("Unsupported process mitigation policy: 0x%X\n", static_cast<uint32_t>(input.Policy));
+                    c.emu.stop();
+                    return STATUS_NOT_SUPPORTED;
+                }
+                const auto status = c.win_emu.memory.set_aslr_policy(input.Value);
+                c.win_emu.log.print(status == STATUS_SUCCESS ? color::green : color::red,
+                                    "--> ASLR requested 0x%X; effective 0x%X; status 0x%X\n", input.Value,
+                                    c.win_emu.memory.get_aslr_policy(), status);
+                return status;
+            }
+
             if (!c.proc.is_current_process_handle(process_handle))
             {
                 return STATUS_NOT_SUPPORTED;

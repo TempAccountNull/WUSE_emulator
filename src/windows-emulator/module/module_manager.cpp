@@ -268,6 +268,10 @@ namespace sogen
             this->callbacks_->on_module_load(entry.first->second);
             return &entry.first->second;
         }
+        catch (const image_relocation_error&)
+        {
+            throw;
+        }
         catch (const std::exception& e)
         {
             logger.error("Failed to map module: %s\n", e.what());

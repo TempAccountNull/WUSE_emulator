@@ -438,8 +438,10 @@ namespace sogen
         this->stack_size = WOW64_NATIVE_STACK_SIZE;
         this->wow64_stack_size = page_align_up(std::max(stack_size, static_cast<uint64_t>(STACK_SIZE)));
 
-        // Set the default memory allocation address to the specified 32-bit address
-        memory.set_default_allocation_address(DEFAULT_ALLOCATION_ADDRESS_32BIT);
+        if (memory.get_default_allocation_address() >= DEFAULT_ALLOCATION_ADDRESS_64BIT)
+        {
+            memory.set_default_allocation_address(DEFAULT_ALLOCATION_ADDRESS_32BIT);
+        }
 
         // Calculate required GS segment size for WOW64 (64-bit TEB + 32-bit TEB)
         constexpr auto teb64_size = sizeof(TEB64);

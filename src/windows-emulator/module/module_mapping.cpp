@@ -549,7 +549,25 @@ namespace sogen
         const bool is_32bit = (nt_headers.FileHeader.Machine == PEMachineType::I386);
         const auto is_dll = nt_headers.FileHeader.Characteristics & IMAGE_FILE_DLL;
         const auto has_dynamic_base = optional_header.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
-        const auto is_relocatable = is_dll || has_dynamic_base;
+        const bool stripped = (nt_headers.FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED) != 0;
+        const auto policy = memory.get_aslr_policy();
+        if (stripped && (policy & 8))
+        {
+            throw image_relocation_error("ASLR rejects image with stripped relocations");
+        }
+        const auto force_relocation = (policy & 2) != 0;
+        const auto is_relocatable = !stripped && (is_dll || has_dynamic_base || force_relocation);
+        if (!stripped && relocation_base == 0 && (force_relocation || (has_dynamic_base && (policy & 1))))
+        {
+            binary.image_base =
+                memory.find_randomized_image_base(static_cast<size_t>(binary.size_of_image), is_32bit || force_wow64cpu_32bit_va);
+            if (binary.image_base == binary.image_base_file)
+            {
+                binary.image_base = memory.find_free_host_allocation_base(
+                    static_cast<size_t>(binary.size_of_image), binary.image_base + ALLOCATION_GRANULARITY,
+                    is_32bit || force_wow64cpu_32bit_va ? below_4gb_ceiling : MAX_ALLOCATION_ADDRESS);
+            }
+        }
 
         if (!binary.image_base || !try_map_module_at_current_base(memory, binary, buffer, nt_headers, nt_headers_offset, optional_header,
                                                                   relocation_base ? relocation_base : binary.image_base))

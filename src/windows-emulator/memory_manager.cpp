@@ -9,9 +9,90 @@
 #include <optional>
 #include <stdexcept>
 #include <cassert>
+#include <random>
 
 namespace sogen
 {
+    uint64_t memory_manager::next_aslr_random()
+    {
+        auto& value = this->aslr_random_state_;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        return value;
+    }
+
+    void memory_manager::initialize_aslr_policy(const bool high_entropy, const bool is_32bit, const bool deterministic)
+    {
+        this->aslr_policy_ = 1u | (high_entropy && !is_32bit ? 4u : 0u);
+        this->aslr_random_state_ = 0x9e3779b97f4a7c15ULL;
+        if (!deterministic)
+        {
+            std::random_device random{};
+            this->aslr_random_state_ = (static_cast<uint64_t>(random()) << 32) ^ random();
+        }
+        if (!this->aslr_random_state_)
+        {
+            this->aslr_random_state_ = 1;
+        }
+        const auto mask = (this->aslr_policy_ & 4) ? 0xffffffULL : 0xffULL;
+        const auto origin = is_32bit ? DEFAULT_ALLOCATION_ADDRESS_32BIT : DEFAULT_ALLOCATION_ADDRESS_64BIT;
+        this->default_allocation_address_ = origin + ((this->next_aslr_random() & mask) + 1) * ALLOCATION_GRANULARITY;
+    }
+
+    NTSTATUS memory_manager::set_aslr_policy(const uint32_t flags)
+    {
+        if (flags & ~0xfu)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if ((this->aslr_policy_ & 0xbu) & ~flags)
+        {
+            return STATUS_ACCESS_DENIED;
+        }
+        if ((flags & 8) && !(flags & 2))
+        {
+            return STATUS_INVALID_PARAMETER_MIX;
+        }
+        // High-entropy eligibility is fixed at process creation, not by this syscall.
+        this->aslr_policy_ = (flags & 0xbu) | (this->aslr_policy_ & 4u);
+        return STATUS_SUCCESS;
+    }
+
+    uint64_t memory_manager::find_randomized_image_base(const size_t size, const bool is_32bit)
+    {
+        const auto mask = (this->aslr_policy_ & 4) && !is_32bit ? 0xffffffULL : 0xffULL;
+        const auto origin = is_32bit ? DEFAULT_ALLOCATION_ADDRESS_32BIT : DEFAULT_ALLOCATION_ADDRESS_64BIT;
+        const auto start = origin + ((this->next_aslr_random() & mask) + 1) * ALLOCATION_GRANULARITY;
+        return this->find_free_host_allocation_base(size, start, is_32bit ? UINT32_MAX : MAX_ALLOCATION_ADDRESS);
+    }
+
+    void memory_manager::serialize_aslr_state(utils::buffer_serializer& buffer) const
+    {
+        buffer.write<uint64_t>(0x31594c4f50524c41);
+        buffer.write(this->aslr_policy_);
+        buffer.write(this->aslr_random_state_);
+    }
+
+    void memory_manager::deserialize_aslr_state(utils::buffer_deserializer& buffer, const bool high_entropy, const bool is_32bit,
+                                                const bool deterministic)
+    {
+        if (!buffer.get_remaining_size())
+        {
+            this->initialize_aslr_policy(high_entropy, is_32bit, deterministic);
+            return;
+        }
+        if (buffer.read<uint64_t>() != 0x31594c4f50524c41)
+        {
+            throw std::runtime_error("Invalid ASLR snapshot extension");
+        }
+        buffer.read(this->aslr_policy_);
+        buffer.read(this->aslr_random_state_);
+        if ((this->aslr_policy_ & ~0xfu) || ((this->aslr_policy_ & 8) && !(this->aslr_policy_ & 2)))
+        {
+            throw std::runtime_error("Invalid saved ASLR policy");
+        }
+    }
 
     namespace
     {

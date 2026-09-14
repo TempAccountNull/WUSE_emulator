@@ -5,6 +5,11 @@
 
 namespace sogen
 {
+    class image_relocation_error : public std::runtime_error
+    {
+      public:
+        using std::runtime_error::runtime_error;
+    };
 
     template <typename T>
     mapped_module map_module_from_data(memory_manager& memory, std::span<const std::byte> data, std::filesystem::path file,
