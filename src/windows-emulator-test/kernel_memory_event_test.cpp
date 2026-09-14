@@ -79,6 +79,32 @@ namespace sogen::test
         EXPECT_EQ(length.read(), sizeof(EVENT_BASIC_INFORMATION));
     }
 
+    TEST_F(KernelMemoryEventTest, LsaReadinessQueryAgreesWithWait)
+    {
+        set_name(u"\\SECURITY\\LSA_AUTHENTICATION_INITIALIZED", 0x40);
+        ASSERT_EQ(open(), STATUS_SUCCESS);
+        const auto h = opened();
+        ASSERT_EQ(h, LSA_AUTHENTICATION_INITIALIZED);
+        const emulator_object<EVENT_BASIC_INFORMATION> info{emu.memory, buffer + 0x200};
+        const emulator_object<uint32_t> length{emu.memory, buffer + 0x220};
+        for (const bool wait_any : {true, false})
+        {
+            auto& thread = *emu.vcpu(0).active_thread;
+            thread.await_objects = {h};
+            thread.await_any = wait_any;
+            ASSERT_TRUE(thread.is_thread_ready(emu));
+            ASSERT_EQ(syscalls::handle_NtQueryEvent(context(), h, 0, info, sizeof(EVENT_BASIC_INFORMATION), length), STATUS_SUCCESS);
+            EXPECT_EQ(info.read().EventType, NotificationEvent);
+            EXPECT_EQ(info.read().EventState, 1);
+            EXPECT_EQ(length.read(), sizeof(EVENT_BASIC_INFORMATION));
+        }
+        ASSERT_EQ(syscalls::handle_NtClose(context(), h), STATUS_SUCCESS);
+        ASSERT_EQ(open(), STATUS_SUCCESS);
+        ASSERT_EQ(syscalls::handle_NtQueryEvent(context(), opened(), 0, info, sizeof(EVENT_BASIC_INFORMATION), {emu.memory, 0}),
+                  STATUS_SUCCESS);
+        EXPECT_EQ(info.read().EventState, 1);
+    }
+
     TEST_F(KernelMemoryEventTest, KernelReferenceSurvivesLastUserCloseAndReopen)
     {
         ASSERT_EQ(open(), STATUS_SUCCESS);
