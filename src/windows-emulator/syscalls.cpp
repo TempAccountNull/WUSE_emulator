@@ -1249,8 +1249,43 @@ namespace sogen
             }
         }
 
-        NTSTATUS handle_NtNotifyChangeDirectoryFile()
+        NTSTATUS handle_NtNotifyChangeDirectoryFile(const syscall_context& c, const handle file_handle, const handle event_handle,
+                                                    const uint64_t apc_routine, const uint64_t apc_context, const uint64_t io_status_block,
+                                                    const uint64_t buffer, const ULONG length, const ULONG completion_filter,
+                                                    const BOOLEAN watch_tree)
         {
+            return c.proc.directory_notifications.begin(c.win_emu, file_handle,
+                                                        {.event = event_handle,
+                                                         .thread_id = c.vcpu.active_thread ? c.thread().id : 0,
+                                                         .apc_routine = apc_routine,
+                                                         .apc_context = apc_context,
+                                                         .io_status_block = io_status_block,
+                                                         .output_buffer = buffer,
+                                                         .length = length},
+                                                        completion_filter, watch_tree != FALSE);
+        }
+
+        NTSTATUS handle_NtCancelIoFileEx(const syscall_context& c, const handle file_handle, const uint64_t request_io_status_block,
+                                         const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block)
+        {
+            if (!c.proc.files.get(file_handle))
+            {
+                return STATUS_INVALID_HANDLE;
+            }
+            const auto status = c.proc.directory_notifications.cancel(c.win_emu, file_handle, request_io_status_block);
+            io_status_block.write({.Status = status, .Information = 0});
+            return status;
+        }
+
+        NTSTATUS handle_NtCancelIoFile(const syscall_context& c, const handle file_handle,
+                                       const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block)
+        {
+            if (!c.proc.files.get(file_handle))
+            {
+                return STATUS_INVALID_HANDLE;
+            }
+            (void)c.proc.directory_notifications.cancel(c.win_emu, file_handle, 0, c.thread().id);
+            io_status_block.write({.Status = STATUS_SUCCESS, .Information = 0});
             return STATUS_SUCCESS;
         }
 
@@ -1763,6 +1798,8 @@ namespace sogen
         add_handler(NtUserLoadKeyboardLayoutEx);
         add_handler(NtUserGetGUIThreadInfo);
         add_handler(NtNotifyChangeDirectoryFile);
+        add_handler(NtCancelIoFile);
+        add_handler(NtCancelIoFileEx);
         add_handler(NtUserChangeWindowMessageFilter);
         add_handler(NtUserSetWinEventHook);
         add_handler(NtUserUnhookWinEvent);

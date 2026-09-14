@@ -719,6 +719,8 @@ namespace sogen
         buffer.write(this->threads);
 
         buffer.write(this->threads.find_handle(active_thread).bits);
+        buffer.write<uint64_t>(0x31594649544F4E44);
+        buffer.write(this->directory_notifications);
     }
 
     void process_context::deserialize(utils::buffer_deserializer& buffer, emulator_thread*& active_thread)
@@ -825,6 +827,15 @@ namespace sogen
         }
 
         active_thread = this->threads.get(buffer.read<uint64_t>());
+        this->directory_notifications = {};
+        if (buffer.get_remaining_size())
+        {
+            if (buffer.read<uint64_t>() != 0x31594649544F4E44)
+            {
+                throw std::runtime_error("Invalid directory notification snapshot extension");
+            }
+            buffer.read(this->directory_notifications);
+        }
     }
 
     void process_context::prepare_for_state_restore(windows_emulator& win_emu)
@@ -838,6 +849,7 @@ namespace sogen
     void process_context::restore_after_state_restore(windows_emulator& win_emu)
     {
         restore_windows_after_state_restore(win_emu);
+        this->directory_notifications.process_completions(win_emu);
 
         for (auto& port : this->ports | std::views::values)
         {

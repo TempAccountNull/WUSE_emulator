@@ -52,6 +52,7 @@ namespace sogen
                 auto* file = c.proc.files.get(h);
                 if (file && file->ref_count == 1)
                 {
+                    c.proc.directory_notifications.close(c.win_emu, h);
                     for (auto it = c.proc.file_locks.begin(); it != c.proc.file_locks.end();)
                     {
                         auto& locks = it->second.locks;

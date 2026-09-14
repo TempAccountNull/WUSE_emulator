@@ -396,6 +396,8 @@ namespace sogen
                 }
             }
 
+            win_emu.process.directory_notifications.process_completions(win_emu);
+
             auto& devices = win_emu.process.devices;
 
             // Crappy mechanism to prevent mutation while iterating.

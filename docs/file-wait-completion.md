@@ -14,10 +14,9 @@ association, retained handle lifetime, cancellation and invalid handles. All
 four fail on the previous handler; they pass with the change in interpreter and
 JIT modes. The full focused set passes 29 tests in each mode.
 
-Directory change notification requires separate support. The current
-`NtNotifyChangeDirectoryFile` stub returns immediate success. Windows returns
-`STATUS_PENDING` and leaves the directory unsignaled until a matching change;
-that pending state must not be treated as completed synchronous I/O.
+Pending directory I/O now supplies the file signal state described in
+[directory-notifications.md](directory-notifications.md). A newly opened file
+is signaled; a pending notification clears that signal until completion.
 
 Reference: https://learn.microsoft.com/en-us/windows/win32/devnotes/ntassociatewaitcompletionpacket
 

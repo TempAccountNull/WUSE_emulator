@@ -10,6 +10,7 @@
 #include <arch_emulator.hpp>
 
 #include "io_device.hpp"
+#include "directory_notifications.hpp"
 #include "kusd_mmio.hpp"
 #include "windows_objects.hpp"
 #include "emulator_thread.hpp"
@@ -531,6 +532,7 @@ namespace sogen
         handle_store<handle_types::event, event> events{};
         handle_store<handle_types::file, file> files{};
         utils::insensitive_u16string_map<file_lock_ranges> file_locks{};
+        directory_notification_manager directory_notifications{};
         handle_store<handle_types::section, section, 2> sections{};
         handle_store<handle_types::device, io_device_container> devices{};
         handle console_handle{};

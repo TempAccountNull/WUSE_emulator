@@ -17,7 +17,8 @@ namespace sogen
                     return target_object_handle == GUEST_PROCESS_HANDLE && process.exit_status.has_value();
 
                 case handle_types::file:
-                    return process.files.get(target_object_handle) != nullptr;
+                    return process.files.get(target_object_handle) != nullptr &&
+                           process.directory_notifications.is_signaled(target_object_handle);
 
                 case handle_types::event: {
                     const auto* e = process.events.get(target_object_handle);
