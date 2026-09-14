@@ -137,7 +137,15 @@ namespace sogen
                                              e.created_thread_id, e.start_address, e.argument, flags.c_str());
                         },
                         [&](const thread_terminated_event& e) {
-                            this->log_.print(color::gray, "Thread terminated: tid %u\n", e.terminated_thread_id);
+                            if (e.exit_status.has_value())
+                            {
+                                this->log_.print(color::gray, "Thread terminated: tid %u | exit 0x%08" PRIX32 "\n", e.terminated_thread_id,
+                                                 *e.exit_status);
+                            }
+                            else
+                            {
+                                this->log_.print(color::gray, "Thread terminated: tid %u\n", e.terminated_thread_id);
+                            }
                         },
                         [&](const thread_set_name_event& e) {
                             this->log_.print(color::blue, "Setting thread (%u) name: %s\n", e.renamed_thread_id, e.name.c_str());

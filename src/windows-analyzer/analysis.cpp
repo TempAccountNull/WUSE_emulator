@@ -295,7 +295,13 @@ namespace sogen
         {
             if (!c.settings->skip_generic_activity)
             {
-                c.emit_observation<thread_terminated_event>([&](auto& event) { event.terminated_thread_id = t.id; });
+                c.emit_observation<thread_terminated_event>([&](auto& event) {
+                    event.terminated_thread_id = t.id;
+                    if (t.exit_status.has_value())
+                    {
+                        event.exit_status = static_cast<uint32_t>(*t.exit_status);
+                    }
+                });
             }
         }
 

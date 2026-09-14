@@ -442,6 +442,10 @@ namespace sogen
             static void write_fields(json_object_builder& object, const thread_terminated_event& event)
             {
                 object.field("terminatedTid", event.terminated_thread_id);
+                if (event.exit_status.has_value())
+                {
+                    object.field("exit", *event.exit_status);
+                }
             }
 
             static void write_fields(json_object_builder& object, const thread_set_name_event& event)

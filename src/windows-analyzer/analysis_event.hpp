@@ -146,6 +146,7 @@ namespace sogen
     struct thread_terminated_event : observation_event
     {
         uint32_t terminated_thread_id{};
+        std::optional<uint32_t> exit_status{};
     };
 
     struct thread_set_name_event : observation_event

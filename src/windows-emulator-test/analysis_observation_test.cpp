@@ -1,6 +1,12 @@
 #include "emulation_test_utils.hpp"
 #include "../windows-analyzer/analysis.hpp"
 #include "../windows-analyzer/analysis_reporter.hpp"
+#include <syscall_utils.hpp>
+
+namespace sogen::syscalls
+{
+    NTSTATUS handle_NtTerminateThread(const syscall_context&, handle, NTSTATUS);
+}
 
 namespace sogen::test
 {
@@ -16,6 +22,7 @@ namespace sogen::test
         analysis_context analysis{.settings = &logging_settings, .win_emu = &win_emu, .reporters = {this}};
         std::vector<function_execution_event> calls{};
         std::vector<execution_progress_event> progress{};
+        std::vector<thread_terminated_event> terminated{};
         uint64_t caller{};
         uint64_t callee{};
         uint64_t stack{};
@@ -25,6 +32,10 @@ namespace sogen::test
             if (const auto* call = std::get_if<function_execution_event>(&event))
             {
                 calls.push_back(*call);
+            }
+            if (const auto* exit = std::get_if<thread_terminated_event>(&event))
+            {
+                terminated.push_back(*exit);
             }
             if (const auto* update = std::get_if<execution_progress_event>(&event))
             {
@@ -73,6 +84,25 @@ namespace sogen::test
         EXPECT_EQ(win_emu.emu().reg<uint64_t>(x86_register::rax), 0x800B0100U);
         ASSERT_EQ(calls.size(), 1U);
         EXPECT_EQ(calls.front().execution.rip, callee);
+    }
+
+    TEST_F(AnalysisObservation, ThreadExitReportsTargetAndFullStatusWithoutExitingProcess)
+    {
+        for (const auto status : std::array<NTSTATUS, 2>{STATUS_SUCCESS, STATUS_ACCESS_VIOLATION})
+        {
+            const auto target = win_emu.process.create_thread(win_emu.memory, caller, 0, 0x10000, 0);
+            const auto id = win_emu.process.threads.get(target)->id;
+            auto& vcpu = win_emu.vcpu(0);
+            const syscall_context context{.win_emu = win_emu, .emu = vcpu.cpu, .vcpu = vcpu, .proc = win_emu.process};
+            ASSERT_NE(id, vcpu.active_thread->id);
+            ASSERT_EQ(syscalls::handle_NtTerminateThread(context, target, status), STATUS_SUCCESS);
+            ASSERT_FALSE(terminated.empty());
+            EXPECT_EQ(terminated.back().terminated_thread_id, id);
+            EXPECT_EQ(terminated.back().exit_status, static_cast<uint32_t>(status));
+            EXPECT_FALSE(vcpu.active_thread->exit_status.has_value());
+            EXPECT_FALSE(win_emu.process.exit_status.has_value());
+        }
+        EXPECT_EQ(terminated.size(), 2U);
     }
 
     TEST_F(AnalysisObservation, ProgressExcludesInstructionsFromRestoredSnapshot)
