@@ -29,3 +29,24 @@ Local evidence: graphics-api-returns capture 1789410624329191500 and the
 read-only inspectors 1789411462539053600 and 1789411570549694200. The texture
 checkpoint SHA-256 is
 cf410be533e0a31d8abd6901c13bf4a9bb23edca623764417bda0fcfeaf41f11.
+
+## Replay before device creation
+
+The current build resumed the earlier post-unpacking checkpoint. All 87
+CreateTexture2D calls before the first Map returned S_OK, non-null objects and
+balanced stacks. The cached removal reason was zero at every texture entry.
+No device-removal callback was observed on this path.
+
+The first Map received resource 0x2AB039F0B8. Its previously faulting instruction
+at d3d11.dll+0x12C370 read resource type 3 and advanced to RVA 0x12C378. Map then
+returned S_OK to destiny2.exe+0x122FDB1, with RSP advanced by 0x50 (the function's
+0x48-byte frame plus return slot). Mapped data was 0x2AD7500000, row pitch 16,
+depth pitch 16. The continuation reached d3dcompiler_47.dll execution.
+
+Evidence: graphics-removal-origin capture 1789410914245052700 contains
+graphics-recovery-proof.json and the 87 before/after call records. The healthy
+checkpoint SHA-256 is
+d975867f52869669e25a755f1cc8a9123242a6e926366b865af8a554c5acbb3d.
+The continuation 1789412092706152100 contains map-return-proof.json with the
+instruction read, saved return slot, registers and mapped output. This proves
+the old null-resource failure was passed. It does not establish Sunrise boot.
