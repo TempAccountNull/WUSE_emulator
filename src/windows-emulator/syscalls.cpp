@@ -831,6 +831,7 @@ namespace sogen
         NTSTATUS handle_NtGdiDdDDICloseAdapter();
         NTSTATUS handle_NtGdiDdDDIQueryAdapterInfo(const syscall_context& c, emulator_object<EMU_D3DKMT_QUERYADAPTERINFO> query_adapter);
         NTSTATUS handle_NtGdiDdDDICreateDevice(const syscall_context& c, emulator_object<EMU_D3DKMT_CREATEDEVICE> device_desc);
+        NTSTATUS handle_NtGdiDdDDISetQueuedLimit(const syscall_context& c, emulator_object<EMU_D3DKMT_SETQUEUEDLIMIT> limits);
         NTSTATUS handle_NtGdiDdDDIEscape(const syscall_context& c, emulator_object<EMU_D3DKMT_ESCAPE> escape_desc);
         NTSTATUS handle_NtGdiDdDDICreateContext(const syscall_context& c, emulator_object<EMU_D3DKMT_CREATECONTEXT> context_desc);
         NTSTATUS handle_NtGdiDdDDIRender(const syscall_context& c, emulator_object<EMU_D3DKMT_RENDER> render_desc);
@@ -1700,6 +1701,7 @@ namespace sogen
         add_handler(NtGdiDdDDICloseAdapter);
         add_handler(NtGdiDdDDIQueryAdapterInfo);
         add_handler(NtGdiDdDDICreateDevice);
+        add_handler(NtGdiDdDDISetQueuedLimit);
         add_handler(NtGdiDdDDIEscape);
         add_handler(NtGdiDdDDICreateContext);
         add_handler(NtGdiDdDDIRender);

@@ -256,6 +256,7 @@ namespace sogen
                 }
             };
 
+            uint32_t queued_present_limit{3};
             uint32_t next_resource_handle{0x8000};
             uint32_t next_allocation_handle{0x9000};
             std::map<uint32_t, dxgk_allocation> allocations{};

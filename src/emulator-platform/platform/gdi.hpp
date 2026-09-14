@@ -353,6 +353,16 @@ namespace sogen
         UINT32 PatchLocationListSize;
     };
 
+    struct EMU_D3DKMT_SETQUEUEDLIMIT
+    {
+        UINT32 hDevice;
+        UINT32 Type;
+        UINT32 QueuedPresentLimit;
+        UINT32 Reserved;
+    };
+
+    static_assert(sizeof(EMU_D3DKMT_SETQUEUEDLIMIT) == 16);
+
     struct EMU_D3DKMT_ESCAPE
     {
         UINT32 hAdapter;

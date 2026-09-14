@@ -728,6 +728,8 @@ namespace sogen
         }
         buffer.write<uint64_t>(0x314C414544495254);
         buffer.write_map(ideal_processors);
+        buffer.write<uint64_t>(0x3154494D494C5147);
+        buffer.write(this->dxgk.queued_present_limit);
     }
 
     void process_context::deserialize(utils::buffer_deserializer& buffer, emulator_thread*& active_thread)
@@ -864,6 +866,15 @@ namespace sogen
                 }
                 this->threads.get(entry->second)->ideal_processor = processor;
             }
+        }
+        this->dxgk.queued_present_limit = 3;
+        if (buffer.get_remaining_size())
+        {
+            if (buffer.read<uint64_t>() != 0x3154494D494C5147)
+            {
+                throw std::runtime_error("Invalid graphics queue limit snapshot extension");
+            }
+            buffer.read(this->dxgk.queued_present_limit);
         }
     }
 

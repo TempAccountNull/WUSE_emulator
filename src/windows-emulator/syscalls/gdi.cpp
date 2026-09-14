@@ -4249,6 +4249,7 @@ namespace sogen
                 }
 
                 create_device.hDevice = k_dxgk_device_handle;
+                c.proc.dxgk.queued_present_limit = 3;
                 create_device.pCommandBuffer = 0;
                 create_device.CommandBufferSize = 0;
 
@@ -4256,6 +4257,37 @@ namespace sogen
                           create_device.hAdapter);
             });
 
+            return STATUS_SUCCESS;
+        }
+
+        NTSTATUS handle_NtGdiDdDDISetQueuedLimit(const syscall_context& c, const emulator_object<EMU_D3DKMT_SETQUEUEDLIMIT> limits)
+        {
+            if (!limits)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            const auto request = limits.read();
+            if (request.hDevice != k_dxgk_device_handle)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            switch (request.Type)
+            {
+            case 1:
+                c.proc.dxgk.queued_present_limit = request.QueuedPresentLimit == 0 ? 3 : request.QueuedPresentLimit;
+                break;
+            case 2:
+                c.emu.write_memory<UINT32>(limits.value() + offsetof(EMU_D3DKMT_SETQUEUEDLIMIT, QueuedPresentLimit),
+                                           c.proc.dxgk.queued_present_limit);
+                break;
+            default:
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            dxgk_info(c, "NtGdiDdDDISetQueuedLimit: Device 0x%X, Type %u, Present Limit %u", request.hDevice, request.Type,
+                      c.proc.dxgk.queued_present_limit);
             return STATUS_SUCCESS;
         }
 
