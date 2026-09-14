@@ -798,6 +798,7 @@ namespace sogen
         const auto apiset_data = apiset::obtain(this->emulation_root);
 
         this->process.setup(*this, this->application_settings_, *executable, *ntdll, apiset_data, this->mod_manager.wow64_modules_.ntdll32);
+        this->configure_xstate();
 
         const auto ntdll_data = emu.read_memory(ntdll->image_base, static_cast<size_t>(ntdll->size_of_image));
         const auto win32u_data = emu.read_memory(win32u->image_base, static_cast<size_t>(win32u->size_of_image));
@@ -1169,6 +1170,9 @@ namespace sogen
             case 6:
                 this->callbacks.on_suspicious_activity("Illegal instruction");
                 dispatch_illegal_instruction_violation(*this, vcpu);
+                return;
+            case 13:
+                dispatch_access_violation(*this, vcpu, std::numeric_limits<uint64_t>::max(), memory_operation::read);
                 return;
             case 41:
                 this->callbacks.on_fast_fail(acting.reg<uint32_t>(x86_register::ecx));
@@ -1836,11 +1840,28 @@ namespace sogen
         this->install_section_first_execution_hooks();
         this->dispatcher.deserialize(buffer);
         this->process.deserialize(buffer, this->vcpus_[0]->active_thread);
+        this->configure_xstate();
         this->memory.deserialize_aslr_state(buffer,
                                             this->mod_manager.executable && (this->mod_manager.executable->dll_characteristics &
                                                                              IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) != 0,
                                             this->process.is_wow64_process, this->uses_relative_time());
         this->process.restore_after_state_restore(*this);
+    }
+
+    void windows_emulator::configure_xstate()
+    {
+        if (this->emu().get_name() != "icicle-emu")
+        {
+            return;
+        }
+        this->process.kusd.access([](KUSER_SHARED_DATA64& kusd) {
+            kusd.XState = {};
+            kusd.XState.EnabledFeatures = 3;
+            kusd.XState.EnabledVolatileFeatures = 3;
+            kusd.XState.Size = 576;
+            kusd.XState.Features[0] = {.Offset = 0, .Size = 160};
+            kusd.XState.Features[1] = {.Offset = 160, .Size = 256};
+        });
     }
 
     void windows_emulator::save_snapshot()
@@ -1896,6 +1917,7 @@ namespace sogen
         this->install_section_first_execution_hooks();
         this->dispatcher.deserialize(buffer);
         this->process.deserialize(buffer, this->vcpus_[0]->active_thread);
+        this->configure_xstate();
         this->memory.deserialize_aslr_state(buffer,
                                             this->mod_manager.executable && (this->mod_manager.executable->dll_characteristics &
                                                                              IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) != 0,

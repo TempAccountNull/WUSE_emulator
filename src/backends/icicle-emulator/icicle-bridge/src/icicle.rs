@@ -19,6 +19,7 @@ fn create_x64_vm() -> icicle_vm::Vm {
 
     let mut vm = icicle_vm::build(&cpu_config).unwrap();
     crate::reciprocal_sqrt::register(&mut vm.cpu);
+    crate::xstate::register(&mut vm.cpu);
     vm
 }
 
@@ -721,6 +722,9 @@ impl IcicleEmulator {
             self.flush_pending_code();
             return true;
         }
+        if value == crate::xstate::GENERAL_PROTECTION {
+            return self.handle_interrupt(13);
+        }
         let kind = value >> 8;
         if !(1..=2).contains(&kind) {
             return false;
@@ -1015,6 +1019,7 @@ impl IcicleEmulator {
         unsafe {
             self.vm.cpu.regs.write_at(0, buffer);
         };
+        crate::xstate::restore_legacy_xcr0(&mut self.vm.cpu);
     }
 
     // Deserializing reuses the live VM, so any execution state that a freshly built VM would not carry must be

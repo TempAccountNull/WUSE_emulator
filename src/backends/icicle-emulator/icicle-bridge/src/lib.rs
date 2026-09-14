@@ -1,6 +1,7 @@
 mod icicle;
 mod reciprocal_sqrt;
 mod registers;
+mod xstate;
 
 use icicle::{IcicleEmulator, IcicleStopInfo};
 use registers::X86Register;

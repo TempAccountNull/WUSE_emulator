@@ -43,6 +43,25 @@ namespace sogen::test
         }
     };
 
+    TEST_P(MemoryFaultContext, XrstorGeneralProtectionReachesGuestExceptionDispatcher)
+    {
+        if (win_emu.emu().get_name() != "icicle-emu")
+        {
+            GTEST_SKIP();
+        }
+        const std::array<uint8_t, 3> bytes{0x0F, 0xAE, 0x2B};
+        win_emu.emu().write_memory(code, bytes.data(), bytes.size());
+        win_emu.emu().reg(x86_register::rbx, target + 8);
+        win_emu.emu().reg(x86_register::rax, 3ULL);
+        win_emu.emu().reg(x86_register::rdx, 0ULL);
+        capture();
+        EXPECT_EQ(record.ExceptionInformation[0], 0U);
+        EXPECT_EQ(record.ExceptionInformation[1], std::numeric_limits<uint64_t>::max());
+        EXPECT_EQ(record.ExceptionAddress, code);
+        EXPECT_EQ(context.Rip, code);
+        EXPECT_EQ(context.Rsp, stack);
+    }
+
     TEST_P(MemoryFaultContext, ReturnToNonExecutableMemoryPreservesConsumedReturn)
     {
         win_emu.emu().write_memory<uint8_t>(code, 0xC3);
