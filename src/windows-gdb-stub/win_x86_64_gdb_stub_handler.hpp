@@ -185,6 +185,100 @@ namespace sogen
             return thread_list;
         }
 
+        bool supports_thread_diagnostics() const override
+        {
+            return true;
+        }
+
+        std::vector<gdb_stub::thread_diagnostic> get_thread_diagnostics() const override
+        {
+            std::vector<gdb_stub::thread_diagnostic> result;
+            const auto* active = this->win_emu_->vcpu(0).active_thread;
+            for (const auto& [index, thread] : this->win_emu_->process.threads)
+            {
+                gdb_stub::thread_diagnostic row{.id = thread.id};
+                auto add = [&](const std::string& name, const auto value) { row.fields.emplace_back(name, std::to_string(value)); };
+                auto address = [&](const std::string& name, const uint64_t value) {
+                    row.fields.emplace_back(name, "0x" + utils::string::to_hex_number(value));
+                    if (const auto* module = this->win_emu_->mod_manager.find_by_address(value))
+                    {
+                        row.fields.emplace_back(name + "_module", module->name);
+                        row.fields.emplace_back(name + "_rva", "0x" + utils::string::to_hex_number(value - module->image_base));
+                    }
+                };
+                row.fields.emplace_back("handle",
+                                        "0x" + utils::string::to_hex_number(this->win_emu_->process.threads.make_handle(index).bits));
+                row.fields.emplace_back("name", u16_to_u8(thread.name));
+                add("active", active == &thread);
+                add("terminated", thread.is_terminated());
+                add("initialized", thread.setup_done);
+                add("suspended", thread.suspended);
+                add("instructions", thread.executed_instructions);
+                add("blocks", thread.executed_blocks);
+                address("start", thread.start_address);
+                address("last_instruction", thread.current_ip);
+                if (active == &thread)
+                {
+                    address("rip", this->win_emu_->vcpu(0).cpu.reg<uint64_t>(x86_register::rip));
+                }
+                if (thread.exit_status)
+                {
+                    row.fields.emplace_back("exit_status", "0x" + utils::string::to_hex_number(static_cast<uint32_t>(*thread.exit_status)));
+                }
+                if (thread.pending_status)
+                {
+                    row.fields.emplace_back("pending_status",
+                                            "0x" + utils::string::to_hex_number(static_cast<uint32_t>(*thread.pending_status)));
+                }
+                std::string handles;
+                std::string wait_threads;
+                for (const auto handle : thread.await_objects)
+                {
+                    if (!handles.empty())
+                    {
+                        handles += ',';
+                    }
+                    handles += "0x" + utils::string::to_hex_number(handle.bits);
+                    if (const auto* target = this->win_emu_->process.threads.get(handle))
+                    {
+                        if (!wait_threads.empty())
+                        {
+                            wait_threads += ',';
+                        }
+                        wait_threads += "0x" + utils::string::to_hex_number(target->id);
+                    }
+                }
+                row.fields.emplace_back("wait_handles", handles);
+                row.fields.emplace_back("wait_thread_ids", wait_threads);
+                add("wait_any", thread.await_any);
+                add("wait_alert", thread.waiting_for_alert);
+                add("alerted", thread.alerted);
+                add("apc_alertable", thread.apc_alertable);
+                add("pending_apcs", thread.pending_apcs.size());
+                add("wait_message", thread.await_msg.has_value());
+                add("wait_message_mask_present", thread.await_msg_mask.has_value());
+                add("wait_message_mask", thread.await_msg_mask.value_or(0));
+                add("queued_messages", thread.message_queue.size());
+                add("wait_io_completion", thread.await_io_completion.has_value());
+                add("wait_host_condition", static_cast<bool>(thread.await_host_condition));
+                add("callback_depth", thread.callback_stack.size());
+                if (thread.await_time)
+                {
+                    if (*thread.await_time == std::chrono::steady_clock::time_point::min())
+                    {
+                        row.fields.emplace_back("wait_deadline", "infinite");
+                    }
+                    else
+                    {
+                        add("wait_deadline_steady_ns",
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(thread.await_time->time_since_epoch()).count());
+                    }
+                }
+                result.push_back(std::move(row));
+            }
+            return result;
+        }
+
         uint64_t get_thread_teb_addr(uint32_t id) const override
         {
             for (const auto& t : this->win_emu_->process.threads | std::views::values)

@@ -320,6 +320,34 @@ namespace sogen::gdb_stub
             send_xfer_data(c.connection, std::string(data), xml);
         }
 
+        void handle_thread_diagnostics(const debugging_context& c, const std::string_view payload)
+        {
+            const auto [command, args] = split_string(payload, ':');
+            const auto [annex, data] = split_string(args, ':');
+            if (command != "read" || !annex.empty() || !c.handler.supports_thread_diagnostics())
+            {
+                c.connection.send_reply({});
+                return;
+            }
+            if (c.async.is_running())
+            {
+                c.connection.send_reply("E16");
+                return;
+            }
+            std::string xml = "<sogen-threads version=\"1\">\n";
+            for (const auto& thread : c.handler.get_thread_diagnostics())
+            {
+                xml += "<thread id=\"" + utils::string::to_hex_number(thread.id) + "\"";
+                for (const auto& [name, value] : thread.fields)
+                {
+                    xml += " " + name + "=\"" + escape_xml(value) + "\"";
+                }
+                xml += "/>\n";
+            }
+            xml += "</sogen-threads>";
+            send_xfer_data(c.connection, std::string(data), xml);
+        }
+
         void process_xfer(const debugging_context& c, const std::string_view payload)
         {
             auto [name, args] = split_string(payload, ':');
@@ -339,6 +367,10 @@ namespace sogen::gdb_stub
             else if (name == "threads")
             {
                 handle_threads(c, args);
+            }
+            else if (name == "sogen-threads")
+            {
+                handle_thread_diagnostics(c, args);
             }
             else
             {
@@ -360,6 +392,10 @@ namespace sogen::gdb_stub
                              ";qXfer:threads:read+"
                              ";binary-upload+");
 
+                if (c.handler.supports_thread_diagnostics())
+                {
+                    reply.append(";qXfer:sogen-threads:read+");
+                }
                 c.connection.send_reply(reply);
             }
             else if (name == "Attached")

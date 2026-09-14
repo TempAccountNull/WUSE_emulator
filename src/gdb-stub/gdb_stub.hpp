@@ -37,6 +37,12 @@ namespace sogen::gdb_stub
         std::string name;
     };
 
+    struct thread_diagnostic
+    {
+        uint32_t id;
+        std::vector<std::pair<std::string, std::string>> fields;
+    };
+
     class binding_error : public std::runtime_error
     {
       public:
@@ -101,6 +107,16 @@ namespace sogen::gdb_stub
         }
 
         virtual std::vector<thread_info> get_thread_list() const
+        {
+            return {};
+        }
+
+        virtual bool supports_thread_diagnostics() const
+        {
+            return false;
+        }
+
+        virtual std::vector<thread_diagnostic> get_thread_diagnostics() const
         {
             return {};
         }
