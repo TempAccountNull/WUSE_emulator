@@ -730,6 +730,8 @@ namespace sogen
         buffer.write_map(ideal_processors);
         buffer.write<uint64_t>(0x3154494D494C5147);
         buffer.write(this->dxgk.queued_present_limit);
+        buffer.write<uint64_t>(0x31434E5953504744);
+        buffer.write_vector(this->dxgk.pending_sync_commands);
     }
 
     void process_context::deserialize(utils::buffer_deserializer& buffer, emulator_thread*& active_thread)
@@ -876,6 +878,70 @@ namespace sogen
             }
             buffer.read(this->dxgk.queued_present_limit);
         }
+        this->dxgk.pending_sync_commands.clear();
+        auto extension = buffer;
+        if (extension.get_remaining_size() && extension.read<uint64_t>() == 0x31434E5953504744)
+        {
+            buffer.read<uint64_t>();
+            buffer.read_vector(this->dxgk.pending_sync_commands);
+            for (const auto& command : this->dxgk.pending_sync_commands)
+            {
+                if ((command.signal_event && !this->events.get(command.signal_event)) ||
+                    (command.finish_event && !this->events.get(command.finish_event)))
+                {
+                    throw std::runtime_error("Invalid saved graphics synchronization event");
+                }
+            }
+        }
+    }
+
+    void process_context::process_graphics_commands()
+    {
+        auto& commands = this->dxgk.pending_sync_commands;
+        size_t completed = 0;
+        for (auto& command : commands)
+        {
+            if (!command.started)
+            {
+                if (auto* signal = this->events.get(command.signal_event))
+                {
+                    signal->signaled = true;
+                }
+                command.started = true;
+            }
+            if (auto* finish = this->events.get(command.finish_event))
+            {
+                if (!finish->signaled)
+                {
+                    break;
+                }
+                if (finish->type == SynchronizationEvent)
+                {
+                    finish->signaled = false;
+                }
+            }
+            this->events.erase(command.signal_event);
+            this->events.erase(command.finish_event);
+            ++completed;
+        }
+        commands.erase(commands.begin(), commands.begin() + static_cast<ptrdiff_t>(completed));
+    }
+
+    void process_context::discard_graphics_commands()
+    {
+        for (const auto& command : this->dxgk.pending_sync_commands)
+        {
+            if (!command.started)
+            {
+                if (auto* signal = this->events.get(command.signal_event))
+                {
+                    signal->signaled = true;
+                }
+            }
+            this->events.erase(command.signal_event);
+            this->events.erase(command.finish_event);
+        }
+        this->dxgk.pending_sync_commands.clear();
     }
 
     void process_context::prepare_for_state_restore(windows_emulator& win_emu)

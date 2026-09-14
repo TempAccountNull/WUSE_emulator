@@ -4442,34 +4442,72 @@ namespace sogen
             {
                 return STATUS_INVALID_PARAMETER;
             }
+            auto render = render_desc.read();
+            if (render.hContext != k_dxgk_context_handle && render.hContext != k_dxgk_device_handle)
+            {
+                return STATUS_INVALID_HANDLE;
+            }
 
-            render_desc.access([&](EMU_D3DKMT_RENDER& render) {
-                if (render.hContext != k_dxgk_context_handle && render.hContext != k_dxgk_device_handle)
+            auto& dxgk = c.proc.dxgk;
+            std::optional<process_context::dxgk_state::sync_command> sync;
+            if (render.CommandLength != 0)
+            {
+                if (render.CommandOffset > render.CommandLength || render.CommandLength > dxgk.command_buffer.size ||
+                    dxgk.command_buffer.address == 0)
                 {
-                    dxgk_warn(c, "NtGdiDdDDIRender: Unknown context 0x%X", render.hContext);
+                    return STATUS_INVALID_PARAMETER;
                 }
+                if (render.CommandLength - render.CommandOffset != 24 || render.BroadcastContextCount != 0 || (render.Flags & 0x60) != 0)
+                {
+                    return STATUS_NOT_SUPPORTED;
+                }
+                const auto command = c.emu.read_memory<std::array<uint64_t, 3>>(dxgk.command_buffer.address + render.CommandOffset);
+                if (command[0] != 0x18434E5953)
+                {
+                    return STATUS_NOT_SUPPORTED;
+                }
+                if ((command[1] != 0 && !c.proc.events.get(command[1])) || (command[2] != 0 && !c.proc.events.get(command[2])))
+                {
+                    return STATUS_INVALID_HANDLE;
+                }
+                sync = process_context::dxgk_state::sync_command{.signal_event = command[1], .finish_event = command[2]};
+            }
 
-                // Clamp the guest-controlled sizes: at least the defaults, but never above the caps above.
-                reserve_dxgk_submission_buffers(
-                    c, std::clamp(render.NewCommandBufferSize, k_dxgk_command_buffer_size, k_dxgk_max_command_buffer_size),
-                    std::clamp(render.NewAllocationListSize, k_dxgk_allocation_list_count, k_dxgk_max_list_count),
-                    std::clamp(render.NewPatchLocationListSize, k_dxgk_patch_location_list_count, k_dxgk_max_list_count));
+            reserve_dxgk_submission_buffers(
+                c, std::clamp(render.NewCommandBufferSize, k_dxgk_command_buffer_size, k_dxgk_max_command_buffer_size),
+                std::clamp(render.NewAllocationListSize, k_dxgk_allocation_list_count, k_dxgk_max_list_count),
+                std::clamp(render.NewPatchLocationListSize, k_dxgk_patch_location_list_count, k_dxgk_max_list_count));
 
-                const auto& dxgk = c.proc.dxgk;
+            if (sync)
+            {
+                dxgk.pending_sync_commands.push_back(*sync);
+                if (auto* signal = c.proc.events.get(sync->signal_event))
+                {
+                    ++signal->ref_count;
+                }
+                if (auto* finish = c.proc.events.get(sync->finish_event))
+                {
+                    ++finish->ref_count;
+                }
+                // BasicRender translates SYNC(24) to SYAK(8), signals the first event, then waits on the second.
+                c.emu.write_memory<uint64_t>(dxgk.command_buffer.address + render.CommandOffset, 0x84B415953);
+            }
+            c.proc.process_graphics_commands();
 
-                render.pNewCommandBuffer = dxgk.command_buffer.address;
-                render.NewCommandBuffer = dxgk.command_buffer.address;
-                render.NewCommandBufferSize = dxgk.command_buffer.size;
-                render.pNewAllocationList = dxgk.allocation_list.address;
-                render.NewAllocationListSize = dxgk.allocation_list.size / k_dxgk_allocation_list_entry_size;
-                render.pNewPatchLocationList = dxgk.patch_location_list.address;
-                render.NewPatchLocationListSize = dxgk.patch_location_list.size / k_dxgk_patch_location_list_entry_size;
-                render.QueuedBufferCount = 0;
-
-                dxgk_info(c, "NtGdiDdDDIRender: Context 0x%X CommandOffset=0x%X CommandLength=0x%X Allocations=%u Patches=%u",
-                          render.hContext, render.CommandOffset, render.CommandLength, render.AllocationCount, render.PatchLocationCount);
-            });
-
+            render.pNewCommandBuffer = dxgk.command_buffer.address;
+            render.NewCommandBuffer = dxgk.command_buffer.address;
+            render.NewCommandBufferSize = dxgk.command_buffer.size;
+            render.pNewAllocationList = dxgk.allocation_list.address;
+            render.NewAllocationListSize = dxgk.allocation_list.size / k_dxgk_allocation_list_entry_size;
+            render.pNewPatchLocationList = dxgk.patch_location_list.address;
+            render.NewPatchLocationListSize = dxgk.patch_location_list.size / k_dxgk_patch_location_list_entry_size;
+            render.QueuedBufferCount = static_cast<uint32_t>(dxgk.pending_sync_commands.size());
+            render_desc.write(render);
+            if (sync)
+            {
+                c.win_emu.log.info("WARP SYNC: signal 0x%" PRIx64 ", finish 0x%" PRIx64 ", queued %u\n", sync->signal_event,
+                                   sync->finish_event, render.QueuedBufferCount);
+            }
             return STATUS_SUCCESS;
         }
 
@@ -4877,13 +4915,23 @@ namespace sogen
             return destroy_dxgk_allocations(c, destroy_allocation);
         }
 
-        NTSTATUS handle_NtGdiDdDDIDestroyContext()
+        NTSTATUS handle_NtGdiDdDDIDestroyContext(const syscall_context& c, const emulator_object<uint32_t> context)
         {
+            if (!context || context.read() != k_dxgk_context_handle)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            c.proc.discard_graphics_commands();
             return STATUS_SUCCESS;
         }
 
-        NTSTATUS handle_NtGdiDdDDIDestroyDevice()
+        NTSTATUS handle_NtGdiDdDDIDestroyDevice(const syscall_context& c, const emulator_object<uint32_t> device)
         {
+            if (!device || device.read() != k_dxgk_device_handle)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            c.proc.discard_graphics_commands();
             return STATUS_SUCCESS;
         }
 

@@ -70,6 +70,7 @@ namespace sogen
             }
 
             entry->signaled = true;
+            c.proc.process_graphics_commands();
             return STATUS_SUCCESS;
         }
 

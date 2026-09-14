@@ -857,8 +857,8 @@ namespace sogen
                                                      emulator_object<EMU_D3DKMT_DESTROYALLOCATION2> destroy_allocation);
         NTSTATUS handle_NtGdiDdDDIDestroyAllocation(const syscall_context& c,
                                                     emulator_object<EMU_D3DKMT_DESTROYALLOCATION> destroy_allocation);
-        NTSTATUS handle_NtGdiDdDDIDestroyContext();
-        NTSTATUS handle_NtGdiDdDDIDestroyDevice();
+        NTSTATUS handle_NtGdiDdDDIDestroyContext(const syscall_context&, emulator_object<uint32_t>);
+        NTSTATUS handle_NtGdiDdDDIDestroyDevice(const syscall_context&, emulator_object<uint32_t>);
         NTSTATUS handle_NtGdiDdDDICreateDCFromMemory(const syscall_context& c, emulator_object<EMU_D3DKMT_CREATEDCFROMMEMORY> create_dc);
         NTSTATUS handle_NtGdiDdDDIDestroyDCFromMemory(const syscall_context& c, emulator_object<EMU_D3DKMT_DESTROYDCFROMMEMORY> destroy_dc);
         NTSTATUS handle_NtGdiDdDDIOpenAdapterFromLuid(const syscall_context& c,

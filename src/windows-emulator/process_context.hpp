@@ -256,6 +256,28 @@ namespace sogen
                 }
             };
 
+            struct sync_command
+            {
+                uint64_t signal_event{};
+                uint64_t finish_event{};
+                bool started{};
+
+                void serialize(utils::buffer_serializer& buffer) const
+                {
+                    buffer.write(this->signal_event);
+                    buffer.write(this->finish_event);
+                    buffer.write(this->started);
+                }
+
+                void deserialize(utils::buffer_deserializer& buffer)
+                {
+                    buffer.read(this->signal_event);
+                    buffer.read(this->finish_event);
+                    buffer.read(this->started);
+                }
+            };
+
+            std::vector<sync_command> pending_sync_commands{};
             uint32_t queued_present_limit{3};
             uint32_t next_resource_handle{0x8000};
             uint32_t next_allocation_handle{0x9000};
@@ -384,6 +406,9 @@ namespace sogen
                 buffer.read(this->patch_location_list);
             }
         };
+
+        void process_graphics_commands();
+        void discard_graphics_commands();
 
         process_context(x86_64_emulator& emu, memory_manager& memory, utils::clock& clock, callbacks& cb)
             : callbacks_(&cb),
