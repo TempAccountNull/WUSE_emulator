@@ -139,6 +139,34 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
+            if (info_class == ThreadIdealProcessor)
+            {
+                if (thread_information_length != sizeof(uint32_t))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                if (thread_information % alignof(uint32_t))
+                {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                uint32_t requested{};
+                if (!c.win_emu.memory.try_read_memory(thread_information, &requested, sizeof(requested)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if (requested > 64)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                const auto previous = thread->ideal_processor;
+                const auto processor_count = c.proc.kusd.access([](const KUSER_SHARED_DATA64& kusd) { return kusd.ActiveProcessorCount; });
+                if (requested < std::min<ULONG>(processor_count, 64))
+                {
+                    thread->ideal_processor = requested;
+                }
+                return static_cast<NTSTATUS>(previous);
+            }
+
             if (info_class == ThreadSchedulerSharedDataSlot || info_class == ThreadBasePriority || info_class == ThreadAffinityMask ||
                 info_class == ThreadPriorityBoost || info_class == ThreadEnableAlignmentFaultFixup)
             {
@@ -269,6 +297,25 @@ namespace sogen
             if (!thread)
             {
                 return STATUS_INVALID_HANDLE;
+            }
+
+            if (info_class == ThreadIdealProcessor)
+            {
+                return STATUS_INVALID_INFO_CLASS;
+            }
+            if (info_class == ThreadIdealProcessorEx)
+            {
+                if (thread_information_length != sizeof(PROCESSOR_NUMBER))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                const emulator_object<PROCESSOR_NUMBER> info{c.emu, thread_information};
+                info.write({.Group = 0, .Number = static_cast<uint8_t>(thread->ideal_processor), .Reserved = 0});
+                if (return_length)
+                {
+                    return_length.write(sizeof(PROCESSOR_NUMBER));
+                }
+                return STATUS_SUCCESS;
             }
 
             emulator_thread& cur_emulator_thread = c.thread();

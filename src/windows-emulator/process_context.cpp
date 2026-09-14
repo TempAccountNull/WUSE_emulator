@@ -721,6 +721,13 @@ namespace sogen
         buffer.write(this->threads.find_handle(active_thread).bits);
         buffer.write<uint64_t>(0x31594649544F4E44);
         buffer.write(this->directory_notifications);
+        std::map<uint32_t, uint32_t> ideal_processors{};
+        for (const auto& thread : this->threads | std::views::values)
+        {
+            ideal_processors.emplace(thread.id, thread.ideal_processor);
+        }
+        buffer.write<uint64_t>(0x314C414544495254);
+        buffer.write_map(ideal_processors);
     }
 
     void process_context::deserialize(utils::buffer_deserializer& buffer, emulator_thread*& active_thread)
@@ -835,6 +842,28 @@ namespace sogen
                 throw std::runtime_error("Invalid directory notification snapshot extension");
             }
             buffer.read(this->directory_notifications);
+        }
+        for (auto& thread : this->threads | std::views::values)
+        {
+            thread.ideal_processor = 0;
+        }
+        if (buffer.get_remaining_size())
+        {
+            if (buffer.read<uint64_t>() != 0x314C414544495254)
+            {
+                throw std::runtime_error("Invalid thread ideal processor snapshot extension");
+            }
+            std::map<uint32_t, uint32_t> ideal_processors{};
+            buffer.read_map(ideal_processors);
+            for (const auto& [id, processor] : ideal_processors)
+            {
+                const auto entry = this->thread_handles_by_id.find(id);
+                if (entry == this->thread_handles_by_id.end() || processor >= 64)
+                {
+                    throw std::runtime_error("Invalid saved thread ideal processor");
+                }
+                this->threads.get(entry->second)->ideal_processor = processor;
+            }
         }
     }
 

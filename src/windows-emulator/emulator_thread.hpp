@@ -291,6 +291,7 @@ namespace sogen
         bool setup_done{false};
 
         uint32_t id{};
+        uint32_t ideal_processor{};
 
         uint64_t current_ip{0};
         uint64_t previous_ip{0};
