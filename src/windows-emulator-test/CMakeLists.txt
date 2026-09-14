@@ -14,6 +14,8 @@ target_link_libraries(windows-emulator-test PRIVATE
   gtest
   gtest_main
   windows-emulator
+  windows-analyzer
+  disassembler
   backend-selection
   vulkan-bridge-marshal
 )
