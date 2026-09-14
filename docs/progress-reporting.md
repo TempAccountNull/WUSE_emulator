@@ -18,3 +18,21 @@ Tidy: build passes; all three observation tests pass in both modes.
 The CLI smoke retains its separate Window Geometry C000041D exception.
 
 Evidence: PatchScanner/benchmarks/sogen-fixes/progress-restoration-validation.json.
+
+## External colored log viewer
+
+PatchScanner's viewer keeps one progress panel beneath verbose output. It
+refreshes once per second and redraws after each bounded 64 KiB read. Completed
+hash and decryption milestones remain visible when a later syscall stops.
+Current phase percentage, instruction rate, elapsed time and module-relative
+instruction address are separate fields.
+
+A saved-log replay with 11,000 lines verifies console-buffer scrolling, one
+remaining panel, fractional percentages, split-line text, ANSI colors and
+highlights, terminal state and an unchanged idle cursor position. It does not
+execute the guest. The reopened viewer also displays the actual Destiny capture:
+SHA-384 100%, decryption marker reached, four verified AES blocks, and the
+NtSetInformationProcess class 0x34 stop.
+
+Evidence: PatchScanner/benchmarks/sogen-fixes/progress-panel-validation.json
+and progress-panel-live.json. Viewer source remains in PatchScanner/scripts.
