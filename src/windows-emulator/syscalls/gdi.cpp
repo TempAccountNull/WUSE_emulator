@@ -248,6 +248,12 @@ namespace sogen
 
             uint64_t ensure_gdi_cookie(const syscall_context& c)
             {
+                const auto* win32u = c.win_emu.mod_manager.win32u;
+                if (win32u == nullptr || win32u->find_export("NtGdiInit2") == 0)
+                {
+                    return 0;
+                }
+
                 uint64_t cookie = 0;
                 c.proc.peb64.access([&](PEB64& peb) {
                     if (peb.GdiDCAttributeList == 0)
@@ -1623,15 +1629,17 @@ namespace sogen
                 return STATUS_UNSUCCESSFUL;
             }
 
-            const auto cookie = ensure_gdi_cookie(c);
             seed_gdi_stock_objects(c);
-
-            return static_cast<NTSTATUS>(cookie);
+            return TRUE;
         }
 
         NTSTATUS handle_NtGdiInit2(const syscall_context& c)
         {
-            return handle_NtGdiInit(c);
+            if (handle_NtGdiInit(c) != TRUE)
+            {
+                return 0;
+            }
+            return static_cast<NTSTATUS>(ensure_gdi_cookie(c));
         }
 
         uint32_t handle_NtGdiGetDeviceCaps(const syscall_context&, const hdc /*dc*/, const uint32_t index)
