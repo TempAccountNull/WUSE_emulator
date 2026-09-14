@@ -1,5 +1,6 @@
 #include "logger.hpp"
 
+#include <utils/async_file_writer.hpp>
 #include <utils/finally.hpp>
 #include <utils/win.hpp>
 
@@ -137,25 +138,41 @@ namespace sogen
     va_end(ap2);                                   \
     va_end(ap1)
 
+#ifdef _WIN32
+        bool use_ansi_colors()
+        {
+            const auto* value = std::getenv("FORCE_COLOR");
+            return value && std::string_view(value) != "0";
+        }
+
+        void print_ansi_colored(const std::string_view line, const color_type base_color, utils::async_file_writer* writer)
+        {
+            constexpr std::array ansi_colors{30, 34, 32, 36, 31, 35, 33, 37, 90, 94, 92, 96, 91, 95, 93, 97};
+            std::array<char, 16> prefix{};
+            const auto count =
+                snprintf(prefix.data(), prefix.size(), "\033[%dm", base_color == get_reset_color() ? 0 : ansi_colors[base_color & 0xF]);
+            thread_local std::string record;
+            record.assign(prefix.data(), static_cast<size_t>(count));
+            record.append(line);
+            record.append("\033[0m");
+            if (writer)
+            {
+                writer->write(record);
+            }
+            else
+            {
+                (void)fwrite(record.data(), 1, record.size(), stdout);
+                (void)fflush(stdout);
+            }
+        }
+#endif
+
         void print_colored(const std::string_view& line, const color_type base_color)
         {
 #ifdef _WIN32
-            static const bool use_ansi = [] {
-                const auto* value = std::getenv("FORCE_COLOR");
-                return value && std::string_view(value) != "0";
-            }();
-            if (use_ansi)
+            if (use_ansi_colors())
             {
-                constexpr std::array ansi_colors{30, 34, 32, 36, 31, 35, 33, 37, 90, 94, 92, 96, 91, 95, 93, 97};
-                std::array<char, 16> prefix{};
-                const auto count =
-                    snprintf(prefix.data(), prefix.size(), "\033[%dm", base_color == get_reset_color() ? 0 : ansi_colors[base_color & 0xF]);
-                thread_local std::string record;
-                record.assign(prefix.data(), static_cast<size_t>(count));
-                record.append(line);
-                record.append("\033[0m");
-                (void)fwrite(record.data(), 1, record.size(), stdout);
-                (void)fflush(stdout);
+                print_ansi_colored(line, base_color, nullptr);
                 return;
             }
 #endif
@@ -170,10 +187,15 @@ namespace sogen
     {
         old_cp = GetConsoleOutputCP();
         SetConsoleOutputCP(CP_UTF8);
+        if (use_ansi_colors() && GetFileType(get_console_handle()) == FILE_TYPE_DISK)
+        {
+            this->console_output_ = std::make_unique<utils::async_file_writer>(stdout);
+        }
     }
 
     logger::~logger()
     {
+        this->console_output_.reset();
         SetConsoleOutputCP(old_cp);
     }
 #endif
@@ -192,6 +214,17 @@ namespace sogen
             return;
         }
 
+#ifdef _WIN32
+        if (this->console_output_)
+        {
+            print_ansi_colored(message, get_color_type(c), this->console_output_.get());
+            if (force)
+            {
+                this->console_output_->flush();
+            }
+            return;
+        }
+#endif
         print_colored(message, get_color_type(c));
     }
 

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -24,6 +25,17 @@ namespace sogen::utils
             if (!this->file_)
             {
                 throw std::runtime_error("Failed to open output file: " + path.string());
+            }
+            this->pending_.reserve(BUFFER_LIMIT);
+            this->worker_ = std::thread([this] { this->run(); });
+        }
+
+        explicit async_file_writer(std::FILE* stream)
+            : stream_(stream)
+        {
+            if (!this->stream_)
+            {
+                throw std::invalid_argument("Output stream is null");
             }
             this->pending_.reserve(BUFFER_LIMIT);
             this->worker_ = std::thread([this] { this->run(); });
@@ -75,6 +87,7 @@ namespace sogen::utils
         static constexpr size_t BUFFER_LIMIT = 1024 * 1024;
         static constexpr size_t FLUSH_SIZE = 64 * 1024;
         std::ofstream file_;
+        std::FILE* stream_{};
         std::mutex mutex_;
         std::condition_variable changed_;
         std::string pending_;
@@ -109,14 +122,25 @@ namespace sogen::utils
                     batch.swap(this->pending_);
                     lock.unlock();
                     this->changed_.notify_all();
-                    if (!batch.empty())
+                    if (this->stream_)
                     {
-                        this->file_.write(batch.data(), static_cast<std::streamsize>(batch.size()));
+                        if ((!batch.empty() && std::fwrite(batch.data(), 1, batch.size(), this->stream_) != batch.size()) ||
+                            std::fflush(this->stream_) != 0)
+                        {
+                            throw std::runtime_error("Failed to write output stream");
+                        }
                     }
-                    this->file_.flush();
-                    if (!this->file_)
+                    else
                     {
-                        throw std::runtime_error("Failed to write output file");
+                        if (!batch.empty())
+                        {
+                            this->file_.write(batch.data(), static_cast<std::streamsize>(batch.size()));
+                        }
+                        this->file_.flush();
+                        if (!this->file_)
+                        {
+                            throw std::runtime_error("Failed to write output file");
+                        }
                     }
                     batch.clear();
                     lock.lock();

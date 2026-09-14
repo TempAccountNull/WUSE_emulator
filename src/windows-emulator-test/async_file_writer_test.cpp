@@ -76,4 +76,32 @@ namespace sogen
     {
         EXPECT_THROW((utils::async_file_writer{std::filesystem::temp_directory_path()}), std::runtime_error);
     }
+
+    TEST(AsyncFileWriter, PreservesBorrowedStreamAndDrainsColoredRecords)
+    {
+        auto* stream = std::tmpfile();
+        ASSERT_NE(stream, nullptr);
+        const auto cleanup = utils::finally([&] { std::fclose(stream); });
+        std::string expected;
+        {
+            utils::async_file_writer writer(stream);
+            for (size_t i = 0; i < 50000; ++i)
+            {
+                const auto record = "\033[96m" + std::to_string(i) + " \033[43mhighlight\033[0m\n";
+                expected += record;
+                writer.write(record);
+            }
+        }
+        ASSERT_EQ(std::fwrite("last", 1, 4, stream), 4U);
+        expected += "last";
+        ASSERT_EQ(std::fseek(stream, 0, SEEK_SET), 0);
+        std::string actual(expected.size(), '\0');
+        ASSERT_EQ(std::fread(actual.data(), 1, actual.size(), stream), actual.size());
+        EXPECT_EQ(actual, expected);
+    }
+
+    TEST(AsyncFileWriter, RejectsNullStream)
+    {
+        EXPECT_THROW((utils::async_file_writer{static_cast<std::FILE*>(nullptr)}), std::invalid_argument);
+    }
 }

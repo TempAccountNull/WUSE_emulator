@@ -31,7 +31,7 @@ $env:FORCE_COLOR = '1'
 
 `--snapshot-out` saves on stop, failure or debugger disconnect. It prevents an automatic fresh restart after disconnect. EOF at the interactive prompt returns without spinning. Snapshot restore does not roll back files exposed through host mappings.
 
-Verbose output reports instruction rate and module RVA every five seconds. `FORCE_COLOR=1` preserves ANSI spans in redirected Windows output. Each JSONL event is flushed as a complete record.
+Verbose output reports instruction rate and module RVA every five seconds. `FORCE_COLOR=1` preserves ANSI spans in redirected Windows output. JSONL event ordering is preserved; bounded background writers flush batches and drain on explicit flush.
 
 ## Validation
 

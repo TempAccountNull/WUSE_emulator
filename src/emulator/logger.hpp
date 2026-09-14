@@ -4,9 +4,15 @@
 #include <utils/function.hpp>
 #include <utils/win.hpp>
 
+#include <memory>
 #include <mutex>
 #include <string_view>
 #include <utility>
+
+namespace sogen::utils
+{
+    class async_file_writer;
+}
 
 namespace sogen
 {
@@ -66,6 +72,7 @@ namespace sogen
       private:
 #ifdef _WIN32
         UINT old_cp{};
+        std::unique_ptr<utils::async_file_writer> console_output_;
 #endif
         bool disable_output_{false};
         bool silent_{false};
