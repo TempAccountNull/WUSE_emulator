@@ -3,6 +3,7 @@
 #include "analysis_reporter.hpp"
 #include "analysis_reporter_common.hpp"
 #include "jsonl_reporter.hpp"
+#include <utils/async_file_writer.hpp>
 
 #include <array>
 #include <cinttypes>
@@ -198,12 +199,8 @@ namespace sogen
         {
           public:
             explicit jsonl_analysis_reporter(const std::filesystem::path& path)
-                : file_(path, std::ios::binary | std::ios::out | std::ios::trunc)
+                : file_(path)
             {
-                if (!this->file_)
-                {
-                    throw std::runtime_error("Failed to open analysis report file: " + path.string());
-                }
             }
 
             void report(const analysis_event& event) override
@@ -217,12 +214,7 @@ namespace sogen
                 }
 
                 line.push_back('\n');
-                this->file_.write(line.data(), static_cast<std::streamsize>(line.size()));
-                this->file_.flush();
-                if (!this->file_)
-                {
-                    throw std::runtime_error("Failed to write analysis event");
-                }
+                this->file_.write(line);
             }
 
             void flush() override
@@ -231,7 +223,7 @@ namespace sogen
             }
 
           private:
-            std::ofstream file_{};
+            utils::async_file_writer file_;
 
             static void write_record(json_object_builder& object, const run_started_event& event)
             {

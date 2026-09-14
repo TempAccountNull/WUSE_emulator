@@ -139,6 +139,26 @@ namespace sogen
 
         void print_colored(const std::string_view& line, const color_type base_color)
         {
+#ifdef _WIN32
+            static const bool use_ansi = [] {
+                const auto* value = std::getenv("FORCE_COLOR");
+                return value && std::string_view(value) != "0";
+            }();
+            if (use_ansi)
+            {
+                constexpr std::array ansi_colors{30, 34, 32, 36, 31, 35, 33, 37, 90, 94, 92, 96, 91, 95, 93, 97};
+                std::array<char, 16> prefix{};
+                const auto count =
+                    snprintf(prefix.data(), prefix.size(), "\033[%dm", base_color == get_reset_color() ? 0 : ansi_colors[base_color & 0xF]);
+                thread_local std::string record;
+                record.assign(prefix.data(), static_cast<size_t>(count));
+                record.append(line);
+                record.append("\033[0m");
+                (void)fwrite(record.data(), 1, record.size(), stdout);
+                (void)fflush(stdout);
+                return;
+            }
+#endif
             const auto _ = utils::finally(&reset_color);
             set_color(base_color);
             (void)fwrite(line.data(), 1, line.size(), stdout);
