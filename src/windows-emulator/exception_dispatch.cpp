@@ -60,8 +60,9 @@ namespace sogen
             case memory_operation::read:
                 return 0;
             case memory_operation::write:
-            case memory_operation::exec:
                 return 1;
+            case memory_operation::exec:
+                return 8;
             }
         }
 
@@ -260,9 +261,9 @@ namespace sogen
         CONTEXT64 ctx{};
         ctx.ContextFlags = CONTEXT64_ALL;
         cpu_context::save(vcpu.cpu, ctx);
-        ctx.Rip = win_emu.uses_instruction_precision() //
-                      ? thread.current_ip
-                      : vcpu.cpu.read_instruction_pointer();
+        const bool is_execute_fault =
+            (status == STATUS_ACCESS_VIOLATION || status == STATUS_GUARD_PAGE_VIOLATION) && !parameters.empty() && parameters[0] == 8;
+        ctx.Rip = win_emu.uses_instruction_precision() && !is_execute_fault ? thread.current_ip : vcpu.cpu.read_instruction_pointer();
 
         exception_record record{};
         memset(&record, 0, sizeof(record));

@@ -642,7 +642,7 @@ impl IcicleEmulator {
             ExceptionCode::WritePerm => self.handle_violation(value, FOREIGN_WRITE, false),
             ExceptionCode::ReadUnmapped => self.handle_violation(value, FOREIGN_READ, true),
             ExceptionCode::WriteUnmapped => self.handle_violation(value, FOREIGN_WRITE, true),
-            ExceptionCode::ExecViolation => self.handle_violation(value, FOREIGN_EXEC, false),
+            ExceptionCode::ExecViolation => self.handle_execute_violation(value),
             ExceptionCode::SelfModifyingCode => self.handle_self_modifying_code(value),
             ExceptionCode::Environment => self.handle_environment(value),
             ExceptionCode::SoftwareBreakpoint => self.handle_interrupt(3),
@@ -759,6 +759,19 @@ impl IcicleEmulator {
                 HookType::Timestamp
             },
         )
+    }
+
+    fn handle_execute_violation(&mut self, instruction: u64) -> bool {
+        use icicle_cpu::mem::perm;
+
+        // Icicle reports the instruction start, even when a later instruction byte fails the fetch.
+        let required = perm::EXEC | perm::INIT;
+        let address = (0..15)
+            .filter_map(|offset| instruction.checked_add(offset))
+            .find(|address| self.vm.cpu.mem.get_perm(*address) & required != required)
+            .unwrap_or(instruction);
+        let unmapped = self.vm.cpu.mem.get_perm(address) & perm::MAP == 0;
+        self.handle_violation(address, FOREIGN_EXEC, unmapped)
     }
 
     fn handle_violation(&mut self, address: u64, permission: u8, unmapped: bool) -> bool {
