@@ -207,8 +207,8 @@ namespace sogen
         std::vector<uint8_t> make_bootstrap_reply(const uint32_t request_id)
         {
             packet out(0x60, request_id, 0x38);
-            out.u32s(o_body0, {0x0E, static_cast<unsigned>(registrar_reply::reply_bootstrap), 0x04, 0x00, 0x08, 0x7B, 0x00, 0x10, 0x00,
-                               0x00, 0x00, 0x00, 0x04, 0x01});
+            out.u32s(o_body0, {0x0E, static_cast<unsigned>(registrar_reply::reply_bootstrap), 0x04, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
+                               0x08, 0x7B, 0x00, 0x04, 0x01});
             return out.finish();
         }
 
