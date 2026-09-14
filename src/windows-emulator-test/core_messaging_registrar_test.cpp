@@ -146,5 +146,60 @@ namespace sogen::test
         }
     }
 
+    TEST_P(CoreMessagingRegistrarTest, AdvertisesOnePartitionForClientAndInputService)
+    {
+        emu.setup_process_if_necessary();
+        emu.version.set_windows_build_number(19045);
+        const auto buffer = emu.memory.allocate_memory(0x1000, memory_permission::read_write);
+        auto service = create_port(u"\\BaseNamedObjects\\CoreMessagingRegistrar");
+        const auto call = [&](const uint32_t method, const uint32_t length) {
+            std::vector<uint32_t> request(length / sizeof(uint32_t), 0);
+            request[4] = 2;
+            request[6] = 0x10000;
+            request[8] = length - 0x28;
+            request[10] = request[8] / sizeof(uint32_t);
+            request[11] = method;
+            emu.memory.write_memory(buffer, request.data(), length);
+            return service->handle_request(emu, {.send_buffer = buffer, .send_buffer_length = length});
+        };
+        const auto bootstrap = call(0x10001, 0x30);
+        ASSERT_EQ(bootstrap.status, STATUS_SUCCESS);
+        ASSERT_TRUE(bootstrap.payload.has_value());
+        ASSERT_EQ(bootstrap.payload->size(), 0x60);
+        uint64_t partition{};
+        std::memcpy(&partition, bootstrap.payload->data() + 0x50, sizeof(partition));
+        for (const auto length : {0x88U, 0xFCU})
+        {
+            const auto resolved = call(0x160001, length);
+            ASSERT_EQ(resolved.status, STATUS_SUCCESS);
+            ASSERT_TRUE(resolved.payload.has_value());
+            ASSERT_GE(resolved.payload->size(), 0x7C);
+            uint64_t server_partition{};
+            std::memcpy(&server_partition, resolved.payload->data() + 0x74, sizeof(server_partition));
+            EXPECT_EQ(server_partition, partition);
+        }
+        const auto prepared = call(0x30001, 0x6C);
+        ASSERT_EQ(prepared.status, STATUS_SUCCESS);
+        ASSERT_TRUE(prepared.payload.has_value());
+        const auto& reply = *prepared.payload;
+        size_t offset = 0x30;
+        for (size_t parameter = 0; parameter < 4; ++parameter)
+        {
+            ASSERT_LE(offset + sizeof(uint32_t), reply.size());
+            uint32_t length{};
+            std::memcpy(&length, reply.data() + offset, sizeof(length));
+            offset += sizeof(length);
+            ASSERT_LE(offset + length, reply.size());
+            if (parameter == 3)
+            {
+                ASSERT_EQ(length, 56);
+                uint64_t reverse_partition{};
+                std::memcpy(&reverse_partition, reply.data() + offset + 16, sizeof(reverse_partition));
+                EXPECT_EQ(reverse_partition, partition);
+            }
+            offset += (length + 3) & ~3U;
+        }
+    }
+
     INSTANTIATE_TEST_SUITE_P(PortHeaders, CoreMessagingRegistrarTest, testing::Bool());
 }

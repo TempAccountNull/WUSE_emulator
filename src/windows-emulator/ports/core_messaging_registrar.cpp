@@ -11,6 +11,7 @@ namespace sogen
         constexpr uint32_t k_request_kind = 0x00000002;
         constexpr uint32_t k_sync_flags = 0x00010000;
         constexpr ULONG k_min_request_size = 0x30;
+        constexpr uint32_t local_partition_id = 0x7B;
 
         enum class registrar_method : uint32_t
         {
@@ -263,12 +264,12 @@ namespace sogen
             if (windows10)
             {
                 out.u32s(o_body0, {0x0E, static_cast<unsigned>(registrar_reply::reply_bootstrap), 0x04, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
-                                   0x08, 0x7B, 0x00, 0x04, 0x01});
+                                   0x08, local_partition_id, 0x00, 0x04, 0x01});
             }
             else
             {
-                out.u32s(o_body0, {0x0E, static_cast<unsigned>(registrar_reply::reply_bootstrap), 0x04, 0x00, 0x08, 0x7B, 0x00, 0x10, 0x00,
-                                   0x00, 0x00, 0x00, 0x04, 0x01});
+                out.u32s(o_body0, {0x0E, static_cast<unsigned>(registrar_reply::reply_bootstrap), 0x04, 0x00, 0x08, local_partition_id,
+                                   0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x04, 0x01});
             }
             return out.finish();
         }
@@ -321,6 +322,10 @@ namespace sogen
             packet out(0x9C, req.id, 0x74);
             out.u32s(o_body0, {0x1D, encode_reply(registrar_reply::reply_resolve_service, windows10), 0x04, 0x00, 0x04});
             append_resolve_payload(out, req.body0 >= 0x35);
+            if (windows10)
+            {
+                out.u32(0x74, local_partition_id);
+            }
             return out.finish();
         }
 
@@ -337,10 +342,15 @@ namespace sogen
 
             const uint32_t tail_slot0 = conversation_variant ? 0x03 : 0x02;
             const uint32_t tail_slot1 = conversation_variant ? 0x4A : 0x49;
-            const std::array<uint32_t, 25> tail = {
+            std::array<uint32_t, 25> tail = {
                 0x10,       0x00,   0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,       0x00,       0x38,       0x00,   0x00,
                 0x00200000, 0x8000, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, tail_slot0, tail_slot1, 0x00200001, 0x8000,
             };
+
+            if (windows10)
+            {
+                tail[15] = local_partition_id;
+            }
 
             const auto name_size = static_cast<uint32_t>(utf16z_size(name));
             const auto tail_start = windows10 ? 5U : 0U;
