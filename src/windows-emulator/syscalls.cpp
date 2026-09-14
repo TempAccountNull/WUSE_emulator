@@ -619,6 +619,7 @@ namespace sogen
                                            UINT flags);
         BOOL handle_NtUserSetForegroundWindow(const syscall_context& c, hwnd window);
         BOOL completion_NtUserSetForegroundWindow(const syscall_context& c, hwnd window);
+        emulator_pointer handle_NtUserCallOneParam(const syscall_context& c, uint64_t parameter, uint32_t code);
         BOOL handle_NtUserCallHwndLock(const syscall_context& c, hwnd window, uint32_t code);
         hwnd handle_NtUserGetForegroundWindow(const syscall_context& c);
         hwnd handle_NtUserSetFocus(const syscall_context& c, hwnd hwnd);
@@ -1669,6 +1670,7 @@ namespace sogen
         add_handler(NtUserSetParent);
         add_handler(NtUserSetWindowPos);
         add_handler(NtUserSetForegroundWindow);
+        add_handler(NtUserCallOneParam);
         add_handler(NtUserCallHwndLock);
         add_handler(NtUserGetForegroundWindow);
         add_handler(NtUserSetFocus);

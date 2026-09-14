@@ -4369,6 +4369,116 @@ namespace sogen
             return handle_entry.pHead;
         }
 
+        bool is_window_mapping_operation(const syscall_context& c, const uint32_t code)
+        {
+            const auto* user32 = c.win_emu.mod_manager.find_by_name("user32.dll");
+            const auto* win32u = c.win_emu.mod_manager.find_by_name("win32u.dll");
+            if (!user32 || !win32u)
+            {
+                return false;
+            }
+            const auto address = user32->find_export("GetParent");
+            const auto syscall = win32u->find_export("NtUserCallOneParam");
+            constexpr std::array<uint8_t, 7> prefix{0x40, 0x53, 0x48, 0x83, 0xec, 0x30, 0xe8};
+            std::array<uint8_t, 11> wrapper{};
+            if (address == 0 || syscall == 0 || !c.emu.try_read_memory(address, wrapper.data(), wrapper.size()) ||
+                !std::ranges::equal(prefix, std::span{wrapper}.first(prefix.size())))
+            {
+                return false;
+            }
+            int32_t displacement{};
+            memcpy(&displacement, wrapper.data() + prefix.size(), sizeof(displacement));
+            const auto helper = address + wrapper.size() + static_cast<uint64_t>(displacement);
+            std::array<uint8_t, 0x100> validation{};
+            if (!user32->contains(helper) || !user32->contains(helper + validation.size() - 1) ||
+                !c.emu.try_read_memory(helper, validation.data(), validation.size()))
+            {
+                return false;
+            }
+            constexpr std::array<uint8_t, 6> call_prefix{0x48, 0x8b, 0xcf, 0x48, 0xff, 0x15};
+            std::optional<uint32_t> operation{};
+            for (size_t i = 0; i + 15 <= validation.size(); ++i)
+            {
+                if (validation[i] != 0xba || !std::ranges::equal(call_prefix, std::span{validation}.subspan(i + 5, call_prefix.size())))
+                {
+                    continue;
+                }
+                memcpy(&displacement, validation.data() + i + 11, sizeof(displacement));
+                const auto slot = helper + i + 15 + static_cast<uint64_t>(displacement);
+                uint64_t target{};
+                if (!user32->contains(slot) || !user32->contains(slot + sizeof(target) - 1) ||
+                    !c.emu.try_read_memory(slot, &target, sizeof(target)) || target != syscall)
+                {
+                    continue;
+                }
+                if (operation.has_value())
+                {
+                    return false;
+                }
+                uint32_t selector{};
+                memcpy(&selector, validation.data() + i + 1, sizeof(selector));
+                operation = selector;
+            }
+            return operation == code;
+        }
+
+        bool is_post_quit_operation(const syscall_context& c, const uint32_t code)
+        {
+            const auto* user32 = c.win_emu.mod_manager.find_by_name("user32.dll");
+            const auto* win32u = c.win_emu.mod_manager.find_by_name("win32u.dll");
+            if (!user32 || !win32u)
+            {
+                return false;
+            }
+            const auto address = user32->find_export("PostQuitMessage");
+            const auto syscall = win32u->find_export("NtUserCallOneParam");
+            std::array<uint8_t, 15> wrapper{};
+            if (address == 0 || syscall == 0 || !c.emu.try_read_memory(address, wrapper.data(), wrapper.size()) || wrapper[0] != 0x48 ||
+                wrapper[1] != 0x63 || wrapper[2] != 0xc9 || wrapper[3] != 0xba || wrapper[8] != 0x48 || wrapper[9] != 0xff ||
+                wrapper[10] != 0x25)
+            {
+                return false;
+            }
+            uint32_t selector{};
+            int32_t displacement{};
+            memcpy(&selector, wrapper.data() + 4, sizeof(selector));
+            memcpy(&displacement, wrapper.data() + 11, sizeof(displacement));
+            const auto slot = address + 15 + static_cast<uint64_t>(displacement);
+            uint64_t target{};
+            return selector == code && user32->contains(slot) && user32->contains(slot + sizeof(target) - 1) &&
+                   c.emu.try_read_memory(slot, &target, sizeof(target)) && target == syscall;
+        }
+
+        emulator_pointer handle_NtUserCallOneParam(const syscall_context& c, const uint64_t parameter, const uint32_t code)
+        {
+            if (is_post_quit_operation(c, code))
+            {
+                return handle_NtUserPostQuitMessage(c, static_cast<int>(parameter));
+            }
+            if (is_window_mapping_operation(c, code))
+            {
+                const auto index = static_cast<uint16_t>(parameter);
+                const auto* win = c.proc.windows.get_by_index(index);
+                if (!win)
+                {
+                    return 0;
+                }
+                const auto entry = c.proc.user_handles.get_handle_table().read(index);
+                const auto generation = static_cast<uint16_t>(parameter >> 16);
+                if ((generation != entry.wUniq && generation != 0xffff) || entry.bType != TYPE_WINDOW || (entry.bFlags & 1) != 0 ||
+                    entry.pHead != win->guest.value())
+                {
+                    return 0;
+                }
+                return win->guest.value();
+            }
+            c.win_emu.log.error("Unsupported NtUserCallOneParam operation: 0x%X (parameter: 0x%" PRIx64 ")\n", code, parameter);
+            c.win_emu.record_stop(stop_reason::unimplemented_syscall,
+                                  "NtUserCallOneParam operation 0x" + utils::string::to_hex_number(code));
+            c.win_emu.stop();
+            return 0;
+        }
+
         BOOL handle_NtUserTransformRect(const syscall_context& c, const emulator_object<RECT> rect, const hwnd hwnd,
                                         const uint32_t /*type*/, const uint64_t /*unknown*/)
         {
