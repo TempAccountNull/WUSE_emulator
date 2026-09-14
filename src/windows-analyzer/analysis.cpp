@@ -871,6 +871,9 @@ namespace sogen
 
     void register_analysis_callbacks(analysis_context& c)
     {
+        c.progress_started = std::chrono::steady_clock::now();
+        c.progress_last = c.progress_started;
+        c.progress_instructions = c.win_emu->get_executed_instructions();
         auto& cb = c.win_emu->callbacks;
 
         cb.on_stdout = make_callback(c, handle_stdout);

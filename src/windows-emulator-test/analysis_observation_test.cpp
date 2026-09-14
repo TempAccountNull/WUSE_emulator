@@ -15,6 +15,7 @@ namespace sogen::test
         analysis_settings logging_settings{.verbose_logging = true};
         analysis_context analysis{.settings = &logging_settings, .win_emu = &win_emu, .reporters = {this}};
         std::vector<function_execution_event> calls{};
+        std::vector<execution_progress_event> progress{};
         uint64_t caller{};
         uint64_t callee{};
         uint64_t stack{};
@@ -24,6 +25,10 @@ namespace sogen::test
             if (const auto* call = std::get_if<function_execution_event>(&event))
             {
                 calls.push_back(*call);
+            }
+            if (const auto* update = std::get_if<execution_progress_event>(&event))
+            {
+                progress.push_back(*update);
             }
         }
 
@@ -69,4 +74,28 @@ namespace sogen::test
         ASSERT_EQ(calls.size(), 1U);
         EXPECT_EQ(calls.front().execution.rip, callee);
     }
+
+    TEST_F(AnalysisObservation, ProgressExcludesInstructionsFromRestoredSnapshot)
+    {
+        const std::array<uint8_t, 2> loop{0xEB, 0xFE};
+        win_emu.emu().write_memory(caller, loop.data(), loop.size());
+        win_emu.emu().reg(x86_register::rip, caller);
+        win_emu.emu().start(0x20000);
+        win_emu.emu().start(0x20000);
+        const auto count = win_emu.get_executed_instructions();
+        ASSERT_EQ(count, 0x40000U);
+        utils::buffer_serializer output{};
+        win_emu.serialize(output);
+        utils::buffer_deserializer input{output.get_buffer()};
+        win_emu.deserialize(input);
+        analysis_context restored{.settings = &logging_settings, .win_emu = &win_emu, .reporters = {this}};
+        register_analysis_callbacks(restored);
+        restored.progress_last -= std::chrono::seconds(6);
+        progress.clear();
+        win_emu.callbacks.on_instruction(caller);
+        ASSERT_EQ(progress.size(), 1U);
+        EXPECT_EQ(progress.front().header.instruction_count, count);
+        EXPECT_EQ(progress.front().instructions_per_second, 0U);
+    }
+
 }
