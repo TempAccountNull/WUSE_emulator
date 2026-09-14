@@ -5504,12 +5504,32 @@ CMPSS_OPERAND: ", "^imm8 is imm8   { }
 @endif
 
 define pcodeop divpd;
-:DIVPD        XmmReg, m128     is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x5E; XmmReg ... & m128 { XmmReg = divpd(XmmReg, m128); }
-:DIVPD        XmmReg1, XmmReg2 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x5E; xmmmod=3 & XmmReg1 & XmmReg2 { XmmReg1 = divpd(XmmReg1, XmmReg2); }
+:DIVPD        XmmReg, m128     is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x5E; XmmReg ... & m128 {
+    local divisor:16 = m128;
+    XmmReg[0,64] = XmmReg[0,64] f/ divisor[0,64];
+    XmmReg[64,64] = XmmReg[64,64] f/ divisor[64,64];
+}
+:DIVPD        XmmReg1, XmmReg2 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x5E; xmmmod=3 & XmmReg1 & XmmReg2 {
+    local divisor:16 = XmmReg2;
+    XmmReg1[0,64] = XmmReg1[0,64] f/ divisor[0,64];
+    XmmReg1[64,64] = XmmReg1[64,64] f/ divisor[64,64];
+}
 
 define pcodeop divps;
-:DIVPS        XmmReg, m128     is vexMode=0 & mandover=0 & byte=0x0F; byte=0x5E; XmmReg ... & m128 { XmmReg = divps(XmmReg, m128); }
-:DIVPS        XmmReg1, XmmReg2 is vexMode=0 & mandover=0 & byte=0x0F; byte=0x5E; xmmmod=3 & XmmReg1 & XmmReg2 { XmmReg1 = divps(XmmReg1, XmmReg2); }
+:DIVPS        XmmReg, m128     is vexMode=0 & mandover=0 & byte=0x0F; byte=0x5E; XmmReg ... & m128 {
+    local divisor:16 = m128;
+    XmmReg[0,32] = XmmReg[0,32] f/ divisor[0,32];
+    XmmReg[32,32] = XmmReg[32,32] f/ divisor[32,32];
+    XmmReg[64,32] = XmmReg[64,32] f/ divisor[64,32];
+    XmmReg[96,32] = XmmReg[96,32] f/ divisor[96,32];
+}
+:DIVPS        XmmReg1, XmmReg2 is vexMode=0 & mandover=0 & byte=0x0F; byte=0x5E; xmmmod=3 & XmmReg1 & XmmReg2 {
+    local divisor:16 = XmmReg2;
+    XmmReg1[0,32] = XmmReg1[0,32] f/ divisor[0,32];
+    XmmReg1[32,32] = XmmReg1[32,32] f/ divisor[32,32];
+    XmmReg1[64,32] = XmmReg1[64,32] f/ divisor[64,32];
+    XmmReg1[96,32] = XmmReg1[96,32] f/ divisor[96,32];
+}
                 
 :DIVSD        XmmReg, m64      is vexMode=0 & $(PRE_F2) & byte=0x0F; byte=0x5E; m64 & XmmReg ...
 {

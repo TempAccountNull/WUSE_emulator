@@ -456,6 +456,7 @@ namespace sogen
         std::string last_stop_detail_{};
 
         std::map<uint64_t, std::vector<emulator_hook*>> section_first_execution_hooks_{};
+        basic_memory_region<> last_executed_section_{};
 
         void setup_hooks();
         void setup_process();

@@ -938,7 +938,7 @@ namespace sogen
         }
 
         thread.previous_ip = thread.current_ip;
-        thread.current_ip = vcpu.cpu.read_instruction_pointer();
+        thread.current_ip = address;
 
         if (!this->uses_section_first_execution_hooks())
         {
@@ -955,6 +955,10 @@ namespace sogen
 
     void windows_emulator::track_section_first_execution(const uint64_t address)
     {
+        if (address - this->last_executed_section_.start < this->last_executed_section_.length)
+        {
+            return;
+        }
         auto* mod = this->mod_manager.find_by_address(address);
         if (!mod)
         {
@@ -974,6 +978,7 @@ namespace sogen
                 continue;
             }
 
+            this->last_executed_section_ = section.region;
             if (section.first_execute.has_value())
             {
                 return;
@@ -996,6 +1001,7 @@ namespace sogen
 
     void windows_emulator::clear_section_first_execution_hooks()
     {
+        this->last_executed_section_ = {};
         for (const auto& hooks : this->section_first_execution_hooks_ | std::views::values)
         {
             for (auto* hook : hooks)
@@ -1060,6 +1066,7 @@ namespace sogen
     void windows_emulator::setup_hooks()
     {
         this->callbacks.on_module_load.add([this](mapped_module& mod) {
+            this->last_executed_section_ = {};
             for (size_t i = 0; i < mod.sections.size(); ++i)
             {
                 this->install_section_first_execution_hook(mod, i);
@@ -1067,6 +1074,7 @@ namespace sogen
         });
 
         this->callbacks.on_module_unload.add([this](mapped_module& mod) {
+            this->last_executed_section_ = {};
             const auto hooks = this->section_first_execution_hooks_.extract(mod.image_base);
             if (hooks)
             {
@@ -1414,10 +1422,11 @@ namespace sogen
                 }
             }
 
-            // Guest code executes with the kernel lock released; hook callbacks
-            // (syscalls, exceptions, exec hooks) re-acquire it on VM exit.
             lock.unlock();
-            vcpu.cpu.start(count);
+            {
+                const kernel_lock::guest_execution_scope guest_scope(this->kernel_lock_, this->uses_instruction_precision());
+                vcpu.cpu.start(count);
+            }
             lock.lock();
 
             if (!vcpu.switch_thread && !vcpu.cpu.has_violation())

@@ -88,8 +88,13 @@ namespace sogen
 
         std::filesystem::path write_emulator_snapshot(const windows_emulator& win_emu, const bool log)
         {
-            std::filesystem::path snapshot_file = get_main_executable_name(win_emu) + "-" + std::to_string(time(nullptr)) + ".snap";
+            const std::filesystem::path snapshot_file = get_main_executable_name(win_emu) + "-" + std::to_string(time(nullptr)) + ".snap";
+            return write_emulator_snapshot(win_emu, snapshot_file, log);
+        }
 
+        std::filesystem::path write_emulator_snapshot(const windows_emulator& win_emu, const std::filesystem::path& snapshot_file,
+                                                      const bool log)
+        {
             if (log)
             {
                 win_emu.log.log("Writing snapshot to %s...\n", snapshot_file.string().c_str());

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <type_traits>
+#include <chrono>
 #include <utility>
 #include <set>
 #include <string>
@@ -60,6 +61,9 @@ namespace sogen
         std::set<uint64_t> rdtscp_cache{};
         std::set<std::pair<uint64_t, uint32_t>> cpuid_cache{};
         uint64_t traced_call_count{};
+        std::chrono::steady_clock::time_point progress_started{std::chrono::steady_clock::now()};
+        std::chrono::steady_clock::time_point progress_last{progress_started};
+        uint64_t progress_instructions{};
         std::optional<uint64_t> auto_break_before_call{};
         std::optional<uint64_t> syscall_to_resume_after_break{};
 

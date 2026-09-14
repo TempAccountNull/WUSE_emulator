@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <span>
 #include <string>
 #include <string_view>
@@ -72,7 +73,16 @@ namespace sogen
         void set_color(const color_type color)
         {
 #ifdef _WIN32
-            SetConsoleTextAttribute(get_console_handle(), color);
+            const auto* force_color = std::getenv("FORCE_COLOR");
+            if (force_color && std::string_view(force_color) != "0")
+            {
+                constexpr std::array ansi_colors{30, 34, 32, 36, 31, 35, 33, 37, 90, 94, 92, 96, 91, 95, 93, 97};
+                printf("\033[%dm", color == get_reset_color() ? 0 : ansi_colors[color & 0xF]);
+            }
+            else
+            {
+                SetConsoleTextAttribute(get_console_handle(), color);
+            }
 #else
             printf("%s", color);
 #endif

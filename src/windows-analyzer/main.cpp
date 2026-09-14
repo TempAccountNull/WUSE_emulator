@@ -64,6 +64,7 @@ namespace sogen
 #endif
             std::optional<uint64_t> break_call{};
             std::filesystem::path dump{};
+            std::filesystem::path snapshot_output{};
             std::filesystem::path minidump_path{};
             std::filesystem::path report_path{};
             std::filesystem::path stdout_path{};
@@ -303,7 +304,12 @@ namespace sogen
         {
             while (true)
             {
-                const auto chr = static_cast<char>(getchar());
+                const auto chr = getchar();
+                if (chr == EOF)
+                {
+                    return false;
+                }
+
                 if (chr == 'y')
                 {
                     return true;
@@ -389,7 +395,24 @@ namespace sogen
             });
 #endif
 
+            bool snapshot_attempted = false;
+            auto save_requested_snapshot = [&] {
+                if (!options.snapshot_output.empty() && !snapshot_attempted)
+                {
+                    snapshot_attempted = true;
+                    snapshot::write_emulator_snapshot(win_emu, options.snapshot_output);
+                }
+            };
+
             auto emit_failure = [&](std::string message) {
+                try
+                {
+                    save_requested_snapshot();
+                }
+                catch (const std::exception& e)
+                {
+                    message += " (snapshot failed: "s + e.what() + ")";
+                }
                 do_post_emulation_work(c);
                 c.emit_summary<run_failed_event>([&](auto& event) {
                     event.rip = win_emu.emu().read_instruction_pointer();
@@ -410,6 +433,10 @@ namespace sogen
 
                     win_x86_64_gdb_stub_handler handler{win_emu, should_stop, parse_gdb_target_architecture(options.gdb_architecture)};
                     gdb_stub::run_gdb_stub(address, handler);
+                    if (!options.snapshot_output.empty())
+                    {
+                        options.use_gdb = false;
+                    }
                 }
                 else if (!options.minidump_path.empty())
                 {
@@ -433,10 +460,15 @@ namespace sogen
                     win_emu.start();
                 }
 
+                save_requested_snapshot();
+
                 if (signals_received > 0)
                 {
                     options.use_gdb = false;
+                }
 
+                if (signals_received > 0 && options.snapshot_output.empty())
+                {
                     win_emu.log.log("Do you want to create a snapshot? (y/n)\n");
                     const auto write_snapshot = read_yes_no_answer();
 
@@ -905,6 +937,8 @@ namespace sogen
 
             app.add_option("-e,--emulation", options.emulation_root, "Set emulation root path");
             app.add_option("-a,--snapshot", options.dump, "Load snapshot dump from path");
+            app.add_option("--snapshot-out", options.snapshot_output,
+                           "Save resumable state to path when emulation stops or the debugger disconnects");
             app.add_option("--minidump", options.minidump_path, "Load minidump from path");
             app.add_option("--report", options.report_path, "Write machine-readable analysis events to a file");
             app.add_option("--report-format", options.report_format, "Report format (supported: jsonl)")->capture_default_str();

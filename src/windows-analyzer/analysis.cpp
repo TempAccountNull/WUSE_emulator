@@ -489,9 +489,35 @@ namespace sogen
             });
         }
 
+        void report_execution_progress(analysis_context& c, const uint64_t address)
+        {
+            const auto count = c.win_emu->get_executed_instructions();
+            if (!c.settings->verbose_logging || c.settings->reproducible || (count & 0x3FFFF) != 0)
+            {
+                return;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            const auto interval = std::chrono::duration<double>(now - c.progress_last).count();
+            if (interval < 5.0)
+            {
+                return;
+            }
+            c.emit_observation<execution_progress_event>([&](auto& event) {
+                event.elapsed_milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now - c.progress_started).count();
+                event.instructions_per_second = static_cast<uint64_t>(static_cast<double>(count - c.progress_instructions) / interval);
+                if (const auto* module = c.win_emu->mod_manager.find_by_address(address))
+                {
+                    event.module_rva = address - module->image_base;
+                }
+            });
+            c.progress_last = now;
+            c.progress_instructions = count;
+        }
+
         void handle_instruction(analysis_context& c, const uint64_t address)
         {
             auto& win_emu = *c.win_emu;
+            report_execution_progress(c, address);
             update_import_access(c, address);
 
 #if defined(OS_EMSCRIPTEN) && !defined(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS)
@@ -507,6 +533,12 @@ namespace sogen
             [[maybe_unused]] const auto current_ip = current_thread.current_ip;
             const auto is_main_exe = win_emu.mod_manager.executable->contains(address);
             const auto is_previous_main_exe = win_emu.mod_manager.executable->contains(previous_ip);
+
+            if (is_main_exe && is_previous_main_exe && !c.settings->instruction_summary &&
+                address != win_emu.mod_manager.executable->entry_point && !win_emu.mod_manager.executable->address_names.contains(address))
+            {
+                return;
+            }
 
             const auto binary = utils::make_lazy([&] {
                 if (is_main_exe)

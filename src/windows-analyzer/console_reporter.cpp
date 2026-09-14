@@ -204,6 +204,18 @@ namespace sogen
                                 color::green, "Section %s (%s) first execute at 0x%" PRIx64 " 0x%" PRIx64 " (tid: %" PRIu32 ")\n",
                                 e.module_name.c_str(), e.section_name.c_str(), e.execution.rip, e.file_address, e.execution.thread_id);
                         },
+                        [&](const execution_progress_event& e) {
+                            this->log_.print(color::green,
+                                             "Progress: %" PRIu64 " ms | %" PRIu64 " instructions | %" PRIu64 " inst/s | tid %" PRIu32
+                                             " | RIP 0x%" PRIx64 " (%s",
+                                             e.elapsed_milliseconds, e.header.instruction_count, e.instructions_per_second,
+                                             e.execution.thread_id, e.execution.rip, e.execution.rip_module.c_str());
+                            if (e.module_rva)
+                            {
+                                this->log_.print(color::green, "+0x%" PRIx64, *e.module_rva);
+                            }
+                            this->log_.print(color::green, ")\n");
+                        },
                         [&](const rdtsc_event& e) {
                             this->log_.print(color::blue, "Executing RDTSC instruction at 0x%" PRIx64 " (%s)\n", e.execution.rip,
                                              e.execution.rip_module.c_str());

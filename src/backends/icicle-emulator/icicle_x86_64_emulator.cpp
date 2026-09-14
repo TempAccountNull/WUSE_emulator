@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <unordered_set>
+#include <utility>
 #include <utils/object.hpp>
 #include <utils/finally.hpp>
 
@@ -14,6 +15,7 @@ extern "C"
     using icicle_mmio_write_func = void(void* user, uint64_t address, const void* data, size_t length);
 
     using raw_func = void(void*);
+    using instruction_func = uint32_t(void*);
     using ptr_func = void(void*, uint64_t);
     using block_func = void(void*, uint64_t, uint64_t);
     using interrupt_func = void(void*, int32_t);
@@ -42,6 +44,7 @@ extern "C"
     uint32_t icicle_create_snapshot(icicle_emulator*);
     void icicle_restore_snapshot(icicle_emulator*, uint32_t id);
     uint32_t icicle_add_syscall_hook(icicle_emulator*, raw_func* callback, void* data);
+    uint32_t icicle_add_timestamp_hook(icicle_emulator*, int32_t serializing, instruction_func* callback, void* data);
     uint32_t icicle_add_interrupt_hook(icicle_emulator*, interrupt_func* callback, void* data);
     uint32_t icicle_add_block_hook(icicle_emulator*, block_func* callback, void* data);
     uint32_t icicle_add_execution_hook(icicle_emulator*, uint64_t address, ptr_func* callback, void* data);
@@ -72,6 +75,31 @@ namespace sogen::icicle
             }
         }
 
+        class hook_scope
+        {
+          public:
+            explicit hook_scope(bool* state) noexcept
+                : state_(state),
+                  previous_(state ? std::exchange(*state, true) : false)
+            {
+            }
+
+            ~hook_scope()
+            {
+                if (this->state_)
+                {
+                    *this->state_ = this->previous_;
+                }
+            }
+
+            hook_scope(const hook_scope&) = delete;
+            hook_scope& operator=(const hook_scope&) = delete;
+
+          private:
+            bool* state_;
+            bool previous_;
+        };
+
         template <typename T>
         struct function_object : utils::object
         {
@@ -87,19 +115,7 @@ namespace sogen::icicle
             template <typename... Args>
             auto operator()(Args&&... args) const
             {
-                bool old_state{};
-                if (this->hook_state)
-                {
-                    old_state = *this->hook_state;
-                    *this->hook_state = true;
-                }
-
-                const auto _ = utils::finally([&] {
-                    if (this->hook_state)
-                    {
-                        *this->hook_state = old_state;
-                    }
-                });
+                const hook_scope scope(this->hook_state);
 
                 return this->func.operator()(std::forward<Args>(args)...);
             }
@@ -331,9 +347,10 @@ namespace sogen::icicle
 
         emulator_hook* hook_instruction(int instruction_type, instruction_hook_callback callback) override
         {
-            if (static_cast<x86_hookable_instructions>(instruction_type) != x86_hookable_instructions::syscall)
+            const auto kind = static_cast<x86_hookable_instructions>(instruction_type);
+            if (kind != x86_hookable_instructions::syscall && kind != x86_hookable_instructions::rdtsc &&
+                kind != x86_hookable_instructions::rdtscp)
             {
-                // TODO
                 return nullptr;
             }
 
@@ -345,7 +362,13 @@ namespace sogen::icicle
                 (void)func(0); //
             };
 
-            const auto id = icicle_add_syscall_hook(this->emu_, invoker, ptr);
+            const auto timestamp_invoker = +[](void* cb) -> uint32_t {
+                const auto& func = *static_cast<decltype(ptr)>(cb);
+                return static_cast<uint32_t>(func(0));
+            };
+            const auto id = kind == x86_hookable_instructions::syscall
+                                ? icicle_add_syscall_hook(this->emu_, invoker, ptr)
+                                : icicle_add_timestamp_hook(this->emu_, kind == x86_hookable_instructions::rdtscp, timestamp_invoker, ptr);
             this->hooks_[id] = std::move(obj);
 
             return wrap_hook(id);

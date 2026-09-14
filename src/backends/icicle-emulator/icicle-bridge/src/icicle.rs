@@ -1,13 +1,15 @@
 use icicle_cpu::ExceptionCode;
 use icicle_cpu::ValueSource;
-use std::collections::HashSet;
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashSet};
+use std::time::Instant;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::registers;
 
 fn create_x64_vm() -> icicle_vm::Vm {
     let mut cpu_config = icicle_vm::cpu::Config::from_target_triple("x86_64-none");
-    cpu_config.enable_jit = false;
+    cpu_config.enable_jit = std::env::var("SOGEN_ICICLE_JIT").as_deref() == Ok("1");
     cpu_config.enable_jit_mem = true;
     cpu_config.enable_shadow_stack = false;
     cpu_config.enable_recompilation = true;
@@ -15,8 +17,12 @@ fn create_x64_vm() -> icicle_vm::Vm {
     cpu_config.optimize_instructions = true;
     cpu_config.optimize_block = false;
 
-    return icicle_vm::build(&cpu_config).unwrap();
+    let mut vm = icicle_vm::build(&cpu_config).unwrap();
+    crate::reciprocal_sqrt::register(&mut vm.cpu);
+    vm
 }
+
+const CACHE_INVALIDATED: u64 = 0x10000;
 
 const FOREIGN_READ: u8 = 1 << 0;
 const FOREIGN_WRITE: u8 = 1 << 1;
@@ -100,6 +106,8 @@ enum HookType {
     Violation,
     Interrupt,
     Block,
+    Timestamp,
+    TimestampSerializing,
     Unknown,
 }
 
@@ -160,6 +168,9 @@ impl<Func: ?Sized> HookContainer<Func> {
     where
         F: FnMut(&Func),
     {
+        if self.hooks.is_empty() {
+            return;
+        }
         let was_iterating = self.do_pre_access_work();
 
         for (_, func) in &self.hooks {
@@ -207,14 +218,17 @@ impl<Func: ?Sized> HookContainer<Func> {
             return;
         }
 
-        let to_remove = std::mem::take(&mut self.hooks_to_remove);
-        for id in &to_remove {
-            self.hooks.remove(&id);
+        if !self.hooks_to_remove.is_empty() {
+            let to_remove = std::mem::take(&mut self.hooks_to_remove);
+            for id in &to_remove {
+                self.hooks.remove(id);
+            }
         }
-
-        let to_add = std::mem::take(&mut self.hooks_to_add);
-        for (id, func) in to_add {
-            self.hooks.insert(id, func);
+        if !self.hooks_to_add.is_empty() {
+            let to_add = std::mem::take(&mut self.hooks_to_add);
+            for (id, func) in to_add {
+                self.hooks.insert(id, func);
+            }
         }
     }
 }
@@ -237,7 +251,7 @@ fn count_instructions(block: &icicle_cpu::lifter::Block) -> u64 {
 impl icicle_vm::CodeInjector for InstructionHookInjector {
     fn inject(
         &mut self,
-        _cpu: &mut icicle_vm::cpu::Cpu,
+        cpu: &mut icicle_vm::cpu::Cpu,
         group: &icicle_vm::cpu::BlockGroup,
         code: &mut icicle_vm::BlockTable,
     ) {
@@ -250,7 +264,13 @@ impl icicle_vm::CodeInjector for InstructionHookInjector {
             let mut is_first_inst = true;
             let inst_count = count_instructions(&block);
 
+            let mut replace_instruction = false;
             for stmt in block.pcode.instructions.drain(..) {
+                if matches!(stmt.op, pcode::Op::InstructionMarker) {
+                    replace_instruction = false;
+                } else if replace_instruction {
+                    continue;
+                }
                 tmp_block.push(stmt);
                 if let pcode::Op::InstructionMarker = stmt.op {
                     if is_first_inst {
@@ -260,6 +280,50 @@ impl icicle_vm::CodeInjector for InstructionHookInjector {
                     }
 
                     tmp_block.push(pcode::Op::Hook(self.inst_hook));
+                    let length = stmt.inputs.second().as_u64();
+                    let mut bytes = [0u8; 15];
+                    if length <= 15
+                        && cpu
+                            .mem
+                            .read_bytes(
+                                stmt.inputs.first().as_u64(),
+                                &mut bytes[..length as usize],
+                                0,
+                            )
+                            .is_ok()
+                    {
+                        let instruction = &bytes[..length as usize];
+                        let prefix_length = instruction
+                            .iter()
+                            .take_while(|&&byte| {
+                                matches!(
+                                    byte,
+                                    0x26 | 0x2e
+                                        | 0x36
+                                        | 0x3e
+                                        | 0x64
+                                        | 0x65
+                                        | 0x66
+                                        | 0x67
+                                        | 0xf2
+                                        | 0xf3
+                                        | 0x40..=0x4f
+                                )
+                            })
+                            .count();
+                        let kind = match &instruction[prefix_length..] {
+                            [0x0f, 0x31] => 1u64,
+                            [0x0f, 0x01, 0xf9] => 2u64,
+                            _ => 0u64,
+                        };
+                        if kind != 0 {
+                            tmp_block.push((
+                                pcode::Op::Exception,
+                                (ExceptionCode::Environment as u64, (kind << 8) | length),
+                            ));
+                            replace_instruction = true;
+                        }
+                    }
                     code.modified.insert(id);
                 }
             }
@@ -271,23 +335,25 @@ impl icicle_vm::CodeInjector for InstructionHookInjector {
 
 struct ExecutionHooks {
     stop: Rc<RefCell<bool>>,
+    invalidate_code: Rc<Cell<bool>>,
     generic_hooks: HookContainer<dyn Fn(u64)>,
     ranged_hooks: HookContainer<dyn Fn(u64)>,
     specific_hooks: HookContainer<dyn Fn(u64)>,
     block_hooks: HookContainer<dyn Fn(u64, u64)>,
-    address_mapping: HashMap<u64, Vec<u32>>,
+    address_mapping: BTreeMap<u64, Vec<u32>>,
     one_time_callbacks: Vec<Box<dyn Fn()>>,
 }
 
 impl ExecutionHooks {
-    pub fn new(stop_value: Rc<RefCell<bool>>) -> Self {
+    pub fn new(stop_value: Rc<RefCell<bool>>, invalidate_code: Rc<Cell<bool>>) -> Self {
         Self {
             stop: stop_value,
+            invalidate_code,
             generic_hooks: HookContainer::new(),
             ranged_hooks: HookContainer::new(),
             specific_hooks: HookContainer::new(),
             block_hooks: HookContainer::new(),
-            address_mapping: HashMap::new(),
+            address_mapping: BTreeMap::new(),
             one_time_callbacks: Vec::new(),
         }
     }
@@ -327,11 +393,19 @@ impl ExecutionHooks {
     }
 
     pub fn execute(&mut self, cpu: &mut icicle_cpu::Cpu, address: u64) {
+        if self.invalidate_code.get() {
+            cpu.exception =
+                icicle_cpu::Exception::new(ExceptionCode::Environment, CACHE_INVALIDATED);
+            return;
+        }
         self.run_hooks(address);
 
         if *self.stop.borrow() {
             cpu.exception.code = ExceptionCode::InstructionLimit as u32;
             cpu.exception.value = address;
+        } else if self.invalidate_code.get() {
+            cpu.exception =
+                icicle_cpu::Exception::new(ExceptionCode::Environment, CACHE_INVALIDATED);
         }
     }
 
@@ -348,12 +422,11 @@ impl ExecutionHooks {
     }
 
     pub fn add_range_hook(&mut self, start: u64, size: u64, callback: Box<dyn Fn(u64)>) -> u32 {
-        self.ranged_hooks
-            .add_hook(Box::new(move |address: u64| {
-                if size != 0 && is_within_start_and_length(address, start, size) {
-                    callback(address);
-                }
-            }))
+        self.ranged_hooks.add_hook(Box::new(move |address: u64| {
+            if size != 0 && is_within_start_and_length(address, start, size) {
+                callback(address);
+            }
+        }))
     }
 
     pub fn add_specific_hook(&mut self, address: u64, callback: Box<dyn Fn(u64)>) -> u32 {
@@ -392,6 +465,10 @@ pub struct IcicleEmulator {
     last_stop: IcicleStopInfo,
     reg: registers::X86RegisterNodes,
     syscall_hooks: HookContainer<dyn Fn()>,
+    timestamp_hooks: [HookContainer<dyn Fn() -> u32>; 2],
+    timestamp_epoch: Instant,
+    invalidate_code: Rc<Cell<bool>>,
+    resume_pcode: bool,
     interrupt_hooks: HookContainer<dyn Fn(i32)>,
     violation_hooks: HookContainer<dyn Fn(u64, u8, bool) -> bool>,
     execution_hooks: Rc<RefCell<ExecutionHooks>>,
@@ -457,7 +534,11 @@ impl IcicleEmulator {
         virtual_machine.cpu.mem.set_capacity(capacity);
 
         let stop_value = Rc::new(RefCell::new(false));
-        let exec_hooks = Rc::new(RefCell::new(ExecutionHooks::new(stop_value.clone())));
+        let invalidate_code = Rc::new(Cell::new(false));
+        let exec_hooks = Rc::new(RefCell::new(ExecutionHooks::new(
+            stop_value.clone(),
+            invalidate_code.clone(),
+        )));
 
         let inst_exec_hooks = Rc::clone(&exec_hooks);
 
@@ -486,6 +567,10 @@ impl IcicleEmulator {
             reg: registers::X86RegisterNodes::new(&virtual_machine.cpu.arch),
             vm: virtual_machine,
             syscall_hooks: HookContainer::new(),
+            timestamp_hooks: [HookContainer::new(), HookContainer::new()],
+            timestamp_epoch: Instant::now(),
+            invalidate_code,
+            resume_pcode: false,
             interrupt_hooks: HookContainer::new(),
             violation_hooks: HookContainer::new(),
             execution_hooks: exec_hooks,
@@ -507,8 +592,11 @@ impl IcicleEmulator {
         };
 
         loop {
-            self.vm.cpu.block_id = u64::MAX;
-            self.vm.cpu.block_offset = 0;
+            if !std::mem::take(&mut self.resume_pcode) {
+                self.flush_pending_code();
+                self.vm.cpu.block_id = u64::MAX;
+                self.vm.cpu.block_offset = 0;
+            }
             self.vm.cpu.pending_exception = None;
             self.vm.cpu.exception.clear();
             *self.stop.borrow_mut() = false;
@@ -555,7 +643,8 @@ impl IcicleEmulator {
             ExceptionCode::ReadUnmapped => self.handle_violation(value, FOREIGN_READ, true),
             ExceptionCode::WriteUnmapped => self.handle_violation(value, FOREIGN_WRITE, true),
             ExceptionCode::ExecViolation => self.handle_violation(value, FOREIGN_EXEC, false),
-            ExceptionCode::SelfModifyingCode => self.handle_self_modifying_code(),
+            ExceptionCode::SelfModifyingCode => self.handle_self_modifying_code(value),
+            ExceptionCode::Environment => self.handle_environment(value),
             ExceptionCode::SoftwareBreakpoint => self.handle_interrupt(3),
             ExceptionCode::InvalidInstruction => self.handle_interrupt(6),
             ExceptionCode::DivisionException => self.handle_interrupt(0),
@@ -565,10 +654,111 @@ impl IcicleEmulator {
         return continue_execution;
     }
 
-    fn handle_self_modifying_code(&mut self) -> bool {
-        self.vm.code.flush_code();
-        self.vm.cpu.block_id = u64::MAX;
-        return true;
+    fn invalidate_code_range(&mut self, address: u64, length: u64) -> bool {
+        if length == 0 {
+            return false;
+        }
+        let last = address.saturating_add(length - 1);
+        let page_size = self.vm.cpu.mem.page_size();
+        let mut page_address = self.vm.cpu.mem.page_aligned(address);
+        let mut changed = false;
+        loop {
+            if let Some(index) = self.vm.cpu.mem.get_physical_index(page_address) {
+                let page = self.vm.cpu.mem.get_physical_mut(index);
+                if page.executed {
+                    page.executed = false;
+                    for permission in &mut page.data_mut().perm {
+                        *permission &= !icicle_cpu::mem::perm::IN_CODE_CACHE;
+                    }
+                    changed = true;
+                }
+            }
+            if last - page_address < page_size {
+                break;
+            }
+            page_address += page_size;
+        }
+        if changed {
+            self.vm.cpu.mem.clear_tlb();
+            self.invalidate_code.set(true);
+        }
+        changed
+    }
+
+    fn flush_pending_code(&mut self) {
+        if self.invalidate_code.replace(false) {
+            self.vm.code.flush_code();
+            self.vm.jit.clear();
+            self.vm.cpu.block_id = u64::MAX;
+            self.vm.cpu.block_offset = 0;
+        }
+    }
+
+    fn handle_self_modifying_code(&mut self, address: u64) -> bool {
+        let length = self
+            .vm
+            .code
+            .blocks
+            .get(self.vm.cpu.block_id as usize)
+            .and_then(|block| {
+                block
+                    .pcode
+                    .instructions
+                    .get(self.vm.cpu.block_offset as usize)
+            })
+            .filter(|instruction| matches!(instruction.op, pcode::Op::Store(_)))
+            .map_or(1, |instruction| instruction.inputs.second().size() as u64);
+        if !self.invalidate_code_range(address, length) {
+            return false;
+        }
+        // Preserve the failed p-code operation: replaying the x86 instruction can duplicate earlier stores or stack updates.
+        self.resume_pcode = self.vm.cpu.block_id != u64::MAX;
+        true
+    }
+
+    fn handle_environment(&mut self, value: u64) -> bool {
+        if value == CACHE_INVALIDATED {
+            self.flush_pending_code();
+            return true;
+        }
+        let kind = value >> 8;
+        if !(1..=2).contains(&kind) {
+            return false;
+        }
+        let mut continuation = 0;
+        self.timestamp_hooks[(kind - 1) as usize].for_each_hook(|callback| {
+            continuation = continuation.max(callback());
+        });
+        if continuation == 0 {
+            let ticks = self.timestamp_epoch.elapsed().as_nanos() as u64;
+            self.write_register(
+                registers::X86Register::Rax,
+                &(ticks as u32 as u64).to_ne_bytes(),
+            );
+            self.write_register(
+                registers::X86Register::Rdx,
+                &((ticks >> 32) as u32 as u64).to_ne_bytes(),
+            );
+            if kind == 2 {
+                self.write_register(registers::X86Register::Rcx, &0u64.to_ne_bytes());
+            }
+        }
+        if continuation != 2 {
+            self.vm.cpu.write_pc(self.vm.cpu.read_pc() + (value & 0xff));
+        }
+        true
+    }
+
+    pub fn add_timestamp_hook(&mut self, serializing: bool, callback: Box<dyn Fn() -> u32>) -> u32 {
+        let id = self.timestamp_hooks[serializing as usize].add_hook(callback);
+        qualify_hook_id(
+            id,
+            if serializing {
+                HookType::TimestampSerializing
+            } else {
+                HookType::Timestamp
+            },
+        )
     }
 
     fn handle_violation(&mut self, address: u64, permission: u8, unmapped: bool) -> bool {
@@ -689,6 +879,8 @@ impl IcicleEmulator {
 
         match hook_type {
             HookType::Syscall => self.syscall_hooks.remove_hook(hook_id),
+            HookType::Timestamp => self.timestamp_hooks[0].remove_hook(hook_id),
+            HookType::TimestampSerializing => self.timestamp_hooks[1].remove_hook(hook_id),
             HookType::Violation => self.violation_hooks.remove_hook(hook_id),
             HookType::Interrupt => self.interrupt_hooks.remove_hook(hook_id),
             HookType::ExecuteGeneric => self
@@ -718,9 +910,8 @@ impl IcicleEmulator {
     }
 
     pub fn map_memory(&mut self, address: u64, length: u64, permissions: u8) -> bool {
-        const MAPPING_PERMISSIONS: u8 = icicle_vm::cpu::mem::perm::MAP
-            | icicle_vm::cpu::mem::perm::INIT
-            | icicle_vm::cpu::mem::perm::IN_CODE_CACHE;
+        const MAPPING_PERMISSIONS: u8 =
+            icicle_vm::cpu::mem::perm::MAP | icicle_vm::cpu::mem::perm::INIT;
 
         let native_permissions = map_permissions(permissions);
 
@@ -748,10 +939,12 @@ impl IcicleEmulator {
     }
 
     pub fn unmap_memory(&mut self, address: u64, length: u64) -> bool {
+        self.invalidate_code_range(address, length);
         return self.get_mem().unmap_memory_len(address, length);
     }
 
     pub fn protect_memory(&mut self, address: u64, length: u64, permissions: u8) -> bool {
+        self.invalidate_code_range(address, length);
         let native_permissions = map_permissions(permissions);
         let res = self
             .get_mem()
@@ -760,6 +953,7 @@ impl IcicleEmulator {
     }
 
     pub fn write_memory(&mut self, address: u64, data: &[u8]) -> bool {
+        self.invalidate_code_range(address, data.len() as u64);
         let res = self
             .get_mem()
             .write_bytes(address, data, icicle_vm::cpu::mem::perm::NONE);
@@ -805,8 +999,15 @@ impl IcicleEmulator {
     fn read_generic_register(&mut self, reg: registers::X86Register, buffer: &mut [u8]) -> usize {
         let reg_node = self.reg.get_node(reg);
 
-        let res = self.vm.cpu.read_dynamic(pcode::Value::Var(reg_node));
-        let bytes: [u8; 32] = res.zxt();
+        let mut bytes = [0u8; 32];
+        if reg_node.size == 32 {
+            bytes[..16]
+                .copy_from_slice(&self.vm.cpu.read::<[u8; 16]>(reg_node.slice(0, 16).into()));
+            bytes[16..]
+                .copy_from_slice(&self.vm.cpu.read::<[u8; 16]>(reg_node.slice(16, 16).into()));
+        } else {
+            bytes = self.vm.cpu.read_dynamic(pcode::Value::Var(reg_node)).zxt();
+        }
 
         let len = std::cmp::min(bytes.len(), buffer.len());
         buffer[..len].copy_from_slice(&bytes[..len]);
@@ -905,6 +1106,10 @@ impl IcicleEmulator {
             14 => cpu.write_var::<[u8; 14]>(reg_node, buffer[..14].try_into().unwrap()),
             15 => cpu.write_var::<[u8; 15]>(reg_node, buffer[..15].try_into().unwrap()),
             16 => cpu.write_var::<[u8; 16]>(reg_node, buffer[..16].try_into().unwrap()),
+            32 => {
+                cpu.write_var::<[u8; 16]>(reg_node.slice(0, 16), buffer[..16].try_into().unwrap());
+                cpu.write_var::<[u8; 16]>(reg_node.slice(16, 16), buffer[16..].try_into().unwrap());
+            }
             _ => panic!("invalid dynamic value size"),
         }
 

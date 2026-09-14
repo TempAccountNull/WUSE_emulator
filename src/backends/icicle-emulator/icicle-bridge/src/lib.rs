@@ -1,4 +1,5 @@
 mod icicle;
+mod reciprocal_sqrt;
 mod registers;
 
 use icicle::{IcicleEmulator, IcicleStopInfo};
@@ -50,6 +51,7 @@ pub fn icicle_stop(ptr: *mut c_void) {
 }
 
 type RawFunction = extern "C" fn(*mut c_void);
+type InstructionFunction = extern "C" fn(*mut c_void) -> u32;
 type PtrFunction = extern "C" fn(*mut c_void, u64);
 type BlockFunction = extern "C" fn(*mut c_void, u64, u64);
 type DataFunction = extern "C" fn(*mut c_void, *const c_void, usize);
@@ -283,6 +285,19 @@ pub fn icicle_add_syscall_hook(ptr: *mut c_void, callback: RawFunction, data: *m
     unsafe {
         let emulator = &mut *(ptr as *mut IcicleEmulator);
         return emulator.add_syscall_hook(Box::new(move || callback(data)));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn icicle_add_timestamp_hook(
+    ptr: *mut c_void,
+    serializing: i32,
+    callback: InstructionFunction,
+    data: *mut c_void,
+) -> u32 {
+    unsafe {
+        let emulator = &mut *(ptr as *mut IcicleEmulator);
+        emulator.add_timestamp_hook(serializing != 0, Box::new(move || callback(data)))
     }
 }
 

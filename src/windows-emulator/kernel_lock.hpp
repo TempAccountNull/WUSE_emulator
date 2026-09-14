@@ -11,12 +11,8 @@
 namespace sogen
 {
 
-    // The emulator kernel lock (docs/multi-vcpu-design.md, sections 2 and 7).
-    // Serializes all emulator code that touches shared kernel state: acquired at
-    // every entry point (VM-exit hook callbacks, UI event delivery, scheduler
-    // iterations) and released while guest code executes. Interior code asserts
-    // ownership instead of re-acquiring; the lock is deliberately not recursive,
-    // so nested acquisition is caught immediately in debug builds.
+    // See docs/multi-vcpu-design.md, sections 2 and 7. Guest execution normally releases
+    // this lock; a single-vCPU instruction-precise quantum retains it for same-thread callbacks.
     class kernel_lock
     {
       public:
@@ -36,8 +32,47 @@ namespace sogen
             return enabled;
         }
 
+        class guest_execution_scope
+        {
+          public:
+            guest_execution_scope(kernel_lock& lock, const bool enabled)
+                : lock_(enabled ? &lock : nullptr)
+            {
+                if (this->lock_)
+                {
+                    assert(!guest_owner_);
+                    this->lock_->lock();
+                    guest_owner_ = this->lock_;
+                }
+            }
+
+            ~guest_execution_scope()
+            {
+                if (this->lock_)
+                {
+                    assert(!guest_callback_active_);
+                    guest_owner_ = nullptr;
+                    this->lock_->unlock();
+                }
+            }
+
+            guest_execution_scope(const guest_execution_scope&) = delete;
+            guest_execution_scope& operator=(const guest_execution_scope&) = delete;
+            guest_execution_scope(guest_execution_scope&&) = delete;
+            guest_execution_scope& operator=(guest_execution_scope&&) = delete;
+
+          private:
+            kernel_lock* lock_{};
+        };
+
         void lock()
         {
+            if (guest_owner_ == this)
+            {
+                assert(!guest_callback_active_ && "The kernel lock is not recursive");
+                guest_callback_active_ = true;
+                return;
+            }
             assert(!this->is_held_by_current_thread() && "The kernel lock is not recursive");
 
             if (profiling_enabled())
@@ -56,6 +91,12 @@ namespace sogen
         // behind a long-running emulator operation; the caller is expected to retry later or skip the work.
         bool try_lock()
         {
+            if (guest_owner_ == this)
+            {
+                assert(!guest_callback_active_ && "The kernel lock is not recursive");
+                guest_callback_active_ = true;
+                return true;
+            }
             assert(!this->is_held_by_current_thread() && "The kernel lock is not recursive");
 
             if (!this->mutex_.try_lock())
@@ -75,6 +116,12 @@ namespace sogen
 
         void unlock()
         {
+            if (guest_owner_ == this)
+            {
+                assert(guest_callback_active_);
+                guest_callback_active_ = false;
+                return;
+            }
             this->owner_.store({}, std::memory_order_relaxed);
 
             if (profiling_enabled())
@@ -129,6 +176,11 @@ namespace sogen
             this->acquisitions_.fetch_add(1, std::memory_order_relaxed);
             this->held_since_ = clock::now();
         }
+
+        // Only software backends with cooperative instruction time slicing use this scope.
+        // The real mutex stays held for the quantum; callbacks borrow it on the same host thread.
+        static inline thread_local kernel_lock* guest_owner_{};
+        static inline thread_local bool guest_callback_active_{};
 
         std::mutex mutex_{};
         std::atomic<std::thread::id> owner_{};

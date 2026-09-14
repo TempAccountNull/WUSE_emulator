@@ -236,6 +236,13 @@ namespace sogen
         uint64_t file_address{};
     };
 
+    struct execution_progress_event : observation_event
+    {
+        uint64_t elapsed_milliseconds{};
+        uint64_t instructions_per_second{};
+        std::optional<uint64_t> module_rva{};
+    };
+
     struct rdtsc_event : observation_event
     {
     };
@@ -293,7 +300,8 @@ namespace sogen
                      memory_allocate_event, memory_protect_event, memory_violation_event, io_control_event, thread_create_event,
                      thread_terminated_event, thread_set_name_event, thread_switch_event, module_load_event, module_unload_event,
                      import_read_event, import_write_event, object_access_event, environment_access_event, function_execution_event,
-                     entry_point_execution_event, foreign_code_transition_event, section_first_execute_event, rdtsc_event, rdtscp_event,
-                     cpuid_event, syscall_event, foreign_module_read_event, executable_read_event, executable_write_event, fast_fail_event>;
+                     entry_point_execution_event, foreign_code_transition_event, section_first_execute_event, execution_progress_event,
+                     rdtsc_event, rdtscp_event, cpuid_event, syscall_event, foreign_module_read_event, executable_read_event,
+                     executable_write_event, fast_fail_event>;
 
 } // namespace sogen

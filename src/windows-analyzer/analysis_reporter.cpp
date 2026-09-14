@@ -216,7 +216,13 @@ namespace sogen
                     std::visit(make_overloaded([&](const auto& e) { write_record(object, e); }), event);
                 }
 
-                this->file_ << line << '\n';
+                line.push_back('\n');
+                this->file_.write(line.data(), static_cast<std::streamsize>(line.size()));
+                this->file_.flush();
+                if (!this->file_)
+                {
+                    throw std::runtime_error("Failed to write analysis event");
+                }
             }
 
             void flush() override
@@ -298,6 +304,7 @@ namespace sogen
             EVENT_NAME(entry_point_execution_event, "entry_point_execution");
             EVENT_NAME(foreign_code_transition_event, "foreign_code_transition");
             EVENT_NAME(section_first_execute_event, "section_first_execute");
+            EVENT_NAME(execution_progress_event, "execution_progress");
             EVENT_NAME(rdtsc_event, "rdtsc");
             EVENT_NAME(rdtscp_event, "rdtscp");
             EVENT_NAME(cpuid_event, "cpuid");
@@ -537,6 +544,16 @@ namespace sogen
                 object.field("moduleName", event.module_name);
                 object.field("section", event.section_name);
                 object.hex_field("fileAddr", event.file_address);
+            }
+
+            static void write_fields(json_object_builder& object, const execution_progress_event& event)
+            {
+                object.field("elapsedMs", event.elapsed_milliseconds);
+                object.field("instructionsPerSecond", event.instructions_per_second);
+                if (event.module_rva)
+                {
+                    object.hex_field("moduleRva", *event.module_rva);
+                }
             }
 
             static void write_fields(json_object_builder&, const rdtsc_event&)
