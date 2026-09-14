@@ -16,6 +16,9 @@ namespace sogen
                 case handle_types::process:
                     return target_object_handle == GUEST_PROCESS_HANDLE && process.exit_status.has_value();
 
+                case handle_types::file:
+                    return process.files.get(target_object_handle) != nullptr;
+
                 case handle_types::event: {
                     const auto* e = process.events.get(target_object_handle);
                     return e && e->signaled;
@@ -114,6 +117,7 @@ namespace sogen
             switch (target_object_handle.value.type)
             {
             case handle_types::process:
+            case handle_types::file:
             case handle_types::event:
             case handle_types::thread:
             case handle_types::semaphore:

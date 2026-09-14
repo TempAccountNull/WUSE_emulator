@@ -319,6 +319,8 @@ namespace sogen
                 {
                 case handle_types::process:
                     return resolved_target_handle == GUEST_PROCESS_HANDLE;
+                case handle_types::file:
+                    return c.proc.files.get(resolved_target_handle) != nullptr;
                 case handle_types::event:
                     return c.proc.events.get(resolved_target_handle) != nullptr;
                 case handle_types::thread:
