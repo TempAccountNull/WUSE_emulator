@@ -9,6 +9,7 @@
 #include "devices/gpu_bridge.hpp"
 #include "devices/steam_bridge.hpp"
 #include "devices/console.hpp"
+#include "devices/cm_api.hpp"
 #include <iostream>
 
 namespace sogen
@@ -88,7 +89,7 @@ namespace sogen
             {u"CNG"sv, create_dummy_device},
             {u"RasAcd"sv, create_dummy_device},
             {u"PcwDrv"sv, create_dummy_device},
-            {u"DeviceApi\\CMApi"sv, create_dummy_device},
+            {u"DeviceApi\\CMApi"sv, create_cm_api},
             {u"DeviceApi\\CMNotify"sv, create_dummy_device},
             {u"ConDrv\\Server"sv, create_dummy_device},
             {u"DeviceApi\\Dev\\Query"sv, create_unsupported_io_device},
