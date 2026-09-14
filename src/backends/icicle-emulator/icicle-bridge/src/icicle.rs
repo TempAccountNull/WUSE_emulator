@@ -474,7 +474,12 @@ pub struct IcicleEmulator {
     violation_hooks: HookContainer<dyn Fn(u64, u8, bool) -> bool>,
     execution_hooks: Rc<RefCell<ExecutionHooks>>,
     stop: Rc<RefCell<bool>>,
-    snapshots: Vec<Box<icicle_vm::Snapshot>>,
+    vm_running: bool,
+    pending_free_pages: Vec<icicle_cpu::mem::physical::Index>,
+    snapshots: Vec<(
+        Box<icicle_vm::Snapshot>,
+        Vec<icicle_cpu::mem::physical::Index>,
+    )>,
 }
 
 struct MemoryHook {
@@ -575,6 +580,8 @@ impl IcicleEmulator {
             interrupt_hooks: HookContainer::new(),
             violation_hooks: HookContainer::new(),
             execution_hooks: exec_hooks,
+            vm_running: false,
+            pending_free_pages: Vec::new(),
             snapshots: Vec::new(),
         }
     }
@@ -595,6 +602,7 @@ impl IcicleEmulator {
         loop {
             if !std::mem::take(&mut self.resume_pcode) {
                 self.flush_pending_code();
+                self.reclaim_pending_pages();
                 self.vm.cpu.block_id = u64::MAX;
                 self.vm.cpu.block_offset = 0;
             }
@@ -602,7 +610,9 @@ impl IcicleEmulator {
             self.vm.cpu.exception.clear();
             *self.stop.borrow_mut() = false;
 
+            self.vm_running = true;
             let reason = self.vm.run();
+            self.vm_running = false;
 
             match reason {
                 icicle_vm::VmExit::InstructionLimit => {
@@ -955,9 +965,43 @@ impl IcicleEmulator {
         return self.get_mem().map_memory_len(address, length, handler_id);
     }
 
+    fn reclaim_pending_pages(&mut self) {
+        let threshold = (self.vm.cpu.mem.capacity() / 16).clamp(1, 4096);
+        if self.vm_running || self.resume_pcode || self.pending_free_pages.is_empty() {
+            return;
+        }
+        if self.pending_free_pages.len() < threshold
+            && self.vm.cpu.mem.total_pages().saturating_add(threshold) < self.vm.cpu.mem.capacity()
+        {
+            return;
+        }
+        self.flush_pending_code();
+        self.vm
+            .cpu
+            .mem
+            .reclaim_unmapped_physical(&self.pending_free_pages, &[]);
+        self.pending_free_pages.clear();
+    }
+
     pub fn unmap_memory(&mut self, address: u64, length: u64) -> bool {
+        let Some(last) = length
+            .checked_sub(1)
+            .and_then(|value| address.checked_add(value))
+        else {
+            return false;
+        };
         self.invalidate_code_range(address, length);
-        return self.get_mem().unmap_memory_len(address, length);
+        let mem = &mut self.vm.cpu.mem;
+        for (_, _, entry) in mem.mapping.overlapping_iter(address..=last) {
+            if let Some(icicle_cpu::mem::MemoryMapping::Physical(page)) = entry {
+                if !page.index.is_zero_page() {
+                    self.pending_free_pages.push(page.index);
+                }
+            }
+        }
+        let result = mem.unmap_memory_len(address, length);
+        self.reclaim_pending_pages();
+        result
     }
 
     pub fn protect_memory(&mut self, address: u64, length: u64, permissions: u8) -> bool {
@@ -990,8 +1034,18 @@ impl IcicleEmulator {
             };
             page = next;
         }
-        mem.write_bytes(address, data, icicle_vm::cpu::mem::perm::NONE)
-            .is_ok()
+        match mem.write_bytes(address, data, icicle_vm::cpu::mem::perm::NONE) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "Icicle memory write failed: address={address:#x} bytes={} error={error:?} physical_pages={} capacity={}",
+                    data.len(),
+                    mem.total_pages(),
+                    mem.capacity()
+                );
+                false
+            }
+        }
     }
 
     pub fn read_memory(&mut self, address: u64, data: &mut [u8]) -> bool {
@@ -1076,14 +1130,16 @@ impl IcicleEmulator {
         let snap = self.vm.snapshot();
 
         let id = self.snapshots.len() as u32;
-        self.snapshots.push(Box::new(snap));
+        self.snapshots
+            .push((Box::new(snap), self.pending_free_pages.clone()));
 
         return id;
     }
 
     pub fn restore_snapshot(&mut self, id: u32) {
-        let snap = self.snapshots[id as usize].as_ref();
-        self.vm.restore(&snap);
+        let (snapshot, pending_free_pages) = &self.snapshots[id as usize];
+        self.vm.restore(snapshot);
+        self.pending_free_pages.clone_from(pending_free_pages);
     }
 
     fn write_flags<T>(&mut self, data: &[u8]) -> usize {
@@ -1149,5 +1205,87 @@ impl IcicleEmulator {
         }
 
         return reg_node.size.into();
+    }
+}
+
+#[cfg(test)]
+mod page_reclamation_tests {
+    use super::*;
+
+    const ADDRESS: u64 = 0x10000;
+
+    fn emulator(capacity: usize) -> IcicleEmulator {
+        let mut emu = IcicleEmulator::new();
+        assert!(emu.vm.cpu.mem.set_capacity(capacity));
+        emu
+    }
+
+    fn map_data(emu: &mut IcicleEmulator, address: u64, byte: u8) {
+        assert!(emu.map_memory(address, 4096, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+        assert!(emu.write_memory(address, &[byte; 4096]));
+    }
+
+    #[test]
+    fn host_unmaps_reuse_pages_and_find_partial_mappings() {
+        let mut emu = emulator(16);
+        for _ in 0..1000 {
+            map_data(&mut emu, ADDRESS, 0x41);
+            assert!(emu.unmap_memory(ADDRESS, 2048));
+            assert!(emu.unmap_memory(ADDRESS + 2048, 2048));
+            assert_eq!(emu.vm.cpu.mem.total_pages(), 2);
+        }
+    }
+
+    #[test]
+    fn reclamation_waits_for_vm_and_pcode_boundaries() {
+        let mut emu = emulator(16);
+        map_data(&mut emu, ADDRESS, 0x41);
+        emu.vm_running = true;
+        assert!(emu.unmap_memory(ADDRESS, 4096));
+        assert_eq!(emu.vm.cpu.mem.total_pages(), 3);
+        emu.vm_running = false;
+        emu.resume_pcode = true;
+        emu.reclaim_pending_pages();
+        assert_eq!(emu.vm.cpu.mem.total_pages(), 3);
+        emu.resume_pcode = false;
+        emu.reclaim_pending_pages();
+        assert_eq!(emu.vm.cpu.mem.total_pages(), 2);
+    }
+
+    #[test]
+    fn snapshot_restores_pending_candidates_with_physical_state() {
+        let mut emu = emulator(32);
+        map_data(&mut emu, ADDRESS, 0x41);
+        assert!(emu.unmap_memory(ADDRESS, 4096));
+        assert_eq!(emu.pending_free_pages.len(), 1);
+        let saved = emu.create_snapshot();
+        map_data(&mut emu, ADDRESS + 4096, 0x42);
+        assert!(emu.unmap_memory(ADDRESS + 4096, 4096));
+        assert!(emu.pending_free_pages.is_empty());
+        emu.restore_snapshot(saved);
+        assert_eq!(emu.pending_free_pages.len(), 1);
+        map_data(&mut emu, ADDRESS + 8192, 0x43);
+        assert!(emu.unmap_memory(ADDRESS + 8192, 4096));
+        assert_eq!(emu.vm.cpu.mem.total_pages(), 2);
+    }
+
+    #[test]
+    fn remapped_code_executes_new_bytes_after_reclamation() {
+        let mut emu = emulator(16);
+        for value in 1u32..=20 {
+            map_data(&mut emu, ADDRESS, 0x90);
+            let mut code = vec![0xb8];
+            code.extend_from_slice(&value.to_le_bytes());
+            code.extend_from_slice(&[0xeb, 0xfe]);
+            assert!(emu.write_memory(ADDRESS, &code));
+            emu.write_register(registers::X86Register::Rip, &ADDRESS.to_le_bytes());
+            emu.start(1000);
+            assert!(!emu.vm.code.blocks.is_empty());
+            let mut actual = [0; 8];
+            emu.read_register(registers::X86Register::Rax, &mut actual);
+            assert_eq!(u64::from_le_bytes(actual), value as u64);
+            assert!(emu.unmap_memory(ADDRESS, 4096));
+            assert_eq!(emu.vm.cpu.mem.total_pages(), 2);
+        }
     }
 }

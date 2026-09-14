@@ -1,0 +1,12 @@
+[package]
+name = "icicle-mem"
+version = "0.3.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+doctest = false
+
+[dependencies]
+tracing = { version = "0.1.40", default-features = false }
+ahash = "0.8.11"
