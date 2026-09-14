@@ -4449,8 +4449,39 @@ namespace sogen
                    c.emu.try_read_memory(slot, &target, sizeof(target)) && target == syscall;
         }
 
+        bool is_message_beep_operation(const syscall_context& c, const uint32_t code)
+        {
+            const auto* user32 = c.win_emu.mod_manager.find_by_name("user32.dll");
+            const auto* win32u = c.win_emu.mod_manager.find_by_name("win32u.dll");
+            if (!user32 || !win32u)
+            {
+                return false;
+            }
+            const auto address = user32->find_export("MessageBeep");
+            const auto syscall = win32u->find_export("NtUserCallOneParam");
+            std::array<uint8_t, 14> wrapper{};
+            if (address == 0 || syscall == 0 || !c.emu.try_read_memory(address, wrapper.data(), wrapper.size()) || wrapper[0] != 0x8b ||
+                wrapper[1] != 0xc9 || wrapper[2] != 0xba || wrapper[7] != 0x48 || wrapper[8] != 0xff || wrapper[9] != 0x25)
+            {
+                return false;
+            }
+            uint32_t selector{};
+            int32_t displacement{};
+            memcpy(&selector, wrapper.data() + 3, sizeof(selector));
+            memcpy(&displacement, wrapper.data() + 10, sizeof(displacement));
+            const auto slot = address + wrapper.size() + static_cast<uint64_t>(displacement);
+            uint64_t target{};
+            return selector == code && user32->contains(slot) && user32->contains(slot + sizeof(target) - 1) &&
+                   c.emu.try_read_memory(slot, &target, sizeof(target)) && target == syscall;
+        }
+
         emulator_pointer handle_NtUserCallOneParam(const syscall_context& c, const uint64_t parameter, const uint32_t code)
         {
+            if (is_message_beep_operation(c, code))
+            {
+                c.win_emu.log.info("MessageBeep request: type 0x%X (legacy USER dispatch)\n", static_cast<uint32_t>(parameter));
+                return handle_NtUserMessageBeep();
+            }
             if (is_post_quit_operation(c, code))
             {
                 return handle_NtUserPostQuitMessage(c, static_cast<int>(parameter));
@@ -4825,8 +4856,56 @@ namespace sogen
                    destination == expected;
         }
 
+        bool is_update_window_operation(const syscall_context& c, const uint32_t code)
+        {
+            const auto* user32 = c.win_emu.mod_manager.find_by_name("user32.dll");
+            const auto* win32u = c.win_emu.mod_manager.find_by_name("win32u.dll");
+            if (!user32 || !win32u)
+            {
+                return false;
+            }
+            const auto address = user32->find_export("UpdateWindow");
+            const auto syscall = win32u->find_export("NtUserCallHwndLock");
+            std::array<uint8_t, 0x50> wrapper{};
+            if (address == 0 || syscall == 0 || !user32->contains(address + wrapper.size() - 1) ||
+                !c.emu.try_read_memory(address, wrapper.data(), wrapper.size()))
+            {
+                return false;
+            }
+            constexpr std::array<uint8_t, 11> epilogue{0x48, 0x8b, 0xcb, 0x48, 0x83, 0xc4, 0x20, 0x5b, 0x48, 0xff, 0x25};
+            std::optional<uint32_t> operation{};
+            for (size_t i = 0; i + 20 <= wrapper.size(); ++i)
+            {
+                if (wrapper[i] != 0xba || !std::ranges::equal(epilogue, std::span{wrapper}.subspan(i + 5, epilogue.size())))
+                {
+                    continue;
+                }
+                int32_t displacement{};
+                memcpy(&displacement, wrapper.data() + i + 16, sizeof(displacement));
+                const auto slot = address + i + 20 + static_cast<uint64_t>(displacement);
+                uint64_t target{};
+                if (!user32->contains(slot) || !user32->contains(slot + sizeof(target) - 1) ||
+                    !c.emu.try_read_memory(slot, &target, sizeof(target)) || target != syscall)
+                {
+                    continue;
+                }
+                if (operation.has_value())
+                {
+                    return false;
+                }
+                uint32_t selector{};
+                memcpy(&selector, wrapper.data() + i + 1, sizeof(selector));
+                operation = selector;
+            }
+            return operation == code;
+        }
+
         BOOL handle_NtUserCallHwndLock(const syscall_context& c, const hwnd window, const uint32_t code)
         {
+            if (is_update_window_operation(c, code))
+            {
+                return handle_NtUserUpdateWindow(c, window);
+            }
             if (is_foreground_window_operation(c, code))
             {
                 return handle_NtUserSetForegroundWindow(c, window);
