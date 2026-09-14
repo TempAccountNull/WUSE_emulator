@@ -1,6 +1,7 @@
 #include "core_messaging_registrar.hpp"
 
 #include <logger.hpp>
+#include <platform/unicode.hpp>
 #include "../windows_emulator.hpp"
 
 namespace sogen
@@ -317,11 +318,16 @@ namespace sogen
             out.u32s(0x8C, {0x00200011, 0x8000, 0x01, 0x280});
         }
 
-        std::vector<uint8_t> make_resolve_service_reply(const request& req, const bool windows10)
+        std::vector<uint8_t> make_resolve_service_reply(const request& req, const bool windows10, const bool conversation_variant,
+                                                        const uint64_t conversation_id)
         {
             packet out(0x9C, req.id, 0x74);
             out.u32s(o_body0, {0x1D, encode_reply(registrar_reply::reply_resolve_service, windows10), 0x04, 0x00, 0x04});
-            append_resolve_payload(out, req.body0 >= 0x35);
+            append_resolve_payload(out, conversation_variant);
+            if (conversation_id)
+            {
+                out.bytes(0x44, &conversation_id, sizeof(conversation_id));
+            }
             if (windows10)
             {
                 out.u32(0x74, local_partition_id);
@@ -372,8 +378,69 @@ namespace sogen
             return out.finish();
         }
 
+        std::optional<std::u16string> read_service_name(windows_emulator& win_emu, const lpc_request_context& c, const request& req)
+        {
+            if (req.length < 0x34 || req.nested_size > req.length - o_body0 || req.nested_size < 12)
+            {
+                return std::nullopt;
+            }
+            const auto length = win_emu.emu().read_memory<uint32_t>(c.send_buffer + 0x30);
+            if (length < sizeof(char16_t) || length % sizeof(char16_t) || length > req.nested_size - 12)
+            {
+                return std::nullopt;
+            }
+            std::u16string name(length / sizeof(char16_t), u'\0');
+            win_emu.emu().read_memory(c.send_buffer + 0x34, name.data(), length);
+            if (name.back() != u'\0')
+            {
+                return std::nullopt;
+            }
+            name.pop_back();
+            return name;
+        }
+
         struct core_messaging_registrar_port : port
         {
+            uint64_t next_conversation_id{0xF5};
+
+            void serialize_object(utils::buffer_serializer& buffer) const override
+            {
+                port::serialize_object(buffer);
+                buffer.write(next_conversation_id);
+            }
+
+            void deserialize_object(utils::buffer_deserializer& buffer) override
+            {
+                port::deserialize_object(buffer);
+                buffer.read(next_conversation_id);
+            }
+
+            lpc_request_result resolve_service(windows_emulator& win_emu, const lpc_request_context& c, const request& req,
+                                               const bool windows10)
+            {
+                if (!windows10)
+                {
+                    return {STATUS_SUCCESS, make_resolve_service_reply(req, false, req.body0 >= 0x35, 0)};
+                }
+                const auto name = read_service_name(win_emu, c, req);
+                if (!name)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                const bool conversation_variant =
+                    *name == u"System\\InputSystemConversation" || *name == u"System\\InputSystemConversation_BAMO";
+                if (!conversation_variant && *name != u"System\\InputDelivery")
+                {
+                    win_emu.log.error("Unsupported CoreMessagingRegistrar service: %s\n", u16_to_u8(*name).c_str());
+                    return STATUS_NOT_SUPPORTED;
+                }
+                if (!next_conversation_id)
+                {
+                    return STATUS_INTEGER_OVERFLOW;
+                }
+                return {STATUS_SUCCESS, make_resolve_service_reply(req, true, conversation_variant, next_conversation_id++)};
+            }
+
             lpc_request_result handle_request(windows_emulator& win_emu, const lpc_request_context& c) override
             {
                 if (c.send_buffer_length < k_min_request_size)
@@ -417,7 +484,7 @@ namespace sogen
                 case registrar_method::resolve_service:
                     if (req.matches(0x40, 0x68))
                     {
-                        return {STATUS_SUCCESS, make_resolve_service_reply(req, windows10)};
+                        return resolve_service(win_emu, c, req, windows10);
                     }
                     break;
 
