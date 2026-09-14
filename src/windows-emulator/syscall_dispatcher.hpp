@@ -237,6 +237,25 @@ namespace sogen
         }
     };
 
+    struct window_activation_state : completion_state
+    {
+        hwnd target{};
+        std::vector<msg> messages{};
+
+      private:
+        void serialize_object(utils::buffer_serializer& buffer) const override
+        {
+            buffer.write(this->target);
+            buffer.write_vector(this->messages);
+        }
+
+        void deserialize_object(utils::buffer_deserializer& buffer) override
+        {
+            buffer.read(this->target);
+            buffer.read_vector(this->messages);
+        }
+    };
+
     struct window_position_state : completion_state
     {
         emulator_stack_allocation window_pos_alloc{};

@@ -617,7 +617,9 @@ namespace sogen
                                        UINT flags);
         BOOL completion_NtUserSetWindowPos(const syscall_context& c, hwnd hWnd, hwnd hwnd_insert_after, int x, int y, int cx, int cy,
                                            UINT flags);
-        NTSTATUS handle_NtUserSetForegroundWindow();
+        BOOL handle_NtUserSetForegroundWindow(const syscall_context& c, hwnd window);
+        BOOL completion_NtUserSetForegroundWindow(const syscall_context& c, hwnd window);
+        BOOL handle_NtUserCallHwndLock(const syscall_context& c, hwnd window, uint32_t code);
         hwnd handle_NtUserGetForegroundWindow(const syscall_context& c);
         hwnd handle_NtUserSetFocus(const syscall_context& c, hwnd hwnd);
         emulator_pointer handle_NtUserSetWindowLongPtr(const syscall_context& c, handle hWnd, int nIndex, emulator_pointer dwNewLong,
@@ -1666,6 +1668,7 @@ namespace sogen
         add_handler(NtUserSetParent);
         add_handler(NtUserSetWindowPos);
         add_handler(NtUserSetForegroundWindow);
+        add_handler(NtUserCallHwndLock);
         add_handler(NtUserGetForegroundWindow);
         add_handler(NtUserSetFocus);
         add_handler(NtUserSetWindowLongPtr);
@@ -1834,6 +1837,7 @@ namespace sogen
         add_callback(NtUserDestroyWindow, window_destroy_state);
         add_callback(NtUserShowWindow, window_show_state);
         add_callback(NtUserSetWindowPos, window_position_state);
+        add_callback(NtUserSetForegroundWindow, window_activation_state);
         add_callback(NtUserMessageCall, message_call_state);
         add_callback(NtUserUpdateWindow, window_update_state);
         add_stateless_callback(NtUserEnumDisplayMonitors);

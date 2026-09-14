@@ -4588,9 +4588,144 @@ namespace sogen
             return TRUE;
         }
 
-        NTSTATUS handle_NtUserSetForegroundWindow()
+        BOOL advance_window_activation(const syscall_context& c, window_activation_state& state)
         {
-            return STATUS_SUCCESS;
+            while (c.proc.foreground_window == state.target && c.proc.windows.get(state.target))
+            {
+                if (state.messages.empty())
+                {
+                    return TRUE;
+                }
+
+                const auto message = state.messages.back();
+                state.messages.pop_back();
+                const auto* win = c.proc.windows.get(message.window);
+                if (!win)
+                {
+                    continue;
+                }
+                if (win->thread_id != c.thread().id)
+                {
+                    if (auto* thread = c.proc.find_thread_by_id(win->thread_id))
+                    {
+                        thread->post_message(c.win_emu, message);
+                    }
+                    continue;
+                }
+
+                dispatch_window_message(c, callback_id::NtUserSetForegroundWindow, std::move(state), *win, message.message, message.wParam,
+                                        message.lParam);
+                return {};
+            }
+            return FALSE;
+        }
+
+        BOOL handle_NtUserSetForegroundWindow(const syscall_context& c, const hwnd window)
+        {
+            const auto* win = c.proc.windows.get(window);
+            if (!win || win->message_only || (win->style & WS_DISABLED) != 0 ||
+                ((win->style & WS_CHILD) != 0 && (win->style & WS_POPUP) == 0) || !c.proc.find_thread_by_id(win->thread_id))
+            {
+                return FALSE;
+            }
+
+            const auto previous_handle = c.proc.foreground_window;
+            const auto* previous = c.proc.windows.get(previous_handle);
+            const auto previous_thread = previous ? previous->thread_id : 0;
+            c.proc.foreground_window = window;
+            c.proc.user_handles.get_server_info().access([&](USER_SERVERINFO& info) { info.foregroundWindow = window; });
+            if (previous_handle == window)
+            {
+                return TRUE;
+            }
+
+            window_activation_state state{};
+            state.target = window;
+            const auto append = [&](const hwnd target, const uint32_t message, const uint64_t w_param, const uint64_t l_param) {
+                state.messages.push_back({.window = target, .message = message, .wParam = w_param, .lParam = l_param});
+            };
+            if (previous)
+            {
+                append(previous_handle, WM_NCACTIVATE, FALSE, window);
+                append(previous_handle, WM_ACTIVATE, (previous->style & WS_MINIMIZE) != 0 ? 0x10000 : 0, window);
+                append(previous_handle, WM_KILLFOCUS, window, 0);
+            }
+            if (previous_thread != win->thread_id)
+            {
+                for (const auto& [index, candidate] : c.proc.windows)
+                {
+                    (void)index;
+                    if (candidate.handle == c.proc.default_desktop_window_handle.bits || candidate.message_only ||
+                        (candidate.style & WS_CHILD) != 0)
+                    {
+                        continue;
+                    }
+                    if (previous_thread != 0 && candidate.thread_id == previous_thread)
+                    {
+                        append(candidate.handle, WM_ACTIVATEAPP, FALSE, win->thread_id);
+                    }
+                    else if (candidate.thread_id == win->thread_id)
+                    {
+                        append(candidate.handle, WM_ACTIVATEAPP, TRUE, previous_thread);
+                    }
+                }
+            }
+            append(window, WM_NCACTIVATE, TRUE, previous_handle);
+            append(window, WM_ACTIVATE, (win->style & WS_MINIMIZE) != 0 ? 0x10001 : WA_ACTIVE, previous_handle);
+            if ((win->style & WS_MINIMIZE) == 0)
+            {
+                append(window, WM_SETFOCUS, previous_handle, 0);
+            }
+            std::ranges::reverse(state.messages);
+
+            c.win_emu.log.info("Foreground window: 0x%" PRIx64 " -> 0x%" PRIx64 " (owner tid: %u, caller tid: %u)\n", previous_handle,
+                               window, win->thread_id, c.thread().id);
+            return advance_window_activation(c, state);
+        }
+
+        BOOL completion_NtUserSetForegroundWindow(const syscall_context& c, const hwnd /*window*/)
+        {
+            auto& state = c.get_completion_state<window_activation_state>();
+            return advance_window_activation(c, state);
+        }
+
+        bool is_foreground_window_operation(const syscall_context& c, const uint32_t code)
+        {
+            const auto* user32 = c.win_emu.mod_manager.find_by_name("user32.dll");
+            if (!user32)
+            {
+                return false;
+            }
+            const auto address = user32->find_export("SetForegroundWindow");
+            std::array<uint8_t, 12> wrapper{};
+            if (address == 0 || !c.emu.try_read_memory(address, wrapper.data(), wrapper.size()) || wrapper[0] != 0xba ||
+                wrapper[5] != 0x48 || wrapper[6] != 0xff || wrapper[7] != 0x25)
+            {
+                return false;
+            }
+            uint32_t operation{};
+            int32_t displacement{};
+            memcpy(&operation, wrapper.data() + 1, sizeof(operation));
+            memcpy(&displacement, wrapper.data() + 8, sizeof(displacement));
+            const auto* win32u = c.win_emu.mod_manager.find_by_name("win32u.dll");
+            const auto expected = win32u ? win32u->find_export("NtUserCallHwndLock") : 0;
+            uint64_t destination{};
+            const auto slot = address + wrapper.size() + static_cast<uint64_t>(displacement);
+            return operation == code && expected != 0 && c.emu.try_read_memory(slot, &destination, sizeof(destination)) &&
+                   destination == expected;
+        }
+
+        BOOL handle_NtUserCallHwndLock(const syscall_context& c, const hwnd window, const uint32_t code)
+        {
+            if (is_foreground_window_operation(c, code))
+            {
+                return handle_NtUserSetForegroundWindow(c, window);
+            }
+            c.win_emu.log.error("Unsupported NtUserCallHwndLock operation: 0x%X (hwnd: 0x%" PRIx64 ")\n", code, window);
+            c.win_emu.record_stop(stop_reason::unimplemented_syscall,
+                                  "NtUserCallHwndLock operation 0x" + utils::string::to_hex_number(code));
+            c.win_emu.stop();
+            return FALSE;
         }
 
         hwnd find_foreground_window(const syscall_context& c)
