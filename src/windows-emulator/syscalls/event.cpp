@@ -1,12 +1,49 @@
 #include "../std_include.hpp"
 #include "../emulator_utils.hpp"
 #include "../syscall_utils.hpp"
+#include <utils/string.hpp>
 
 namespace sogen
 {
 
     namespace syscalls
     {
+
+        namespace
+        {
+            constexpr ULONG object_case_insensitive = 0x40;
+            constexpr std::u16string_view maximum_commit_event = u"\\KernelObjects\\MaximumCommitCondition";
+
+            std::optional<handle> open_named_event(process_context& process, const std::u16string_view name, const bool case_insensitive)
+            {
+                const auto matches = [&](const std::u16string_view candidate) {
+                    return case_insensitive ? utils::string::equals_ignore_case(name, candidate) : name == candidate;
+                };
+
+                for (auto& [id, entry] : process.events)
+                {
+                    if (matches(entry.name))
+                    {
+                        ++entry.ref_count;
+                        return process.events.make_handle(id);
+                    }
+                }
+
+                if (!matches(maximum_commit_event))
+                {
+                    return std::nullopt;
+                }
+
+                event entry{};
+                entry.name = maximum_commit_event;
+                entry.type = NotificationEvent;
+                // The kernel owns a reference independently of open user handles. System commit-pressure
+                // transitions are not modeled; the event starts nonsignaled, as in MiCreateMemoryEvent.
+                entry.ref_count = 2;
+                return process.events.store(std::move(entry));
+            }
+        }
+
         NTSTATUS handle_NtSetEvent(const syscall_context& c, const uint64_t handle, const emulator_object<LONG> previous_state)
         {
             if (handle == DBWIN_DATA_READY)
@@ -127,9 +164,11 @@ namespace sogen
                                       const EVENT_TYPE event_type, const BOOLEAN initial_state)
         {
             std::u16string name{};
+            bool case_insensitive{};
             if (object_attributes)
             {
                 const auto attributes = object_attributes.read();
+                case_insensitive = (attributes.Attributes & object_case_insensitive) != 0;
                 if (attributes.ObjectName)
                 {
                     name = read_unicode_string(c.emu, attributes.ObjectName);
@@ -139,14 +178,10 @@ namespace sogen
 
             if (!name.empty())
             {
-                for (auto& entry : c.proc.events)
+                if (const auto existing = open_named_event(c.proc, name, case_insensitive))
                 {
-                    if (entry.second.name == name)
-                    {
-                        ++entry.second.ref_count;
-                        event_handle.write(c.proc.events.make_handle(entry.first));
-                        return STATUS_OBJECT_NAME_EXISTS;
-                    }
+                    event_handle.write(*existing);
+                    return STATUS_OBJECT_NAME_EXISTS;
                 }
             }
 
@@ -202,14 +237,10 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            for (auto& entry : c.proc.events)
+            if (const auto existing = open_named_event(c.proc, name, (attributes.Attributes & object_case_insensitive) != 0))
             {
-                if (entry.second.name == name)
-                {
-                    ++entry.second.ref_count;
-                    event_handle.write(c.proc.events.make_handle(entry.first).bits);
-                    return STATUS_SUCCESS;
-                }
+                event_handle.write(existing->bits);
+                return STATUS_SUCCESS;
             }
 
             return STATUS_NOT_FOUND;
