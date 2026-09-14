@@ -44,6 +44,7 @@ CALL :collect combase.dll
 CALL :collect comctl32.dll
 CALL :collect comdlg32.dll
 CALL :collect coremessaging.dll
+CALL :collect coreuicomponents.dll
 CALL :collect crypt32.dll
 CALL :collect cryptbase.dll
 CALL :collect cryptsp.dll
@@ -114,6 +115,7 @@ CALL :collect normaliz.dll
 CALL :collect nsi.dll
 CALL :collect ntasn1.dll
 CALL :collect ntdll.dll
+CALL :collect ntmarta.dll
 CALL :collect ole32.dll
 CALL :collect oleaut32.dll
 CALL :collect opengl32.dll
