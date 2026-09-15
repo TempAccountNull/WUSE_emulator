@@ -67,10 +67,7 @@ namespace sogen
                     const auto reg = static_cast<x86_register>(static_cast<int>(x86_register::st0) + i);
                     emu.reg<M128A>(reg, context.FltSave.FloatRegisters[i]);
                 }
-            }
 
-            if ((context.ContextFlags & CONTEXT_XSTATE_64) == CONTEXT_XSTATE_64)
-            {
                 emu.reg<uint32_t>(x86_register::mxcsr, context.MxCsr);
 
                 for (int i = 0; i < 16; i++)
@@ -139,11 +136,9 @@ namespace sogen
                     const auto reg = static_cast<x86_register>(static_cast<int>(x86_register::st0) + i);
                     context.FltSave.FloatRegisters[i] = emu.reg<M128A>(reg);
                 }
-            }
 
-            if ((context.ContextFlags & CONTEXT_XSTATE_64) == CONTEXT_XSTATE_64)
-            {
                 context.MxCsr = emu.reg<uint32_t>(x86_register::mxcsr);
+                context.FltSave.MxCsr = context.MxCsr;
                 for (int i = 0; i < 16; i++)
                 {
                     const auto reg = static_cast<x86_register>(static_cast<int>(x86_register::xmm0) + i);

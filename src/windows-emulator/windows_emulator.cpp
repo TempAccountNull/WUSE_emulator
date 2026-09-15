@@ -1175,6 +1175,42 @@ namespace sogen
             case 13:
                 dispatch_access_violation(*this, vcpu, std::numeric_limits<uint64_t>::max(), memory_operation::read);
                 return;
+            case 19: {
+                const auto mxcsr = acting.reg<uint32_t>(x86_register::mxcsr);
+                const auto pending = mxcsr & ~(mxcsr >> 7) & 0x3F;
+                if (pending == 0)
+                {
+                    return;
+                }
+                DWORD status = STATUS_FLOAT_INEXACT_RESULT;
+                if (acting.reg<uint16_t>(x86_register::cs) == 0x23)
+                {
+                    status = pending & 7 ? STATUS_FLOAT_MULTIPLE_FAULTS : STATUS_FLOAT_MULTIPLE_TRAPS;
+                }
+                else if ((pending & 1) != 0)
+                {
+                    status = STATUS_FLOAT_INVALID_OPERATION;
+                }
+                else if ((pending & 4) != 0)
+                {
+                    status = STATUS_FLOAT_DIVIDE_BY_ZERO;
+                }
+                else if ((pending & 2) != 0)
+                {
+                    // Windows reports an unmasked SIMD denormal as invalid operation (KiXmmException).
+                    status = STATUS_FLOAT_INVALID_OPERATION;
+                }
+                else if ((pending & 8) != 0)
+                {
+                    status = STATUS_FLOAT_OVERFLOW;
+                }
+                else if ((pending & 0x10) != 0)
+                {
+                    status = STATUS_FLOAT_UNDERFLOW;
+                }
+                dispatch_exception(*this, vcpu, status, {0, mxcsr});
+                return;
+            }
             case 41:
                 this->callbacks.on_fast_fail(acting.reg<uint32_t>(x86_register::ecx));
                 this->process.exit_status = STATUS_FAIL_FAST_EXCEPTION;

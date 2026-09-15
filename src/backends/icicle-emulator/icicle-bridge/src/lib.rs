@@ -1,4 +1,5 @@
 mod icicle;
+mod packed_max;
 mod reciprocal_sqrt;
 mod registers;
 mod xstate;

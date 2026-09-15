@@ -5628,7 +5628,9 @@ define pcodeop maxpd;
 :MAXPD        XmmReg1, XmmReg2    is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x5F; xmmmod=3 & XmmReg1 & XmmReg2 { XmmReg1 = maxpd(XmmReg1, XmmReg2); }
 
 define pcodeop maxps;
-:MAXPS        XmmReg, m128        is vexMode=0 &  mandover=0 & byte=0x0F; byte=0x5F; XmmReg ... & m128 { XmmReg = maxps(XmmReg, m128); }
+define pcodeop sogen_maxps_memory;
+MaxpsMem: "xmmword ptr" Mem is Mem { export Mem; }
+:MAXPS        XmmReg, MaxpsMem    is vexMode=0 &  mandover=0 & byte=0x0F; byte=0x5F; XmmReg ... & MaxpsMem { XmmReg = sogen_maxps_memory(XmmReg, MaxpsMem); }
 :MAXPS        XmmReg1, XmmReg2    is vexMode=0 &  mandover=0 & byte=0x0F; byte=0x5F; xmmmod=3 & XmmReg1 & XmmReg2 { XmmReg1 = maxps(XmmReg1, XmmReg2); }
 
 :MAXSD        XmmReg, m64         is vexMode=0 &  $(PRE_F2) & byte=0x0F; byte=0x5F; XmmReg ... & m64
