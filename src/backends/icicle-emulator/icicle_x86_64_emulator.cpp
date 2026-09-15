@@ -58,6 +58,7 @@ extern "C"
     size_t icicle_write_register(icicle_emulator*, int reg, const void* data, size_t length);
     void icicle_start(icicle_emulator*, size_t count);
     int32_t icicle_get_stop_info(icicle_emulator*, icicle_stop_info* info);
+    void icicle_get_exception_name(uint32_t code, data_accessor_func* callback, void* data);
     void icicle_stop(icicle_emulator*);
     void icicle_destroy_emulator(icicle_emulator*);
     void icicle_run_on_next_instruction(icicle_emulator*, raw_func* callback, void* data);
@@ -620,8 +621,16 @@ namespace sogen::icicle
             std::array<char, 160> message{};
             if (kind == icicle_stop_kind::unhandled_exception)
             {
-                std::snprintf(message.data(), message.size(), "Icicle stopped on unhandled exception: code=0x%X value=0x%llX rip=0x%llX",
-                              info.code, static_cast<unsigned long long>(info.value),
+                std::string name{};
+                icicle_get_exception_name(
+                    info.code,
+                    [](void* data, const void* text, const size_t length) {
+                        static_cast<std::string*>(data)->assign(static_cast<const char*>(text), length);
+                    },
+                    &name);
+                std::snprintf(message.data(), message.size(),
+                              "Icicle stopped on unhandled exception: code=0x%X (%s) value=0x%llX rip=0x%llX", info.code, name.c_str(),
+                              static_cast<unsigned long long>(info.value),
                               static_cast<unsigned long long>(this->read_instruction_pointer()));
             }
             else

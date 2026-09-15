@@ -496,7 +496,8 @@ namespace sogen
             exit_status = win_emu.process.exit_status;
             if (!exit_status.has_value())
             {
-                return emit_failure("Emulation terminated without status");
+                return emit_failure(win_emu.last_stop_reason() == stop_reason::backend_error ? win_emu.last_stop_detail()
+                                                                                             : "Emulation terminated without status");
             }
 
             const auto success = *exit_status == STATUS_SUCCESS;

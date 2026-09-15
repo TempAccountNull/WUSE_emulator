@@ -67,7 +67,10 @@ namespace sogen
             }
             catch (const std::exception& e)
             {
-                this->win_emu_->log.error("%s\n", e.what());
+                if (this->win_emu_->last_stop_reason() != stop_reason::backend_error)
+                {
+                    this->win_emu_->log.error("%s\n", e.what());
+                }
             }
 
             return action;
@@ -87,11 +90,14 @@ namespace sogen
                 // receive a T05 for an unexpected tid → SIGTRAP error.
                 vcpu.switch_thread = false;
                 vcpu.thread().setup_if_necessary(vcpu.cpu, this->win_emu_->process);
-                vcpu.cpu.start(1);
+                this->win_emu_->start_cpu(vcpu, 1);
             }
             catch (const std::exception& e)
             {
-                this->win_emu_->log.error("%s\n", e.what());
+                if (this->win_emu_->last_stop_reason() != stop_reason::backend_error)
+                {
+                    this->win_emu_->log.error("%s\n", e.what());
+                }
             }
 
             return action;

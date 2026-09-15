@@ -899,7 +899,7 @@ namespace sogen
             // Guest code executes with the kernel lock released; hook callbacks
             // (syscalls, exceptions, exec hooks) re-acquire it on VM exit.
             lock.unlock();
-            vcpu.cpu.start();
+            this->start_cpu(vcpu);
             lock.lock();
 
             if (!vcpu.switch_thread && !vcpu.cpu.has_violation())
@@ -1434,7 +1434,7 @@ namespace sogen
             lock.unlock();
             {
                 const kernel_lock::guest_execution_scope guest_scope(this->kernel_lock_, this->uses_instruction_precision());
-                vcpu.cpu.start(count);
+                this->start_cpu(vcpu, count);
             }
             lock.lock();
 

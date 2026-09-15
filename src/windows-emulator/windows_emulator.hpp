@@ -374,6 +374,7 @@ namespace sogen
 
         void setup_process_if_necessary();
 
+        void start_cpu(vcpu_context& vcpu, size_t count = 0);
         void start(size_t count = 0);
         void stop();
 

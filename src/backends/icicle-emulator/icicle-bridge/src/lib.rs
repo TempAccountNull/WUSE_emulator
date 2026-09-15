@@ -44,6 +44,12 @@ pub fn icicle_get_stop_info(ptr: *mut c_void, out: *mut IcicleStopInfo) -> i32 {
 }
 
 #[unsafe(no_mangle)]
+pub fn icicle_get_exception_name(code: u32, callback: DataFunction, data: *mut c_void) {
+    let name = format!("{:?}", icicle_cpu::ExceptionCode::from_u32(code));
+    callback(data, name.as_ptr() as *const c_void, name.len());
+}
+
+#[unsafe(no_mangle)]
 pub fn icicle_stop(ptr: *mut c_void) {
     unsafe {
         let emulator = &mut *(ptr as *mut IcicleEmulator);
