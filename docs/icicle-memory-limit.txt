@@ -1,0 +1,23 @@
+Icicle memory backing and VM exits
+
+SOGEN_ICICLE_MEMORY_MB sets the per-emulator guest backing-page limit in MiB.
+The default remains 800000 pages (3125 MiB on the 64-bit backend). The setting
+does not reserve its entire capacity and is not a host process memory limit.
+Page permissions, JIT code and checkpoints consume additional host memory.
+
+Unhandled VM exits now preserve the actual VmExit, CPU exception code/value,
+physical page count, capacity and deferred-free count in the native error.
+
+Actual Destiny checkpoint validation:
+The default pool failed during restore with OutOfMemory at 800000/800000 pages.
+With 4096 MiB backing, the captured steam_api64.dll+0x4E5D64 MOVDQA store
+executed and advanced to +0x4E5D69. Restored registers matched the original;
+destination bytes matched XMM0 and other registers, vectors and stack stayed
+unchanged. The old generic VM error discarded its reason, so that original
+stop cannot be retrospectively classified from the message alone.
+
+Validation: Release and tidy builds; two native memory-limit regressions in
+interpreter and JIT modes; Rust invalid-limit and exhausted-store/resume tests;
+final 78-test selection in both modes (two JIT-only tests skipped in interpreter);
+guest CLI smoke with -e and -v, exit 0 in 26.053 seconds.
+Full Destiny boot is still unconfirmed.

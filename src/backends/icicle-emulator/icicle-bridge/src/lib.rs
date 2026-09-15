@@ -19,8 +19,11 @@ fn to_cbool(value: bool) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub fn icicle_create_emulator() -> *mut c_void {
-    let emulator = Box::new(IcicleEmulator::new());
+pub fn icicle_create_emulator(memory_limit_mib: u64) -> *mut c_void {
+    let mut emulator = Box::new(IcicleEmulator::new());
+    if memory_limit_mib != 0 && !emulator.set_memory_limit_mib(memory_limit_mib) {
+        return std::ptr::null_mut();
+    }
     return Box::into_raw(emulator) as *mut c_void;
 }
 
@@ -44,6 +47,13 @@ pub fn icicle_get_stop_info(ptr: *mut c_void, out: *mut IcicleStopInfo) -> i32 {
     }
 
     return 1;
+}
+
+#[unsafe(no_mangle)]
+pub fn icicle_get_vm_exit_description(ptr: *mut c_void, callback: DataFunction, data: *mut c_void) {
+    let emulator = unsafe { &*(ptr as *mut IcicleEmulator) };
+    let description = emulator.vm_exit_description();
+    callback(data, description.as_ptr() as *const c_void, description.len());
 }
 
 #[unsafe(no_mangle)]

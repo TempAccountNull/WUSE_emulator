@@ -70,11 +70,11 @@ impl IcicleStopInfo {
         }
     }
 
-    fn other() -> Self {
+    fn other(code: u32, value: u64) -> Self {
         Self {
             kind: Self::OTHER,
-            code: 0,
-            value: 0,
+            code,
+            value,
         }
     }
 }
@@ -482,6 +482,7 @@ pub struct IcicleEmulator {
     executing_thread: std::thread::ThreadId,
     vm: icicle_vm::Vm,
     last_stop: IcicleStopInfo,
+    last_vm_exit: icicle_vm::VmExit,
     reg: registers::X86RegisterNodes,
     syscall_hooks: HookContainer<dyn Fn()>,
     timestamp_hooks: [HookContainer<dyn Fn() -> u32>; 2],
@@ -596,6 +597,7 @@ impl IcicleEmulator {
             stop: stop_value,
             executing_thread: std::thread::current().id(),
             last_stop: IcicleStopInfo::none(),
+            last_vm_exit: icicle_vm::VmExit::Running,
             reg: registers::X86RegisterNodes::new(&virtual_machine.cpu.arch),
             vm: virtual_machine,
             syscall_hooks: HookContainer::new(),
@@ -612,6 +614,19 @@ impl IcicleEmulator {
         }
     }
 
+    pub fn set_memory_limit_mib(&mut self, mib: u64) -> bool {
+        let Some(pages) = mib.checked_mul(256) else {
+            return false;
+        };
+        if mib == 0 || pages > u32::MAX as u64 {
+            return false;
+        }
+        let Ok(pages) = usize::try_from(pages) else {
+            return false;
+        };
+        self.vm.cpu.mem.set_capacity(pages)
+    }
+
     fn get_mem(&mut self) -> &mut icicle_vm::cpu::Mmu {
         return &mut self.vm.cpu.mem;
     }
@@ -619,6 +634,7 @@ impl IcicleEmulator {
     pub fn start(&mut self, count: u64) {
         self.executing_thread = std::thread::current().id();
         self.last_stop = IcicleStopInfo::none();
+        self.last_vm_exit = icicle_vm::VmExit::Running;
 
         self.vm.icount_limit = match count {
             0 => u64::MAX,
@@ -639,6 +655,7 @@ impl IcicleEmulator {
             self.vm_running = true;
             let reason = self.vm.run();
             self.vm_running = false;
+            self.last_vm_exit = reason;
 
             match reason {
                 icicle_vm::VmExit::InstructionLimit => {
@@ -653,11 +670,24 @@ impl IcicleEmulator {
                     }
                 }
                 _ => {
-                    self.last_stop = IcicleStopInfo::other();
+                    self.last_stop = IcicleStopInfo::other(
+                        self.vm.cpu.exception.code,
+                        self.vm.cpu.exception.value,
+                    );
                     break;
                 }
             };
         }
+    }
+
+    pub fn vm_exit_description(&self) -> String {
+        format!(
+            "{:?}; physical_pages={}/{}; pending_free_pages={}",
+            self.last_vm_exit,
+            self.vm.cpu.mem.total_pages(),
+            self.vm.cpu.mem.capacity(),
+            self.pending_free_pages.len()
+        )
     }
 
     pub fn last_stop_info(&self) -> IcicleStopInfo {
@@ -1504,5 +1534,53 @@ mod execution_hook_filter_tests {
             *calls.borrow(),
             addresses.into_iter().skip(1).step_by(2).collect::<Vec<_>>()
         );
+    }
+}
+
+#[cfg(test)]
+mod vm_exit_tests {
+    use super::*;
+
+    #[test]
+    fn guest_store_reports_memory_exhaustion_and_can_resume() {
+        let mut emu = IcicleEmulator::new();
+        assert!(emu.vm.cpu.mem.set_capacity(3));
+        assert!(emu.map_memory(0x10000, 4096, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+        assert!(emu.write_memory(0x10000, &[0x89, 0x00, 0xeb, 0xfe]));
+        assert!(emu.map_memory(0x20000, 4096, FOREIGN_READ | FOREIGN_WRITE));
+        emu.vm.cpu.write_pc(0x10000);
+        emu.write_register(registers::X86Register::Rax, &0x20000u64.to_le_bytes());
+        emu.start(1);
+        let stop = emu.last_stop_info();
+        assert_eq!(stop.kind, IcicleStopInfo::OTHER);
+        assert_eq!(stop.code, ExceptionCode::OutOfMemory as u32);
+        assert_eq!(stop.value, 0x20000);
+        assert!(emu.vm_exit_description().starts_with("OutOfMemory; physical_pages=3/3;"));
+        assert_eq!(emu.vm.cpu.read_pc(), 0x10000);
+        assert!(emu.vm.cpu.mem.set_capacity(4));
+        emu.start(1);
+        assert_eq!(emu.last_stop_info().kind, IcicleStopInfo::INSTRUCTION_LIMIT);
+        let mut value = [0; 4];
+        assert!(emu.read_memory(0x20000, &mut value));
+        assert_eq!(u32::from_le_bytes(value), 0x20000);
+    }
+}
+
+#[cfg(test)]
+mod memory_limit_tests {
+    use super::*;
+
+    #[test]
+    fn validates_limits_without_changing_the_previous_capacity_on_error() {
+        let mut emu = IcicleEmulator::new();
+        assert!(emu.set_memory_limit_mib(1));
+        assert_eq!(emu.vm.cpu.mem.capacity(), 256);
+        for invalid in [0, u64::MAX, 16_777_216] {
+            assert!(!emu.set_memory_limit_mib(invalid));
+            assert_eq!(emu.vm.cpu.mem.capacity(), 256);
+        }
+        assert!(emu.set_memory_limit_mib(4096));
+        assert_eq!(emu.vm.cpu.mem.capacity(), 1_048_576);
+        assert_eq!(emu.vm.cpu.mem.total_pages(), 2);
     }
 }

@@ -1,0 +1,25 @@
+{
+  "result": "PASS",
+  "instruction": "movdqa xmmword ptr [rcx + 0x10], xmm0",
+  "bytes": "66 0F 7F 41 10",
+  "module_rva": "steam_api64.dll+0x4E5D64",
+  "after_rva": "steam_api64.dll+0x4E5D69",
+  "source_snapshot": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789470957335282400-after-jit-memory-release\\guest.snap",
+  "memory_limit_mib": 4096,
+  "destination": "0xbb84b59000",
+  "before_bytes": "00000000000000000000000000000000",
+  "after_bytes": "00000000000000000000000000000000",
+  "expected": "00000000000000000000000000000000",
+  "general_changes": {
+    "rip": [
+      "0x6d50035d64",
+      "0x6d50035d69"
+    ]
+  },
+  "vector_state_unchanged": true,
+  "stack_unchanged": true,
+  "restored_registers_match_original": true,
+  "scope": "Actual-game saved instruction replay with an explicit backing limit; full boot remains unconfirmed.",
+  "analyzer.exe_sha256": "47e9433189c134e2cb41dcd191498d24cf7384084ed57bc9beca8e00f14d6680",
+  "icicle-emulator.dll_sha256": "adfd9d901aae0f4035625f7cd0bc27456c2e3a26cb241b149dedf587d0578ae5"
+}

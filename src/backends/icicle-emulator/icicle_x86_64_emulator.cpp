@@ -2,6 +2,10 @@
 #include "icicle_x86_64_emulator.hpp"
 
 #include <cstdio>
+#include <charconv>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <unordered_set>
 #include <utility>
 #include <utils/object.hpp>
@@ -30,7 +34,7 @@ extern "C"
         uint64_t value;
     };
 
-    icicle_emulator* icicle_create_emulator();
+    icicle_emulator* icicle_create_emulator(uint64_t memory_limit_mib);
     int32_t icicle_protect_memory(icicle_emulator*, uint64_t address, uint64_t length, uint8_t permissions);
     int32_t icicle_map_memory(icicle_emulator*, uint64_t address, uint64_t length, uint8_t permissions);
     int32_t icicle_map_mmio(icicle_emulator*, uint64_t address, uint64_t length, icicle_mmio_read_func* read_callback, void* read_data,
@@ -60,6 +64,7 @@ extern "C"
     void icicle_start(icicle_emulator*, size_t count);
     int32_t icicle_get_stop_info(icicle_emulator*, icicle_stop_info* info);
     void icicle_get_exception_name(uint32_t code, data_accessor_func* callback, void* data);
+    void icicle_get_vm_exit_description(icicle_emulator*, data_accessor_func* callback, void* data);
     void icicle_stop(icicle_emulator*);
     void icicle_destroy_emulator(icicle_emulator*);
     void icicle_run_on_next_instruction(icicle_emulator*, raw_func* callback, void* data);
@@ -143,6 +148,24 @@ namespace sogen::icicle
             bool is_read{};
         };
 
+        uint64_t configured_memory_limit_mib()
+        {
+            const auto* text = std::getenv("SOGEN_ICICLE_MEMORY_MB");
+            if (!text)
+            {
+                return 0;
+            }
+            const auto* end = text + std::strlen(text);
+            uint64_t limit{};
+            const auto parsed = std::from_chars(text, end, limit);
+            constexpr uint64_t maximum = std::numeric_limits<uint32_t>::max() / 256;
+            if (parsed.ec != std::errc{} || parsed.ptr != end || limit == 0 || limit > maximum)
+            {
+                throw std::runtime_error("SOGEN_ICICLE_MEMORY_MB must be a decimal guest backing limit in MiB (1..16777215)");
+            }
+            return limit;
+        }
+
         enum class icicle_stop_kind : uint32_t
         {
             none = 0,
@@ -156,7 +179,7 @@ namespace sogen::icicle
     {
       public:
         icicle_x86_64_emulator()
-            : emu_(icicle_create_emulator())
+            : emu_(icicle_create_emulator(configured_memory_limit_mib()))
         {
             if (!this->emu_)
             {
@@ -625,7 +648,7 @@ namespace sogen::icicle
                 return;
             }
 
-            std::array<char, 160> message{};
+            std::array<char, 320> message{};
             if (kind == icicle_stop_kind::unhandled_exception)
             {
                 std::string name{};
@@ -642,7 +665,15 @@ namespace sogen::icicle
             }
             else
             {
-                std::snprintf(message.data(), message.size(), "Icicle stopped on unhandled VM exit at rip=0x%llX",
+                std::string description{};
+                icicle_get_vm_exit_description(
+                    this->emu_,
+                    [](void* data, const void* text, const size_t length) {
+                        static_cast<std::string*>(data)->assign(static_cast<const char*>(text), length);
+                    },
+                    &description);
+                std::snprintf(message.data(), message.size(), "Icicle stopped on unhandled VM exit: %s code=0x%X value=0x%llX rip=0x%llX",
+                              description.c_str(), info.code, static_cast<unsigned long long>(info.value),
                               static_cast<unsigned long long>(this->read_instruction_pointer()));
             }
 
