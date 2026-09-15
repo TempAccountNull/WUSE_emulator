@@ -142,5 +142,72 @@
     },
     "profile": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789484352677458100-after-hook-dispatch-optimization\\cpu-profile-1789484512031820400.json",
     "game_boot_accepted": false
+  },
+  "subsequent_fault": {
+    "instruction": "PMULHUW XMM7,XMM4",
+    "bytes": "66 0F E4 FC",
+    "address": "0xbacc5ee2f2",
+    "region": "No mapped image; generated-code allocation 0xBACC5E0000+0xE2F2",
+    "observed_context": "Thread 12, WARP-generated code. No DLL RVA applies to this allocation.",
+    "backend_fault": {
+      "code": "0x100A",
+      "value": "0x0",
+      "rip": "0xBACC5EE2F2"
+    },
+    "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789484352677458100-after-hook-dispatch-optimization",
+    "state": "state-00004.json",
+    "source_xmm7_unsigned_words": [
+      0,
+      0,
+      2,
+      0,
+      4,
+      0,
+      6,
+      0
+    ],
+    "source_xmm4_unsigned_words": [
+      20,
+      0,
+      20,
+      0,
+      20,
+      0,
+      20,
+      0
+    ],
+    "expected_unsigned_high_words": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "expected_xmm7": "00000000000000000000000000000000",
+    "expected_next_rip": "0xbacc5ee2f6",
+    "expected_preservation": "All other general/vector registers, EFLAGS and stack bytes",
+    "snapshot_sha256": "a4b4decdc7d119028d1adb9ae5b399c7a708c4c7ed50beaa9800701ac84ac843",
+    "snapshot_bytes": 110512593,
+    "manual": "D:\\Emulation\\sogen\\docs\\Intel docs\\325462-092-sdm-vol-1-2abcd-3abcd-4.pdf",
+    "manual_pages": [
+      1668,
+      1669,
+      1670,
+      1671
+    ],
+    "exception_table_pages": [
+      645,
+      670
+    ],
+    "missing_source_operations": [
+      "ia.sinc: pmulhuw",
+      "avx.sinc: vpmulhuw_avx",
+      "avx2.sinc: vpmulhuw_avx2"
+    ],
+    "status": "Cause identified and checkpoint preserved; instruction implementation pending",
+    "coverage_required": "MMX and legacy XMM; VEX 128/256; EVEX 128/256/512. Memory, mask, upper-vector, state and exception semantics from Intel Type 4 / E4.nb tables."
   }
 }
