@@ -77,3 +77,50 @@ transport cannot substitute for the verified Windows 10 CMApi layout.
 Local evidence: sogen-fixes/cfgmgr-crosscheck-20260915.json and
 cmapi-current-{sample,cycle}-evidence.json. No handler change follows from
 this cross-check. Dawn boot remains unconfirmed.
+
+## Actual-game end-of-enumeration observation
+
+The fresh CNG-validation game repeated the same 583 PRESENT classes. Its last
+16 MiB contained 1,834 successful interface queries, each class seen three or
+four times. A checkpoint from that run was resumed without changing guest
+results or crypto state, with breakpoints at the enumeration-exhausted branch
+and DevObjGetClassDevs entry/return in the matched devobj.dll.
+
+Three observed sweeps ended with ERROR_NO_MORE_ITEMS at index 583 at
+devobj.dll+0x4D07. DevObjGetClassDevs then returned TRUE to
+setupapi.dll+0x2EBF on thread 0x54. The next invocations used flags 0x16.
+The end-of-enumeration result is therefore present and consumed correctly;
+the caller restarts the sweep. This does not establish that the polling causes
+the white window. The caller above setupapi remains under investigation.
+
+ReactOS SetupDiGetClassDevsExW rejects a null interface class even with
+DIGCF_ALLCLASSES. The matched Windows build permits the observed all-class
+enumeration; the ReactOS branch cannot be substituted for this DLL's behavior.
+
+Exact boundary registers, stacks, binary hashes and checkpoint ancestry are
+in cm-api-enumeration-boundaries.json. No CMApi behavior was changed.
+
+## Matched SetupAPI callers
+
+The x64 and x86 guest-root setupapi.dll hashes match the inspected IDBs.
+SetupDiGetClassDevsExW is at RVA 0x2DB0 (x64) and 0x194A0 (x86). Both
+validate Reserved and flags, create or access the device set, and call
+DevObjGetClassDevs once. On failure they destroy a new set or release an
+existing set and preserve the error. Neither contains an outer retry loop.
+
+Both permit a null class with DIGCF_ALLCLASSES, reject nonzero Reserved
+with error 87, and reject (Flags & 0x11) == 1 with error 1004. The observed
+internal set fields differ: hwnd/reference-count/mutex offsets are
+8/328/392 on x64 and 4/188/220 on x86. These offsets describe these builds,
+not a portable public structure.
+
+The captured x64 frame unwinds to setupapi.dll+0x2D67 inside
+SetupDiGetClassDevsW. That wrapper calls ExW once. The higher caller is
+outside the captured stack range and has not been identified by this sample.
+
+Wine dlls/setupapi/devinst.c:2106 supports the all-interface-class sweep in
+a finite CM_Enumerate_Classes loop. Its unsupported flag and remote-machine
+paths prevent using it as a complete substitute. ReactOS's null-interface
+class rejection differs from the matched DLL. These sources were read only;
+no reference tree was built or executed. Full disassembly and hash evidence
+are saved in cm-api-enumeration-boundaries.json.

@@ -1,0 +1,561 @@
+{
+  "scope": "Actual-game enumeration boundaries; game boot and the reason for caller repetition remain unverified",
+  "source_capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789493624811644800-cng-provider-fresh-game",
+  "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789498303439329300-cng-provider-interface-replay",
+  "source_snapshot_sha256": "c58329b77e3a7a9f8c8c36f7ac81b71de3029dd634a7956f184772d8778a5dc0",
+  "deployed_source_commit": "277d3ffc970b95ff364302d2c4d76afb9fa29ba1",
+  "deployed_analyzer_sha256": "29824cb3971de7556b947a5b0174da1f4dfcaea8683c17443063d97f3f221c8c",
+  "deployed_backend_sha256": "8cc2bc33d2202f2808b466895960df49c0f77f16adfea53a73d551375b7f9e85",
+  "sample": {
+    "time": 1789498051.1787145,
+    "source": "benchmarks\\destiny-sogen-1789493624811644800-cng-provider-fresh-game\\console.log",
+    "source_range": [
+      697534797,
+      714312013
+    ],
+    "queries": 1834,
+    "distinct_classes": 583,
+    "repetitions": {
+      "4": 85,
+      "3": 498
+    },
+    "selections": {
+      "active": 1834
+    },
+    "operation_statuses": {
+      "0x00000000": 1834
+    },
+    "min_count": 3,
+    "max_count": 4
+  },
+  "boundary_file_sha256": "cf1350bba2b71cba3a8ba4533305dfa38bb99f11ee151ca1484397dda2936e6a",
+  "boundaries": [
+    {
+      "event": "enumeration-exhausted",
+      "time": 1789498313.0218978,
+      "thread": "QC54",
+      "location": {
+        "address": "0xba00574d07",
+        "module": "c:\\windows\\system32\\devobj.dll",
+        "rva": "0x4d07"
+      },
+      "caller": {
+        "address": "0xc0111b2ebf",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2ebf"
+      },
+      "entry_rsp": "0x1379b2f6e8",
+      "registers": {
+        "rax": "0x103",
+        "rbx": "0x13786235a0",
+        "rcx": "0x0",
+        "rdx": "0x0",
+        "rsi": "0x1378624540",
+        "rdi": "0xffffffff",
+        "rbp": "0x1379b2f898",
+        "rsp": "0x1379b2f370",
+        "r8": "0x2d",
+        "r9": "0x2e",
+        "r10": "0x0",
+        "r11": "0x1379b2f340",
+        "r12": "0x247",
+        "r13": "0x139b1e15b0",
+        "r14": "0x0",
+        "r15": "0x16",
+        "rip": "0xba00574d07"
+      },
+      "stack_address": "0x1379b2f370",
+      "stack": "8000000500000000a035627813000000404562781300000050f4b27913000000000000000000000000000000000000000000000000000000a8f4b27913000000000000001300000010d05900ba0000009d04ab3f01ee000010190580010000000000000000000000b5265700ba00000000000000000000001000000000000000b0f4b27913000000010000000100000000400000470200000100000013000000000000000000000047020000000200000000000000000000000000000000000000000000000000000200000000000000b0151e9b130000000000000000000000270000001600000000000000000000000000000000000000000000000000000010f5b27913000000800000050000000000000000000000004045627813000000a035627813000000000000000000000040456278130000000000000000000000ffffffffffffffff00000000000000007b00660066006600660066006600660066002d0066006600660066002d0066006600660066002d0030003000300030002d003000300030003000300030003000300030003000300030007d00000000000000000000000000000000000000000090f5517813000000a41100b513000000000000000000000002000002000000000000000000000000ff0100fe01000000000000000000000000000000000000001eb9063934f60000000000000000000090f5517813000000f07c717913000000000000000000000000000000000000000000000000000000a15b02800100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000060e462781300000001000000000000000000000000000000a0f35178130000000000000000000000000000000000000000005cb3120000000000000000000000000000000000000000000000000000000000000000000000000000000000000090f5517813000000000000000000000000402c11c0000000000000000000000090f5517813000000b1470280010000001eb8063934f600000000edb212000000000000000000000098f8b27913000000000000000000000000402c11c000000000402c11c000000063491b11c00000009b640e2c05dd000090f5517813000000000000000000000098f8b27913000000000000000000000000402c11c000000030f7517813000000160000000000000030f7517813000000bf2e1b11c0000000160000000000000016000000000000000000000000000000160000000000000000000000000000000000000000000000fd01ab3f01ee000030f751781300000000402c11c00000000000000000000000000000000000000000000000000000000000000000000000672d1b11c000000016000000000000000000000000000000",
+      "reg_enum_status": "ERROR_NO_MORE_ITEMS",
+      "final_index": 583,
+      "registry_handle": "0x5000080"
+    },
+    {
+      "event": "return",
+      "time": 1789498313.1340866,
+      "thread": "QC54",
+      "location": {
+        "address": "0xba005750bb",
+        "module": "c:\\windows\\system32\\devobj.dll",
+        "rva": "0x50bb"
+      },
+      "caller": {
+        "address": "0xc0111b2ebf",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2ebf"
+      },
+      "entry_rsp": "0x1379b2f6e8",
+      "registers": {
+        "rax": "0x1",
+        "rbx": "0x137851f730",
+        "rcx": "0xdd1655bc97eb0000",
+        "rdx": "0x0",
+        "rsi": "0x16",
+        "rdi": "0x137851f730",
+        "rbp": "0x1379b2f898",
+        "rsp": "0x1379b2f6e8",
+        "r8": "0x12b35c15c0",
+        "r9": "0x1",
+        "r10": "0x580000d",
+        "r11": "0x46",
+        "r12": "0xc0112c4000",
+        "r13": "0x0",
+        "r14": "0x1379b2f898",
+        "r15": "0x0",
+        "rip": "0xba005750bb"
+      },
+      "stack_address": "0x1379b2f6e8",
+      "stack": "bf2e1b11c0000000160000000000000016000000000000000000000000000000160000000000000000000000000000000000000000000000fd01ab3f01ee000030f751781300000000402c11c00000000000000000000000000000000000000000000000000000000000000000000000672d1b11c00000001600000000000000",
+      "result": 1
+    },
+    {
+      "event": "entry",
+      "time": 1789498315.4571195,
+      "thread": "QC54",
+      "location": {
+        "address": "0xba005744c0",
+        "module": "c:\\windows\\system32\\devobj.dll",
+        "rva": "0x44c0"
+      },
+      "caller": {
+        "address": "0xc0111b2ebf",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2ebf"
+      },
+      "entry_rsp": "0x1379b2f6e8",
+      "registers": {
+        "rax": "0x0",
+        "rbx": "0x13796eee80",
+        "rcx": "0x1378623f00",
+        "rdx": "0x1379b2f898",
+        "rsi": "0x16",
+        "rdi": "0x13796eee80",
+        "rbp": "0x1379b2f898",
+        "rsp": "0x1379b2f6e8",
+        "r8": "0x0",
+        "r9": "0x16",
+        "r10": "0x2",
+        "r11": "0x1379b2f670",
+        "r12": "0xc0112c4000",
+        "r13": "0x0",
+        "r14": "0x1379b2f898",
+        "r15": "0x0",
+        "rip": "0xba005744c0"
+      },
+      "stack_address": "0x1379b2f6e8",
+      "stack": "bf2e1b11c0000000160000000000000016000000000000000000000000000000160000000000000000000000000000000000000000000000fd01ab3f01ee000080ee6e791300000000402c11c00000000000000000000000000000000000000000000000000000000000000000000000672d1b11c00000001600000000000000",
+      "flags": "0x16"
+    },
+    {
+      "event": "enumeration-exhausted",
+      "time": 1789498317.6802266,
+      "thread": "QC54",
+      "location": {
+        "address": "0xba00574d07",
+        "module": "c:\\windows\\system32\\devobj.dll",
+        "rva": "0x4d07"
+      },
+      "caller": {
+        "address": "0xc0111b2ebf",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2ebf"
+      },
+      "entry_rsp": "0x1379b2f6e8",
+      "registers": {
+        "rax": "0x103",
+        "rbx": "0x1378623f00",
+        "rcx": "0x0",
+        "rdx": "0x0",
+        "rsi": "0x13786247c0",
+        "rdi": "0xffffffff",
+        "rbp": "0x1379b2f898",
+        "rsp": "0x1379b2f370",
+        "r8": "0x2d",
+        "r9": "0x2e",
+        "r10": "0x0",
+        "r11": "0x1379b2f340",
+        "r12": "0x247",
+        "r13": "0x139b045550",
+        "r14": "0x0",
+        "r15": "0x16",
+        "rip": "0xba00574d07"
+      },
+      "stack_address": "0x1379b2f370",
+      "stack": "8000000500000000003f627813000000c04762781300000050f4b27913000000000000000000000000000000000000000000000000000000a8f4b27913000000000000001300000010d05900ba0000009d04ab3f01ee000010190580010000000000000000000000b5265700ba00000000000000000000001000000000000000b0f4b279130000000100000001000000004000004702000001000000130000000000000000000000470200000002000000000000000000000000000000000000000000000000000002000000000000005055049b130000000000000000000000270000001600000000000000000000000000000000000000000000000000000010f5b2791300000080000005000000000000000000000000c047627813000000003f6278130000000000000000000000c0476278130000000000000000000000ffffffffffffffff00000000000000007b00660066006600660066006600660066002d0066006600660066002d0066006600660066002d0030003000300030002d003000300030003000300030003000300030003000300030007d00000000000000000000000000000000000000000030f7517813000000598e00d713000000000000000000000002000002000000000000000000000000ff0300fc010000000000000000000000000000000000000000000000000000008a3502800100000030f7517813000000b0085079130000000000000000000000000000000000000060e4627813000000a15b02800100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000060e462781300000002000000000000000000000000000000a0f35178130000000000000000000000000000000000000000005cb3120000000000000000000000000000000000000000000000000000000000000000000000000000000000000030f7517813000000000000000000000000402c11c0000000000000000000000030f7517813000000b1470280010000001eb8063934f600000000edb212000000000000000000000098f8b27913000000000000000000000000402c11c000000000402c11c000000063491b11c00000009b640e2c05dd000030f7517813000000000000000000000098f8b27913000000000000000000000000402c11c000000080ee6e7913000000160000000000000080ee6e7913000000bf2e1b11c0000000160000000000000016000000000000000000000000000000160000000000000000000000000000000000000000000000fd01ab3f01ee000080ee6e791300000000402c11c00000000000000000000000000000000000000000000000000000000000000000000000672d1b11c000000016000000000000000000000000000000",
+      "reg_enum_status": "ERROR_NO_MORE_ITEMS",
+      "final_index": 583,
+      "registry_handle": "0x5000080"
+    },
+    {
+      "event": "return",
+      "time": 1789498317.7900069,
+      "thread": "QC54",
+      "location": {
+        "address": "0xba005750bb",
+        "module": "c:\\windows\\system32\\devobj.dll",
+        "rva": "0x50bb"
+      },
+      "caller": {
+        "address": "0xc0111b2ebf",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2ebf"
+      },
+      "entry_rsp": "0x1379b2f6e8",
+      "registers": {
+        "rax": "0x1",
+        "rbx": "0x13796eee80",
+        "rcx": "0xdd1655bc97eb0000",
+        "rdx": "0x0",
+        "rsi": "0x16",
+        "rdi": "0x13796eee80",
+        "rbp": "0x1379b2f898",
+        "rsp": "0x1379b2f6e8",
+        "r8": "0x12b35c15c0",
+        "r9": "0x1",
+        "r10": "0x580000d",
+        "r11": "0x46",
+        "r12": "0xc0112c4000",
+        "r13": "0x0",
+        "r14": "0x1379b2f898",
+        "r15": "0x0",
+        "rip": "0xba005750bb"
+      },
+      "stack_address": "0x1379b2f6e8",
+      "stack": "bf2e1b11c0000000160000000000000016000000000000000000000000000000160000000000000000000000000000000000000000000000fd01ab3f01ee000080ee6e791300000000402c11c00000000000000000000000000000000000000000000000000000000000000000000000672d1b11c00000001600000000000000",
+      "result": 1
+    },
+    {
+      "event": "entry",
+      "time": 1789498323.5291824,
+      "thread": "QC54",
+      "location": {
+        "address": "0xba005744c0",
+        "module": "c:\\windows\\system32\\devobj.dll",
+        "rva": "0x44c0"
+      },
+      "caller": {
+        "address": "0xc0111b2ebf",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2ebf"
+      },
+      "entry_rsp": "0x1379b2f6e8",
+      "registers": {
+        "rax": "0x0",
+        "rbx": "0x13796ee4c0",
+        "rcx": "0x1378624900",
+        "rdx": "0x1379b2f898",
+        "rsi": "0x16",
+        "rdi": "0x13796ee4c0",
+        "rbp": "0x1379b2f898",
+        "rsp": "0x1379b2f6e8",
+        "r8": "0x0",
+        "r9": "0x16",
+        "r10": "0x2",
+        "r11": "0x1379b2f670",
+        "r12": "0xc0112c4000",
+        "r13": "0x0",
+        "r14": "0x1379b2f898",
+        "r15": "0x0",
+        "rip": "0xba005744c0"
+      },
+      "stack_address": "0x1379b2f6e8",
+      "stack": "bf2e1b11c0000000160000000000000016000000000000000000000000000000160000000000000000000000000000000000000000000000fd01ab3f01ee0000c0e46e791300000000402c11c00000000000000000000000000000000000000000000000000000000000000000000000672d1b11c00000001600000000000000",
+      "flags": "0x16"
+    },
+    {
+      "event": "enumeration-exhausted",
+      "time": 1789498333.1884973,
+      "thread": "QC54",
+      "location": {
+        "address": "0xba00574d07",
+        "module": "c:\\windows\\system32\\devobj.dll",
+        "rva": "0x4d07"
+      },
+      "caller": {
+        "address": "0xc0111b2ebf",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2ebf"
+      },
+      "entry_rsp": "0x1379b2f6e8",
+      "registers": {
+        "rax": "0x103",
+        "rbx": "0x1378624900",
+        "rcx": "0x0",
+        "rdx": "0x0",
+        "rsi": "0x1378624a40",
+        "rdi": "0xffffffff",
+        "rbp": "0x1379b2f898",
+        "rsp": "0x1379b2f370",
+        "r8": "0x2d",
+        "r9": "0x2e",
+        "r10": "0x0",
+        "r11": "0x1379b2f340",
+        "r12": "0x247",
+        "r13": "0x139b045550",
+        "r14": "0x0",
+        "r15": "0x16",
+        "rip": "0xba00574d07"
+      },
+      "stack_address": "0x1379b2f370",
+      "stack": "80000005000000000049627813000000404a62781300000050f4b27913000000000000000000000000000000000000000000000000000000a8f4b27913000000000000001300000010d05900ba0000009d04ab3f01ee000010190580010000000000000000000000b5265700ba00000000000000000000001000000000000000b0f4b279130000000100000001000000004000004702000001000000130000000000000000000000470200000002000000000000000000000000000000000000000000000000000002000000000000005055049b130000000000000000000000270000001600000000000000000000000000000000000000000000000000000010f5b2791300000080000005000000000000000000000000404a62781300000000496278130000000000000000000000404a6278130000000000000000000000ffffffffffffffff00000000000000007b00660066006600660066006600660066002d0066006600660066002d0066006600660066002d0030003000300030002d003000300030003000300030003000300030003000300030007d00000000000000000000000000000000000000000080ee6e7913000000ed6e008313000000000000000000000002000002000000000000000000000000fe0100ff01000000000000000000000000000000000000001eb9063934f60000000000000000000080ee6e7913000000b008507913000000000000000000000000000000000000000000000000000000a15b028001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a043d077130000000f000000000000000000000000000000d0d56e79130000000000000000000000000000000000000000005cb3120000000000000000000000000000000000000000000000000000000000000000000000000000000000000080ee6e7913000000000000000000000000402c11c0000000000000000000000080ee6e7913000000b1470280010000001eb8063934f600000000edb212000000000000000000000098f8b27913000000000000000000000000402c11c000000000402c11c000000063491b11c00000009b640e2c05dd000080ee6e7913000000000000000000000098f8b27913000000000000000000000000402c11c0000000c0e46e79130000001600000000000000c0e46e7913000000bf2e1b11c0000000160000000000000016000000000000000000000000000000160000000000000000000000000000000000000000000000fd01ab3f01ee0000c0e46e791300000000402c11c00000000000000000000000000000000000000000000000000000000000000000000000672d1b11c000000016000000000000000000000000000000",
+      "reg_enum_status": "ERROR_NO_MORE_ITEMS",
+      "final_index": 583,
+      "registry_handle": "0x5000080"
+    },
+    {
+      "event": "return",
+      "time": 1789498333.3000565,
+      "thread": "QC54",
+      "location": {
+        "address": "0xba005750bb",
+        "module": "c:\\windows\\system32\\devobj.dll",
+        "rva": "0x50bb"
+      },
+      "caller": {
+        "address": "0xc0111b2ebf",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2ebf"
+      },
+      "entry_rsp": "0x1379b2f6e8",
+      "registers": {
+        "rax": "0x1",
+        "rbx": "0x13796ee4c0",
+        "rcx": "0xdd1655bc97eb0000",
+        "rdx": "0x0",
+        "rsi": "0x16",
+        "rdi": "0x13796ee4c0",
+        "rbp": "0x1379b2f898",
+        "rsp": "0x1379b2f6e8",
+        "r8": "0x12b35c15c0",
+        "r9": "0x1",
+        "r10": "0x580000d",
+        "r11": "0x46",
+        "r12": "0xc0112c4000",
+        "r13": "0x0",
+        "r14": "0x1379b2f898",
+        "r15": "0x0",
+        "rip": "0xba005750bb"
+      },
+      "stack_address": "0x1379b2f6e8",
+      "stack": "bf2e1b11c0000000160000000000000016000000000000000000000000000000160000000000000000000000000000000000000000000000fd01ab3f01ee0000c0e46e791300000000402c11c00000000000000000000000000000000000000000000000000000000000000000000000672d1b11c00000001600000000000000",
+      "result": 1
+    }
+  ],
+  "devobj_sha256": "1b96bcec045e48833b5eec1a86e675608efd0683ab7a73459a26b7189acecacb",
+  "reactos_comparison": "ReactOS SetupDiGetClassDevsExW rejects a null class for DIGCF_DEVICEINTERFACE. This guest Windows build enumerates all classes with flags 0x16, so the ReactOS path is not an equivalent implementation.",
+  "setupapi_crosscheck": {
+    "x64": {
+      "path": "D:\\Sunrise\\D2\\sogen\\root\\filesys\\c\\windows\\system32\\setupapi.dll",
+      "sha256": "3777075e8391c40c21fd5662845f5e2928d3cfd2b6abdf4003e087d2089cb853",
+      "SetupDiGetClassDevsExW_rva": "0x2db0",
+      "observed_internal_set_offsets": {
+        "hwnd": 8,
+        "references": 328,
+        "mutex": 392
+      }
+    },
+    "x86": {
+      "path": "D:\\Sunrise\\D2\\sogen\\root\\filesys\\c\\windows\\syswow64\\setupapi.dll",
+      "sha256": "51fe292f62a06c90a653ca4961232f2a79ad89fac56e1405ffa392634c1eddc1",
+      "SetupDiGetClassDevsExW_rva": "0x194a0",
+      "observed_internal_set_offsets": {
+        "hwnd": 4,
+        "references": 188,
+        "mutex": 220
+      }
+    }
+  },
+  "setupapi_parent_callers": {
+    "proof": "Matched SetupDiGetClassDevsExW prologue pushes 5 registers and subtracts 0x40. Its return is DevObj entry RSP + 8 + 0x68.",
+    "callers": [
+      {
+        "event": "enumeration-exhausted",
+        "thread": "QC54",
+        "slot": "0x1379b2f758",
+        "address": "0xc0111b2d67",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2d67"
+      },
+      {
+        "event": "return",
+        "thread": "QC54",
+        "slot": "0x1379b2f758",
+        "address": "0xc0111b2d67",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2d67"
+      },
+      {
+        "event": "entry",
+        "thread": "QC54",
+        "slot": "0x1379b2f758",
+        "address": "0xc0111b2d67",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2d67"
+      },
+      {
+        "event": "enumeration-exhausted",
+        "thread": "QC54",
+        "slot": "0x1379b2f758",
+        "address": "0xc0111b2d67",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2d67"
+      },
+      {
+        "event": "return",
+        "thread": "QC54",
+        "slot": "0x1379b2f758",
+        "address": "0xc0111b2d67",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2d67"
+      },
+      {
+        "event": "entry",
+        "thread": "QC54",
+        "slot": "0x1379b2f758",
+        "address": "0xc0111b2d67",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2d67"
+      },
+      {
+        "event": "enumeration-exhausted",
+        "thread": "QC54",
+        "slot": "0x1379b2f758",
+        "address": "0xc0111b2d67",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2d67"
+      },
+      {
+        "event": "return",
+        "thread": "QC54",
+        "slot": "0x1379b2f758",
+        "address": "0xc0111b2d67",
+        "module": "c:\\windows\\system32\\setupapi.dll",
+        "rva": "0x2d67"
+      }
+    ]
+  },
+  "setupapi_disassembly": {
+    "x64": {
+      "addr": "0x180002DB0",
+      "code": "HDEVINFO __stdcall SetupDiGetClassDevsExW(\n        const GUID *ClassGuid,\n        PCWSTR Enumerator,\n        HWND hwndParent,\n        DWORD Flags,\n        HDEVINFO DeviceInfoSet,\n        PCWSTR MachineName,\n        PVOID Reserved)\n{\n  HWND hwndParent_1; // r10\n  WINERROR LastError; // r15d\n  const GUID *ClassGuid_1; // rcx\n  HDEVINFO DeviceInfoList; // rax\n  __int64 DeviceInfoList_1; // rdi\n  __int64 v14; // rbx\n  _QWORD *WPP_GLOBAL_Control; // rcx\n  __int64 n44; // rdx\n\n  hwndParent_1 = hwndParent; /*0x180002dd4*/\n  if ( ::WPP_GLOBAL_Control != (_UNKNOWN *)&::WPP_GLOBAL_Control /*0x180002df4*/\n    && (*((_DWORD *)::WPP_GLOBAL_Control + 7) & 0x20000) != 0 )\n  {\n    WPP_SF_(a1: *((_QWORD *)::WPP_GLOBAL_Control + 2), a2: 43, a3: &WPP_79faa2af93c9358b9c491f4b00fd8d02_Traceguids); /*0x180037c56*/\n    hwndParent_1 = hwndParent; /*0x180037c5b*/\n  }\n  if ( Reserved != 0 ) /*0x180002e03*/\n  {\n    SetLastError(dwErrCode: 0x57u); /*0x180037c6d*/\n    WPP_GLOBAL_Control = ::WPP_GLOBAL_Control; /*0x180037c79*/\n    if ( ::WPP_GLOBAL_Control == (_UNKNOWN *)&::WPP_GLOBAL_Control /*0x180037c90*/\n      || (*((_DWORD *)::WPP_GLOBAL_Control + 7) & 0x20000) == 0 )\n    {\n      return (HDEVINFO)-1LL; /*0x180037c90*/\n    }\n    n44 = 44; /*0x180037c96*/\n    goto LABEL_42; /*0x180037c9b*/\n  }\n  if ( (Flags & 4) == 0 && ClassGuid == 0 ) /*0x180002e12*/\n  {\n    SetLastError(dwErrCode: 0x57u); /*0x180037ca5*/\n    WPP_GLOBAL_Control = ::WPP_GLOBAL_Control; /*0x180037cb1*/\n    if ( ::WPP_GLOBAL_Control == (_UNKNOWN *)&::WPP_GLOBAL_Control /*0x180037cc8*/\n      || (*((_DWORD *)::WPP_GLOBAL_Control + 7) & 0x20000) == 0 )\n    {\n      return (HDEVINFO)-1LL; /*0x180037cc8*/\n    }\n    n44 = 45; /*0x180037cce*/\n    goto LABEL_42; /*0x180037cd3*/\n  }\n  if ( (Flags & 0x11) == 1 ) /*0x180002e1e*/\n  {\n    SetLastError(dwErrCode: 0x3ECu); /*0x180037cdd*/\n    WPP_GLOBAL_Control = ::WPP_GLOBAL_Control; /*0x180037ce9*/\n    if ( ::WPP_GLOBAL_Control == (_UNKNOWN *)&::WPP_GLOBAL_Control /*0x180037d00*/\n      || (*((_DWORD *)::WPP_GLOBAL_Control + 7) & 0x20000) == 0 )\n    {\n      return (HDEVINFO)-1LL; /*0x180037d00*/\n    }\n    n44 = 46; /*0x180037d06*/\n    goto LABEL_42; /*0x180037d0b*/\n  }\n  if ( (char *)DeviceInfoSet - 1 <= (char *)0xFFFFFFFFFFFFFFFDLL ) /*0x180002e34*/\n  {\n    LastError = ERROR_SUCCESS; /*0x180037d10*/\n    DeviceInfoList_1 = 0; /*0x180037d13*/\n    v14 = AccessDeviceInfoSet(a1: DeviceInfoSet); /*0x180037d26*/\n    if ( v14 != 0 ) /*0x180037d31*/\n      goto LABEL_13; /*0x180037d31*/\n    SetLastError(dwErrCode: 6u); /*0x180037d3a*/\n    WPP_GLOBAL_Control = ::WPP_GLOBAL_Control; /*0x180037d46*/\n    if ( ::WPP_GLOBAL_Control == (_UNKNOWN *)&::WPP_GLOBAL_Control /*0x180037d59*/\n      || (*((_DWORD *)::WPP_GLOBAL_Control + 7) & 0x20000) == 0 )\n    {\n      return (HDEVINFO)-1LL; /*0x180037dbe*/\n    }\n    n44 = 49; /*0x180037d5b*/\nLABEL_42:\n    WPP_SF_(a1: WPP_GLOBAL_Control[2], a2: n44, a3: &WPP_79faa2af93c9358b9c491f4b00fd8d02_Traceguids); /*0x180037da7*/\n    return (HDEVINFO)-1LL; /*0x180037db2*/\n  }\n  LastError = ERROR_SUCCESS; /*0x180002e3e*/\n  ClassGuid_1 = 0; /*0x180002e44*/\n  if ( (Flags & 0x14) == 0 ) /*0x180002e47*/\n    ClassGuid_1 = ClassGuid; /*0x180002e47*/\n  DeviceInfoList = SetupDiCreateDeviceInfoListExW( /*0x180002e59*/\n                     ClassGuid: ClassGuid_1,\n                     hwndParent: hwndParent_1,\n                     MachineName,\n                     Reserved: 0);\n  DeviceInfoList_1 = (__int64)DeviceInfoList; /*0x180002e5e*/\n  if ( DeviceInfoList == (HDEVINFO)-1LL ) /*0x180002e6d*/\n  {\n    WPP_GLOBAL_Control = ::WPP_GLOBAL_Control; /*0x180037d60*/\n    if ( ::WPP_GLOBAL_Control == (_UNKNOWN *)&::WPP_GLOBAL_Control /*0x180037d73*/\n      || (*((_DWORD *)::WPP_GLOBAL_Control + 7) & 0x20000) == 0 )\n    {\n      return (HDEVINFO)-1LL; /*0x180037d73*/\n    }\n    n44 = 47; /*0x180037d75*/\n    goto LABEL_42; /*0x180037d7a*/\n  }\n  v14 = AccessDeviceInfoSet(a1: DeviceInfoList); /*0x180002e7b*/\n  if ( v14 == 0 ) /*0x180002e86*/\n  {\n    SetLastError(dwErrCode: 6u); /*0x180037d81*/\n    WPP_GLOBAL_Control = ::WPP_GLOBAL_Control; /*0x180037d8d*/\n    if ( ::WPP_GLOBAL_Control == (_UNKNOWN *)&::WPP_GLOBAL_Control /*0x180037da0*/\n      || (*((_DWORD *)::WPP_GLOBAL_Control + 7) & 0x20000) == 0 )\n    {\n      return (HDEVINFO)-1LL; /*0x180037da0*/\n    }\n    n44 = 48; /*0x180037da2*/\n    goto LABEL_42; /*0x180037da2*/\n  }\nLABEL_13:\n  *(_QWORD *)(v14 + 8) = hwndParent; /*0x180002e8c*/\n  if ( (unsigned int)DevObjGetClassDevs( /*0x180002ec6*/\n                       a1: *(_QWORD *)v14,\n                       a2: ClassGuid,\n                       a3: Enumerator,\n                       a4: Flags,\n                       a5: MachineName,\n                       a6: 0) == 0 )\n    LastError = GetLastError(); /*0x180002ed4*/\n  if ( LastError != ERROR_SUCCESS ) /*0x180002f07*/\n  {\n    if ( DeviceInfoList_1 != 0 ) /*0x180037dc6*/\n    {\n      DestroyDeviceInfoSet(a1: DeviceInfoList_1, a2: v14); /*0x180037dce*/\n    }\n    else\n    {\n      --*(_DWORD *)(v14 + 328); /*0x180037dda*/\n      ReleaseMutex(hMutex: *(HANDLE *)(v14 + 392)); /*0x180037de7*/\n    }\n    SetLastError(dwErrCode: LastError); /*0x180037df6*/\n    DeviceInfoList_1 = -1; /*0x180037e02*/\n  }\n  else\n  {\n    if ( DeviceInfoList_1 == 0 ) /*0x180002f10*/\n      DeviceInfoList_1 = (__int64)DeviceInfoSet; /*0x180002f68*/\n    --*(_DWORD *)(v14 + 328); /*0x180002f17*/\n    ReleaseMutex(hMutex: *(HANDLE *)(v14 + 392)); /*0x180002f24*/\n  }\n  if ( ::WPP_GLOBAL_Control != (_UNKNOWN *)&::WPP_GLOBAL_Control /*0x180002f43*/\n    && (*((_DWORD *)::WPP_GLOBAL_Control + 7) & 0x20000) != 0 )\n  {\n    WPP_SF_(a1: *((_QWORD *)::WPP_GLOBAL_Control + 2), a2: 50, a3: &WPP_79faa2af93c9358b9c491f4b00fd8d02_Traceguids); /*0x180037e1e*/\n  }\n  return (HDEVINFO)DeviceInfoList_1; /*0x180002f4c*/\n}",
+      "refs": [
+        {
+          "addr": "0x18003ca54",
+          "name": "WPP_SF_"
+        },
+        {
+          "addr": "0x180114000",
+          "name": "WPP_GLOBAL_Control"
+        },
+        {
+          "addr": "0x1800ea198",
+          "name": "WPP_79faa2af93c9358b9c491f4b00fd8d02_Traceguids"
+        },
+        {
+          "addr": "0x1800dd578",
+          "name": "__imp_SetLastError"
+        },
+        {
+          "addr": "0x180004900",
+          "name": "AccessDeviceInfoSet"
+        },
+        {
+          "addr": "0x1800049e0",
+          "name": "SetupDiCreateDeviceInfoListExW"
+        },
+        {
+          "addr": "0x1800dd580",
+          "name": "__imp_GetLastError"
+        },
+        {
+          "addr": "0x18011d1b0",
+          "name": "__imp_DevObjGetClassDevs"
+        },
+        {
+          "addr": "0x180003030",
+          "name": "DestroyDeviceInfoSet"
+        },
+        {
+          "addr": "0x1800dda20",
+          "name": "__imp_ReleaseMutex"
+        }
+      ]
+    },
+    "x86": {
+      "addr": "0x100194A0",
+      "code": "HDEVINFO __stdcall SetupDiGetClassDevsExW(\n        const GUID *ClassGuid,\n        PCWSTR Enumerator,\n        HWND hwndParent,\n        DWORD Flags,\n        HDEVINFO DeviceInfoSet,\n        PCWSTR MachineName,\n        PVOID Reserved)\n{\n  HDEVINFO DeviceInfoList; // eax\n  int DeviceInfoList_1; // edi\n  int v9; // esi\n  DWORD LastError; // ebx\n  _DWORD *_WPP_GLOBAL_Control; // eax\n\n  if ( WPP_GLOBAL_Control != (_UNKNOWN *)&WPP_GLOBAL_Control && (*((_DWORD *)WPP_GLOBAL_Control + 7) & 0x20000) != 0 ) /*0x100194e8*/\n    WPP_SF_(a1: *((_DWORD *)WPP_GLOBAL_Control + 4), a2: *((_DWORD *)WPP_GLOBAL_Control + 5)); /*0x1003af87*/\n  if ( Reserved != 0 ) /*0x100194f2*/\n  {\n    SetLastError(dwErrCode: 0x57u); /*0x1003af93*/\n    _WPP_GLOBAL_Control = WPP_GLOBAL_Control; /*0x1003af99*/\n    if ( WPP_GLOBAL_Control == (_UNKNOWN *)&WPP_GLOBAL_Control || (*((_DWORD *)WPP_GLOBAL_Control + 7) & 0x20000) == 0 ) /*0x1003afb0*/\n      return (HDEVINFO)-1; /*0x1003afb0*/\nLABEL_41:\n    WPP_SF_(a1: _WPP_GLOBAL_Control[4], a2: _WPP_GLOBAL_Control[5]); /*0x1003b07c*/\n    return (HDEVINFO)-1; /*0x1003b08f*/\n  }\n  if ( (Flags & 4) == 0 && ClassGuid == 0 ) /*0x10019505*/\n  {\n    SetLastError(dwErrCode: 0x57u); /*0x1003afc2*/\n    _WPP_GLOBAL_Control = WPP_GLOBAL_Control; /*0x1003afc8*/\n    if ( WPP_GLOBAL_Control == (_UNKNOWN *)&WPP_GLOBAL_Control || (*((_DWORD *)WPP_GLOBAL_Control + 7) & 0x20000) == 0 ) /*0x1003afdf*/\n      return (HDEVINFO)-1; /*0x1003afdf*/\n    goto LABEL_41; /*0x1003afdf*/\n  }\n  if ( (Flags & 0x11) == 1 ) /*0x10019511*/\n  {\n    SetLastError(dwErrCode: 0x3ECu); /*0x1003aff4*/\n    _WPP_GLOBAL_Control = WPP_GLOBAL_Control; /*0x1003affa*/\n    if ( WPP_GLOBAL_Control == (_UNKNOWN *)&WPP_GLOBAL_Control || (*((_DWORD *)WPP_GLOBAL_Control + 7) & 0x20000) == 0 ) /*0x1003b011*/\n      return (HDEVINFO)-1; /*0x1003b011*/\n    goto LABEL_41; /*0x1003b011*/\n  }\n  if ( DeviceInfoSet == 0 || DeviceInfoSet == (HDEVINFO)-1 )\n  {\n    DeviceInfoList = SetupDiCreateDeviceInfoListExW(\n                       ClassGuid: (Flags & 0x14) == 0 ? ClassGuid : 0,\n                       hwndParent,\n                       MachineName,\n                       Reserved: 0);\n    DeviceInfoList_1 = (int)DeviceInfoList; /*0x1001953f*/\n    if ( DeviceInfoList == (HDEVINFO)-1 ) /*0x10019547*/\n    {\n      _WPP_GLOBAL_Control = WPP_GLOBAL_Control; /*0x1003b03e*/\n      if ( WPP_GLOBAL_Control == (_UNKNOWN *)&WPP_GLOBAL_Control || (*((_DWORD *)WPP_GLOBAL_Control + 7) & 0x20000) == 0 ) /*0x1003b051*/\n        return (HDEVINFO)-1; /*0x1003b051*/\n      goto LABEL_41; /*0x1003b051*/\n    }\n    v9 = AccessDeviceInfoSet(a1: DeviceInfoList); /*0x10019554*/\n    if ( v9 == 0 ) /*0x1001955b*/\n    {\n      SetLastError(dwErrCode: 6u); /*0x1003b05c*/\n      _WPP_GLOBAL_Control = WPP_GLOBAL_Control; /*0x1003b062*/\n      if ( WPP_GLOBAL_Control == (_UNKNOWN *)&WPP_GLOBAL_Control || (*((_DWORD *)WPP_GLOBAL_Control + 7) & 0x20000) == 0 ) /*0x1003b075*/\n        return (HDEVINFO)-1; /*0x1003b075*/\n      goto LABEL_41; /*0x1003b075*/\n    }\n  }\n  else\n  {\n    DeviceInfoList_1 = 0; /*0x100195ed*/\n    v9 = AccessDeviceInfoSet(a1: DeviceInfoSet); /*0x100195f9*/\n    if ( v9 == 0 ) /*0x10019600*/\n    {\n      SetLastError(dwErrCode: 6u); /*0x1003b01c*/\n      _WPP_GLOBAL_Control = WPP_GLOBAL_Control; /*0x1003b022*/\n      if ( WPP_GLOBAL_Control == (_UNKNOWN *)&WPP_GLOBAL_Control || (*((_DWORD *)WPP_GLOBAL_Control + 7) & 0x20000) == 0 ) /*0x1003b035*/\n        return (HDEVINFO)-1; /*0x1003b035*/\n      goto LABEL_41; /*0x1003b035*/\n    }\n  }\n  *(_DWORD *)(v9 + 4) = hwndParent; /*0x1001956b*/\n  if ( DevObjGetClassDevs(a1: *(_DWORD *)v9, a2: ClassGuid, a3: Enumerator, a4: Flags, a5: MachineName, a6: 0) != 0 ) /*0x10019584*/\n    LastError = 0; /*0x1001958a*/\n  else\n    LastError = GetLastError(); /*0x1003b09a*/\n  if ( LastError != 0 ) /*0x10019595*/\n  {\n    if ( DeviceInfoList_1 != 0 ) /*0x1003b0c9*/\n    {\n      DestroyDeviceInfoSet(a1: DeviceInfoList_1, a2: v9); /*0x1003b0cf*/\n    }\n    else\n    {\n      --*(_DWORD *)(v9 + 188); /*0x1003b0da*/\n      ReleaseMutex(hMutex: *(HANDLE *)(v9 + 220)); /*0x1003b0e6*/\n    }\n    SetLastError(dwErrCode: LastError); /*0x1003b0ed*/\n    DeviceInfoList_1 = -1; /*0x1003b0f3*/\n  }\n  else\n  {\n    if ( DeviceInfoList_1 == 0 ) /*0x1001959d*/\n      DeviceInfoList_1 = (int)DeviceInfoSet; /*0x1001960b*/\n    --*(_DWORD *)(v9 + 188); /*0x100195a3*/\n    ReleaseMutex(hMutex: *(HANDLE *)(v9 + 220)); /*0x100195af*/\n  }\n  if ( WPP_GLOBAL_Control != (_UNKNOWN *)&WPP_GLOBAL_Control && (*((_DWORD *)WPP_GLOBAL_Control + 7) & 0x20000) != 0 ) /*0x100195c8*/\n    WPP_SF_(a1: *((_DWORD *)WPP_GLOBAL_Control + 4), a2: *((_DWORD *)WPP_GLOBAL_Control + 5)); /*0x1003b10b*/\n  return (HDEVINFO)DeviceInfoList_1; /*0x100195d0*/\n}",
+      "refs": [
+        {
+          "addr": "0x10046980",
+          "name": "_WPP_SF_@16"
+        },
+        {
+          "addr": "0x100d5000",
+          "name": "_WPP_GLOBAL_Control"
+        },
+        {
+          "addr": "0x100d7128",
+          "name": "__imp__SetLastError@4"
+        },
+        {
+          "addr": "0x1001a5e0",
+          "name": "_SetupDiCreateDeviceInfoListExW@16"
+        },
+        {
+          "addr": "0x1001a460",
+          "name": "_AccessDeviceInfoSet@4"
+        },
+        {
+          "addr": "0x100d7120",
+          "name": "__imp__GetLastError@0"
+        },
+        {
+          "addr": "0x100db0d8",
+          "name": "__imp__DevObjGetClassDevs@24"
+        },
+        {
+          "addr": "0x100196e0",
+          "name": "_DestroyDeviceInfoSet@8"
+        },
+        {
+          "addr": "0x100d7394",
+          "name": "__imp__ReleaseMutex@4"
+        }
+      ]
+    },
+    "wrapper_x64": {
+      "addr": "0x180002D00",
+      "code": "HDEVINFO __stdcall SetupDiGetClassDevsW(const GUID *ClassGuid, PCWSTR Enumerator, HWND hwndParent, DWORD Flags)\n{\n  HDEVINFO ClassDevs; // rbx\n\n  if ( WPP_GLOBAL_Control != (_UNKNOWN *)&WPP_GLOBAL_Control && (*((_DWORD *)WPP_GLOBAL_Control + 7) & 0x20000) != 0 ) /*0x180002d3f*/\n    WPP_SF_(a1: *((_QWORD *)WPP_GLOBAL_Control + 2), a2: 39, a3: &WPP_79faa2af93c9358b9c491f4b00fd8d02_Traceguids); /*0x180037c20*/\n  ClassDevs = SetupDiGetClassDevsExW( /*0x180002d67*/\n                ClassGuid,\n                Enumerator,\n                hwndParent,\n                Flags,\n                DeviceInfoSet: 0,\n                MachineName: 0,\n                Reserved: 0);\n  if ( WPP_GLOBAL_Control != (_UNKNOWN *)&WPP_GLOBAL_Control && (*((_DWORD *)WPP_GLOBAL_Control + 7) & 0x20000) != 0 ) /*0x180002d7d*/\n    WPP_SF_(a1: *((_QWORD *)WPP_GLOBAL_Control + 2), a2: 40, a3: &WPP_79faa2af93c9358b9c491f4b00fd8d02_Traceguids); /*0x180037c3b*/\n  return ClassDevs; /*0x180002d83*/\n}",
+      "refs": [
+        {
+          "addr": "0x18003ca54",
+          "name": "WPP_SF_"
+        },
+        {
+          "addr": "0x180114000",
+          "name": "WPP_GLOBAL_Control"
+        },
+        {
+          "addr": "0x1800ea198",
+          "name": "WPP_79faa2af93c9358b9c491f4b00fd8d02_Traceguids"
+        },
+        {
+          "addr": "0x180002db0",
+          "name": "SetupDiGetClassDevsExW"
+        }
+      ]
+    }
+  },
+  "source_references": {
+    "wine": {
+      "path": "D:\\Dawn\\refs\\wine\\dlls\\setupapi\\devinst.c",
+      "line": 2106,
+      "finding": "ALLCLASSES plus DEVICEINTERFACE enumerates interface classes in a finite loop. No outer retry. Contains unsupported flags and remote-machine paths; not an equivalent full implementation."
+    },
+    "reactos": {
+      "path": "F:\\Part1\\Reversal\\reactos_functions\\dll\\win32\\setupapi\\devinst.c",
+      "line": 2548,
+      "finding": "The DEVICEINTERFACE branch rejects null class even with ALLCLASSES, unlike the matched Windows wrappers."
+    }
+  }
+}

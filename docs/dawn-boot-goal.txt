@@ -11,11 +11,19 @@ source, disassembly and actual guest state; distinguish source from build proof.
 ALWAYS Please use the intel manuals to support these asm instruction, unsupported operations that are unimplemented. Fully implement them. Read the documentation pdfs here. NEVER HALF-IMPLEMENT THEM
 D:\Emulation\sogen\docs\Intel docs
 
-Cross-check F:/Part1/Reversal/reactos_functions against the user's actual DLL
+Reference trees are strictly read-only research material:
+- D:/Dawn/refs, including D3D and other rendering components
+- F:/Part1/Reversal/reactos_functions
+- D:/Dawn/refs/wine
+- D:/Dawn/refs/XPSRC (XP SP1 source)
+Never execute files, run scripts, or build projects from these reference trees.
+
+Cross-check relevant reference implementations against the user's actual DLL
 versions when implementing unsupported Sogen behavior. Verify relevant classes,
 structures, layouts, field widths, x86/x64 differences, status codes, buffer
-contracts, lifetime and asynchronous behavior. ReactOS is a reference, not proof
-that a particular Windows DLL has the same contract.
+contracts, lifetime and asynchronous behavior. Reference source is not proof
+that the current Windows DLL has the same contract. Resolve differences using
+matched disassembly, symbols and observed guest behavior before implementing.
 
 Read the relevant Intel manuals in D:/Emulation/sogen/docs/Intel docs before
 implementing missing assembly instructions or unsupported CPU operations. Read
