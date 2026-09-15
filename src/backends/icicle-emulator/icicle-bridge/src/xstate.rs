@@ -67,7 +67,9 @@ fn version_query(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
     // The SLEIGH result order is EAX, EBX, EDX, ECX; Icicle's version helper swaps the last pair.
     let ecx = cpu.read_var::<u32>(dst.slice(8, 4));
     let edx = cpu.read_var::<u32>(dst.slice(12, 4));
-    cpu.write_var(dst.slice(8, 4), edx);
+    // CPUID.01H:EDX: x87, TSC, CMPXCHG8B, CMOV, MMX, FXSR, SSE and SSE2.
+    const BASELINE_EDX: u32 = 0x0780_8111;
+    cpu.write_var(dst.slice(8, 4), edx | BASELINE_EDX);
     cpu.write_var(dst.slice(12, 4), ecx | (1 << 27));
 }
 

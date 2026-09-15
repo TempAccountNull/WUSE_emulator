@@ -1,0 +1,34 @@
+Icicle baseline CPUID features
+
+CPUID.01H returned EDX=0 despite the backend executing SSE/SSE2 and Windows
+shared data advertising those features. The analyzer's CPUID override is
+not installed on Icicle: its hook_instruction currently returns nullptr
+for CPUID. The backend result therefore controls guest feature detection.
+
+The bridge now includes x87, TSC, CMPXCHG8B, CMOV, MMX, FXSR, SSE and SSE2
+in CPUID.01H:EDX (0x07808111). EAX/EBX/ECX and the existing feature policy
+are preserved; this change does not advertise SSE4, AVX or AVX-512.
+
+Reference: Intel SDM 325462-092-sdm-vol-1-2abcd-3abcd-4.pdf,
+Volume 1 tables 21-9 and 21-10, PDF pages 450-454; CPUID instruction,
+Volume 2A, PDF pages 907-908.
+
+Exact x64 d3d10warp.dll SHA-256:
+ac35b849b483fc9196f24138a731c0739fc2f30b04792931de72cc5a7ce3053f
+WarpPlatform::Initialize executes CPUID leaf 1 at RVA 0x349232 and checks
+EDX bit 26 at RVA 0x349282. If clear, it removes gWarpConfig bit 4.
+PixelJITProcessor::Initialize at RVA 0x40DA80 requires bits 2, 4 and 0x400
+to select compiled pixel-shader execution (RVA 0x40D750).
+
+The saved actual-game state had gWarpConfig=0x26E0A, processor+0xD8=0,
+and processor+0x68 pointing to interpreted execution (RVA 0x40D700).
+These fields were read from an isolated, non-executing snapshot inspector
+and checked against the matching IDB. The running guest spent most sampled
+instructions inside WARP's pixel shader interpreter.
+
+Regression tests reproduce EDX=0 and the resulting WARP branch before the
+fix. They verify the corrected branch, register order, zeroed high halves,
+preserved flags/non-output registers, Windows XSAVE ABI, and existing
+min/max behavior in interpreter and JIT modes. Validation is recorded in
+cpuid-baseline-validation.json. This is CPU enumeration repair, not a
+claim that every instruction in those ISA families has been audited.

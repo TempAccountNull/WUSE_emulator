@@ -251,6 +251,60 @@ namespace sogen::test
         EXPECT_EQ(emu->reg<uint32_t>(x86_register::edx), 0u);
     }
 
+    TEST_P(IcicleXstate, CpuidReportsBaselineFeaturesWithoutChangingFlagsOrOtherRegisters)
+    {
+        const std::array<uint8_t, 3> instruction{0x0F, 0xA2, 0x90};
+        emu->write_memory(code, instruction.data(), instruction.size());
+        emu->reg(x86_register::rip, code);
+        emu->reg(x86_register::rax, 0xFFFFFFFF00000001ULL);
+        emu->reg(x86_register::rbx, 0xFFFFFFFFFFFFFFFFULL);
+        emu->reg(x86_register::rcx, 0xFFFFFFFFFFFFFFFFULL);
+        emu->reg(x86_register::rdx, 0xFFFFFFFFFFFFFFFFULL);
+        emu->reg(x86_register::r8, 0x1122334455667788ULL);
+        emu->reg<vector>(x86_register::xmm0, vector{11, 22});
+        emu->reg(x86_register::mxcsr, 0x1F80u);
+        emu->start(1);
+        const auto features = emu->reg<uint32_t>(x86_register::edx);
+        RecordProperty("leaf1_edx", static_cast<int>(features));
+        RecordProperty("leaf1_ecx", static_cast<int>(emu->reg<uint32_t>(x86_register::ecx)));
+        EXPECT_NE(features & (1u << 0), 0u);
+        EXPECT_NE(features & (1u << 4), 0u);
+        EXPECT_NE(features & (1u << 8), 0u);
+        EXPECT_NE(features & (1u << 15), 0u);
+        EXPECT_NE(features & (1u << 23), 0u);
+        EXPECT_NE(features & (1u << 24), 0u);
+        EXPECT_NE(features & (1u << 25), 0u);
+        EXPECT_NE(features & (1u << 26), 0u);
+        EXPECT_EQ(emu->reg<uint64_t>(x86_register::rip), code + 2);
+        EXPECT_EQ(emu->reg<uint64_t>(x86_register::rsp), state + 0xF00);
+        EXPECT_EQ(emu->reg<uint32_t>(x86_register::eflags), 0x246u);
+        EXPECT_EQ(emu->reg<uint64_t>(x86_register::r8), 0x1122334455667788ULL);
+        EXPECT_EQ(emu->reg<vector>(x86_register::xmm0), (vector{11, 22}));
+        EXPECT_EQ(emu->reg<uint32_t>(x86_register::mxcsr), 0x1F80u);
+        for (const auto reg : {x86_register::rax, x86_register::rbx, x86_register::rcx, x86_register::rdx})
+        {
+            EXPECT_EQ(emu->reg<uint64_t>(reg) >> 32, 0u);
+        }
+        EXPECT_EQ(emu->reg<uint32_t>(x86_register::ecx) & 0x10180000u, 0u);
+    }
+
+    TEST_P(IcicleXstate, WarpSse2ProbeKeepsShaderCompilerEnabled)
+    {
+        // WARP ac35b849...: leaf 1 at +0x349232, SSE2 test at +0x349282.
+        const std::array<uint8_t, 28> instructions{0x0F, 0xA2, 0x44, 0x8B, 0xDA, 0x41, 0xC1, 0xEB, 0x1A, 0x41, 0x81, 0xC8, 0xFE, 0x01,
+                                                   0x00, 0x00, 0x41, 0xF6, 0xC3, 0x01, 0x75, 0x04, 0x41, 0x83, 0xE0, 0xFB, 0x90, 0x90};
+        emu->write_memory(code, instructions.data(), instructions.size());
+        emu->reg(x86_register::rip, code);
+        emu->reg(x86_register::rax, 1ULL);
+        emu->reg(x86_register::rcx, 0ULL);
+        emu->reg(x86_register::r8, 0x24C00ULL);
+        emu->start(6);
+        EXPECT_EQ(emu->reg<uint64_t>(x86_register::rip), code + 26);
+        EXPECT_NE(emu->reg<uint32_t>(x86_register::r8d) & 4, 0u);
+        emu->start(1);
+        EXPECT_NE(emu->reg<uint32_t>(x86_register::r8d) & 4, 0u);
+    }
+
     INSTANTIATE_TEST_SUITE_P(Encoding, IcicleXstate, testing::Bool());
 
     TEST(EmulationTest, IcicleSharedXstateMatchesCpuAfterSetupAndSnapshotRestore)

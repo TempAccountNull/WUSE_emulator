@@ -1,0 +1,162 @@
+{
+  "before": {
+    "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789481582826377100",
+    "results": [
+      {
+        "mode": "interpreter",
+        "command": [
+          "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo\\windows-emulator-test.exe",
+          "--gtest_filter=*IcicleXstate.CpuidReportsBaselineFeatures*:*IcicleXstate.WarpSse2Probe*",
+          "--gtest_color=no",
+          "--gtest_output=json:D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789481582826377100\\interpreter.json"
+        ],
+        "exit_code": 1,
+        "seconds": 0.2529722999315709
+      },
+      {
+        "mode": "jit",
+        "command": [
+          "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo\\windows-emulator-test.exe",
+          "--gtest_filter=*IcicleXstate.CpuidReportsBaselineFeatures*:*IcicleXstate.WarpSse2Probe*",
+          "--gtest_color=no",
+          "--gtest_output=json:D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789481582826377100\\jit.json"
+        ],
+        "exit_code": 1,
+        "seconds": 0.38110650004819036
+      }
+    ],
+    "interpreter": {
+      "tests": 4,
+      "failures": 4,
+      "errors": 0,
+      "time": "0.223s"
+    },
+    "jit": {
+      "tests": 4,
+      "failures": 4,
+      "errors": 0,
+      "time": "0.369s"
+    }
+  },
+  "release_xstate": {
+    "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789481718383145900",
+    "results": [
+      {
+        "mode": "interpreter",
+        "command": [
+          "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo\\windows-emulator-test.exe",
+          "--gtest_filter=*IcicleXstate.*:EmulationTest.IcicleSharedXstateMatchesCpuAfterSetupAndSnapshotRestore",
+          "--gtest_color=no",
+          "--gtest_output=json:D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789481718383145900\\interpreter.json"
+        ],
+        "exit_code": 0,
+        "seconds": 1.7867846998851746
+      },
+      {
+        "mode": "jit",
+        "command": [
+          "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo\\windows-emulator-test.exe",
+          "--gtest_filter=*IcicleXstate.*:EmulationTest.IcicleSharedXstateMatchesCpuAfterSetupAndSnapshotRestore",
+          "--gtest_color=no",
+          "--gtest_output=json:D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789481718383145900\\jit.json"
+        ],
+        "exit_code": 0,
+        "seconds": 2.9535326999612153
+      }
+    ],
+    "interpreter": {
+      "tests": 23,
+      "failures": 0,
+      "errors": 0,
+      "time": "1.66s"
+    },
+    "jit": {
+      "tests": 23,
+      "failures": 0,
+      "errors": 0,
+      "time": "2.939s"
+    }
+  },
+  "release_simd_boot": {
+    "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789481910142858800",
+    "results": [
+      {
+        "mode": "interpreter",
+        "command": [
+          "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo\\windows-emulator-test.exe",
+          "--gtest_filter=IcicleMinMax.*:IcicleBootSupport.*",
+          "--gtest_color=no",
+          "--gtest_output=json:D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789481910142858800\\interpreter.json"
+        ],
+        "exit_code": 0,
+        "seconds": 2.2962603999767452
+      },
+      {
+        "mode": "jit",
+        "command": [
+          "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo\\windows-emulator-test.exe",
+          "--gtest_filter=IcicleMinMax.*:IcicleBootSupport.*",
+          "--gtest_color=no",
+          "--gtest_output=json:D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789481910142858800\\jit.json"
+        ],
+        "exit_code": 0,
+        "seconds": 16.7666726000607
+      }
+    ],
+    "interpreter": {
+      "tests": 24,
+      "failures": 0,
+      "errors": 0,
+      "time": "2.176s"
+    },
+    "jit": {
+      "tests": 24,
+      "failures": 0,
+      "errors": 0,
+      "time": "16.753s"
+    }
+  },
+  "tidy_xstate_simd": {
+    "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789481909959525700",
+    "results": [
+      {
+        "mode": "interpreter",
+        "command": [
+          "D:\\Emulation\\sogen\\build\\tidy\\artifacts\\windows-emulator-test.exe",
+          "--gtest_filter=*IcicleXstate.*:EmulationTest.IcicleSharedXstateMatchesCpuAfterSetupAndSnapshotRestore:IcicleMinMax.*",
+          "--gtest_color=no",
+          "--gtest_output=json:D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789481909959525700\\interpreter.json"
+        ],
+        "exit_code": 0,
+        "seconds": 3.198528400156647
+      },
+      {
+        "mode": "jit",
+        "command": [
+          "D:\\Emulation\\sogen\\build\\tidy\\artifacts\\windows-emulator-test.exe",
+          "--gtest_filter=*IcicleXstate.*:EmulationTest.IcicleSharedXstateMatchesCpuAfterSetupAndSnapshotRestore:IcicleMinMax.*",
+          "--gtest_color=no",
+          "--gtest_output=json:D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789481909959525700\\jit.json"
+        ],
+        "exit_code": 0,
+        "seconds": 18.246332900132984
+      }
+    ],
+    "interpreter": {
+      "tests": 37,
+      "failures": 0,
+      "errors": 0,
+      "time": "3.151s"
+    },
+    "jit": {
+      "tests": 37,
+      "failures": 0,
+      "errors": 0,
+      "time": "18.228s"
+    }
+  },
+  "release_build": "vs2022-1789481626846563400.log",
+  "tidy_build": "tidy-1789481762916892900.log",
+  "guest_smoke": "sogen-cli-smoke-1789481764673971300",
+  "actual_game": "Pending replay from before WARP initialization; no boot claim"
+}
