@@ -1,6 +1,7 @@
 #include "emulation_test_utils.hpp"
 #include <memory_manager.hpp>
 #include <array>
+#include <vector>
 
 namespace sogen::test
 {
@@ -26,6 +27,38 @@ namespace sogen::test
             emu->reg(x86_register::rip, code);
         }
     };
+
+    TEST_F(IcicleBootSupport, ExecutionHookRemovalPreservesOtherHookKinds)
+    {
+        load(std::array<uint8_t, 5>{0x90, 0x90, 0x90, 0x90, 0x90});
+        std::vector<uint64_t> all;
+        std::vector<uint64_t> range;
+        size_t self_count{};
+        size_t other_count{};
+        auto* generic = emu->hook_memory_execution([&](cpu_interface&, const uint64_t address) { all.push_back(address); });
+        auto* ranged =
+            emu->hook_memory_range_execution(code + 1, 2, [&](cpu_interface&, const uint64_t address) { range.push_back(address); });
+        emulator_hook* self{};
+        self = emu->hook_memory_execution(code + 2, [&](cpu_interface&, uint64_t) {
+            ++self_count;
+            emu->delete_hook(self);
+        });
+        auto* other = emu->hook_memory_execution(code + 2, [&](cpu_interface&, uint64_t) { ++other_count; });
+        emu->start(4);
+        EXPECT_EQ(all, (std::vector<uint64_t>{code, code + 1, code + 2, code + 3}));
+        EXPECT_EQ(range, (std::vector<uint64_t>{code + 1, code + 2}));
+        EXPECT_EQ(self_count, 1U);
+        EXPECT_EQ(other_count, 1U);
+        emu->delete_hook(generic);
+        emu->delete_hook(ranged);
+        emu->reg(x86_register::rip, code);
+        emu->start(4);
+        EXPECT_EQ(all.size(), 4U);
+        EXPECT_EQ(range.size(), 2U);
+        EXPECT_EQ(self_count, 1U);
+        EXPECT_EQ(other_count, 2U);
+        emu->delete_hook(other);
+    }
 
     TEST_F(IcicleBootSupport, TimestampHooksPreserveOutputsAndInstructionLength)
     {

@@ -137,7 +137,7 @@ fn is_within_start_and_length(value: u64, start: u64, length: u64) -> bool {
 pub struct HookContainer<Func: ?Sized> {
     hook_id: u32,
     is_iterating: bool,
-    hooks: HashMap<u32, Box<Func>>,
+    hooks: Vec<(u32, Box<Func>)>,
     hooks_to_add: HashMap<u32, Box<Func>>,
     hooks_to_remove: HashSet<u32>,
 }
@@ -147,7 +147,7 @@ impl<Func: ?Sized> HookContainer<Func> {
         Self {
             hook_id: 0,
             is_iterating: false,
-            hooks: HashMap::new(),
+            hooks: Vec::new(),
             hooks_to_add: HashMap::new(),
             hooks_to_remove: HashSet::new(),
         }
@@ -160,7 +160,7 @@ impl<Func: ?Sized> HookContainer<Func> {
         if self.is_iterating {
             self.hooks_to_add.insert(id, callback);
         } else {
-            self.hooks.insert(id, callback);
+            self.hooks.push((id, callback));
         }
 
         return id;
@@ -188,9 +188,8 @@ impl<Func: ?Sized> HookContainer<Func> {
     {
         let was_iterating = self.do_pre_access_work();
 
-        let hook = self.hooks.get(&id);
-        if hook.is_some() {
-            callback(hook.unwrap().as_ref());
+        if let Some((_, hook)) = self.hooks.iter().find(|(hook_id, _)| *hook_id == id) {
+            callback(hook.as_ref());
         }
 
         self.do_post_access_work(was_iterating);
@@ -204,7 +203,7 @@ impl<Func: ?Sized> HookContainer<Func> {
         if self.is_iterating {
             self.hooks_to_remove.insert(id);
         } else {
-            self.hooks.remove(&id);
+            self.hooks.retain(|(hook_id, _)| *hook_id != id);
         }
     }
 
@@ -222,15 +221,11 @@ impl<Func: ?Sized> HookContainer<Func> {
 
         if !self.hooks_to_remove.is_empty() {
             let to_remove = std::mem::take(&mut self.hooks_to_remove);
-            for id in &to_remove {
-                self.hooks.remove(id);
-            }
+            self.hooks.retain(|(id, _)| !to_remove.contains(id));
         }
         if !self.hooks_to_add.is_empty() {
             let to_add = std::mem::take(&mut self.hooks_to_add);
-            for (id, func) in to_add {
-                self.hooks.insert(id, func);
-            }
+            self.hooks.extend(to_add);
         }
     }
 }
@@ -1291,5 +1286,76 @@ mod page_reclamation_tests {
             assert!(emu.unmap_memory(ADDRESS, 4096));
             assert_eq!(emu.vm.cpu.mem.total_pages(), 2);
         }
+    }
+}
+
+#[cfg(test)]
+mod hook_container_tests {
+    use super::HookContainer;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn add(
+        container: &mut HookContainer<dyn Fn()>,
+        observed: &Rc<RefCell<Vec<u32>>>,
+        value: u32,
+    ) -> u32 {
+        let observed = observed.clone();
+        container.add_hook(Box::new(move || observed.borrow_mut().push(value)))
+    }
+
+    fn observed_values(observed: &Rc<RefCell<Vec<u32>>>) -> Vec<u32> {
+        let mut values = std::mem::take(&mut *observed.borrow_mut());
+        values.sort_unstable();
+        values
+    }
+
+    #[test]
+    fn removal_preserves_other_hook_ids_and_callbacks() {
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let mut container: HookContainer<dyn Fn()> = HookContainer::new();
+        let first = add(&mut container, &observed, 10);
+        let second = add(&mut container, &observed, 20);
+        let third = add(&mut container, &observed, 30);
+        container.remove_hook(second);
+        container.for_each_hook(|callback| callback());
+        assert_eq!(observed_values(&observed), vec![10, 30]);
+        container.access_hook(third, |callback| callback());
+        container.access_hook(second, |callback| callback());
+        container.access_hook(first, |callback| callback());
+        assert_eq!(observed_values(&observed), vec![10, 30]);
+        container.remove_hook(first);
+        container.remove_hook(third);
+        assert!(container.is_empty());
+        assert!(add(&mut container, &observed, 40) > third);
+    }
+
+    #[test]
+    fn deferred_changes_wait_for_the_outermost_iteration() {
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let mut container: HookContainer<dyn Fn()> = HookContainer::new();
+        let first = add(&mut container, &observed, 10);
+        let second = add(&mut container, &observed, 20);
+        let outer = container.do_pre_access_work();
+        container.remove_hook(first);
+        let third = add(&mut container, &observed, 30);
+        container.for_each_hook(|callback| callback());
+        assert_eq!(observed_values(&observed), vec![10, 20]);
+        container.access_hook(third, |callback| callback());
+        assert!(observed_values(&observed).is_empty());
+        container.access_hook(second, |callback| callback());
+        assert_eq!(observed_values(&observed), vec![20]);
+        container.do_post_access_work(outer);
+        container.for_each_hook(|callback| callback());
+        assert_eq!(observed_values(&observed), vec![20, 30]);
+    }
+
+    #[test]
+    fn empty_and_missing_hook_dispatch_are_noops() {
+        let mut container: HookContainer<dyn Fn()> = HookContainer::new();
+        container.for_each_hook(|_| panic!("unexpected callback"));
+        container.access_hook(77, |_| panic!("unexpected callback"));
+        container.remove_hook(77);
+        assert!(container.is_empty());
     }
 }
