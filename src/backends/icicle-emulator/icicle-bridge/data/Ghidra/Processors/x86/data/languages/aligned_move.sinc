@@ -25,3 +25,5 @@ AlignedMoveTail: is mod=2 & r_m!=4; imm32 {}
 :VMAXPS is $(LONGMODE_ON) & vexMode=0 & byte=0x62; aligned_p0 & aligned_w=0 & minmax_pp=0; byte=0x5F; AlignedMoveTail { sogen_minmax(inst_next:8); }
 :VMAXPD is $(LONGMODE_ON) & vexMode=0 & byte=0x62; aligned_p0 & aligned_w=1 & minmax_pp=1; byte=0x5F; AlignedMoveTail { sogen_minmax(inst_next:8); }
 :VMAXSD is $(LONGMODE_ON) & vexMode=0 & byte=0x62; aligned_p0 & aligned_w=1 & minmax_pp=3; byte=0x5F; AlignedMoveTail { sogen_minmax(inst_next:8); }
+
+:VPMULHUW is $(LONGMODE_ON) & vexMode=0 & byte=0x62; aligned_p0; byte=0xE4; AlignedMoveTail { sogen_pmulhuw(inst_next:8); }

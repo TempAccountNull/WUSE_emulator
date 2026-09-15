@@ -1,0 +1,33 @@
+Packed unsigned word high multiply (Icicle x64)
+
+The game stopped on 66 0F E4 FC (PMULHUW XMM7,XMM4) at 0xBACC5EE2F2.
+This is WARP-generated code in allocation 0xBACC5E0000+0xE2F2. It is not
+a mapped DLL address. The fault and original guest checkpoint are retained.
+
+Reference: Intel SDM 325462-092-sdm-vol-1-2abcd-3abcd-4.pdf, PDF 1668-1671.
+Type 4 / E4.nb exception tables: PDF 645 and 670. MMX state: PDF 250 and
+3658-3660. MMX exceptions: 253669-092-sdm-vol-3b-1.pdf, PDF 473, table 25-7.
+
+Implemented seven forms: MMX, legacy XMM, VEX 128/256, EVEX 128/256/512.
+Each unsigned word product uses all 32 bits and writes its high 16 bits.
+Both WIG values, extended vector registers and register aliases are handled.
+Legacy XMM preserves upper vector state; VEX/EVEX zero above their width.
+EVEX masks select individual words with merging or zeroing. There is no
+broadcast or SAE. Only active memory words are accessed; all reads complete
+before the destination changes. Failed reads retain the exact fault address.
+EFLAGS and MXCSR are unchanged.
+
+MMX addresses physical x87 registers even with a nonzero TOP. On success,
+TOP becomes zero, all tags become valid, and the destination exponent is
+set to all ones. Failed memory accesses preserve the original x87 state.
+CR0/CR4/XCR0, pending x87 exceptions, reserved encodings, alignment,
+canonical addresses and masked fault suppression are checked explicitly.
+The shared address decoder supports RIP/EIP-relative, SIB, FS/GS and
+full-vector EVEX compressed displacement.
+
+The advertised CPU profile and default XCR0 are unchanged. VEX/EVEX tests
+explicitly enable their state. These operations do not claim a complete
+AVX-512 CPU or expand the guest Windows XSAVE ABI.
+
+Validation: pmulhuw-validation.json. Regression tests and single-instruction
+replay are separate from user confirmation that the game has booted.

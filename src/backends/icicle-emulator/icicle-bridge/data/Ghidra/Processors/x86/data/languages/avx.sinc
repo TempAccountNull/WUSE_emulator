@@ -2240,13 +2240,6 @@ define pcodeop vpmulhrsw_avx ;
 }
 
 # PMULHUW 4-366 PAGE 1486 LINE 77141
-define pcodeop vpmulhuw_avx ;
-:VPMULHUW XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xE4; (XmmReg1 & YmmReg1) ... & XmmReg2_m128
-{
-	local tmp:16 = vpmulhuw_avx( vexVVVV_XmmReg, XmmReg2_m128 );
-	YmmReg1 = zext(tmp);
-	# TODO ZmmReg1 = zext(XmmReg1)
-}
 
 # PMULHW 4-370 PAGE 1490 LINE 77370
 define pcodeop vpmulhw_avx ;
@@ -3254,3 +3247,6 @@ define pcodeop vxorps_avx ;
 	YmmReg1 = vxorps_avx( vexVVVV_YmmReg, YmmReg2_m256 );
 	# TODO ZmmReg1 = zext(YmmReg1)
 }
+
+:VPMULHUW XmmReg1, vexVVVV_XmmReg, XmmReg2 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xE4; mod=3 & XmmReg1 & XmmReg2 { sogen_pmulhuw(inst_next:8); }
+:VPMULHUW XmmReg1, vexVVVV_XmmReg, PmulhuwMem is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xE4; XmmReg1 ... & PmulhuwMem { sogen_pmulhuw(inst_next:8); }

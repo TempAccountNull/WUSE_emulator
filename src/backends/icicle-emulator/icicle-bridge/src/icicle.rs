@@ -24,6 +24,7 @@ fn create_x64_vm() -> icicle_vm::Vm {
     crate::xstate::register(&mut vm.cpu);
     crate::aligned_move::register(&mut vm.cpu);
     crate::simd_minmax::register(&mut vm.cpu);
+    crate::packed_mul_high::register(&mut vm.cpu);
     vm
 }
 

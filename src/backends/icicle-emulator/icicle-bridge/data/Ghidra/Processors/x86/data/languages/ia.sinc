@@ -7193,11 +7193,12 @@ define pcodeop pmulhrsw;
 :PMULHRSW       XmmReg, m128     is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x38; byte=0x0B; XmmReg ... & m128              { XmmReg=pmulhrsw(XmmReg,m128); }
 :PMULHRSW       XmmReg1, XmmReg2 is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x38; byte=0x0B; xmmmod = 3 & XmmReg1 & XmmReg2 { XmmReg1=pmulhrsw(XmmReg1,XmmReg2); }
 
-define pcodeop pmulhuw;
-:PMULHUW        mmxreg, m64      is vexMode=0 &  mandover=0 & byte=0x0F; byte=0xE4; mmxreg ... & m64 { mmxreg = pmulhuw(mmxreg, m64); }
-:PMULHUW        mmxreg1, mmxreg2 is vexMode=0 &  mandover=0 & byte=0x0F; byte=0xE4; mmxmod = 3 & mmxreg1 & mmxreg2 { mmxreg1 = pmulhuw(mmxreg1, mmxreg2); }
-:PMULHUW        XmmReg, m128     is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0xE4; XmmReg ... & m128 { XmmReg = pmulhuw(XmmReg, m128); }
-:PMULHUW        XmmReg1, XmmReg2 is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0xE4; xmmmod = 3 & XmmReg1 & XmmReg2 { XmmReg1 = pmulhuw(XmmReg1, XmmReg2); }
+define pcodeop sogen_pmulhuw;
+PmulhuwMem: Mem is Mem { export Mem; }
+:PMULHUW mmxreg, PmulhuwMem is vexMode=0 & mandover=0 & byte=0x0F; byte=0xE4; mmxreg ... & PmulhuwMem { sogen_pmulhuw(inst_next:8); }
+:PMULHUW mmxreg1, mmxreg2 is vexMode=0 & mandover=0 & byte=0x0F; byte=0xE4; mmxmod=3 & mmxreg1 & mmxreg2 { sogen_pmulhuw(inst_next:8); }
+:PMULHUW XmmReg, PmulhuwMem is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0xE4; XmmReg ... & PmulhuwMem { sogen_pmulhuw(inst_next:8); }
+:PMULHUW XmmReg1, XmmReg2 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0xE4; xmmmod=3 & XmmReg1 & XmmReg2 { sogen_pmulhuw(inst_next:8); }
 
 macro pmulhw64(mmx1, mmx2) {
 	local tmp0:8 = sext(mmx1[ 0,16]) * sext(mmx2[ 0,16]);

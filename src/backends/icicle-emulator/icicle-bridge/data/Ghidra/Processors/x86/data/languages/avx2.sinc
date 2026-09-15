@@ -523,12 +523,6 @@ define pcodeop vpmulhrsw_avx2 ;
 }
 
 # PMULHUW 4-366 PAGE 1486 LINE 77144
-define pcodeop vpmulhuw_avx2 ;
-:VPMULHUW YmmReg1, vexVVVV_YmmReg, YmmReg2_m256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0xE4; YmmReg1 ... & YmmReg2_m256
-{
-	YmmReg1 = vpmulhuw_avx2( vexVVVV_YmmReg, YmmReg2_m256 );
-	# TODO ZmmReg1 = zext(YmmReg1)
-}
 
 # PMULHW 4-370 PAGE 1490 LINE 77373
 define pcodeop vpmulhw_avx2 ;
@@ -1231,3 +1225,6 @@ define pcodeop vpsrlvq_avx2 ;
 	# TODO ZmmReg1 = zext(YmmReg1)
 }
 
+
+:VPMULHUW YmmReg1, vexVVVV_YmmReg, YmmReg2 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0xE4; mod=3 & YmmReg1 & YmmReg2 { sogen_pmulhuw(inst_next:8); }
+:VPMULHUW YmmReg1, vexVVVV_YmmReg, PmulhuwMem is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0xE4; YmmReg1 ... & PmulhuwMem { sogen_pmulhuw(inst_next:8); }

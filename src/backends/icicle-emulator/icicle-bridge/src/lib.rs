@@ -1,3 +1,4 @@
+mod packed_mul_high;
 mod simd_minmax;
 mod vector_operand;
 mod aes;

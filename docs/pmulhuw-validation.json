@@ -1,0 +1,194 @@
+{
+  "instruction": "PMULHUW/VPMULHUW",
+  "encoding_forms": 7,
+  "instruction_regression_tests": 12,
+  "manual": "325462-092-sdm-vol-1-2abcd-3abcd-4.pdf",
+  "manual_pdf_pages": [
+    1668,
+    1669,
+    1670,
+    1671
+  ],
+  "exception_pages": [
+    645,
+    670
+  ],
+  "mmx_state_pages": [
+    250,
+    3658,
+    3659,
+    3660
+  ],
+  "mmx_exceptions": {
+    "manual": "253669-092-sdm-vol-3b-1.pdf",
+    "pdf_page": 473,
+    "table": "25-7"
+  },
+  "arithmetic": {
+    "log": "rust-tests-1789485766742586400.log",
+    "tests": 2,
+    "all_word_boundary_pairs": 655360,
+    "hardware_sse2_vectors": 4096,
+    "hardware_sse2_lanes": 32768,
+    "failures": 0
+  },
+  "regression": {
+    "release": {
+      "interpreter": {
+        "capture": "regression-1789486324063028400",
+        "tests": 26,
+        "failures": 0,
+        "errors": 0,
+        "time": "2.531s",
+        "suites": [
+          {
+            "name": "IcicleMinMax",
+            "tests": 14,
+            "failures": 0
+          },
+          {
+            "name": "IciclePmulhuw",
+            "tests": 12,
+            "failures": 0
+          }
+        ]
+      },
+      "jit": {
+        "capture": "regression-1789486324063028400",
+        "tests": 26,
+        "failures": 0,
+        "errors": 0,
+        "time": "21.151s",
+        "suites": [
+          {
+            "name": "IcicleMinMax",
+            "tests": 14,
+            "failures": 0
+          },
+          {
+            "name": "IciclePmulhuw",
+            "tests": 12,
+            "failures": 0
+          }
+        ]
+      }
+    },
+    "tidy": {
+      "interpreter": {
+        "capture": "regression-1789486277483995900",
+        "tests": 26,
+        "failures": 0,
+        "errors": 0,
+        "time": "2.649s",
+        "suites": [
+          {
+            "name": "IcicleMinMax",
+            "tests": 14,
+            "failures": 0
+          },
+          {
+            "name": "IciclePmulhuw",
+            "tests": 12,
+            "failures": 0
+          }
+        ]
+      },
+      "jit": {
+        "capture": "regression-1789486277483995900",
+        "tests": 26,
+        "failures": 0,
+        "errors": 0,
+        "time": "21.821s",
+        "suites": [
+          {
+            "name": "IcicleMinMax",
+            "tests": 14,
+            "failures": 0
+          },
+          {
+            "name": "IciclePmulhuw",
+            "tests": 12,
+            "failures": 0
+          }
+        ]
+      }
+    },
+    "adjacent_decoders": {
+      "interpreter": {
+        "capture": "regression-1789486101410862900",
+        "tests": 32,
+        "failures": 0,
+        "errors": 0,
+        "time": "2.176s",
+        "suites": [
+          {
+            "name": "IcicleAlignedMove",
+            "tests": 19,
+            "failures": 0
+          },
+          {
+            "name": "IciclePackedSad",
+            "tests": 13,
+            "failures": 0
+          }
+        ]
+      },
+      "jit": {
+        "capture": "regression-1789486101410862900",
+        "tests": 32,
+        "failures": 0,
+        "errors": 0,
+        "time": "9.625s",
+        "suites": [
+          {
+            "name": "IcicleAlignedMove",
+            "tests": 19,
+            "failures": 0
+          },
+          {
+            "name": "IciclePackedSad",
+            "tests": 13,
+            "failures": 0
+          }
+        ]
+      }
+    }
+  },
+  "builds": {
+    "release": {
+      "log": "vs2022-1789486278147439600.log",
+      "exit_code": 0
+    },
+    "tidy": {
+      "log": "tidy-1789486179036244200.log",
+      "exit_code": 0
+    }
+  },
+  "cli_smoke": {
+    "command": [
+      "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo\\analyzer.exe",
+      "--backend",
+      "icicle",
+      "-v",
+      "-e",
+      "D:\\Sunrise\\D2\\sogen\\root",
+      "-p",
+      "c:\\sogen-tests",
+      "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo",
+      "--env",
+      "EMULATOR_ICICLE",
+      "1",
+      "--report",
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-cli-smoke-1789486093820036000\\events.jsonl",
+      "--stdout",
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-cli-smoke-1789486093820036000\\guest-stdout.log",
+      "c:\\sogen-tests\\test-sample.exe"
+    ],
+    "purpose": "Repository CLI smoke test; distinct from actual Destiny boot acceptance",
+    "pid": 27052,
+    "exit_code": 0,
+    "seconds": 27.98900860012509
+  },
+  "actual_game_replay": "Pending deployment and exact saved-state replay",
+  "game_boot_accepted": false
+}
