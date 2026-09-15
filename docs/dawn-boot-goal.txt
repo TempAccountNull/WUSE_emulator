@@ -1,0 +1,35 @@
+// ACTIVE GOAL
+Boot Destiny2.exe into Dawn through Sogen. User confirmation is required:
+intros -> Press Enter -> character selection -> Login -> orbit -> destination
+selection -> level load -> spawn in the world. A white window is not success.
+
+// IMPLEMENTATION REQUIREMENTS
+Use D:/Dawn/evil-ass-repo-of-doom-and-despair as the Dawn source reference.
+Match the compiled DLL to its PDB GUID and age before using symbols. Compare
+source, disassembly and actual guest state; distinguish source from build proof.
+
+Cross-check F:/Part1/Reversal/reactos_functions against the user's actual DLL
+versions when implementing unsupported Sogen behavior. Verify relevant classes,
+structures, layouts, field widths, x86/x64 differences, status codes, buffer
+contracts, lifetime and asynchronous behavior. ReactOS is a reference, not proof
+that a particular Windows DLL has the same contract.
+
+Implement the supported operation completely, including its error paths. Do not
+return fabricated success or substitute a basic stub. Identify remaining support
+gaps explicitly. Use regression tests and an actual-game replay to prove that
+the implementation passes the previous failure; a test alone is not boot proof.
+
+Ask the user to open any needed executable or DLL in IDA when it is not already
+available. Verify the selected IDB metadata against the target file. Do not
+refresh the IDA inventory unless instances have changed. Tell the user when
+inspection of each requested file is finished so it can be closed.
+
+// RUN AND REVIEW
+Use Icicle guest execution with explicit -e D:/Sunrise/D2/sogen/root and -v.
+Use the authorized existing game-folder mapping; do not copy the full game.
+Open the colored PowerShell live log at each launch or resume in the saved
+bottom-left position and size. Preserve its current colors, highlights and speed.
+Keep progress, module/RVA/assembly failures and the full suspicious-event journal.
+Commit validated Sogen changes with concise descriptions. PDFs remain deferred.
+Clean completed benchmark bulk logs on fresh runs after preserving needed
+failure evidence and checkpoint ancestry. Never remove active-run output.
