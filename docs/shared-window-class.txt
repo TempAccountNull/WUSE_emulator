@@ -1,0 +1,67 @@
+// What
+Populate the guest shared window-class descriptor from the registered class.
+Windows user32 reads this structure directly for GetClassLongPtrW; a syscall
+handler alone cannot supply those reads. Synchronize supported class changes
+across aliases and rebuild the view from registered state after snapshot load.
+Reserve class-extra storage before the copied class name. Preserve existing
+extra bytes and per-window procedures when the class changes.
+
+// Actual failure
+Capture: destiny-sogen-1789459682431227600-class-procedure-entry
+Thread 0x6C; HWND 0x6800008; class "Tiger D3D Window".
+Call: steam_api64.dll+0x14E304, ff 15 3e c3 39 00.
+Return: steam_api64.dll+0x14E30A. RSP remains 0xBAED34F680.
+Window 0x1016B0000 contains procedure 0x1403C0400 (destiny2.exe+0x3C0400).
+Class 0xBACAD00000 contains zero at +0x20. Actual GetClassLongPtrW returns 0.
+Dawn reports: ev=renderer stage=acquire result=fail reason=window_class.
+Evidence: sogen-fixes/shared-class-old-proof.json and saved entry/return states.
+
+// Executable origin
+The unpacked dump contains L"Tiger D3D Window" at destiny2.exe+0x1BD1F28
+(dump VA 0x7FF709E91F28; image base 0x7FF7082C0000).
+At +0x3BC11C the game loads this string; +0x3BC12B stores lpszClassName.
+At +0x3BC138 it loads +0x3C0400; +0x3BC14A stores lpfnWndProc.
+RegisterClassExW is called at +0x3BC19A; CreateWindowExW at +0x3BC205.
+Instruction bytes match the saved dump file. The dump IAT has -1 placeholders,
+so API identities were verified from the actual saved guest import pointers:
++0x20BB270 -> user32.dll+0x6CF0 RegisterClassExW;
++0x20BB268 -> user32.dll+0x7150 CreateWindowExW.
+The UTF-16 text also matches the guest image at 0x141BD1F28 and its ANSI copy
+at 0xBACAD00100. This is the registered class name; the nearby title is Destiny 2.
+Evidence: sogen-fixes/window-class-exe-source.json.
+
+// DLL cross-check
+x64 user32 10.0.19041.6926:
+00db6f02d4a36226e13883b651f470d8cccd552ef5a79672b803f3fa76e4b3d5
+x86 user32 10.0.19041.7417:
+ddfb06256afef7f9e2092ec28f9b86ff3b764b5a48b54a88ad3e29decd1db303
+Both use the shared 64-bit class layout, including procedure +0x20, style +8,
+class-extra count +0xC, instance +0x40 and window-extra counts +0x50/+0x54.
+Extra data starts at +0x58; x64 reads eight bytes and x86 reads four.
+The x64 IDB has blank input metadata. The function bytes and field tables were
+compared directly with the guest-root file; its displayed import labels are
+not used as proof of call targets.
+
+ReactOS win32ss/user/user32/windows/class.c (IntGetClassLongW) and
+win32ss/user/ntuser/class.c provide the public field and encoding behavior.
+Use the actual Windows DLLs for layout. RegisterClassExWOWA passes ANSI flag 2.
+Microsoft GetClassLongPtrW and SetClassLongPtrW document the fields and class
+update semantics: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclasslongptrw
+https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setclasslongptrw
+
+// Validation
+Release build passed. Four new tests execute the real x64 user32 export,
+check class-extra storage, alias updates, existing window-procedure ownership
+and restored descriptors. Related window tests: 18 passed in interpreter mode
+and 18 in JIT mode. These are regression results, not game boot acceptance.
+CLI smoke passed in 31.276 seconds. Actual-game replay of the same saved call
+returns 0x1403C0400 with unchanged RSP. It then reaches steam_api64.dll+0x14E3A2
+with AL=1 after the image ownership and executable-memory checks. Evidence:
+sogen-fixes/shared-class-return-proof.json. The continued game still shows a
+white window according to the user. Final tidy build passed. Its test binary
+passed the same 18 tests in each mode (interpreter and JIT), with zero failures.
+
+This change supplies the shared class view. It does not implement additional
+SetClassLongPtr index cases, per-instance class namespaces or PnP behavior.
+The observed renderer rejection is established; the whole white-screen cause
+and Dawn boot remain unconfirmed.

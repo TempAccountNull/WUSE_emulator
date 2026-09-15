@@ -278,11 +278,28 @@ namespace sogen
 
     struct USER_CLASS
     {
-        uint8_t pad_000[0x30];
+        uint16_t reserved;
+        uint16_t atom;
+        uint16_t function_id;
+        uint16_t flags;
+        uint32_t style;
+        uint32_t class_extra_bytes;
+        uint64_t ansi_menu_name;
+        uint64_t unicode_menu_name;
+        uint64_t window_procedure;
+        uint64_t menu_name;
         uint64_t lpszAnsiClassName;
-        uint8_t pad_038[0xC8];
+        uint64_t small_icon;
+        uint64_t instance;
+        uint64_t background_brush;
+        uint32_t window_extra_bytes;
+        uint32_t wow_window_extra_bytes;
+        uint8_t pad_058[0xA8];
     };
 
+    static_assert(offsetof(USER_CLASS, window_procedure) == 0x20);
+    static_assert(offsetof(USER_CLASS, class_extra_bytes) == 0x0C);
+    static_assert(offsetof(USER_CLASS, window_extra_bytes) == 0x50);
     static_assert(offsetof(USER_CLASS, lpszAnsiClassName) == 0x30);
     static_assert(sizeof(USER_CLASS) == 0x100);
 

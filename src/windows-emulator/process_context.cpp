@@ -615,12 +615,14 @@ namespace sogen
         });
     }
 
-    emulator_pointer process_context::allocate_user_class(memory_manager& memory, const std::u16string_view class_name)
+    emulator_pointer process_context::allocate_user_class(memory_manager& memory, const std::u16string_view class_name,
+                                                          const uint32_t extra_bytes)
     {
         const auto ansi_class_name = u16_to_cp1252(class_name);
-        const auto cls_size = static_cast<size_t>(page_align_up(sizeof(USER_CLASS) + ansi_class_name.size() + 1));
+        const auto name_offset = sizeof(USER_CLASS) + static_cast<size_t>(extra_bytes);
+        const auto cls_size = static_cast<size_t>(page_align_up(name_offset + ansi_class_name.size() + 1));
         const auto cls_ptr = memory.allocate_memory(cls_size, memory_permission::read);
-        const auto ansi_class_name_ptr = cls_ptr + sizeof(USER_CLASS);
+        const auto ansi_class_name_ptr = cls_ptr + name_offset;
 
         memory.write_memory(ansi_class_name_ptr, ansi_class_name.c_str(), ansi_class_name.size() + 1);
 
@@ -628,6 +630,23 @@ namespace sogen
         cls.access([&](USER_CLASS& value) { value.lpszAnsiClassName = ansi_class_name_ptr; });
 
         return cls_ptr;
+    }
+
+    void process_context::sync_user_class(memory_manager& memory, const class_entry& entry)
+    {
+        const auto& source = entry.wnd_class;
+        emulator_object<USER_CLASS>{memory, entry.guest_obj_addr}.access([&](USER_CLASS& value) {
+            value.style = source.style;
+            value.class_extra_bytes = static_cast<uint32_t>(source.cbClsExtra);
+            value.ansi_menu_name = entry.menu_name.pszClientAnsiMenuName;
+            value.unicode_menu_name = entry.menu_name.pwszClientUnicodeMenuName;
+            value.window_procedure = source.lpfnWndProc;
+            value.menu_name = source.lpszMenuName;
+            value.small_icon = source.hIconSm;
+            value.instance = source.hInstance;
+            value.background_brush = source.hbrBackground;
+            value.window_extra_bytes = static_cast<uint32_t>(source.cbWndExtra);
+        });
     }
 
     void process_context::serialize(utils::buffer_serializer& buffer, const emulator_thread* active_thread) const
@@ -958,6 +977,10 @@ namespace sogen
 
     void process_context::restore_after_state_restore(windows_emulator& win_emu)
     {
+        for (const auto& entry : this->classes | std::views::values)
+        {
+            sync_user_class(win_emu.memory, entry);
+        }
         restore_windows_after_state_restore(win_emu);
         this->directory_notifications.process_completions(win_emu);
 

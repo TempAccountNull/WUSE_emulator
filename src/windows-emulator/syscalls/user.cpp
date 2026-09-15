@@ -272,6 +272,7 @@ namespace sogen
             wnd_class.cbWndExtra = wnd_extra;
 
             const auto entry = process_context::class_entry{cls_ptr, wnd_class, {}};
+            process_context::sync_user_class(c.win_emu.memory, entry);
             c.proc.classes.insert_or_assign(std::u16string{normalized_name}, entry);
             c.proc.classes.insert_or_assign(std::u16string{class_name}, entry);
             return &c.proc.classes.find(class_name)->second;
@@ -2848,7 +2849,7 @@ namespace sogen
                                                  const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> class_name,
                                                  const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> /*class_version*/,
                                                  const emulator_object<CLSMENUNAME<EmulatorTraits<Emu64>>> class_menu_name,
-                                                 const DWORD /*function_id*/, const DWORD /*flags*/, const emulator_pointer /*wow*/)
+                                                 const DWORD function_id, const DWORD flags, const emulator_pointer /*wow*/)
         {
             if (!wnd_class_ex)
             {
@@ -2856,13 +2857,23 @@ namespace sogen
                 return 0;
             }
 
+            const auto wnd_class = wnd_class_ex.read();
+            if (wnd_class.cbClsExtra < 0 || wnd_class.cbWndExtra < 0)
+            {
+                set_guest_last_error(c, ERROR_INVALID_PARAMETER);
+                return 0;
+            }
             const auto class_name_str = read_unicode_string(c.emu, class_name);
             const auto index = c.proc.add_or_find_atom(class_name_str);
-
-            const auto cls_ptr = process_context::allocate_user_class(c.win_emu.memory, class_name_str);
-
-            const auto wnd_class = wnd_class_ex.read();
+            const auto cls_ptr =
+                process_context::allocate_user_class(c.win_emu.memory, class_name_str, static_cast<uint32_t>(wnd_class.cbClsExtra));
             const auto entry = process_context::class_entry{cls_ptr, wnd_class, class_menu_name.read()};
+            process_context::sync_user_class(c.win_emu.memory, entry);
+            emulator_object<USER_CLASS>{c.win_emu.memory, cls_ptr}.access([&](USER_CLASS& value) {
+                value.atom = index;
+                value.function_id = static_cast<uint16_t>(function_id);
+                value.flags = static_cast<uint16_t>(flags & 2u);
+            });
 
             if (c.win_emu.callbacks.on_generic_activity)
             {
@@ -4996,7 +5007,7 @@ namespace sogen
         }
 
         emulator_pointer handle_NtUserSetClassLongPtr(const syscall_context& c, handle hWnd, int nIndex, emulator_pointer dwNewLong,
-                                                      BOOL /*Ansi*/)
+                                                      BOOL ansi)
         {
             auto* win = c.proc.windows.get(hWnd);
             if (!win)
@@ -5031,6 +5042,8 @@ namespace sogen
             case gclp_wndproc:
                 old_value = cls.lpfnWndProc;
                 cls.lpfnWndProc = dwNewLong;
+                emulator_object<USER_CLASS>{c.win_emu.memory, entry->second.guest_obj_addr}.access(
+                    [&](USER_CLASS& value) { value.flags = static_cast<uint16_t>((value.flags & ~3u) | (ansi ? 2u : 0u)); });
                 break;
             case gclp_hmodule:
                 old_value = cls.hInstance;
@@ -5057,6 +5070,14 @@ namespace sogen
                 break;
             }
 
+            for (auto& alias : c.proc.classes | std::views::values)
+            {
+                if (alias.guest_obj_addr == entry->second.guest_obj_addr)
+                {
+                    alias.wnd_class = cls;
+                }
+            }
+            process_context::sync_user_class(c.win_emu.memory, entry->second);
             return old_value;
         }
 
