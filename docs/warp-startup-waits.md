@@ -24,8 +24,10 @@ Guest image base is `0x91B1A0000`. Its CodeView GUID bytes are
 
 The terminating thread was different from the worker. The initial termination
 event did not contain its handle argument, return address or selecting caller;
-those require a replay stopped before the call. Do not infer why it selected
-that worker, bypass the call, or fabricate completion of its unfinished work.
+those were subsequently captured before the call; see
+[the follow-up evidence](warp-termination-followup.md). The selecting condition
+remains under investigation. Do not bypass termination or fabricate completion
+of the worker's unfinished work.
 
 The active thread-query implementation does not switch guest threads. A separate
 paused snapshot inspector was used for `Hg` selection and saved register reads,
