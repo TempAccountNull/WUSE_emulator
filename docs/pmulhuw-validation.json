@@ -189,6 +189,48 @@
     "exit_code": 0,
     "seconds": 27.98900860012509
   },
-  "actual_game_replay": "Pending deployment and exact saved-state replay",
-  "game_boot_accepted": false
+  "actual_game_replay": {
+    "result": "PASS",
+    "instruction": "pmulhuw xmm7, xmm4",
+    "bytes": "66 0F E4 FC",
+    "address": "0xBACC5EE2F2",
+    "after_address": "0xBACC5EE2F6",
+    "region": "No mapped image; WARP-generated allocation 0xBACC5E0000+0xE2F2",
+    "source_snapshot": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789484352677458100-after-hook-dispatch-optimization\\guest.snap",
+    "memory_limit_mib": 4096,
+    "destination": "xmm7",
+    "before_xmm7": "00000000020000000400000006000000",
+    "after_xmm7": "00000000000000000000000000000000",
+    "expected": "00000000000000000000000000000000",
+    "source_xmm4": "14000000140000001400000014000000",
+    "general_changes": {
+      "rip": [
+        "0xbacc5ee2f2",
+        "0xbacc5ee2f6"
+      ]
+    },
+    "vector_changes": {
+      "xmm7": [
+        "00000000020000000400000006000000",
+        "00000000000000000000000000000000"
+      ]
+    },
+    "other_captured_registers_unchanged": true,
+    "stack_unchanged": true,
+    "restored_registers_match_original": true,
+    "scope": "Actual-game saved instruction replay; full boot remains unconfirmed.",
+    "analyzer.exe_sha256": "de6808701c81284c0e3eabab2602219e5d718f19b8a775c32f0db661661f9300",
+    "icicle-emulator.dll_sha256": "a9ad203bc1a132bab2b0db49402ecf5302a6203bbe444cfeafbe9cd95582b67c",
+    "Ghidra/Processors/x86/data/languages/ia.sinc_sha256": "79867e1adc483ad98f0e63f97d15a871b9a81f9de5a6f9f8a34f6334c69d509d",
+    "Ghidra/Processors/x86/data/languages/avx.sinc_sha256": "74e71f17ef9dda115db5a26d356b0ad29155e249121578e2c73c7a5db73b00f8",
+    "Ghidra/Processors/x86/data/languages/avx2.sinc_sha256": "fee4d4fa4689f2865575812f012a03453004f80687a56581d3ab5631dc625dbd",
+    "Ghidra/Processors/x86/data/languages/aligned_move.sinc_sha256": "48c44b224f692865838ba846fb6d4f3bf60585e42afe27f3b8c4e537467b6cad"
+  },
+  "game_boot_accepted": false,
+  "continuation_checkpoint": {
+    "capture": "destiny-sogen-1789486434726841600-pmulhuw-proof",
+    "bytes": 110512590,
+    "sha256": "600cd7f99a7e65dd444518c4270e3c2ceef62b8228ea84e2bc094ee2ce928709",
+    "runtime_commit": "415bcae6"
+  }
 }

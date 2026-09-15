@@ -31,3 +31,8 @@ AVX-512 CPU or expand the guest Windows XSAVE ABI.
 
 Validation: pmulhuw-validation.json. Regression tests and single-instruction
 replay are separate from user confirmation that the game has booted.
+
+Actual-game replay passed: RIP advanced to 0xBACC5EE2F6 and XMM7 became
+eight zero words, matching the captured operands. All other captured
+registers and stack bytes were unchanged. Restored registers matched the
+original failure capture. The post-instruction checkpoint is retained.
