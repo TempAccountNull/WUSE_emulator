@@ -1,0 +1,33 @@
+// SOGEN DEBUGGER HANDSHAKE STALL
+The actual-game replay stopped advancing after the WARP copy fix.
+No backend instruction fault was observed at this stop.
+Last guest operation: ntdll.dll+0x9D812, NtSetEvent syscall, followed by
+Dawn output: ev=homecoming stage=dump tag=0x80FC1398 class=0x80809C0F bytes=0 result=read.
+The saved guest RIP is 0x18009D814 (ntdll.dll+0x9D814).
+
+// HOST THREAD EVIDENCE
+Non-invasive CDB stacks from analyzer PID 66548:
+Main host thread 0x10AB0: async_handler::run+0x7A, polling for is_running_.
+Host RIP 0x7FF763738E0A, analyzer!sogen::gdb_stub::async_handler::run+0x7A:
+0F B6 07 / movzx eax, byte ptr [rdi].
+Worker host thread 0x50A0: async_handler::work+0x7D, idle and waiting for run_.
+Host object 0x3CF38FDE10: +0 run_=0, +1 stop_=0, +2 is_running_=0.
+The interrupt worker could start, consume the interrupt, and finish before
+run() observed is_running_=true. The old wait then had no exit condition.
+
+// FIX AND VERIFICATION
+The startup wait now also checks run_, allowing a completed request to return.
+The unchanged implementation failed the immediate-completion regression at
+attempt 0 in interpreter and JIT runs. The fixed build passes all 21 tests
+in each mode, including 64 immediate completions and pause/join behavior.
+Release and final tidy builds passed. CLI smoke passed in 30.761 seconds.
+Native socket and actual-game replay verification follows in the live capture.
+
+// RECOVERED GUEST CHECKPOINT
+Set only host async_handler.stop_ at 0x3CF38FDE11 to 1 after verifying the
+process identity, stack, object layout, and all three flags. This unblocked
+GDB shutdown and the requested snapshot save. No guest memory, registers,
+allocation fields, or host/guest instruction bytes were patched.
+Snapshot SHA-256: 4196e70b717edb98264048a989e27b58e313c082a32990449c0ba172bfa77324
+Sogen exited with code 1 because the guest had no exit status at the checkpoint.
+This is not evidence that the game exited or completed boot.

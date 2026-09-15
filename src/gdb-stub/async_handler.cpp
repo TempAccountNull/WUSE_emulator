@@ -45,7 +45,8 @@ namespace sogen::gdb_stub
 
         this->run_ = true;
 
-        while (!this->is_running_ && !this->stop_)
+        // An interrupt can finish the worker before this thread observes its running flag.
+        while (this->run_ && !this->is_running_ && !this->stop_)
         {
             std::this_thread::sleep_for(1ms);
         }
