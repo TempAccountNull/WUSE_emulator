@@ -1,0 +1,225 @@
+{
+  "implementation_commit": "def83fcaac57f7a201941222adc3bd1e0bab6e8f",
+  "scope": "Isolated x64 Icicle guest using the deployed analyzer and guest bcrypt DLLs; does not establish game boot or x86 API execution",
+  "capture": "cng-hash-probe-1789494639549761900",
+  "command": [
+    "D:\\Sunrise\\D2\\sogen\\builds\\20260915-123308-icicle-startup\\analyzer.exe",
+    "--backend",
+    "icicle",
+    "-v",
+    "-e",
+    "D:\\Sunrise\\D2\\sogen\\root",
+    "-p",
+    "c:\\cng-probe",
+    "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\cng-hash-probe",
+    "--debug",
+    "--port",
+    "28987",
+    "c:\\cng-probe\\cng-hash-probe.exe"
+  ],
+  "message_hex": "616263",
+  "hmac_key_hex": "6b6579",
+  "reference": "SHA/MD5 and HMAC expected vectors generated with Python hashlib/hmac; MD2/MD4 from RFC 1319/1320 appendix A.5",
+  "reference_urls": [
+    "https://www.rfc-editor.org/rfc/rfc1319",
+    "https://www.rfc-editor.org/rfc/rfc1320"
+  ],
+  "probe_source_sha256": "08898044fcac045b4fd5f8ef60cc3458dc788f0f8fd6ad0c5dba5d469be187a4",
+  "captured_log_sha256": "70e24f1609c71abade126cabe3a07abe7f7bb4cc98b33b95b1b2c64d9c927dc4",
+  "guest_exit": "W00",
+  "vectors": [
+    {
+      "kind": "HASH",
+      "algorithm": "SHA1",
+      "digest_hex": "a9993e364706816aba3e25717850c26c9cd0d89d",
+      "stages": {
+        "resolve": "0x00000000",
+        "open": "0x00000000",
+        "hash-length": "0x00000000",
+        "create": "0x00000000",
+        "update": "0x00000000",
+        "finish": "0x00000000",
+        "destroy": "0x00000000",
+        "close": "0x00000000"
+      },
+      "passed": true
+    },
+    {
+      "kind": "HASH",
+      "algorithm": "SHA256",
+      "digest_hex": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+      "stages": {
+        "resolve": "0x00000000",
+        "open": "0x00000000",
+        "hash-length": "0x00000000",
+        "create": "0x00000000",
+        "update": "0x00000000",
+        "finish": "0x00000000",
+        "destroy": "0x00000000",
+        "close": "0x00000000"
+      },
+      "passed": true
+    },
+    {
+      "kind": "HASH",
+      "algorithm": "SHA384",
+      "digest_hex": "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7",
+      "stages": {
+        "resolve": "0x00000000",
+        "open": "0x00000000",
+        "hash-length": "0x00000000",
+        "create": "0x00000000",
+        "update": "0x00000000",
+        "finish": "0x00000000",
+        "destroy": "0x00000000",
+        "close": "0x00000000"
+      },
+      "passed": true
+    },
+    {
+      "kind": "HASH",
+      "algorithm": "SHA512",
+      "digest_hex": "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+      "stages": {
+        "resolve": "0x00000000",
+        "open": "0x00000000",
+        "hash-length": "0x00000000",
+        "create": "0x00000000",
+        "update": "0x00000000",
+        "finish": "0x00000000",
+        "destroy": "0x00000000",
+        "close": "0x00000000"
+      },
+      "passed": true
+    },
+    {
+      "kind": "HASH",
+      "algorithm": "MD2",
+      "digest_hex": "da853b0d3f88d99b30283a69e6ded6bb",
+      "stages": {
+        "resolve": "0x00000000",
+        "open": "0x00000000",
+        "hash-length": "0x00000000",
+        "create": "0x00000000",
+        "update": "0x00000000",
+        "finish": "0x00000000",
+        "destroy": "0x00000000",
+        "close": "0x00000000"
+      },
+      "passed": true
+    },
+    {
+      "kind": "HASH",
+      "algorithm": "MD4",
+      "digest_hex": "a448017aaf21d8525fc10ae87aa6729d",
+      "stages": {
+        "resolve": "0x00000000",
+        "open": "0x00000000",
+        "hash-length": "0x00000000",
+        "create": "0x00000000",
+        "update": "0x00000000",
+        "finish": "0x00000000",
+        "destroy": "0x00000000",
+        "close": "0x00000000"
+      },
+      "passed": true
+    },
+    {
+      "kind": "HASH",
+      "algorithm": "MD5",
+      "digest_hex": "900150983cd24fb0d6963f7d28e17f72",
+      "stages": {
+        "resolve": "0x00000000",
+        "open": "0x00000000",
+        "hash-length": "0x00000000",
+        "create": "0x00000000",
+        "update": "0x00000000",
+        "finish": "0x00000000",
+        "destroy": "0x00000000",
+        "close": "0x00000000"
+      },
+      "passed": true
+    },
+    {
+      "kind": "HMAC",
+      "algorithm": "SHA1",
+      "digest_hex": "4fd0b215276ef12f2b3e4c8ecac2811498b656fc",
+      "stages": {
+        "resolve": "0x00000000",
+        "open": "0x00000000",
+        "hash-length": "0x00000000",
+        "create": "0x00000000",
+        "update": "0x00000000",
+        "finish": "0x00000000",
+        "destroy": "0x00000000",
+        "close": "0x00000000"
+      },
+      "passed": true
+    },
+    {
+      "kind": "HMAC",
+      "algorithm": "SHA256",
+      "digest_hex": "9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab",
+      "stages": {
+        "resolve": "0x00000000",
+        "open": "0x00000000",
+        "hash-length": "0x00000000",
+        "create": "0x00000000",
+        "update": "0x00000000",
+        "finish": "0x00000000",
+        "destroy": "0x00000000",
+        "close": "0x00000000"
+      },
+      "passed": true
+    },
+    {
+      "kind": "HMAC",
+      "algorithm": "SHA384",
+      "digest_hex": "30ddb9c8f347cffbfb44e519d814f074cf4047a55d6f563324f1c6a33920e5edfb2a34bac60bdc96cd33a95623d7d638",
+      "stages": {
+        "resolve": "0x00000000",
+        "open": "0x00000000",
+        "hash-length": "0x00000000",
+        "create": "0x00000000",
+        "update": "0x00000000",
+        "finish": "0x00000000",
+        "destroy": "0x00000000",
+        "close": "0x00000000"
+      },
+      "passed": true
+    },
+    {
+      "kind": "HMAC",
+      "algorithm": "SHA512",
+      "digest_hex": "3926a207c8c42b0c41792cbd3e1a1aaaf5f7a25704f62dfc939c4987dd7ce060009c5bb1c2447355b3216f10b537e9afa7b64a4e5391b0d631172d07939e087a",
+      "stages": {
+        "resolve": "0x00000000",
+        "open": "0x00000000",
+        "hash-length": "0x00000000",
+        "create": "0x00000000",
+        "update": "0x00000000",
+        "finish": "0x00000000",
+        "destroy": "0x00000000",
+        "close": "0x00000000"
+      },
+      "passed": true
+    },
+    {
+      "kind": "HMAC",
+      "algorithm": "MD5",
+      "digest_hex": "d2fe98063f876b03193afb49b4979591",
+      "stages": {
+        "resolve": "0x00000000",
+        "open": "0x00000000",
+        "hash-length": "0x00000000",
+        "create": "0x00000000",
+        "update": "0x00000000",
+        "finish": "0x00000000",
+        "destroy": "0x00000000",
+        "close": "0x00000000"
+      },
+      "passed": true
+    }
+  ],
+  "passed": true
+}

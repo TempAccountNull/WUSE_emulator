@@ -76,6 +76,15 @@ Validation
   AES-128-GCM decryption produces the expected 16-byte plaintext. Changing the
   authentication tag returns 0xC000A002. All probe assertions pass; guest exit W00.
 
+  Fresh x64 guest hash probe cng-hash-probe-1789494639549761900:
+  SHA1, SHA256, SHA384, SHA512, MD2, MD4 and MD5 all resolve, open,
+  create, update and finish with the expected digest. HMAC SHA1, SHA256,
+  SHA384, SHA512 and MD5 also match their expected digests. All handle
+  cleanup calls succeed; 12 vectors pass and the guest exits W00. Exact
+  digests, per-call statuses and command are in cng-hash-compatibility.json.
+  These are the seven hashes explicitly handled by the previous resolver.
+  Available algorithms now follow the guest catalog and provider DLLs.
+
   The x86 guest API probe stops before issuing a CNG request at SysWOW64
   ntdll.dll+0x75890, KiUserExceptionDispatcher, with a repeated mapping fault.
   Its wire contract is statically cross-checked and regression-tested; complete
