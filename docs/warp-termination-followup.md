@@ -82,7 +82,7 @@ process handle `0xB800001` and its synthetic identity, but **does not contain
 worker handle `0x4800002`**. This table therefore does not establish the route by
 which the game acquired the worker handle. The query buffer SHA256 is
 `c04accff6e4b6b82f5a017d43a912172add0470751809d26593e575fe2b8445b`.
-The replay remains in progress at the time of this note.
+The replay completed at the pre-termination checkpoint described below.
 
 Independent source review found that internal thread ownership, public handles,
 access rights, duplication and close semantics share one object store. The
@@ -118,3 +118,43 @@ error remains recorded; recovery is not reported as an uninterrupted collection.
 The two completed captures' cleanup manifests retain checkpoint hashes,
 first/last log samples, selected lifecycle/query observations and both journals.
 Their removed bulk logs total 29,843,027,325 bytes. Active replay logs were kept.
+
+
+## Worker selection captured
+
+The completed worker-handle-selection replay saved checkpoint SHA256
+`e2a410b81692b669f9e8729ef3d93f666e394b009cf2abe5c1b9038bc111580c`
+(335,618,974 bytes). The debugger stopped at `0x12B3F2D0B2`, before the copied
+NtTerminateThread syscall, on thread `0x1C`.
+
+The focused argument/return journal establishes this sequence for worker TID 12:
+
+| Operation | Game return RVA | Observed input/result |
+| --- | --- | --- |
+| NtOpenThread | `0x26DFCB` | CLIENT_ID process 4/thread 12, access `0xB`; Sogen returned handle `0x4800002` |
+| NtSuspendThread | `0x290194` | Success, previous suspend count 0 |
+| NtGetContextThread | `0x267514` | ContextFlags `0x100011` (CONTROL and DEBUGREGS) |
+| NtResumeThread | `0x289554` | Success |
+| NtQueryInformationThread | `0x2784D4` | Class 9; success, start address `ntdll+0x4D110` (TppWorkerThread) |
+| NtTerminateThread | `0x293793` | Handle `0x4800002`, exit status 0; saved before execution |
+
+The first two captured worker contexts had RIP `0x1800A10E4`, in ntdll's wait
+path. The third had RIP `0x148CF65784` and RSP `0x12B33CF0C0`, in generated WARP
+code outside loaded modules. Termination followed that third sample. This is
+correlation; the guest's intervening predicate has not yet been established.
+The handle comes from NtOpenThread, not the earlier observed handle inventory.
+
+The class-9 query succeeds in Sogen although access `0xB` lacks query right
+`0x40`. The matched 19041.7417 kernel's query branch requests `0x40` from
+ObReferenceObjectByHandleWithTag. This is a concrete permissions mismatch;
+whether correcting it changes the termination decision remains unproven.
+
+No class-17 query was observed in this selection path. Independent class-17
+target and buffer fixes, tests and remaining handle-model scope are documented
+in `thread-debugger-flags.md`.
+
+The full focused journal and buffers, worker-selection summary, checkpoint,
+printed and suspicious journals remain in the capture directory. Both collectors
+reached source offset 12,242,496,809 with zero pending bytes. After preserving
+SHA256 hashes and first/last samples, completed raw console/event logs totaling
+18,059,480,914 bytes were removed. No active-run output was removed.

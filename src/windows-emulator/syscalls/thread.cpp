@@ -11,9 +11,97 @@ namespace sogen
 
     namespace syscalls
     {
+
+        namespace
+        {
+            NTSTATUS validate_thread_information_range(const uint64_t address, const uint32_t length, const uint64_t alignment)
+            {
+                if (length == 0)
+                {
+                    return STATUS_SUCCESS;
+                }
+                if ((address & (alignment - 1)) != 0)
+                {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                if (address >= MAX_ALLOCATION_END_EXCL || length > MAX_ALLOCATION_END_EXCL - address)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                return STATUS_SUCCESS;
+            }
+
+            NTSTATUS validate_thread_information_access(memory_manager& memory, const uint64_t address, const uint32_t length,
+                                                        const memory_permission required)
+            {
+                const auto end = address + length;
+                for (auto cursor = address; cursor < end;)
+                {
+                    const auto region = memory.get_region_info(cursor);
+                    if (!region.is_committed)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if (region.permissions.is_guarded())
+                    {
+                        memory.protect_memory(page_align_down(cursor), 0x1000, region.permissions & ~memory_permission_ext::guard);
+                        return STATUS_GUARD_PAGE_VIOLATION;
+                    }
+                    if ((region.permissions.common & required) == memory_permission::none)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    cursor = std::min(end, region.start + region.length);
+                }
+                return STATUS_SUCCESS;
+            }
+
+            NTSTATUS probe_thread_information_length(const syscall_context& c, const emulator_object<uint32_t> return_length)
+            {
+                if (!return_length)
+                {
+                    return STATUS_SUCCESS;
+                }
+                if (return_length.value() >= MAX_ALLOCATION_END_EXCL)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                auto status =
+                    validate_thread_information_access(c.win_emu.memory, return_length.value(), sizeof(uint32_t), memory_permission::read);
+                if (status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+                uint32_t previous{};
+                if (!c.win_emu.memory.try_read_memory(return_length.value(), &previous, sizeof(previous)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                status =
+                    validate_thread_information_access(c.win_emu.memory, return_length.value(), sizeof(uint32_t), memory_permission::write);
+                if (status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+                return return_length.try_write(previous) ? STATUS_SUCCESS : STATUS_ACCESS_VIOLATION;
+            }
+        }
+
         NTSTATUS handle_NtSetInformationThread(const syscall_context& c, const handle thread_handle, const THREADINFOCLASS info_class,
                                                const uint64_t thread_information, const uint32_t thread_information_length)
         {
+            if (info_class == ThreadHideFromDebugger)
+            {
+                const auto status = validate_thread_information_range(thread_information, thread_information_length, sizeof(ULONG));
+                if (status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+                if (thread_information_length != 0)
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+            }
             auto* thread = thread_handle == CURRENT_THREAD ? c.vcpu.active_thread : c.proc.threads.get(thread_handle);
 
             if (!thread)
@@ -175,29 +263,9 @@ namespace sogen
 
             if (info_class == ThreadHideFromDebugger)
             {
-                BOOLEAN hide = true;
-
-                if (thread_information != 0 && thread_information % 4 != 0)
-                {
-                    return STATUS_DATATYPE_MISALIGNMENT;
-                }
-
-                if (thread_information_length == 0 || thread_information_length == sizeof(hide))
-                {
-                    if (thread_information_length == sizeof(hide))
-                    {
-                        if (thread_information == 0 || !c.win_emu.memory.try_read_memory(thread_information, &hide, sizeof(hide)))
-                        {
-                            return STATUS_INTERNAL_ERROR;
-                        }
-                    }
-
-                    c.thread().debugger_hide = hide;
-                    c.win_emu.callbacks.on_suspicious_activity("Hiding thread from debugger");
-                    return STATUS_SUCCESS;
-                }
-
-                return STATUS_INFO_LENGTH_MISMATCH;
+                thread->debugger_hide = true;
+                c.win_emu.callbacks.on_suspicious_activity("Hiding thread from debugger");
+                return STATUS_SUCCESS;
             }
 
             if (info_class == ThreadNameInformation)
@@ -292,6 +360,25 @@ namespace sogen
                                                  const uint64_t thread_information, const uint32_t thread_information_length,
                                                  const emulator_object<uint32_t> return_length)
         {
+            if (info_class == ThreadHideFromDebugger)
+            {
+                // The matched 19041 kernel probes the user range and ReturnLength before dispatching the information class.
+                const auto alignment = thread_information_length < sizeof(ULONG) ? 1 : sizeof(ULONG);
+                auto status = validate_thread_information_range(thread_information, thread_information_length, alignment);
+                if (status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+                status = probe_thread_information_length(c, return_length);
+                if (status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+                if (thread_information_length != sizeof(BOOLEAN))
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+            }
             const auto* thread = thread_handle == CURRENT_THREAD ? c.vcpu.active_thread : c.proc.threads.get(thread_handle);
 
             if (!thread)
@@ -317,8 +404,6 @@ namespace sogen
                 }
                 return STATUS_SUCCESS;
             }
-
-            emulator_thread& cur_emulator_thread = c.thread();
 
             if (info_class == ThreadWow64Context)
             {
@@ -453,26 +538,19 @@ namespace sogen
 
             if (info_class == ThreadHideFromDebugger)
             {
-                if (thread_information != 0 && thread_information % 4 != 0)
+                const auto status =
+                    validate_thread_information_access(c.win_emu.memory, thread_information, sizeof(BOOLEAN), memory_permission::write);
+                if (status != STATUS_SUCCESS)
                 {
-                    return STATUS_DATATYPE_MISALIGNMENT;
+                    return status;
                 }
-
-                if (thread_information_length != sizeof(BOOLEAN))
-                {
-                    return STATUS_INFO_LENGTH_MISMATCH;
-                }
-
-                if (return_length)
-                {
-                    return_length.try_write(sizeof(BOOLEAN));
-                }
-
                 const emulator_object<BOOLEAN> info{c.emu, thread_information};
-                info.try_write(cur_emulator_thread.debugger_hide);
-
+                if (!info.try_write(static_cast<BOOLEAN>(thread->debugger_hide)) ||
+                    (return_length && !return_length.try_write(sizeof(BOOLEAN))))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
                 c.win_emu.callbacks.on_suspicious_activity("Checking if the thread is hidden from the debugger");
-
                 return STATUS_SUCCESS;
             }
 
