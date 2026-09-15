@@ -1455,42 +1455,21 @@ namespace sogen
                 return adapter_info;
             }
 
-            uint64_t infer_warp_allocation_size_from_private_data(const syscall_context& c, const uint64_t private_data,
-                                                                  const uint32_t private_data_size)
+            uint64_t read_warp_allocation_size(const syscall_context& c, const uint64_t private_data, const uint32_t private_data_size)
             {
-                if (private_data == 0 || private_data_size < 0x1C)
+                if (private_data == 0 || private_data_size != sizeof(EMU_WARP_ALLOCATION_DESCRIPTOR))
                 {
                     return 0;
                 }
 
-                const auto kind = c.emu.read_memory<uint32_t>(private_data + 0x00);
-                const auto width_or_size = c.emu.read_memory<uint32_t>(private_data + 0x04);
-                const auto height = c.emu.read_memory<uint32_t>(private_data + 0x08);
-                const auto pitch = c.emu.read_memory<uint32_t>(private_data + 0x14);
-                const auto byte_size = c.emu.read_memory<uint32_t>(private_data + 0x18);
-
-                if (byte_size == 0)
+                const auto descriptor = c.emu.read_memory<EMU_WARP_ALLOCATION_DESCRIPTOR>(private_data);
+                if (descriptor.ResourceDimension < 1 || descriptor.ResourceDimension > 6)
                 {
                     return 0;
                 }
 
-                if (kind == 1)
-                {
-                    return width_or_size != 0 && pitch == byte_size ? byte_size : 0;
-                }
-
-                if (kind == 3)
-                {
-                    if (width_or_size == 0 || height == 0 || pitch == 0)
-                    {
-                        return 0;
-                    }
-
-                    const uint64_t minimum_size = static_cast<uint64_t>(pitch) * height;
-                    return byte_size >= minimum_size ? byte_size : 0;
-                }
-
-                return 0;
+                // AllocationSize includes all subresources; row pitch and physical height alone do not determine it.
+                return descriptor.AllocationSize;
             }
 
             template <typename T>
@@ -4519,6 +4498,27 @@ namespace sogen
                 return STATUS_INVALID_PARAMETER;
             }
 
+            const auto request = allocation_desc.read();
+            if (request.NumAllocations > 0 && request.pAllocationInfo == 0)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            std::vector<uint64_t> backing_sizes;
+            for (uint32_t i = 0; i < request.NumAllocations; ++i)
+            {
+                const auto info =
+                    c.emu.read_memory<EMU_D3DDDI_ALLOCATIONINFO>(request.pAllocationInfo + sizeof(EMU_D3DDDI_ALLOCATIONINFO) * uint64_t{i});
+                const auto size = read_warp_allocation_size(c, info.pPrivateDriverData, info.PrivateDriverDataSize);
+                if (size == 0)
+                {
+                    c.win_emu.log.warn("NtGdiDdDDICreateAllocation: unsupported allocation descriptor at 0x%" PRIx64 " (size %u)\n",
+                                       info.pPrivateDriverData, info.PrivateDriverDataSize);
+                    return STATUS_NOT_SUPPORTED;
+                }
+                backing_sizes.push_back(size);
+            }
+
             allocation_desc.access([&](EMU_D3DKMT_CREATEALLOCATION& create_alloc) {
                 if (create_alloc.hDevice != k_dxgk_device_handle)
                 {
@@ -4539,8 +4539,7 @@ namespace sogen
                         const emulator_object<EMU_D3DDDI_ALLOCATIONINFO> allocation_info{c.emu, current_info_ptr};
 
                         allocation_info.access([&](EMU_D3DDDI_ALLOCATIONINFO& alloc_info) {
-                            const uint64_t backing_size = infer_warp_allocation_size_from_private_data(c, alloc_info.pPrivateDriverData,
-                                                                                                       alloc_info.PrivateDriverDataSize);
+                            const auto backing_size = backing_sizes[allocation_index];
 
                             alloc_info.hAllocation = c.proc.dxgk.create_allocation(c.win_emu.memory, create_alloc.hResource, backing_size);
 

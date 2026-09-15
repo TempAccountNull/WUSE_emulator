@@ -418,6 +418,37 @@ namespace sogen
 
     static_assert(sizeof(EMU_D3DKMT_RENDER) == 368);
 
+    struct EMU_WARP_ALLOCATION_DESCRIPTOR
+    {
+        uint32_t ResourceDimension;
+        uint32_t PhysicalWidth;
+        uint32_t PhysicalHeight;
+        uint32_t PhysicalDepth;
+        uint32_t Format;
+        uint32_t RowPitch;
+        uint32_t AllocationSize;
+        uint32_t ArraySize;
+        uint32_t MipLevels;
+        uint32_t Usage;
+        uint32_t BindFlags;
+        uint32_t SampleCount;
+        uint32_t SampleQuality;
+        uint32_t PrimaryRefreshNumerator;
+        uint32_t PrimaryRefreshDenominator;
+        uint32_t PrimaryRotation;
+        uint32_t VidPnSourceId;
+        uint32_t Reserved44;
+        uint64_t Event1;
+        uint64_t Event2;
+        uint32_t Flags;
+        uint32_t Reserved5C;
+    };
+
+    static_assert(sizeof(EMU_WARP_ALLOCATION_DESCRIPTOR) == 96);
+    static_assert(offsetof(EMU_WARP_ALLOCATION_DESCRIPTOR, AllocationSize) == 0x18);
+    static_assert(offsetof(EMU_WARP_ALLOCATION_DESCRIPTOR, Event1) == 0x48);
+    static_assert(offsetof(EMU_WARP_ALLOCATION_DESCRIPTOR, Flags) == 0x58);
+
     struct EMU_D3DDDI_ALLOCATIONINFO
     {
         UINT32 hAllocation;

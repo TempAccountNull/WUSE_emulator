@@ -1,0 +1,161 @@
+// WARP ALLOCATION FAILURE INTERPRETATION
+
+The old dimension filter rejected TEXTURE3D and allocated one page. The full texture copy crossed that page. The game dispatched its exception handler and entered Sleep(1000) while thread 92 retained WARP gDDICriticalSection. Another WARP worker then waited for that lock. Separately, the zero PEB timeout caused immediate timeout/retry logging.
+
+// EXACT DLLS
+D:\Sunrise\D2\sogen\root\filesys\c\windows\system32\d3d10warp.dll | version 10.0.19041.7181 | machine 0x8664
+SHA-256 ac35b849b483fc9196f24138a731c0739fc2f30b04792931de72cc5a7ce3053f
+D:\Sunrise\D2\sogen\root\filesys\c\windows\system32\ucrtbase.dll | version 10.0.19041.7181 | machine 0x8664
+SHA-256 76ccf6a3e09ef2ecae1b0b43e5c22c500a3228aae048b734b6772ebd1ed2e0bb
+D:\Sunrise\D2\sogen\root\filesys\c\windows\system32\ntdll.dll | version 10.0.19041.7291 | machine 0x8664
+SHA-256 e1ff52ee55a24dc03923f37c325d161e43626f5d43a58d5e16488e998202ed91
+D:\Sunrise\D2\sogen\root\filesys\c\windows\syswow64\ntdll.dll | version 10.0.19041.7417 | machine 0x14c
+SHA-256 9dbf249b38dc2eded87b5d92b5e4035a2480f478586c9b3986dc4574f22cc5cb
+
+// ORIGINAL FAILURE
+Thread: 92 (0x5C). Instruction count: 129,619,915,913.
+ucrtbase.dll+0x48D54 | guest 0xE9CB968D54 | STATUS_ACCESS_VIOLATION 0xC0000005
+0F 29 49 F0    movaps xmmword ptr [rcx-0x10], xmm1
+RCX=0xBAF10A1010; effective address=0xBAF10A1000; attempted operand=16 bytes.
+The backend reports a 1-byte failing probe. That is not the width of the decoded store.
+The effective address is 16-byte aligned. Both instruction ranges match the exact on-disk DLLs.
+IDA 13347 confirms memmove at this location; memcpy and memmove both export RVA 0x48B70 in this DLL.
+Old mapped range: [0xBAF10A0000, 0xBAF10A1000). Requested range: [0xBAF10A0000, 0xBAF10C8000).
+The failed address has no module: it is beyond allocation handle 0x9438, returned by NtGdiDdDDILock.
+
+// CALL ARGUMENTS AND RETURN
+d3d10warp.dll+0xE6A20: mov r8,r12  -> Size=0x28000
+d3d10warp.dll+0xE6A23: mov rdx,rbx -> Src=0xBA6F0E5000
+d3d10warp.dll+0xE6A26: mov rcx,rdi -> Dst=0xBAF10A0000
+d3d10warp.dll+0xE6A29: call memcpy import thunk at d3d10warp.dll+0x5A1293
+Saved return: 0xC13B996A2E (d3d10warp.dll+0xE6A2E). The copy faulted before returning.
+These arguments are recovered from preserved nonvolatile registers and verified caller instructions.
+
+// WARP PRIVATE ALLOCATION DESCRIPTOR | 0x60 BYTES
+Defined in EMU_WARP_ALLOCATION_DESCRIPTOR. The original transient descriptor is reconstructed from the preserved resource.
+Its complete live syscall bytes will be captured by the current replay before the allocation executes.
+Offset Size Field                         Source/interpretation
++0x00   4  ResourceDimension             D3D10DDIRESOURCE_TYPE: buffer=1, 1D=2, 2D=3, 3D=4, cube=5, buffer-ex=6
++0x04   4  PhysicalWidth                 pMipInfoList[0].PhysicalWidth; WARP RVA 0x8CF80
++0x08   4  PhysicalHeight                pMipInfoList[0].PhysicalHeight; RVA 0x8CF87
++0x0C   4  PhysicalDepth                 pMipInfoList[0].PhysicalDepth; RVA 0x8CF8E
++0x10   4  Format                        D3D11DDIARG_CREATERESOURCE+0x24; RVA 0x8CF95
++0x14   4  RowPitch                      AllocateKmMemory argument 7; RVA 0x8CFAD
++0x18   4  AllocationSize                *argument 6, all backing bytes; RVA 0x8CFC8
++0x1C   4  ArraySize                     create-resource+0x34; RVA 0x8CF9C
++0x20   4  MipLevels                     create-resource+0x30; RVA 0x8CFA3
++0x24   4  Usage                         create-resource+0x14; RVA 0x8CFB4
++0x28   4  BindFlags                     create-resource+0x18; RVA 0x8CFBB
++0x2C   4  SampleCount                   create-resource+0x28; RVA 0x8CFC3
++0x30   4  SampleQuality                 create-resource+0x2C; same 8-byte copy
++0x34   4  PrimaryRefreshNumerator       primary descriptor+0x14; RVA 0x8D0FD
++0x38   4  PrimaryRefreshDenominator     primary descriptor+0x18; same 8-byte copy
++0x3C   4  PrimaryRotation               primary descriptor+0x20; RVA 0x8D0D6
++0x40   4  VidPnSourceId                 primary descriptor+0x04; RVA 0x8D053
++0x44   4  Reserved44                    zeroed by this WARP version
++0x48   8  Event1                        first UMEventsPair object handle; RVA 0x8D0A4
++0x50   8  Event2                        second UMEventsPair object handle; RVA 0x8D0BC
++0x58   4  Flags                         WARP flags assembled at RVAs 0x8CF33..0x8D16E
++0x5C   4  Reserved5C                    zeroed at RVA 0x8CF03
+
+// WARP FLAGS PRODUCED BY THIS DLL VERSION
+0x000010: primary descriptor is present.
+0x000080: set on this AllocateKmMemory/AllocateRawKmMemory path.
+0x000100: primary rotation > IDENTITY and the NONPREROTATED flag is clear.
+0x000200: source MiscFlags includes CROSS_ADAPTER (0x2000).
+0x000400: source MiscFlags includes TILE_POOL (0x8000).
+0x000800: AllocateKmMemory argument 10 when the device interface byte at +2644 is >= 0x11 and not TILE_POOL.
+0x007000: (ResourceLayout argument 11 << 12) & 0x7000.
+0x020000: gBreakOnOverRun enables a guard page and increases AllocationSize by the required page rounding/guard.
+0x080000: source MiscFlags includes SHARED (0x2).
+0x200000: source MapFlags is nonzero or device interface byte is below 0x11.
+The decoder preserves these bytes. WARP owns layout and subresource interpretation; Sogen allocates the stated full backing.
+Bit meanings above follow the producer instructions in this exact WARP DLL, not a guessed cross-version bitfield.
+
+// RESOURCE OBJECTS
+UMResource at 0xBAEE19AE90; D3D11DDIARG_CREATERESOURCE copy begins at +0x80.
+UMResource+0x90=4: TEXTURE3D, verified against InitCommon copying create-resource+0x10.
+ResourceShape at 0xBAEE9043E0; one subresource, observed extent 0xF8.
+Offset Size Field                         Captured value
++0x18   8  UMResource                    0xbaee19ae90
++0x40   8  RequestedBackingBytes         0x28000
++0x48   8  ReturnedBackingBytes          0x28000
++0x78   8  LockedBackingMemory           0xbaf10a0000
++0x90   4  AllocationHandle              0x9438
++0xb8   8  SubresourceMemory             0xbaf10a0000
++0xd0   4  RowPitch                      0x80
++0xd4   4  SlicePitch                    0x5000
++0xd8   4  Width                         0x20
++0xdc   4  Height                        0xa0
++0xe0   4  Depth                         0x8
++0xf0   4  Format                        0x22
+RowPitch=128; SlicePitch=128*160=20,480; total=20,480*8=163,840 bytes (160 KiB).
+Format 0x22 is DXGI_FORMAT_R16G16_FLOAT, four bytes per texel. Width=32 gives row pitch 128.
+AllocationSize is authoritative: general textures may also contain mip levels, arrays, padding, and compressed rows.
+
+// CRITICAL SECTION
+Address 0xC13BF64C90 (d3d10warp.dll+0x6B4C90, gDDICriticalSection).
++0x00 DebugInfo (8): 0xBACC013F80
++0x08 LockCount (4 signed): -6
++0x0C RecursionCount (4): 1
++0x10 OwningThread (8): 0x5C
++0x18 LockSemaphore (8): 0xFFFFFFFFFFFFFFFF, address-based wait
++0x20 SpinCount (8): 0x20007D0
+Thread 0x50 waits from UMDevice::IaSetVertexBuffers; return after EnterCriticalSection is d3d10warp.dll+0x65BD9.
+Owning thread 0x5C dispatched the access violation, unwound through the game handler, then repeatedly called Sleep(1000)
+from destiny2.exe+0x3550F5 without releasing this lock. The raw stack also contains stale values; those are not asserted as frames.
+
+// PEB TIMEOUT
+Saved PEB64=0x100030000; CriticalSectionTimeout at +0xC0 was 0.
+x64 ntdll.dll+0xD24C6 reads PEB+0xC0, then stores RtlpTimeout at +0xD24CD.
+x86 ntdll.dll+0xAAB8A/+0xAAB92 reads the two halves at PEB+0x70/+0x74.
+The zero timeout made contended address waits immediately return STATUS_TIMEOUT (0x102), causing retry/debug-output flooding.
+The fix initializes both PEBs to -25,920,000,000,000 (relative 100ns units, 30 days).
+A read-only probe of a disposable host Python process verified this Windows default. Old snapshots retain their old PEB.
+ReactOS reference: ntoskrnl/mm/ARM3/mminit.c:388,2149 and procsup.c:672 in F:/Part1/Reversal/reactos_functions.
+ReactOS uses 150 seconds and documents NT as 30 days; its literal default was not copied into Sogen.
+
+// SAVED EXCEPTION CONTEXT
+CONTEXT at 0xBACE54CE00, ContextFlags=0x10001F. EXCEPTION_RECORD at 0xBACE54D2F0.
+Full raw context, exception record, and structure bytes are retained in interpretation.json.
+RAX   0xba6f10d000
+RCX   0xbaf10a1010
+RDX   0xffffffff7e045000
+RBX   0xba6f0e5000
+RSP   0xbace54d498
+RBP   0xbace54d5a0
+RSI   0x1
+RDI   0xbaf10a0000
+R8    0x27ff0
+R9    0x4df
+R10   0xba6f0e5000
+R11   0xbaf10a0000
+R12   0x28000
+R13   0xbace54d718
+R14   0xbaee9043e0
+R15   0x0
+RIP   0xe9cb968d54
+XMM0  ac2d6c33462d6a33e12c69337d2c6933 (low-address byte first)
+XMM1  0000d13600009a360000613600002736 (low-address byte first)
+XMM2  0000803f000000000000000000000000 (low-address byte first)
+XMM3  10f054ceba0000000000000000000000 (low-address byte first)
+XMM4  00000000000000000000000000000000 (low-address byte first)
+XMM5  00000000000000000000000000000000 (low-address byte first)
+XMM6  00000000000000000000000000000000 (low-address byte first)
+XMM7  00000000000000000000000000000000 (low-address byte first)
+XMM8  00000000000000000000000000000000 (low-address byte first)
+XMM9  00000000000000000000000000000000 (low-address byte first)
+XMM10 00000000000000000000000000000000 (low-address byte first)
+XMM11 00000000000000000000000000000000 (low-address byte first)
+XMM12 00000000000000000000000000000000 (low-address byte first)
+XMM13 00000000000000000000000000000000 (low-address byte first)
+XMM14 00000000000000000000000000000000 (low-address byte first)
+XMM15 00000000000000000000000000000000 (low-address byte first)
+
+// VERIFICATION
+Final clang-tidy build passed (tidy-1789446790058006000.log).
+regression-1789446465322458100: 4/4 failed in interpreter and JIT
+regression-1789446777880359600: 22/22 passed in interpreter and JIT
+CLI smoke: exit 0, 37.152 seconds; capture sogen-cli-smoke-1789447471509370700.
+Actual-game replay is running. Passing the old fault and reaching the game menu are separate pending checks.
+No snapshot registers, instructions, lock fields, or allocation state were patched.
