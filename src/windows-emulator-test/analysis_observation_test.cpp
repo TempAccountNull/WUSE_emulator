@@ -178,6 +178,32 @@ namespace sogen::test
         EXPECT_EQ(transitions.size(), 1U);
     }
 
+    TEST_F(AnalysisObservation, ExportBoundsKeepNamedCallsAndForeignTransitions)
+    {
+        auto& module = *win_emu.mod_manager.ntdll;
+        const auto first = module.image_base + 0x500;
+        const auto last = first + 0x100;
+        module.address_names.clear();
+        module.address_names[first] = "FirstExport";
+        module.address_names[last] = "LastExport";
+        const auto same_module_caller = last + 0x100;
+        observe(same_module_caller, first - 1);
+        observe(same_module_caller, last + 1);
+        observe(same_module_caller, first + 1);
+        EXPECT_TRUE(calls.empty());
+        observe(same_module_caller, first);
+        observe(same_module_caller, last);
+        ASSERT_EQ(calls.size(), 2U);
+        EXPECT_EQ(calls[0].function_name, "FirstExport");
+        EXPECT_EQ(calls[1].function_name, "LastExport");
+        const std::array<uint8_t, 5> branch{0xE9, 0, 0, 0, 0};
+        win_emu.emu().write_memory(caller, branch.data(), branch.size());
+        observe(caller, last + 3);
+        ASSERT_EQ(transitions.size(), 1U);
+        EXPECT_EQ(transitions[0].function_name, "LastExport");
+        EXPECT_EQ(transitions[0].function_offset, 3U);
+    }
+
     TEST_F(AnalysisObservation, IgnoredFunctionsRemainAbsentInVerboseMode)
     {
         logging_settings.ignored_functions.insert("WinVerifyTrust");

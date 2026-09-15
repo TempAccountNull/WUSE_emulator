@@ -542,7 +542,12 @@ namespace sogen
                 return;
             }
 
-            const auto export_entry = binary->address_names.find(address);
+            auto export_entry = binary->address_names.end();
+            if (!binary->address_names.empty() && address >= binary->address_names.begin()->first &&
+                address <= binary->address_names.rbegin()->first)
+            {
+                export_entry = binary->address_names.find(address);
+            }
             const auto is_named = export_entry != binary->address_names.end();
             const auto is_entry = address == binary->entry_point;
             const auto is_previous_main_exe = main->contains(previous_ip);
