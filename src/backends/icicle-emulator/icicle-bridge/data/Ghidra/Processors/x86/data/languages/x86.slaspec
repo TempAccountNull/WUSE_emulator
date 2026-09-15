@@ -3,6 +3,7 @@
 with : lockprefx=0 {
 @include "avx.sinc"
 @include "avx_manual.sinc"
+@include "aligned_move.sinc"
 @include "avx2.sinc"
 @include "avx2_manual.sinc"
 @include "adx.sinc"

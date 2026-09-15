@@ -1,0 +1,84 @@
+{
+  "instruction_family": "MOVDQA / VMOVDQA / VMOVDQA32 / VMOVDQA64",
+  "manual": "325383-092-sdm-vol-2abcd.pdf",
+  "manual_pdf_pages": [
+    762,
+    763,
+    764,
+    765,
+    766
+  ],
+  "exception_tables": {
+    "2-18": 56,
+    "2-39/2-40": 73,
+    "2-41/2-42": 74,
+    "2-43": 75,
+    "2-46": 79
+  },
+  "regression": {
+    "release": {
+      "interpreter": {
+        "tests": 97,
+        "failures": 0,
+        "errors": 0,
+        "time": "7.285s",
+        "stores_100000_seconds": 0.019746
+      },
+      "jit": {
+        "tests": 97,
+        "failures": 0,
+        "errors": 0,
+        "time": "31.985s",
+        "stores_100000_seconds": 0.011527
+      }
+    },
+    "tidy": {
+      "interpreter": {
+        "tests": 97,
+        "failures": 0,
+        "errors": 0,
+        "time": "7.228s",
+        "stores_100000_seconds": 0.01938
+      },
+      "jit": {
+        "tests": 97,
+        "failures": 0,
+        "errors": 0,
+        "time": "31.352s",
+        "stores_100000_seconds": 0.011791
+      }
+    }
+  },
+  "actual_game_replay": {
+    "result": "PASS",
+    "instruction": "movdqa xmmword ptr [rcx + 0x10], xmm0",
+    "bytes": "66 0F 7F 41 10",
+    "module_rva": "steam_api64.dll+0x4E5D64",
+    "after_rva": "steam_api64.dll+0x4E5D69",
+    "source_snapshot": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789470957335282400-after-jit-memory-release\\guest.snap",
+    "memory_limit_mib": 4096,
+    "destination": "0xbb84b59000",
+    "before_bytes": "00000000000000000000000000000000",
+    "after_bytes": "00000000000000000000000000000000",
+    "expected": "00000000000000000000000000000000",
+    "general_changes": {
+      "rip": [
+        "0x6d50035d64",
+        "0x6d50035d69"
+      ]
+    },
+    "vector_state_unchanged": true,
+    "stack_unchanged": true,
+    "restored_registers_match_original": true,
+    "scope": "Actual-game saved instruction replay with an explicit backing limit; full boot remains unconfirmed.",
+    "analyzer.exe_sha256": "0786a348937ccb670267d6b96a09613fe01d017e9698f563ceb22724eb567791",
+    "icicle-emulator.dll_sha256": "5fcd44be79b942b15e83d626f1c84cb642040e3590464eac6be9a42b5a76011c"
+  },
+  "cli_smoke": {
+    "exit_code": 0,
+    "seconds": 25.6341385000851,
+    "capture": "sogen-cli-smoke-1789475754298257000"
+  },
+  "feature_profile": "Existing advertised CPU features and default XCR0 are unchanged; AVX/EVEX paths require their enabled state.",
+  "boot_acceptance": "Unconfirmed"
+}

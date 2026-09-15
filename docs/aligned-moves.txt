@@ -1,0 +1,42 @@
+Aligned packed integer moves (Icicle x64)
+
+Reference: Intel SDM 325383-092-sdm-vol-2abcd.pdf, PDF pages 762-766.
+Exception tables: 2-18 (page 56), 2-39/40 (73), 2-41/42 (74),
+2-43 (75), and 2-46 (79).
+
+Forms:
+MOVDQA: legacy SSE, 128 bits, load/store/register copy.
+VMOVDQA: VEX, 128/256 bits, load/store/register copy.
+VMOVDQA32 and VMOVDQA64: EVEX, 128/256/512 bits, load/store/register
+copy, 32/64-bit element masks, merging and zeroing register destinations.
+
+Legacy copies preserve upper vector state. VEX/EVEX register destinations
+clear bits above their vector length. Unmasked EVEX ignores K0's contents.
+Masked-off stores leave memory intact and perform no memory access.
+Masked-off loads perform no memory access. Alignment faults remain enabled
+even with an all-zero mask, as specified by Type E1.
+
+Checks cover reserved encodings, CR0/CR4/XCR0 state, task-switched faults,
+16/32/64-byte alignment, noncanonical stack/data addresses, and page faults.
+Memory operands are decoded as addresses before checks; operand decoding
+must not read memory ahead of an architectural state fault.
+
+The register API supports XMM/YMM/ZMM0-31 and K0-7. Additional vector
+parts and masks are appended as Icicle custom registers. Existing register
+IDs stay unchanged; thread contexts and snapshots retain the additional
+state. The legacy-register-layout fixture checks saved-game compatibility.
+
+The existing advertised CPU feature profile and default XCR0 are unchanged.
+Tests enable the required AVX/EVEX state explicitly. This change implements
+this instruction family; it does not advertise a complete AVX-512 or AVX10 CPU
+or extend Windows XSAVE/CONTEXT support beyond the existing CPU profile.
+
+Validation: 19 aligned-move tests; full 97-test selection in interpreter and
+JIT modes, with two JIT-only tests skipped in interpreter. Release and tidy
+builds passed. Explicit-root verbose guest CLI smoke exited 0.
+
+Actual-game replay: steam_api64.dll+0x4E5D64, bytes 66 0F 7F 41 10.
+MOVDQA [RCX+0x10],XMM0 stored at 0xBB84B59000 and advanced to +0x4E5D69.
+Restored registers matched the original fault capture; destination matched
+XMM0; other general registers, vectors and stack stayed unchanged.
+Full Destiny boot remains unconfirmed. See aligned-moves-validation.json.

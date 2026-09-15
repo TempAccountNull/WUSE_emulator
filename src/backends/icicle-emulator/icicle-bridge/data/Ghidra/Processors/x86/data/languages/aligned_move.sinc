@@ -1,0 +1,19 @@
+define token aligned_evex (24)
+  aligned_p0=(0,7)
+  aligned_w=(15,15)
+;
+
+AlignedMoveTail: is mod=3 {}
+AlignedMoveTail: is mod=0 & r_m=5; imm32 {}
+AlignedMoveTail: is mod=0 & r_m=4; base=5; imm32 {}
+AlignedMoveTail: is mod=0 & r_m=4; base!=5 {}
+AlignedMoveTail: is mod=0 & r_m!=4 & r_m!=5 {}
+AlignedMoveTail: is mod=1 & r_m=4; base; imm8 {}
+AlignedMoveTail: is mod=1 & r_m!=4; imm8 {}
+AlignedMoveTail: is mod=2 & r_m=4; base; imm32 {}
+AlignedMoveTail: is mod=2 & r_m!=4; imm32 {}
+
+:VMOVDQA32 is $(LONGMODE_ON) & vexMode=0 & byte=0x62; aligned_p0 & aligned_w=0; byte=0x6F; AlignedMoveTail { sogen_aligned_move(inst_next:8); }
+:VMOVDQA32 is $(LONGMODE_ON) & vexMode=0 & byte=0x62; aligned_p0 & aligned_w=0; byte=0x7F; AlignedMoveTail { sogen_aligned_move(inst_next:8); }
+:VMOVDQA64 is $(LONGMODE_ON) & vexMode=0 & byte=0x62; aligned_p0 & aligned_w=1; byte=0x6F; AlignedMoveTail { sogen_aligned_move(inst_next:8); }
+:VMOVDQA64 is $(LONGMODE_ON) & vexMode=0 & byte=0x62; aligned_p0 & aligned_w=1; byte=0x7F; AlignedMoveTail { sogen_aligned_move(inst_next:8); }

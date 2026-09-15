@@ -5804,10 +5804,13 @@ define pcodeop minps;
     XmmReg1[96,32] = XmmReg2[64,32];
 }
 
-:MOVDQA       XmmReg, m128        is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x6F; XmmReg ... & m128            { XmmReg = m128; }  
-:MOVDQA       XmmReg1, XmmReg2    is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x6F; xmmmod=3 & XmmReg1 & XmmReg2 { XmmReg1 = XmmReg2; }
-:MOVDQA       m128, XmmReg        is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x7F; XmmReg ... & m128            { m128 = XmmReg; }
-:MOVDQA       XmmReg2, XmmReg1    is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x7F; xmmmod=3 & XmmReg1 & XmmReg2 { XmmReg2 = XmmReg1; }
+define pcodeop sogen_aligned_move;
+AlignedMem128: "xmmword ptr" Mem is Mem { export Mem; }
+AlignedMem256: "ymmword ptr" Mem is Mem { export Mem; }
+:MOVDQA       XmmReg, AlignedMem128        is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x6F; XmmReg ... & AlignedMem128            { sogen_aligned_move(inst_next:8); }
+:MOVDQA       XmmReg1, XmmReg2    is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x6F; xmmmod=3 & XmmReg1 & XmmReg2 { sogen_aligned_move(inst_next:8); }
+:MOVDQA       AlignedMem128, XmmReg        is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x7F; XmmReg ... & AlignedMem128            { sogen_aligned_move(inst_next:8); }
+:MOVDQA       XmmReg2, XmmReg1    is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x7F; xmmmod=3 & XmmReg1 & XmmReg2 { sogen_aligned_move(inst_next:8); }
 
 :MOVDQU       XmmReg, m128        is vexMode=0 &  $(PRE_F3) & byte=0x0F; byte=0x6F; XmmReg ... & m128            { XmmReg = m128; }
 :MOVDQU       XmmReg1, XmmReg2    is vexMode=0 &  $(PRE_F3) & byte=0x0F; byte=0x6F; xmmmod=3 & XmmReg1 & XmmReg2 { XmmReg1 = XmmReg2; }

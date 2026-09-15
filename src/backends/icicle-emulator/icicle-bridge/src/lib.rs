@@ -1,4 +1,5 @@
 mod aes;
+mod aligned_move;
 mod icicle;
 mod packed_max;
 mod packed_sad;

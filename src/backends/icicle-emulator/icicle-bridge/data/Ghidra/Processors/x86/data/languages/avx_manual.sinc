@@ -68,41 +68,21 @@
     # TODO ZmmReg2 = zext(YmmReg2)
 }
 
-# MOVDQA,VMOVDQA32/64 4-62 PAGE 1182 LINE 61667
-# Note: we do not model the exception generated if VMOVDQA is used with a memory operand which is not 16-bye aligned
-:VMOVDQA XmmReg1, XmmReg2_m128 is $(VEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG); byte=0x6F; (XmmReg1 & YmmReg1) ... & XmmReg2_m128
-{
-	YmmReg1 = zext(XmmReg2_m128);
-	# TODO ZmmReg1 = zext(XmmReg1)
-}
+:VMOVDQA XmmReg1, XmmReg2 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG); byte=0x6F; mod=3 & XmmReg1 & XmmReg2 { sogen_aligned_move(inst_next:8); }
 
-# MOVDQA,VMOVDQA32/64 4-62 PAGE 1182 LINE 61669
-:VMOVDQA XmmReg2, XmmReg1 is $(VEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG); byte=0x7F; XmmReg1 & (mod = 3 & XmmReg2 & YmmReg2)
-{
-	YmmReg2 = zext(XmmReg1);
-	# TODO ZmmReg2 = zext(XmmReg2)
-}
+:VMOVDQA XmmReg2, XmmReg1 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG); byte=0x7F; mod=3 & XmmReg1 & XmmReg2 { sogen_aligned_move(inst_next:8); }
 
-# MOVDQA,VMOVDQA32/64 4-62 PAGE 1182 LINE 61669
-:VMOVDQA m128, XmmReg1 is $(VEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG); byte=0x7F; XmmReg1 ... & m128
-{
-	m128 = XmmReg1;
-	# TODO ZmmReg2 = zext(XmmReg2)
-}
+:VMOVDQA XmmReg1, AlignedMem128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG); byte=0x6F; XmmReg1 ... & AlignedMem128 { sogen_aligned_move(inst_next:8); }
 
-# MOVDQA,VMOVDQA32/64 4-62 PAGE 1182 LINE 61671
-:VMOVDQA YmmReg1, YmmReg2_m256 is $(VEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG); byte=0x6F; YmmReg1 ... & YmmReg2_m256
-{
-	YmmReg1 = YmmReg2_m256;
-	# TODO ZmmReg1 = zext(YmmReg1)
-}
+:VMOVDQA AlignedMem128, XmmReg1 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG); byte=0x7F; XmmReg1 ... & AlignedMem128 { sogen_aligned_move(inst_next:8); }
 
-# MOVDQA,VMOVDQA32/64 4-62 PAGE 1182 LINE 61673
-:VMOVDQA YmmReg2_m256, YmmReg1 is $(VEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG); byte=0x7F; YmmReg1 ... & YmmReg2_m256
-{
-	YmmReg2_m256 = YmmReg1;
-	# TODO ZmmReg2 = zext(YmmReg2)
-}
+:VMOVDQA YmmReg1, YmmReg2 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG); byte=0x6F; mod=3 & YmmReg1 & YmmReg2 { sogen_aligned_move(inst_next:8); }
+
+:VMOVDQA YmmReg2, YmmReg1 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG); byte=0x7F; mod=3 & YmmReg1 & YmmReg2 { sogen_aligned_move(inst_next:8); }
+
+:VMOVDQA YmmReg1, AlignedMem256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG); byte=0x6F; YmmReg1 ... & AlignedMem256 { sogen_aligned_move(inst_next:8); }
+
+:VMOVDQA AlignedMem256, YmmReg1 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG); byte=0x7F; YmmReg1 ... & AlignedMem256 { sogen_aligned_move(inst_next:8); }
 
 # MOVSD 4-111 PAGE 1231 LINE 63970
 :VMOVSD XmmReg1, vexVVVV_XmmReg, XmmReg2 is $(VEX_NDS) & $(VEX_LIG) & $(VEX_PRE_F2) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x10; XmmReg1 & YmmReg1 & (mod=0x3 & XmmReg2)
@@ -284,4 +264,3 @@
     #TODO: Zmm
 }
 @endif
-

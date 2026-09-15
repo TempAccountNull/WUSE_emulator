@@ -23,6 +23,7 @@ fn create_x64_vm() -> icicle_vm::Vm {
     crate::packed_sad::register(&mut vm.cpu);
     crate::reciprocal_sqrt::register(&mut vm.cpu);
     crate::xstate::register(&mut vm.cpu);
+    crate::aligned_move::register(&mut vm.cpu);
     vm
 }
 
@@ -1187,6 +1188,9 @@ impl IcicleEmulator {
     }
 
     pub fn read_register(&mut self, reg: registers::X86Register, data: &mut [u8]) -> usize {
+        if let Some(size) = crate::aligned_move::read_register(&self.vm.cpu, &reg, data) {
+            return size;
+        }
         match reg {
             registers::X86Register::Rflags => self.read_flags::<u64>(data),
             registers::X86Register::Eflags => self.read_flags::<u32>(data),
@@ -1229,6 +1233,9 @@ impl IcicleEmulator {
     }
 
     pub fn write_register(&mut self, reg: registers::X86Register, data: &[u8]) -> usize {
+        if let Some(size) = crate::aligned_move::write_register(&mut self.vm.cpu, &reg, data) {
+            return size;
+        }
         match reg {
             registers::X86Register::Rflags => self.write_flags::<u64>(data),
             registers::X86Register::Eflags => self.write_flags::<u32>(data),
@@ -1582,5 +1589,31 @@ mod memory_limit_tests {
         assert!(emu.set_memory_limit_mib(4096));
         assert_eq!(emu.vm.cpu.mem.capacity(), 1_048_576);
         assert_eq!(emu.vm.cpu.mem.total_pages(), 2);
+    }
+}
+
+#[cfg(test)]
+mod aligned_move_decode_tests {
+    use super::*;
+    #[test]
+    fn instruction_decoder_preserves_length_and_old_register_layout() {
+        let mut emu = IcicleEmulator::new();
+        for line in include_str!("legacy-register-layout.txt").lines() {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            let old_id: i16 = parts[1].parse().unwrap();
+            let old_offset: u8 = parts[2].parse().unwrap();
+            let old_size: u8 = parts[3].parse().unwrap();
+            let current = emu.vm.cpu.arch.sleigh.get_reg(parts[0]).unwrap().get_raw_var();
+            assert_eq!(current, pcode::VarNode::new(old_id, old_offset + old_size).slice(old_offset, old_size), "{}", parts[0]);
+        }
+        assert!(emu.map_memory(0x10000, 4096, 7));
+        for bytes in [&[0x66, 0x0f, 0x6f, 0xca][..], &[0xc5, 0xf9, 0x6f, 0xca][..], &[0x62,0xf1,0x7d,0x48,0x6f,0xca][..]] {
+            assert!(emu.write_memory(0x10000, bytes));
+            emu.vm.cpu.write_pc(0x10000);
+            let mut lifter = icicle_cpu::lifter::InstructionLifter::new();
+            lifter.set_context(emu.vm.cpu.arch.isa_mode_context[0]);
+            let next = lifter.lift(&mut *emu.vm.cpu, 0x10000).unwrap_or_else(|e| panic!("{bytes:x?}: {e:?}"));
+            assert_eq!(next, 0x10000 + bytes.len() as u64, "{}", lifter.disasm);
+        }
     }
 }
