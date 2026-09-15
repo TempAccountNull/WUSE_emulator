@@ -114,3 +114,25 @@ backends explicitly report unsupported information operations except static
 send count. Existing opaque context and socket restore behavior are unchanged.
 Snapshots do not reconstruct an external network conversation or all native
 socket binding/connection state. Full Dawn boot requires actual-game acceptance.
+
+// ACTUAL FIXED REQUEST
+Implementation commit: e93c83e72a6a02bfcbee88e3a029bf50780548d2.
+Deployment: D:\Sunrise\D2\sogen\builds\20260915-015927-icicle-startup.
+Capture: destiny-sogen-1789455614368546900-afd-information-fixed-return.
+Thread 0x54; socket 0x100000D; FIONBIO=0x8004667E.
+Before: RIP=0x4283205DE1 (mswsock.dll+0x5DE1), the SockSetInformation call.
+After: RIP=0x4283205DE6 (mswsock.dll+0x5DE6), RAX=0.
+RSP=0xBACDB4BB90 before and after the call.
+The actual syscall log records AFD_SET_INFORMATION 0x1203B, class 2,
+raw value 0x101, STATUS_SUCCESS. Only the Boolean byte 0x01 selects the mode.
+Read-only inspection of the saved result found device index 0xD, Afd\Endpoint,
+with non_blocking_=true. No guest execution or guest-state edits in the inspector.
+Snapshot SHA-256: 4ab0c93c2107138e8b387314dda442e1fed041e88e1c920f6f5f2a2f88c3b5b9.
+The checkpoint run ended intentionally after 3 traced calls; analyzer exit 1
+means termination without a guest exit status here, not a failed FIONBIO call.
+
+// STARTUP CONTINUATION
+destiny-sogen-1789455691954036600-afd-information-startup-replay starts from
+the earlier AES checkpoint with the affected socket absent. Icicle JIT,
+explicit -e D:\Sunrise\D2\sogen\root and -v; no call-count limit.
+At this audit update it passed 516674 traced calls. Full boot is not verified.
