@@ -61,7 +61,7 @@ WSAIoctl, every output boundary, empty families and invalid guest pointers.
 Regression: sogen-fixes/regression-1789457566711819300.
 Release build passed. CLI smoke exited 0 in 36.241 seconds.
 Final tidy passed: tidy-1789457398697495300.log.
-Actual-game request replay is pending at this revision.
+Actual-game request replay passed; see the return evidence below.
 
 // STARTUP OBSERVATION
 The AFD mode-fixed run still showed a white window, confirmed by the user.
@@ -71,3 +71,30 @@ steam_api64.dll+0x2A5300 and +0x4E58D0 respectively. Saved stack locals show
 a 16-pattern pass advancing from zero-based index 8 to 13 across executable
 ranges of 28,898,816 and 81,353,216 bytes. This is progress inside that pass,
 not an overall boot percentage. Main thread 8 waits on semaphore 0x380001C.
+
+// ACTUAL GAME RETURN
+Deployment: 20260915-023440-icicle-startup; implementation f6d4f438.
+Entry capture: destiny-sogen-1789457720742196500-afd-address-list-entry.
+Return capture: destiny-sogen-1789457954929769100-afd-address-list-return.
+Thread 0xC called mswsock.dll+0x637D at 0x428320637D and returned to
+mswsock.dll+0x6384 at 0x4283206384. Call-site bytes matched the on-disk DLL.
+RSP was 0xBA053CF320 before and after; RAX returned STATUS_SUCCESS (0).
+The actual input was USHORT 23 (AF_INET6), length 2, for socket 0x1000009.
+The 512-byte output at 0xBACC068C10 contains 6 complete TA_ADDRESS records:
+each AddressLength=26, AddressType=23, total output size 184 bytes.
+IO_STATUS_BLOCK at 0xBA053CF558 contains Status=0 and Information=184.
+All 328 unused output bytes match the pre-call buffer; input was unchanged.
+Read-only saved-state inspection captured both buffers, status blocks and
+register sets without executing the inspection copies.
+
+Entry snapshot SHA-256:
+ecdac0ed851855c85214f047c00c44396a286df125b2834e0ae3cc436bb93ef0
+Return snapshot SHA-256:
+965f78fe53c49b8964628843047caad9189654968724ecafeca1ceb8e3aa577f
+Detailed local evidence: PatchScanner/benchmarks/sogen-fixes/
+afd-address-list-evidence/actual-request-proof.json, with before/after reads.
+
+The game continues from the verified return in
+'destiny-sogen-1789458158927020900-after-afd-address-list', using explicit
+-e and -v with the colored live viewer. This verifies the AFD request;
+Dawn boot and progression into the world still require user confirmation.
