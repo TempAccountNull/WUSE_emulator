@@ -48,9 +48,16 @@ The observer now retains the pending response across socket timeouts, including
 partial payload/checksum reads. Four transport regressions pass. The
 high-frequency NtClose breakpoint was removed from this diagnostic observer.
 
-The next replay must show the real game receiving a successful result at its
-previously failing address-zero query. Its relationship to WARP worker selection
-remains unproven. Broader query-contract gaps (probe ordering, short-buffer
+The actual-game replay `destiny-sogen-1789515449358765600-zero-memory-walk-fix`
+returned STATUS_SUCCESS at the same caller, `destiny2.exe+0x282921`. It returned
+48 bytes, BaseAddress=0, RegionSize=0x10000, MEM_FREE, AllocationProtect=0,
+Protect=PAGE_NOACCESS and Type=0. The captured result bytes have SHA256
+`5a3c7bdd033b4fed1520e75bd5ac05d04e03eff67ea2a17c79533d764a145995`.
+The saved checkpoint before the caller consumes the successful result has SHA256
+`5ec1965ebacd413bfb1a413124f68f300418bb9ad8784dec35de557f38336112`
+(324,038,739 bytes). The run ended by the requested debugger disconnect after
+saving, not by a guest exit. The formerly failing query is verified fixed in the
+actual game; its relationship to WARP worker selection remains unproven. Broader query-contract gaps (probe ordering, short-buffer
 status, full protection metadata and process-handle access) remain explicitly
 documented in the kernel-contract audit; this change is an address-walk fix,
 not a claim that all NtQueryVirtualMemory classes are complete.
