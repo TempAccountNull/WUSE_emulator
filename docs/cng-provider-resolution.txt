@@ -1,0 +1,71 @@
+CNG provider resolution: AES resolves to RNG
+
+Actual game capture: destiny-sogen-1789488916133256800-aes-provider-proof.
+Dawn call: steam_api64.dll+0x3EE282; return: +0x3EE288.
+BCryptOpenAlgorithmProvider(&handle, L"AES", nullptr, 0) returned
+0xC00000BB (STATUS_NOT_SUPPORTED), handle zero, on guest thread 0x58.
+The matching DLL/PDB identifies sunrise::middleware::crypto::aes_gcm::decrypt.
+The caller bytes and loaded CodeView GUID/age match the compiled Dawn DLL.
+The saved process used an already cached provider record: this replay did not
+make a Ksec provider-resolution request.
+
+Fresh guest contract probe: cng-contract-probe-1789488308803442500.
+The probe used the same guest root and exact bcrypt.dll. It called
+BCryptResolveProviders(nullptr, 0, L"AES", nullptr, CRYPT_UM, 0, ...).
+The Ksec request explicitly contained AES, but Sogen returned interface 6,
+function RNG and image bcryptprimitives.dll. BCryptResolveProviders accepted
+the structure; BCryptOpenAlgorithmProvider then returned 0xC00000BB.
+The probe exited with guest debugger reply W00. Its analyzer was closed after
+the debugger began waiting for a new replay connection.
+
+Exact x64 bcrypt.dll call sites, decoded from PE runtime-function boundaries:
+  +0x71EE  48 FF 15 73 47 01 00  call [NtDeviceIoControlFile]
+  +0x71F5                       return from the device call
+  +0x1E8D  48 FF 15 04 99 01 00  call [GetProcAddress]
+  +0x1E94                       return from GetProcAddress
+Scanning for FF 15 alone yields addresses one byte inside these instructions.
+
+The captured IOCTL 0x390400 request is a self-relative x64 structure:
+  +0x00  u32 magic 0x1A2B3C4D
+  +0x04  u32 operation 0x00020000
+  +0x08  u64 context string offset; UINT64_MAX means absent
+  +0x10  u32 interface (zero requests inference); +0x14 is padding
+  +0x18  u64 function string offset
+  +0x20  u64 provider string offset; UINT64_MAX means absent
+  +0x28  u32 mode (CRYPT_UM = 1)
+  +0x2C  u32 flags
+  +0x30  UTF-16 strings, sized by the request
+The 56-byte AES request was captured both with flags zero and with flags two.
+
+The guest SYSTEM hive registers AES under cipher interface 1 and the Microsoft
+Primitive Provider, whose UM image is bcryptprimitives.dll. It also contains
+provider order, supported functions, image flags and context properties.
+Sogen currently uses fixed RNG/hash response blobs instead. All other names
+fall through to RNG. Its fixed eight-character input field cannot represent
+the longer algorithm and provider names in the catalog.
+
+BCryptResolveProviders returns CRYPT_PROVIDER_REFS, with provider references,
+properties and UM/KM image references. Existing response bytes at +0x34 are
+padding, not a documented algorithm abbreviation. Pointer fields in the wire
+response are offsets and use UINT64_MAX for null before bcrypt relocates them.
+
+bcrypt.dll+0x7140 implements an error transport that must be preserved:
+STATUS_BUFFER_OVERFLOW with a four-byte underlying status; a too-small result
+uses eight bytes containing STATUS_BUFFER_TOO_SMALL and the required size.
+Its caller retries an automatically allocated result using that size.
+Returning STATUS_BUFFER_TOO_SMALL directly makes this DLL return an internal
+error. The probe also captured startup operation 0x00010500, which Sogen
+currently acknowledges without output. Its full contract needs inspection.
+
+References checked:
+  Microsoft BCryptResolveProviders, CRYPT_PROVIDER_REFS, CRYPT_PROVIDER_REF,
+  CRYPT_PROPERTY_REF and CRYPT_IMAGE_REF documentation.
+  ReactOS dll/win32/bcrypt/bcrypt.spec declares BCryptResolveProviders a stub;
+  it does not supply a resolver implementation to port.
+  Exact guest x64 bcrypt.dll disassembly and captured requests/returns.
+
+No resolver fix has been deployed at this checkpoint. Required work: replace
+the blobs with catalog-backed resolution, verify request/response validation,
+selectors, properties, sizing and error paths against the exact DLLs, then
+test an uncached actual-game lookup and authenticated package read. These
+findings establish a provider bug, not the cause of the whole white screen.

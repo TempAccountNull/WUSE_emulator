@@ -1,0 +1,243 @@
+{
+  "actual_game": {
+    "completed": true,
+    "records": [
+      {
+        "event": "dawn-open-call",
+        "time": 1789488922.547514,
+        "thread": "QC58",
+        "rip": "0x6d4ff3e282",
+        "registers": {
+          "rax": "0xffffffff",
+          "rbx": "0xbace03eb30",
+          "rcx": "0xbace03d438",
+          "rdx": "0x6d5019dc70",
+          "rsi": "0xbace03dc38",
+          "rdi": "0xbace03dc68",
+          "rbp": "0xbace03d4a1",
+          "rsp": "0xbace03d3e0",
+          "r8": "0x0",
+          "r9": "0x0",
+          "r10": "0x800016",
+          "r11": "0x46",
+          "r12": "0xbace03d5c0",
+          "r13": "0x86ba",
+          "r14": "0x0",
+          "r15": "0x86ba",
+          "rip": "0x6d4ff3e282",
+          "eflags": "0x44"
+        },
+        "state": "crypto-000.json",
+        "algorithm": "AES",
+        "provider": null,
+        "flags": 0,
+        "output_handle_address": "0xbace03d438",
+        "indirect_target": "0x9b7e305a60"
+      },
+      {
+        "event": "getproc-call",
+        "time": 1789488922.657702,
+        "thread": "QC58",
+        "rip": "0x9b7e301e8d",
+        "registers": {
+          "rax": "0x1",
+          "rbx": "0xba05e3aa90",
+          "rcx": "0xea30840000",
+          "rdx": "0x9b7e31bdd0",
+          "rsi": "0x0",
+          "rdi": "0xbacc09a660",
+          "rbp": "0xbace03cfd0",
+          "rsp": "0xbace03cf70",
+          "r8": "0x0",
+          "r9": "0xc4f9c4c8",
+          "r10": "0xba05e3aada",
+          "r11": "0xfff00000000000ff",
+          "r12": "0xbacadd6ed8",
+          "r13": "0x1",
+          "r14": "0xbacadd6ee8",
+          "r15": "0xea30840000",
+          "rip": "0x9b7e301e8d",
+          "eflags": "0x44"
+        },
+        "state": "crypto-001.json",
+        "module_handle": "0xea30840000",
+        "symbol": "GetRngInterface"
+      },
+      {
+        "event": "getproc-return",
+        "time": 1789488922.77008,
+        "thread": "QC58",
+        "rip": "0x9b7e301e94",
+        "registers": {
+          "rax": "0xea30860940",
+          "rbx": "0xba05e3aa90",
+          "rcx": "0x8c4721ae5430000",
+          "rdx": "0x4",
+          "rsi": "0x0",
+          "rdi": "0xbacc09a660",
+          "rbp": "0xbace03cfd0",
+          "rsp": "0xbace03cf70",
+          "r8": "0x4",
+          "r9": "0x4",
+          "r10": "0x0",
+          "r11": "0xbace03cc40",
+          "r12": "0xbacadd6ed8",
+          "r13": "0x1",
+          "r14": "0xbacadd6ee8",
+          "r15": "0xea30840000",
+          "rip": "0x9b7e301e94",
+          "eflags": "0x4"
+        },
+        "state": "crypto-002.json",
+        "result": "0xea30860940"
+      },
+      {
+        "event": "dawn-open-return",
+        "time": 1789488922.8811703,
+        "thread": "QC58",
+        "rip": "0x6d4ff3e288",
+        "registers": {
+          "rax": "0xc00000bb",
+          "rbx": "0xbace03eb30",
+          "rcx": "0x9bc03c18ce230000",
+          "rdx": "0xba04ed0000",
+          "rsi": "0xbace03dc38",
+          "rdi": "0xbace03dc68",
+          "rbp": "0xbace03d4a1",
+          "rsp": "0xbace03d3e0",
+          "r8": "0xba055c1b00",
+          "r9": "0x1",
+          "r10": "0xba055c0180",
+          "r11": "0xbace03cf90",
+          "r12": "0xbace03d5c0",
+          "r13": "0x86ba",
+          "r14": "0x0",
+          "r15": "0x86ba",
+          "rip": "0x6d4ff3e288",
+          "eflags": "0x4"
+        },
+        "state": "crypto-003.json",
+        "status": "0xc00000bb",
+        "algorithm_handle": "0x0"
+      }
+    ],
+    "source_snapshot": "D:\\source\\repos\\test_research\\PatchScanner\\artifacts\\sogen-checkpoints\\aes-provider-20260915\\guest.snap",
+    "dawn_codeview": [
+      {
+        "rva": "0x6f25b0",
+        "guid_bytes": "95234399ccd9d74a86584a191d99b243",
+        "age": 2,
+        "pdb_path": "D:\\Dawn\\evil-ass-repo-of-doom-and-despair\\build\\x64\\Release\\steam_api64.pdb"
+      }
+    ],
+    "scope": "Actual guest API and security-provider transport capture; no fabricated return values"
+  },
+  "isolated_probe": [
+    {
+      "event": "observation",
+      "reply": "T05library:;thread:8;",
+      "rip": "0x18009db54"
+    },
+    {
+      "event": "observation",
+      "reply": "T05library:;thread:8;",
+      "rip": "0x18009db54"
+    },
+    {
+      "event": "observation",
+      "reply": "T05library:;thread:8;",
+      "rip": "0x18009db54"
+    },
+    {
+      "event": "call",
+      "thread": "QC8",
+      "rip": "0x4aab8571ee",
+      "rva": "0x71ee",
+      "iosb": 846194799008,
+      "ioctl": 3736576,
+      "input": 846194799232,
+      "input_size": 104,
+      "output": 846194799024,
+      "output_size": 8,
+      "input_bytes": "4d3c2b1a000501000000000000000000ffffffffffffffff0000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000ffffffffffffffffffffffffffffffff0000000000000000ffffffffffffffff0600800100000000"
+    },
+    {
+      "event": "return",
+      "thread": "QC8",
+      "rip": "0x4aab8571f5",
+      "rva": "0x71f5",
+      "status": "0x0",
+      "iosb": "00000000000000000000000000000000",
+      "information": 0,
+      "output_bytes": ""
+    },
+    {
+      "event": "call",
+      "thread": "QC8",
+      "rip": "0x4aab8571ee",
+      "rva": "0x71ee",
+      "iosb": 846194801696,
+      "ioctl": 3736576,
+      "input": 846194802016,
+      "input_size": 56,
+      "output": 850525981344,
+      "output_size": 384,
+      "input_bytes": "4d3c2b1a00000200ffffffffffffffff00000000000000003000000000000000ffffffffffffffff01000000000000004100450053000000"
+    },
+    {
+      "event": "return",
+      "thread": "QC8",
+      "rip": "0x4aab8571f5",
+      "rva": "0x71f5",
+      "status": "0x0",
+      "iosb": "0000000000000000d800000000000000",
+      "information": 216,
+      "output_bytes": "01000000000002001000000000000000180000000000000006000000ffffffff500000000000000058000000000000000000000000000000ffffffffffffffff9800000000000000ffffffffffffffff52004e00470000004d006900630072006f0073006f006600740020005000720069006d00690074006900760065002000500072006f00760069006400650072000000000000000000a80000000000000001000000000000006200630072007900700074007000720069006d006900740069007600650073002e0064006c006c000000000000000000"
+    },
+    {
+      "event": "call",
+      "thread": "QC8",
+      "rip": "0x4aab8571ee",
+      "rva": "0x71ee",
+      "iosb": 846194800704,
+      "ioctl": 3736576,
+      "input": 846194801024,
+      "input_size": 56,
+      "output": 850525981344,
+      "output_size": 384,
+      "input_bytes": "4d3c2b1a00000200ffffffffffffffff00000000586c00003000000000000000ffffffffffffffff01000000020000004100450053000000"
+    },
+    {
+      "event": "return",
+      "thread": "QC8",
+      "rip": "0x4aab8571f5",
+      "rva": "0x71f5",
+      "status": "0x0",
+      "iosb": "0000000000000000d800000000000000",
+      "information": 216,
+      "output_bytes": "01000000000002001000000000000000180000000000000006000000ffffffff500000000000000058000000000000000000000000000000ffffffffffffffff9800000000000000ffffffffffffffff52004e00470000004d006900630072006f0073006f006600740020005000720069006d00690074006900760065002000500072006f00760069006400650072000000000000000000a80000000000000001000000000000006200630072007900700074007000720069006d006900740069007600650073002e0064006c006c000000000000000000"
+    },
+    {
+      "event": "observation",
+      "reply": "T05library:;thread:8;",
+      "rip": "0x18009db54"
+    },
+    {
+      "event": "exit",
+      "reply": "W00"
+    }
+  ],
+  "isolated_probe_output": "resolver-entry=0x00000001400011F9\nresolve-status=0x0000000000000000\nresolve-size=0x00000000000000D8\nresolve-buffer=0x000000C6074C8AA0\ninterface=0x0000000000000006\nRNGMicrosoft Primitive Providerbcryptprimitives.dllopen-status=0x00000000C00000BB\nalgorithm=0x0000000000000000\n",
+  "dll_sha256": {
+    "bcrypt.dll": "3032aac0c31e4242d24c3ef78d742bd3df368b1f868dc2d2796175c0704dc16a",
+    "bcryptprimitives.dll": "7b8ba6ebc93b5eaa1e9e7148f5a4d5182fc2244c425d38d54f09c2bfbaef096d"
+  },
+  "catalog_sha256": "31e26e0ba3cd4c8fd369a960c7d0411b08054f8435ef85ebcc03a78778f5191e",
+  "sources": [
+    "https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/nf-bcrypt-bcryptresolveproviders",
+    "https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/ns-bcrypt-crypt_provider_ref",
+    "https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/ns-bcrypt-crypt_image_ref",
+    "https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/ns-bcrypt-crypt_property_ref"
+  ],
+  "status": "Bug reproduced; implementation and actual-game recovery pending"
+}
