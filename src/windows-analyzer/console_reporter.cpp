@@ -1,4 +1,5 @@
 #include "std_include.hpp"
+#include "debug_print.hpp"
 
 #include "analysis_reporter.hpp"
 #include "analysis_reporter_common.hpp"
@@ -103,7 +104,29 @@ namespace sogen
                                              addition.c_str(), e.execution.rip, e.execution.previous_ip.value_or(0),
                                              e.execution.previous_ip_module.value_or("<N/A>").c_str());
                         },
-                        [&](const debug_string_event& e) { this->log_.info("--> Debug string: %s\n", e.details.c_str()); },
+                        [&](const debug_print_call_event& e) {
+                            this->log_.info("-> Printed args: %s | call %" PRIu64 " | 0x%" PRIx64 " (%s) | caller 0x%" PRIx64 " (%s)\n",
+                                            e.api.c_str(), e.call_id, e.execution.rip, e.execution.rip_module.c_str(), e.return_address,
+                                            e.return_module.c_str());
+                            if (!e.error.empty())
+                            {
+                                this->log_.error("   Capture error: %s\n", escape_debug_console(e.error).c_str());
+                            }
+                            for (const auto& arg : e.arguments)
+                            {
+                                this->log_.info("   %s=0x%" PRIx64 "%s%s%s%s\n", arg.name.c_str(), arg.raw,
+                                                arg.encoding.empty() ? "" : " | ", escape_debug_console(arg.text).c_str(),
+                                                arg.error.empty() ? "" : " | ", escape_debug_console(arg.error).c_str());
+                            }
+                        },
+                        [&](const debug_string_event& e) {
+                            if (!e.error.empty())
+                            {
+                                this->log_.error("-> Print capture error: %s\n", escape_debug_console(e.error).c_str());
+                            }
+                            this->log_.info("-> Printed: %s | %s | 0x%" PRIx64 " (%s)\n", escape_debug_console(e.details).c_str(),
+                                            e.transport.c_str(), e.execution.rip, e.execution.rip_module.c_str());
+                        },
                         [&](const generic_activity_event& e) { this->log_.print(color::dark_gray, "%s\n", e.details.c_str()); },
                         [&](const generic_access_event& e) {
                             this->log_.print(color::dark_gray, "--> %s: %s\n", e.type.c_str(), e.name.c_str());

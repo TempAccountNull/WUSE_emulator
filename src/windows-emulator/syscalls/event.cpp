@@ -51,8 +51,14 @@ namespace sogen
                 if (c.proc.dbwin_buffer && c.win_emu.callbacks.on_debug_string)
                 {
                     constexpr auto pid_length = 4;
-                    const auto debug_data = read_string<char>(c.win_emu.memory, c.proc.dbwin_buffer + pid_length);
-                    c.win_emu.callbacks.on_debug_string(debug_data);
+                    std::array<char, 4096 - pid_length> buffer{};
+                    if (!c.win_emu.memory.try_read_memory(c.proc.dbwin_buffer + pid_length, buffer.data(), buffer.size()))
+                    {
+                        c.win_emu.callbacks.on_debug_string_error(c.proc.dbwin_buffer + pid_length, "DBWIN buffer unreadable");
+                        return STATUS_SUCCESS;
+                    }
+                    const auto end = std::ranges::find(buffer, '\0');
+                    c.win_emu.callbacks.on_debug_string(std::string_view(buffer.data(), static_cast<size_t>(end - buffer.begin())));
                 }
 
                 return STATUS_SUCCESS;

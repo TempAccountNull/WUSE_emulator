@@ -45,12 +45,20 @@ namespace sogen
         std::string import_module{};
     };
 
+    struct debug_print_frame
+    {
+        uint64_t call_id{};
+        uint64_t stack{};
+        uint64_t return_address{};
+    };
+
     struct analysis_context
     {
         const analysis_settings* settings{};
         windows_emulator* win_emu{};
         std::vector<analysis_reporter*> reporters{};
 
+        std::unordered_map<uint32_t, std::vector<debug_print_frame>> debug_print_calls{};
         std::string output{};
         bool has_reached_main{false};
 

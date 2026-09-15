@@ -1222,6 +1222,14 @@ namespace sogen
                     const auto cs_selector = acting.reg<uint16_t>(x86_register::cs);
                     const auto bitness = segment_utils::get_segment_bitness(acting, cs_selector);
                     const auto service = acting.reg<uint32_t>(x86_register::eax);
+                    if (service == BREAKPOINT_PRINT && bitness)
+                    {
+                        const auto bits32 = *bitness == segment_utils::segment_bitness::bit32;
+                        this->callbacks.on_debug_print(bits32 ? acting.reg<uint32_t>(x86_register::ecx) : acting.reg(x86_register::rcx),
+                                                       acting.reg<uint16_t>(x86_register::dx),
+                                                       acting.reg<uint32_t>(bits32 ? x86_register::ebx : x86_register::r8d),
+                                                       acting.reg<uint32_t>(bits32 ? x86_register::edi : x86_register::r9d));
+                    }
 
                     if (bitness && *bitness == segment_utils::segment_bitness::bit64 &&
                         (service == BREAKPOINT_PRINT || service == BREAKPOINT_LOAD_SYMBOLS || service == BREAKPOINT_UNLOAD_SYMBOLS ||

@@ -46,6 +46,8 @@ namespace sogen
         opt_func<void(std::string_view description)> on_generic_activity{};
         opt_func<void(std::string_view description)> on_suspicious_activity{};
         utils::callback_list<void(std::string_view message)> on_debug_string{};
+        opt_func<void(uint64_t address, uint16_t length, uint32_t component, uint32_t level)> on_debug_print{};
+        opt_func<void(uint64_t address, std::string_view error)> on_debug_string_error{};
         utils::callback_list<void(const mapped_module& mod, const mapped_section& section, uint64_t address)> on_section_first_execution{};
         opt_func<void(uint64_t address)> on_instruction{};
         opt_func<void(io_device& device, std::u16string_view device_name, ULONG code)> on_ioctrl{};

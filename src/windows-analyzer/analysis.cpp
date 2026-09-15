@@ -1,4 +1,5 @@
 #include "std_include.hpp"
+#include "debug_print.hpp"
 
 #include "analysis.hpp"
 #include "analysis_reporter.hpp"
@@ -160,9 +161,9 @@ namespace sogen
             });
         }
 
-        void handle_debug_string(const analysis_context& c, const std::string_view details)
+        void handle_debug_string(analysis_context& c, const std::string_view details)
         {
-            c.emit_observation<debug_string_event>([&](auto& event) { event.details = std::string(details); });
+            observe_debug_string(c, details);
         }
 
         void handle_generic_activity(const analysis_context& c, const std::string_view details)
@@ -516,6 +517,7 @@ namespace sogen
         void handle_instruction(analysis_context& c, const uint64_t address)
         {
             auto& win_emu = *c.win_emu;
+            prune_debug_print_calls(c, address);
             report_execution_progress(c, address);
             update_import_access(c, address);
 
@@ -549,6 +551,10 @@ namespace sogen
                 export_entry = binary->address_names.find(address);
             }
             const auto is_named = export_entry != binary->address_names.end();
+            if (is_named)
+            {
+                observe_debug_print_call(c, export_entry->second);
+            }
             const auto is_entry = address == binary->entry_point;
             const auto is_previous_main_exe = main->contains(previous_ip);
             const auto is_foreign = is_previous_main_exe && !is_main_exe;
@@ -886,6 +892,16 @@ namespace sogen
 
         cb.on_instruction = make_callback(c, handle_instruction);
         cb.on_debug_string.add(make_callback(c, handle_debug_string));
+        cb.on_debug_string_error = [&c](const uint64_t address, const std::string_view error) {
+            c.emit_observation<debug_string_event>([&](auto& event) {
+                event.transport = "dbwin";
+                event.data_address = address;
+                event.error = error;
+            });
+        };
+        cb.on_debug_print = [&c](const uint64_t address, const uint16_t length, const uint32_t component, const uint32_t level) {
+            observe_debug_print_interrupt(c, address, length, component, level);
+        };
         cb.on_generic_access = make_callback(c, handle_generic_access);
         cb.on_generic_activity = make_callback(c, handle_generic_activity);
         cb.on_suspicious_activity = make_callback(c, handle_suspicious_activity);

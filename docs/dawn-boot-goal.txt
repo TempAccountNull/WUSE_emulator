@@ -50,3 +50,11 @@ Keep progress, module/RVA/assembly failures and the full suspicious-event journa
 Commit validated Sogen changes with concise descriptions. PDFs remain deferred.
 Clean completed benchmark bulk logs on fresh runs after preserving needed
 failure evidence and checkpoint ancestry. Never remove active-run output.
+
+Additional SDK and CRT header references (cross-check against the matched DLL):
+- C:/Program Files (x86)/Windows Kits/10
+- C:/Program Files (x86)/Microsoft Visual Studio/2019/Enterprise/VC/Tools
+- C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Tools/MSVC
+- C:/Program Files/Microsoft Visual Studio/18/Insiders/VC/Tools/MSVC
+Use headers to establish declarations and ABI details; a header alone does not
+prove implementation behavior in the current guest DLL.

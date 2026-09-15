@@ -275,6 +275,7 @@ namespace sogen
             EVENT_NAME(buffered_stdout_event, "buffered_stdout");
             EVENT_NAME(stdout_chunk_event, "stdout_chunk");
             EVENT_NAME(suspicious_activity_event, "suspicious_activity");
+            EVENT_NAME(debug_print_call_event, "debug_print_call");
             EVENT_NAME(debug_string_event, "debug_string");
             EVENT_NAME(generic_activity_event, "generic_activity");
             EVENT_NAME(generic_access_event, "generic_access");
@@ -377,9 +378,61 @@ namespace sogen
                 }
             }
 
+            static void write_fields(json_object_builder& object, const debug_print_call_event& event)
+            {
+                object.field("call_id", event.call_id);
+                object.field("api", event.api);
+                object.field("pointer_bits", event.pointer_bits);
+                object.hex_field("stack_pointer", event.stack_pointer);
+                object.hex_field("return_address", event.return_address);
+                object.field("return_module", event.return_module);
+                object.field("error", event.error);
+                object.array_field("arguments", [&](const auto& append) {
+                    for (const auto& arg : event.arguments)
+                    {
+                        append([&](std::string& output) {
+                            json_object_builder item(output);
+                            item.field("name", arg.name);
+                            item.hex_field("raw", arg.raw);
+                            if (!arg.encoding.empty())
+                            {
+                                item.field("text", arg.text);
+                                item.field("encoding", arg.encoding);
+                                item.field("bytes_hex", arg.bytes_hex);
+                            }
+                            if (!arg.error.empty())
+                            {
+                                item.field("error", arg.error);
+                            }
+                        });
+                    }
+                });
+            }
+
             static void write_fields(json_object_builder& object, const debug_string_event& event)
             {
                 object.field("details", event.details);
+                object.field("transport", event.transport);
+                object.hex_field("data_address", event.data_address);
+                object.field("byte_length", event.byte_length);
+                object.field("encoding", event.encoding);
+                object.field("bytes_hex", event.bytes_hex);
+                object.field("error", event.error);
+                if (event.ansi_fallback)
+                {
+                    object.field("ansi_fallback_text", event.ansi_fallback->text);
+                    object.field("ansi_fallback_bytes_hex", event.ansi_fallback->bytes_hex);
+                    object.hex_field("ansi_fallback_address", event.ansi_fallback->raw);
+                    object.field("ansi_fallback_error", event.ansi_fallback->error);
+                }
+                object.field("component", event.component);
+                object.field("level", event.level);
+                object.array_field("origin_calls", [&](const auto& append) {
+                    for (const auto call : event.origin_calls)
+                    {
+                        append([&](std::string& output) { output += std::to_string(call); });
+                    }
+                });
             }
 
             static void write_fields(json_object_builder& object, const generic_activity_event& event)
