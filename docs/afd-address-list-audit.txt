@@ -1,0 +1,73 @@
+// AFD ADDRESS LIST QUERY
+Actual startup capture:
+destiny-sogen-1789455691954036600-afd-information-startup-replay
+Call 716539: NtDeviceIoControlFile at ntdll.dll+0x9D732,
+return address 0x4283206384 (mswsock.dll+0x6384).
+Sogen returned STATUS_NOT_SUPPORTED for IOCTL 0x120B3 (request 44).
+The caller propagated the error through WinINet. This is separate from the
+previously corrected AFD_SET_INFORMATION blocking-mode request.
+
+// DLL AND STRUCTURE CROSS-CHECK
+mswsock.dll 10.0.19041.5915, same guest-root x64/x86 inputs recorded in
+afd-information-audit.txt. IDA x64 WSPIoctl RVA 0x5AB0; x86 RVA 0xA220.
+Both DLLs issue the same 0x120B3 request with a 2-byte address-family input.
+The x64 native syscall call site is RVA 0x637D; the return is RVA 0x6384.
+
+AFD output is pointer-free TRANSPORT_ADDRESS data:
+  +0 ULONG AddressCount
+  +4 TA_ADDRESS records, concatenated without pointer-size padding:
+     +0 USHORT AddressLength (excludes the address family)
+     +2 USHORT AddressType (address family)
+     +4 AddressLength bytes of address data
+An IPv4 record occupies 18 bytes; an IPv6 record occupies 30 bytes.
+mswsock constructs the public SOCKET_ADDRESS_LIST itself. Its x64 pointer
+records use 16-byte slots; x86 uses 8-byte slots. No native pointers belong
+in the emulated AFD result.
+
+// NATIVE CONTRACT
+Isolated Windows UDP probes covered both socket families and cross-family
+queries. The requested input family determines the returned list.
+Input shorter than 2 bytes or output shorter than 4: INVALID_PARAMETER.
+Unknown family 0/1: successful empty list, Information=4.
+Successful populated result: Information=4 plus all transport-address records.
+Short output with room for the count: STATUS_BUFFER_OVERFLOW; count and
+Information describe the full list, but only complete records are written.
+Unwritten bytes and bytes outside the supplied buffer remain unchanged.
+The probe saw 3 IPv4 and 6 IPv6 addresses. These are measurements, not constants.
+
+// IMPLEMENTATION
+The Windows socket backend queries the owned native endpoint using owned
+buffers, first retrieving the required size and then the complete address list.
+It retries boundedly if the list grows during collection. Guest pointers are
+not sent to the host kernel; guest instructions remain in Icicle.
+The AFD handler validates the input, verifies record boundaries, writes complete
+records fitting the guest output, and sets the full required Information value.
+Short-buffer results retain STATUS_BUFFER_OVERFLOW for mswsock's size handling.
+Static/non-Windows socket backends report unsupported instead of fabricating
+host interfaces. Address-change notification is a distinct IOCTL.
+
+// REFERENCES
+ReactOS: F:\Part1\Reversal\reactos_functions\dll\win32\msafd\misc\dllmain.c,
+SIO_ADDRESS_LIST_QUERY case. Its single WSLocalAddress result differs from the
+verified Windows enumeration and was not copied into Sogen.
+Microsoft:
+https://learn.microsoft.com/en-us/windows/win32/winsock/sio-address-list-query
+https://learn.microsoft.com/en-us/windows/win32/api/ws2def/ns-ws2def-socket_address_list
+
+// VALIDATION
+37/37 tests pass in interpreter and Icicle JIT modes, including eight new
+address-list cases covering both guest layouts, IPv4/IPv6 comparison with
+WSAIoctl, every output boundary, empty families and invalid guest pointers.
+Regression: sogen-fixes/regression-1789457566711819300.
+Release build passed. CLI smoke exited 0 in 36.241 seconds.
+Final tidy passed: tidy-1789457398697495300.log.
+Actual-game request replay is pending at this revision.
+
+// STARTUP OBSERVATION
+The AFD mode-fixed run still showed a white window, confirmed by the user.
+Its thread 0x58 continued in Dawn's patterns::resolve_all and memchr rather
+than the old indefinitely pending receive. The matching PDB resolves
+steam_api64.dll+0x2A5300 and +0x4E58D0 respectively. Saved stack locals show
+a 16-pattern pass advancing from zero-based index 8 to 13 across executable
+ranges of 28,898,816 and 81,353,216 bytes. This is progress inside that pass,
+not an overall boot percentage. Main thread 8 waits on semaphore 0x380001C.

@@ -29,24 +29,17 @@ namespace sogen
 
         namespace
         {
-            uint32_t socket_information(const SOCKET socket_handle, const bool set, const uint32_t information_class, uint64_t& value,
-                                        const std::span<const std::byte> parameters)
+            uint32_t socket_control(const SOCKET socket_handle, const uint32_t code, const std::span<const std::byte> input,
+                                    const std::span<std::byte> output, uint64_t& information)
             {
 #ifdef _WIN32
-                struct information_request
-                {
-                    uint32_t information_class;
-                    uint32_t reserved;
-                    uint64_t value;
-                };
-
                 struct io_status
                 {
                     uintptr_t status;
                     uintptr_t information;
                 };
 
-                using ioctl_function = LONG(WINAPI*)(HANDLE, HANDLE, void*, void*, io_status*, ULONG, void*, ULONG, void*, ULONG);
+                using ioctl_function = LONG(WINAPI*)(HANDLE, HANDLE, void*, void*, io_status*, ULONG, const void*, ULONG, void*, ULONG);
                 static const auto ioctl =
                     reinterpret_cast<ioctl_function>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtDeviceIoControlFile"));
                 if (!ioctl)
@@ -58,6 +51,37 @@ namespace sogen
                 {
                     return 0xc000009a;
                 }
+                io_status completion{};
+                auto status = static_cast<uint32_t>(ioctl(reinterpret_cast<HANDLE>(socket_handle), event, nullptr, nullptr, &completion,
+                                                          code, input.data(), static_cast<ULONG>(input.size()), output.data(),
+                                                          static_cast<ULONG>(output.size())));
+                if (status == 0x103)
+                {
+                    WaitForSingleObject(event, INFINITE);
+                    status = static_cast<uint32_t>(completion.status);
+                }
+                information = completion.information;
+                return status;
+#else
+                (void)socket_handle;
+                (void)code;
+                (void)input;
+                (void)output;
+                (void)information;
+                return 0xc00000bb;
+#endif
+            }
+
+            uint32_t socket_information(const SOCKET socket_handle, const bool set, const uint32_t information_class, uint64_t& value,
+                                        const std::span<const std::byte> parameters)
+            {
+                struct information_request
+                {
+                    uint32_t information_class;
+                    uint32_t reserved;
+                    uint64_t value;
+                };
+
                 information_request request{.information_class = information_class, .reserved = 0, .value = value};
                 std::vector<std::byte> input(sizeof(request) + parameters.size());
                 memcpy(input.data(), &request, sizeof(request));
@@ -65,28 +89,14 @@ namespace sogen
                 {
                     memcpy(input.data() + sizeof(request), parameters.data(), parameters.size());
                 }
-                io_status completion{};
-                auto status = static_cast<uint32_t>(ioctl(reinterpret_cast<HANDLE>(socket_handle), event, nullptr, nullptr, &completion,
-                                                          set ? 0x1203b : 0x1207b, input.data(), static_cast<ULONG>(input.size()),
-                                                          set ? nullptr : &request, set ? 0 : sizeof(request)));
-                if (status == 0x103)
-                {
-                    WaitForSingleObject(event, INFINITE);
-                    status = static_cast<uint32_t>(completion.status);
-                }
+                const auto output = set ? std::span<std::byte>{} : std::as_writable_bytes(std::span(&request, 1));
+                uint64_t information{};
+                const auto status = socket_control(socket_handle, set ? 0x1203b : 0x1207b, input, output, information);
                 if (status == 0 && !set)
                 {
                     value = request.value;
                 }
                 return status;
-#else
-                (void)socket_handle;
-                (void)set;
-                (void)information_class;
-                (void)value;
-                (void)parameters;
-                return 0xc00000bb;
-#endif
             }
         }
 
@@ -99,6 +109,36 @@ namespace sogen
         uint32_t socket_wrapper::set_information(const uint32_t information_class, uint64_t value)
         {
             return socket_information(this->socket_.get_socket(), true, information_class, value, {});
+        }
+
+        uint32_t socket_wrapper::query_address_list(const uint16_t family, std::vector<std::byte>& data)
+        {
+            data.resize(sizeof(uint32_t));
+            for (unsigned int attempt = 0; attempt < 8; ++attempt)
+            {
+                uint64_t information{};
+                const auto status =
+                    socket_control(this->socket_.get_socket(), 0x120b3, std::as_bytes(std::span(&family, 1)), data, information);
+                if (status == 0)
+                {
+                    if (information < sizeof(uint32_t) || information > data.size())
+                    {
+                        return 0xc000000d;
+                    }
+                    data.resize(static_cast<size_t>(information));
+                    return 0;
+                }
+                if (status != 0x80000005 || information <= data.size())
+                {
+                    return status;
+                }
+                if (information > UINT32_MAX)
+                {
+                    return 0xc000009a;
+                }
+                data.resize(static_cast<size_t>(information));
+            }
+            return 0xc000022d;
         }
 
         bool socket_wrapper::is_ready(const bool in_poll)

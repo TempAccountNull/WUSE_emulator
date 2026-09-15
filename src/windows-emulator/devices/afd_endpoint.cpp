@@ -595,6 +595,8 @@ namespace sogen
                     return this->ioctl_receive_datagram(win_emu, c);
                 case AFD_POLL:
                     return this->ioctl_poll(win_emu, c);
+                case AFD_ADDRESS_LIST_QUERY:
+                    return this->ioctl_address_list(win_emu, c);
                 case AFD_GET_ADDRESS:
                     return this->ioctl_get_address(win_emu, c);
                 case AFD_EVENT_SELECT:
@@ -617,6 +619,68 @@ namespace sogen
                                       static_cast<uint32_t>(request));
                     return STATUS_NOT_SUPPORTED;
                 }
+            }
+
+            NTSTATUS ioctl_address_list(windows_emulator& win_emu, const io_device_context& c)
+            {
+                if (!this->s_)
+                {
+                    return STATUS_INVALID_HANDLE;
+                }
+                if (c.input_buffer_length < sizeof(uint16_t) || c.output_buffer_length < sizeof(uint32_t))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                uint16_t family{};
+                if (!win_emu.memory.try_read_memory(c.input_buffer, &family, sizeof(family)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                std::vector<std::byte> data;
+                const auto result = static_cast<NTSTATUS>(this->s_->query_address_list(family, data));
+                if (result != STATUS_SUCCESS)
+                {
+                    return result;
+                }
+                if (data.size() < sizeof(uint32_t))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                uint32_t count{};
+                memcpy(&count, data.data(), sizeof(count));
+                size_t cursor = sizeof(count);
+                size_t copied = cursor;
+                for (uint32_t index = 0; index < count; ++index)
+                {
+                    if (data.size() - cursor < 4)
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    uint16_t length{};
+                    memcpy(&length, data.data() + cursor, sizeof(length));
+                    if (data.size() - cursor - 4 < length)
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    cursor += 4u + length;
+                    if (cursor <= c.output_buffer_length)
+                    {
+                        copied = cursor;
+                    }
+                }
+                if (cursor != data.size())
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                if (!win_emu.memory.try_write_memory(c.output_buffer, data.data(), copied))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                c.io_status_block.access([&](status_block& block) { block.Information = data.size(); });
+                const auto status = copied == data.size() ? STATUS_SUCCESS : STATUS_BUFFER_OVERFLOW;
+                win_emu.log.info("AFD address list: family %u, %u addresses, %zu/%zu bytes, status 0x%08X\n", family, count, copied,
+                                 data.size(), static_cast<uint32_t>(status));
+                return status;
             }
 
             NTSTATUS ioctl_information(windows_emulator& win_emu, const io_device_context& c, const bool set)

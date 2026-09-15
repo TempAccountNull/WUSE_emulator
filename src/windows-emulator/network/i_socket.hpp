@@ -26,6 +26,11 @@ namespace sogen
                 return 0xc00000bb;
             }
 
+            virtual uint32_t query_address_list(uint16_t, std::vector<std::byte>&)
+            {
+                return 0xc00000bb;
+            }
+
             virtual bool is_ready(bool in_poll) = 0;
             virtual bool is_listening() = 0;
 
