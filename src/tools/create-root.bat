@@ -164,6 +164,7 @@ CALL :collect winmm.dll
 CALL :collect winmmbase.dll
 CALL :collect winnlsres.dll
 CALL :collect wintrust.dll
+CALL :collect wldp.dll
 CALL :collect wintypes.dll
 CALL :collect wlanapi.dll
 CALL :collect wldap32.dll
