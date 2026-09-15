@@ -59,3 +59,26 @@ including actual INT 2D execution, x86 argument layouts, Unicode/ANSI fallback,
 embedded NULs, MMIO rejection, DBWIN bounds and unchanged capture-failure status.
 Twelve journal tests and the printed/checkpoint PowerShell panel checks passed.
 These checks do not establish that Destiny reaches its menus or world.
+
+## Actual game validation, 2026-09-15
+
+The tidy build passed after the interpreter and JIT regressions. Commit
+`c51c7736` was deployed to `20260915-152213-icicle-startup`. The game resumed
+from its saved snapshot with Icicle, explicit `-e` and `-v`, and one debugger
+owner. Capture `destiny-sogen-1789503760812118200-debug-print-capture` records
+new `OutputDebugStringA` arguments and matching exception/DBWIN payloads.
+
+For the observed Oodle `bad decode len` output, the API caller is
+`oo2core_3_win64.dll+0x5D19B`, return address `+0x5D1A1`, on guest thread 68.
+The record preserves the text bytes and origin call IDs. The same-thread
+function journal records Dawn `steam_api64.dll+0x3E60C9` entering
+`OodleLZ_Decompress`; matching Dawn symbols identify the package reader's
+`load_block`. Source and disassembly both show output-size attempts from
+0x40000 down to 0x4000. Failed attempts are a candidate explanation for these
+messages; the log alone does not establish corrupt input or an emulator defect.
+
+The live viewer follows the newest tail and preserves complete file journals.
+The previous completed capture's 44,938,876,959 bytes of bulk console/event logs
+were removed after its checkpoint, provenance, printed and suspicious journals,
+and first/last samples were retained. The new run's files remain active.
+These observations validate actual-game capture, not successful game boot.
