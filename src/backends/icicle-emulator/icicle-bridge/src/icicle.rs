@@ -338,6 +338,7 @@ struct ExecutionHooks {
     specific_hooks: HookContainer<dyn Fn(u64)>,
     block_hooks: HookContainer<dyn Fn(u64, u64)>,
     address_mapping: BTreeMap<u64, Vec<u32>>,
+    address_filter: [u64; 4],
     one_time_callbacks: Vec<Box<dyn Fn()>>,
 }
 
@@ -351,8 +352,15 @@ impl ExecutionHooks {
             specific_hooks: HookContainer::new(),
             block_hooks: HookContainer::new(),
             address_mapping: BTreeMap::new(),
+            address_filter: [0; 4],
             one_time_callbacks: Vec::new(),
         }
+    }
+
+    fn address_filter_bit(address: u64) -> (usize, u64) {
+        let hash = (address ^ (address >> 32)).wrapping_mul(0x9e3779b97f4a7c15);
+        let bit = (hash >> 56) as usize;
+        (bit / 64, 1 << (bit % 64))
     }
 
     fn run_hooks(&mut self, address: u64) {
@@ -370,6 +378,11 @@ impl ExecutionHooks {
         self.ranged_hooks.for_each_hook(|func| {
             func(address);
         });
+
+        let (word, bit) = Self::address_filter_bit(address);
+        if self.address_filter[word] & bit == 0 {
+            return;
+        }
 
         let mapping = self.address_mapping.get(&address);
         if mapping.is_none() {
@@ -430,6 +443,8 @@ impl ExecutionHooks {
         let id = self.specific_hooks.add_hook(callback);
         let mapping = self.address_mapping.entry(address).or_insert_with(Vec::new);
         mapping.push(id);
+        let (word, bit) = Self::address_filter_bit(address);
+        self.address_filter[word] |= bit;
 
         return id;
     }
@@ -453,6 +468,11 @@ impl ExecutionHooks {
         });
 
         self.specific_hooks.remove_hook(id);
+        self.address_filter.fill(0);
+        for &address in self.address_mapping.keys() {
+            let (word, bit) = Self::address_filter_bit(address);
+            self.address_filter[word] |= bit;
+        }
     }
 }
 
@@ -1357,5 +1377,112 @@ mod hook_container_tests {
         container.access_hook(77, |_| panic!("unexpected callback"));
         container.remove_hook(77);
         assert!(container.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod execution_hook_filter_tests {
+    use super::ExecutionHooks;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    fn hooks() -> ExecutionHooks {
+        ExecutionHooks::new(Rc::new(RefCell::new(false)), Rc::new(Cell::new(false)))
+    }
+
+    #[test]
+    fn empty_exact_filter_preserves_generic_and_range_callbacks() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut hooks = hooks();
+        let generic = calls.clone();
+        hooks.add_generic_hook(Box::new(move |address| {
+            generic.borrow_mut().push((0, address))
+        }));
+        let ranged = calls.clone();
+        hooks.add_range_hook(
+            0x1000,
+            2,
+            Box::new(move |address| ranged.borrow_mut().push((1, address))),
+        );
+        hooks.run_hooks(0x1001);
+        hooks.run_hooks(0x1002);
+        assert_eq!(*calls.borrow(), vec![(0, 0x1001), (1, 0x1001), (0, 0x1002)]);
+    }
+
+    #[test]
+    fn collisions_and_shared_addresses_keep_exact_dispatch() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut hooks = hooks();
+        let address = 0x140001234;
+        let collision = (address + 1..address + 0x10000)
+            .find(|&candidate| {
+                ExecutionHooks::address_filter_bit(candidate)
+                    == ExecutionHooks::address_filter_bit(address)
+            })
+            .unwrap();
+        let first_calls = calls.clone();
+        let first =
+            hooks.add_specific_hook(address, Box::new(move |_| first_calls.borrow_mut().push(1)));
+        let second_calls = calls.clone();
+        let second = hooks.add_specific_hook(
+            address,
+            Box::new(move |_| second_calls.borrow_mut().push(2)),
+        );
+        hooks.run_hooks(collision);
+        assert!(calls.borrow().is_empty());
+        let third_calls = calls.clone();
+        let third = hooks.add_specific_hook(
+            collision,
+            Box::new(move |_| third_calls.borrow_mut().push(3)),
+        );
+        hooks.remove_specific_hook(first);
+        hooks.run_hooks(address);
+        hooks.run_hooks(collision);
+        assert_eq!(*calls.borrow(), vec![2, 3]);
+        calls.borrow_mut().clear();
+        hooks.remove_specific_hook(second);
+        hooks.run_hooks(address);
+        hooks.run_hooks(collision);
+        assert_eq!(*calls.borrow(), vec![3]);
+        hooks.remove_specific_hook(third);
+        assert_eq!(hooks.address_filter, [0; 4]);
+    }
+
+    #[test]
+    fn high_addresses_and_removals_do_not_lose_hooks() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut hooks = hooks();
+        let mut ids = Vec::new();
+        let mut addresses = vec![0, u64::MAX, 0x1800a0330, 0x7ff700000000];
+        for index in 0..128u64 {
+            addresses.push(index.wrapping_mul(0x2545f4914f6cdd1d));
+        }
+        addresses.sort_unstable();
+        addresses.dedup();
+        for &address in &addresses {
+            let observed = calls.clone();
+            ids.push(hooks.add_specific_hook(
+                address,
+                Box::new(move |actual| {
+                    assert_eq!(actual, address);
+                    observed.borrow_mut().push(actual);
+                }),
+            ));
+        }
+        for &address in &addresses {
+            hooks.run_hooks(address);
+        }
+        assert_eq!(*calls.borrow(), addresses);
+        calls.borrow_mut().clear();
+        for &id in ids.iter().step_by(2) {
+            hooks.remove_specific_hook(id);
+        }
+        for &address in &addresses {
+            hooks.run_hooks(address);
+        }
+        assert_eq!(
+            *calls.borrow(),
+            addresses.into_iter().skip(1).step_by(2).collect::<Vec<_>>()
+        );
     }
 }
