@@ -455,3 +455,13 @@ pub fn icicle_destroy_emulator(ptr: *mut c_void) {
         let _ = Box::from_raw(ptr as *mut IcicleEmulator);
     }
 }
+
+#[cfg(test)]
+mod architecture_tests {
+    #[test]
+    fn build_both_x86_languages() {
+        for target in ["i686-none", "x86_64-none"] {
+            icicle_vm::build(&icicle_cpu::Config::from_target_triple(target)).unwrap();
+        }
+    }
+}

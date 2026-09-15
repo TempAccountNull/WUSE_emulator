@@ -1,3 +1,4 @@
+@ifdef IA64
 define token aligned_evex (24)
   aligned_p0=(0,7)
   aligned_w=(15,15)
@@ -27,3 +28,4 @@ AlignedMoveTail: is mod=2 & r_m!=4; imm32 {}
 :VMAXSD is $(LONGMODE_ON) & vexMode=0 & byte=0x62; aligned_p0 & aligned_w=1 & minmax_pp=3; byte=0x5F; AlignedMoveTail { sogen_minmax(inst_next:8); }
 
 :VPMULHUW is $(LONGMODE_ON) & vexMode=0 & byte=0x62; aligned_p0; byte=0xE4; AlignedMoveTail { sogen_pmulhuw(inst_next:8); }
+@endif

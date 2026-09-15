@@ -1,0 +1,39 @@
+Icicle address-size and subtraction flags
+
+In 64-bit mode, 67h selects a 32-bit effective address. Calculate the complete
+RIP-relative, base/index or displacement result at that width, then zero-extend
+before adding FS/GS. The former Mem path sign-extended ordinary offsets and
+retained high RIP bits. LEA used a different, incorrect SIB-relative rule.
+
+Use the same addr32 calculation for memory and LEA. Keep mod00/rm101
+RIP-relative in long mode, including REX.B=1. Preserve displacement-only SIB
+addressing. R12D is an index when REX.X=1; six no-index shortcuts omitted that
+condition. The default 64-bit address forms remain unchanged.
+
+The trailing-immediate CMP regression also reproduced stale AF. subflags now
+calculates the bit-3 borrow for CMP, SUB and its other existing callers. Tests
+check all six arithmetic flags for byte, word, dword and qword operands. The
+separate ADC/SBB and addition auxiliary-carry omissions are not fixed here.
+
+The existing long-mode EVEX definitions lacked an IA64 include guard, making
+the standalone i686 language fail compilation. Both x86 language definitions
+now compile. This does not implement compatibility-mode selection, far
+transfers or the custom vector helpers' compatibility address semantics.
+
+Intel references: 325383-092-sdm-vol-2abcd.pdf physical pages 40-42
+(REX/SIB/RIP), 279-280 (CMP), 665-666 (LEA), and
+325462-092-sdm-vol-1-2abcd-3abcd-4.pdf physical page 76 (address truncation).
+
+Validation under PatchScanner/benchmarks/sogen-fixes:
+- regression-1789506901351615900: nine of thirteen tests failed in each engine
+  before the fix, including R12D, RIP-relative and fault-address checks.
+- regression-1789506987389182000: address results passed; CMP reproduced AF.
+- regression-1789507136794956000: forty tests passed in each engine.
+- regression-1789507587317945200: forty-seven address/aligned-move/min-max tests
+  passed in each engine; fourteen address tests overlap the previous run.
+- rust-tests-1789507468479595500: both x86 SLEIGH languages compile.
+- vs2022-1789507502004493700 and tidy-1789507542779980700: builds passed.
+- sogen-cli-smoke-1789507219291767500: Icicle guest CLI smoke exited zero.
+
+These are regression and smoke results, not proof of game boot or an actual
+Destiny failure passing. Actual-game checkpoint replay is the next check.
