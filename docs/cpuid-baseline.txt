@@ -32,3 +32,10 @@ preserved flags/non-output registers, Windows XSAVE ABI, and existing
 min/max behavior in interpreter and JIT modes. Validation is recorded in
 cpuid-baseline-validation.json. This is CPU enumeration repair, not a
 claim that every instruction in those ISA families has been audited.
+
+Actual-game replay passed. WARP received EDX=0x07808111 at RVA 0x349232.
+gWarpConfig became 0x26E0E. Pixel initialization returned success and set
+the compiled execution pointer. The guest then entered generated code at
+0xBACC5E1000 and returned to WARP+0x43A0BF on the same thread with the
+expected stack pointer. Execution continued from that checkpoint.
+Full game boot and an end-to-end speedup remain unconfirmed.
