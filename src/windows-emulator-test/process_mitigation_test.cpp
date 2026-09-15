@@ -263,6 +263,7 @@ namespace sogen::test
         auto bytes = output.move_buffer();
         utils::buffer_serializer extensions{};
         emu.memory.serialize_aslr_state(extensions);
+        emu.cng_changes.serialize(extensions);
         const auto& suffix = extensions.get_buffer();
         ASSERT_GE(bytes.size(), suffix.size());
         ASSERT_TRUE(std::equal(suffix.rbegin(), suffix.rend(), bytes.rbegin()));

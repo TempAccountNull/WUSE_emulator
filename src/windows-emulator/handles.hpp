@@ -177,6 +177,7 @@ namespace sogen
     struct generic_handle_store
     {
         virtual ~generic_handle_store() = default;
+        virtual bool contains(handle h) const = 0;
         virtual bool erase(handle h) = 0;
         virtual std::optional<handle> duplicate(handle h) = 0;
     };
@@ -222,6 +223,11 @@ namespace sogen
             h.value.id = index << IndexShift;
 
             return h;
+        }
+
+        bool contains(const handle h) const override
+        {
+            return h.value.type == Type && !h.value.is_pseudo && this->store_.contains(static_cast<uint32_t>(h.value.id) >> IndexShift);
         }
 
         T* get_by_index(const uint32_t index)
@@ -436,6 +442,11 @@ namespace sogen
       public:
         using key_type = uint32_t;
         using value_map = std::map<key_type, T>;
+
+        bool contains(const handle h) const override
+        {
+            return this->get(h) != nullptr;
+        }
 
         explicit dummy_handle_store(std::initializer_list<handle> handles)
         {

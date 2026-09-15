@@ -239,5 +239,238 @@
     "https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/ns-bcrypt-crypt_image_ref",
     "https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/ns-bcrypt-crypt_property_ref"
   ],
-  "status": "Bug reproduced; implementation and actual-game recovery pending"
+  "status": "Catalog-backed resolution implemented and regression/guest-probe validated; fresh actual-game validation pending",
+  "implementation": {
+    "operations": [
+      "0x20000 resolve providers",
+      "0x10500 register notification",
+      "0x10501 unregister notification"
+    ],
+    "source_versions": "bcrypt.dll x64/x86 and cng.sys x64 10.0.19041.7181",
+    "cng_driver_sha256": "80e3b701e4cfac714cfe51569d480e6610d169072996d3284008bd1467946cb3",
+    "release_build": "vs2022-1789493066629028400.log",
+    "tidy_build": "tidy-1789493024075848500.log",
+    "final_regressions": {
+      "capture": "regression-1789493372720480800",
+      "results": [
+        {
+          "mode": "interpreter",
+          "tests": 69,
+          "failures": 0,
+          "disabled": 0,
+          "errors": 0,
+          "time": "9.012s"
+        },
+        {
+          "mode": "jit",
+          "tests": 69,
+          "failures": 0,
+          "disabled": 0,
+          "errors": 0,
+          "time": "11.2s"
+        }
+      ]
+    },
+    "guest_probe": {
+      "capture": "cng-contract-probe-1789492768502145200",
+      "run": {
+        "pid": 13280,
+        "command": [
+          "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo\\analyzer.exe",
+          "--backend",
+          "icicle",
+          "-v",
+          "-e",
+          "D:\\Sunrise\\D2\\sogen\\root",
+          "-p",
+          "c:\\cng-probe",
+          "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\cng-resolver-probe",
+          "--debug",
+          "--port",
+          "28987",
+          "c:\\cng-probe\\cng-resolver-probe.exe"
+        ],
+        "state": "exited",
+        "architecture": "x64",
+        "scope": "Isolated CNG contract probe; not the game",
+        "viewer_pid": 58632,
+        "exit_code": 1,
+        "termination": "Closed isolated analyzer after captured guest exit; debugger otherwise waits to replay",
+        "guest_exit": "W00",
+        "passed": true
+      },
+      "output": "resolver-entry=0x0000000140001507\nresolve-status=0x0000000000000000\nresolve-size=0x0000000000000118\nresolve-buffer=0x000000E2A98B8AA0\ninterface=0x0000000000000001\nAESMicrosoft Primitive Providerbcryptprimitives.dllopen-status=0x0000000000000000\nalgorithm=0x000000E2A98BB900\ngcm-mode=0x0000000000000000\ngcm-key=0x0000000000000000\ngcm-decrypt=0x0000000000000000\ngcm-written=0x0000000000000010\ngcm-invalid-tag=0x00000000C000A002\ngcm-destroy=0x0000000000000000\nclose=0x0000000000000000\nfailures=0x0000000000000000\n",
+      "transport": [
+        {
+          "event": "ksec-entry",
+          "thread": "QC8",
+          "location": {
+            "address": "0x18009d720",
+            "module": "c:\\windows\\system32\\ntdll.dll",
+            "rva": "0x9d720"
+          },
+          "caller": {
+            "address": "0x71b45d71f5",
+            "module": "c:\\windows\\system32\\bcrypt.dll",
+            "rva": "0x71f5"
+          },
+          "iosb": 969175921056,
+          "input_address": 969175921280,
+          "input_size": 104,
+          "output_address": 969175921072,
+          "output_size": 8,
+          "input": "4d3c2b1a000501000000000000000000ffffffffffffffff0000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000ffffffffffffffffffffffffffffffff0000000000000000ffffffffffffffff0600800100000000",
+          "time": 1789492773.3362308
+        },
+        {
+          "event": "ksec-return",
+          "thread": "QC8",
+          "location": {
+            "address": "0x71b45d71f5",
+            "module": "c:\\windows\\system32\\bcrypt.dll",
+            "rva": "0x71f5"
+          },
+          "caller": {
+            "address": "0x71b45d71f5",
+            "module": "c:\\windows\\system32\\bcrypt.dll",
+            "rva": "0x71f5"
+          },
+          "iosb": 969175921056,
+          "input_address": 969175921280,
+          "input_size": 104,
+          "output_address": 969175921072,
+          "output_size": 8,
+          "input": "4d3c2b1a000501000000000000000000ffffffffffffffff0000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000ffffffffffffffffffffffffffffffff0000000000000000ffffffffffffffff0600800100000000",
+          "time": 1789492773.4447937,
+          "status": "0x0",
+          "io_status": "00000000000000000000000000000000",
+          "information": 0,
+          "output": ""
+        },
+        {
+          "event": "ksec-entry",
+          "thread": "QC8",
+          "location": {
+            "address": "0x18009d720",
+            "module": "c:\\windows\\system32\\ntdll.dll",
+            "rva": "0x9d720"
+          },
+          "caller": {
+            "address": "0x71b45d71f5",
+            "module": "c:\\windows\\system32\\bcrypt.dll",
+            "rva": "0x71f5"
+          },
+          "iosb": 969175923728,
+          "input_address": 969175924048,
+          "input_size": 56,
+          "output_address": 973507103392,
+          "output_size": 384,
+          "input": "4d3c2b1a00000200ffffffffffffffff00000000000000003000000000000000ffffffffffffffff01000000000000004100450053000000",
+          "time": 1789492774.0809216
+        },
+        {
+          "event": "ksec-return",
+          "thread": "QC8",
+          "location": {
+            "address": "0x71b45d71f5",
+            "module": "c:\\windows\\system32\\bcrypt.dll",
+            "rva": "0x71f5"
+          },
+          "caller": {
+            "address": "0x71b45d71f5",
+            "module": "c:\\windows\\system32\\bcrypt.dll",
+            "rva": "0x71f5"
+          },
+          "iosb": 969175923728,
+          "input_address": 969175924048,
+          "input_size": 56,
+          "output_address": 973507103392,
+          "output_size": 384,
+          "input": "4d3c2b1a00000200ffffffffffffffff00000000000000003000000000000000ffffffffffffffff01000000000000004100450053000000",
+          "time": 1789492774.1909435,
+          "status": "0x0",
+          "io_status": "00000000000000001801000000000000",
+          "information": 280,
+          "output": "01000000000000001000000000000000180000000000000001000000000000005000000000000000580000000000000001000000000000009800000000000000d800000000000000ffffffffffffffff41004500530000004d006900630072006f0073006f006600740020005000720069006d00690074006900760065002000500072006f00760069006400650072000000000000000000a000000000000000b8000000000000000400000000000000d0000000000000004b00650079004c0065006e006700740068000000000000008000000000000000e80000000000000001000000000000006200630072007900700074007000720069006d006900740069007600650073002e0064006c006c000000000000000000"
+        },
+        {
+          "event": "ksec-entry",
+          "thread": "QC8",
+          "location": {
+            "address": "0x18009d720",
+            "module": "c:\\windows\\system32\\ntdll.dll",
+            "rva": "0x9d720"
+          },
+          "caller": {
+            "address": "0x71b45d71f5",
+            "module": "c:\\windows\\system32\\bcrypt.dll",
+            "rva": "0x71f5"
+          },
+          "iosb": 969175922736,
+          "input_address": 969175923056,
+          "input_size": 56,
+          "output_address": 973507103392,
+          "output_size": 384,
+          "input": "4d3c2b1a00000200ffffffffffffffff00000000102300003000000000000000ffffffffffffffff01000000020000004100450053000000",
+          "time": 1789492775.1945028
+        },
+        {
+          "event": "ksec-return",
+          "thread": "QC8",
+          "location": {
+            "address": "0x71b45d71f5",
+            "module": "c:\\windows\\system32\\bcrypt.dll",
+            "rva": "0x71f5"
+          },
+          "caller": {
+            "address": "0x71b45d71f5",
+            "module": "c:\\windows\\system32\\bcrypt.dll",
+            "rva": "0x71f5"
+          },
+          "iosb": 969175922736,
+          "input_address": 969175923056,
+          "input_size": 56,
+          "output_address": 973507103392,
+          "output_size": 384,
+          "input": "4d3c2b1a00000200ffffffffffffffff00000000102300003000000000000000ffffffffffffffff01000000020000004100450053000000",
+          "time": 1789492775.3038785,
+          "status": "0x0",
+          "io_status": "00000000000000001801000000000000",
+          "information": 280,
+          "output": "01000000000000001000000000000000180000000000000001000000000000005000000000000000580000000000000001000000000000009800000000000000d800000000000000ffffffffffffffff41004500530000004d006900630072006f0073006f006600740020005000720069006d00690074006900760065002000500072006f00760069006400650072000000000000000000a000000000000000b8000000000000000400000000000000d0000000000000004b00650079004c0065006e006700740068000000000000008000000000000000e80000000000000001000000000000006200630072007900700074007000720069006d006900740069007600650073002e0064006c006c000000000000000000"
+        }
+      ]
+    },
+    "cli_smoke": {
+      "command": [
+        "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo\\analyzer.exe",
+        "--backend",
+        "icicle",
+        "-v",
+        "-e",
+        "D:\\Sunrise\\D2\\sogen\\root",
+        "-p",
+        "c:\\sogen-tests",
+        "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo",
+        "--env",
+        "EMULATOR_ICICLE",
+        "1",
+        "--report",
+        "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-cli-smoke-1789492767004797600\\events.jsonl",
+        "--stdout",
+        "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-cli-smoke-1789492767004797600\\guest-stdout.log",
+        "c:\\sogen-tests\\test-sample.exe"
+      ],
+      "purpose": "Repository CLI smoke test; distinct from actual Destiny boot acceptance",
+      "pid": 20096,
+      "exit_code": 0,
+      "seconds": 30.96851920010522
+    },
+    "x86_limit": "Guest API probe faults before CNG at SysWOW64 ntdll.dll+0x75890; wire contract verified independently, complete x86 API execution unverified",
+    "scope_limits": [
+      "CNG configuration-writing operations remain unsupported",
+      "Existing Sogen handle tables do not model per-handle access rights",
+      "Fresh actual-game recovery and boot acceptance are separate from the passing guest probe"
+    ]
+  }
 }

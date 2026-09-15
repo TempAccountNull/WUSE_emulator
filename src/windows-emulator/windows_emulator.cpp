@@ -1842,6 +1842,7 @@ namespace sogen
         this->dispatcher.serialize(buffer);
         this->process.serialize(buffer, this->vcpus_[0]->active_thread);
         this->memory.serialize_aslr_state(buffer);
+        this->cng_changes.serialize(buffer);
     }
 
     void windows_emulator::deserialize(utils::buffer_deserializer& buffer)
@@ -1882,6 +1883,7 @@ namespace sogen
                                             this->mod_manager.executable && (this->mod_manager.executable->dll_characteristics &
                                                                              IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) != 0,
                                             this->process.is_wow64_process, this->uses_relative_time());
+        this->cng_changes.deserialize(buffer, *this);
         this->process.restore_after_state_restore(*this);
     }
 
@@ -1920,6 +1922,7 @@ namespace sogen
         this->dispatcher.serialize(buffer);
         this->process.serialize(buffer, this->vcpus_[0]->active_thread);
         this->memory.serialize_aslr_state(buffer);
+        this->cng_changes.serialize(buffer);
 
         this->process_snapshot_ = buffer.move_buffer();
     }
@@ -1959,6 +1962,7 @@ namespace sogen
                                             this->mod_manager.executable && (this->mod_manager.executable->dll_characteristics &
                                                                              IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) != 0,
                                             this->process.is_wow64_process, this->uses_relative_time());
+        this->cng_changes.deserialize(buffer, *this);
         this->process.restore_after_state_restore(*this);
     }
 

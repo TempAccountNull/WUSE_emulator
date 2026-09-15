@@ -9,6 +9,7 @@
 #include "syscall_dispatcher.hpp"
 #include "process_context.hpp"
 #include "kernel_lock.hpp"
+#include "devices/cng_notifications.hpp"
 #include "logger.hpp"
 #include "file_system.hpp"
 #include "memory_manager.hpp"
@@ -163,6 +164,7 @@ namespace sogen
         module_manager mod_manager;
         process_context process;
         syscall_dispatcher dispatcher;
+        cng_notifications cng_changes;
 
         windows_emulator(std::unique_ptr<x86_64_emulator> emu, const emulator_settings& settings = {}, emulator_callbacks callbacks = {},
                          emulator_interfaces interfaces = {});

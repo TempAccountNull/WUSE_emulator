@@ -443,6 +443,11 @@ namespace sogen
             return this->get(hh);
         }
 
+        bool contains(const handle h) const override
+        {
+            return this->get(h) != nullptr;
+        }
+
         size_t size() const
         {
             return this->store_.size();

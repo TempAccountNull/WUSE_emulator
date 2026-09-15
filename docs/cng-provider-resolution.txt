@@ -1,71 +1,95 @@
-CNG provider resolution: AES resolves to RNG
+CNG provider resolution and configuration notification events
 
-Actual game capture: destiny-sogen-1789488916133256800-aes-provider-proof.
-Dawn call: steam_api64.dll+0x3EE282; return: +0x3EE288.
-BCryptOpenAlgorithmProvider(&handle, L"AES", nullptr, 0) returned
-0xC00000BB (STATUS_NOT_SUPPORTED), handle zero, on guest thread 0x58.
-The matching DLL/PDB identifies sunrise::middleware::crypto::aes_gcm::decrypt.
-The caller bytes and loaded CodeView GUID/age match the compiled Dawn DLL.
-The saved process used an already cached provider record: this replay did not
-make a Ksec provider-resolution request.
+Problem
+  Dawn's AES wrapper at steam_api64.dll+0x3EE220 called
+  BCryptOpenAlgorithmProvider at +0x3EE282. It returned 0xC00000BB with
+  a zero handle at +0x3EE288. Sogen's provider response contained RNG,
+  interface 6, even when the request contained AES. The game replay had
+  cached that response; an independent fresh guest query reproduced it.
 
-Fresh guest contract probe: cng-contract-probe-1789488308803442500.
-The probe used the same guest root and exact bcrypt.dll. It called
-BCryptResolveProviders(nullptr, 0, L"AES", nullptr, CRYPT_UM, 0, ...).
-The Ksec request explicitly contained AES, but Sogen returned interface 6,
-function RNG and image bcryptprimitives.dll. BCryptResolveProviders accepted
-the structure; BCryptOpenAlgorithmProvider then returned 0xC00000BB.
-The probe exited with guest debugger reply W00. Its analyzer was closed after
-the debugger began waiting for a new replay connection.
+Implementation
+  Resolve providers from the guest Cryptography registry catalog. Preserve
+  context and provider priority, interface inference, UM/KM selection,
+  function and provider selectors, independent enumeration flags, image
+  flags and per-function properties. Reject invalid selectors and ambiguous
+  interfaces. Unknown algorithms return STATUS_NOT_FOUND.
 
-Exact x64 bcrypt.dll call sites, decoded from PE runtime-function boundaries:
-  +0x71EE  48 FF 15 73 47 01 00  call [NtDeviceIoControlFile]
-  +0x71F5                       return from the device call
-  +0x1E8D  48 FF 15 04 99 01 00  call [GetProcAddress]
-  +0x1E94                       return from GetProcAddress
-Scanning for FF 15 alone yields addresses one byte inside these instructions.
+  Decode the variable-length self-relative request; reject out-of-range,
+  overlapping and unterminated fields. The driver permits odd string offsets
+  and strings in unused padding. Both x64 and WOW64 use 64-bit wire offsets;
+  the x86 DLL compacts the response after relocation. Responses contain
+  complete provider/property/image records, aligned offsets and null sentinels.
 
-The captured IOCTL 0x390400 request is a self-relative x64 structure:
-  +0x00  u32 magic 0x1A2B3C4D
-  +0x04  u32 operation 0x00020000
-  +0x08  u64 context string offset; UINT64_MAX means absent
-  +0x10  u32 interface (zero requests inference); +0x14 is padding
-  +0x18  u64 function string offset
-  +0x20  u64 provider string offset; UINT64_MAX means absent
-  +0x28  u32 mode (CRYPT_UM = 1)
-  +0x2C  u32 flags
-  +0x30  UTF-16 strings, sized by the request
-The 56-byte AES request was captured both with flags zero and with flags two.
+  Preserve the exact driver error transport: semantic failures return
+  STATUS_BUFFER_OVERFLOW with the underlying status in four bytes. Insufficient
+  result capacity uses eight bytes: STATUS_BUFFER_TOO_SMALL and required size.
+  Output buffers shorter than eight bytes fail directly. Clear unused output.
 
-The guest SYSTEM hive registers AES under cipher interface 1 and the Microsoft
-Primitive Provider, whose UM image is bcryptprimitives.dll. It also contains
-provider order, supported functions, image flags and context properties.
-Sogen currently uses fixed RNG/hash response blobs instead. All other names
-fall through to RNG. Its fixed eight-character input field cannot represent
-the longer algorithm and provider names in the catalog.
+  Register and unregister notification event references for operations
+  0x10500/0x10501. Validate handle identity/type, retain the event, reject
+  duplicate subscriptions and preserve state across snapshots/device closure.
+  Valid unregistered events can be unregistered repeatedly. Publication signals
+  subscribers and preserves each event's reset type. Older snapshots load with
+  no subscriptions. Sogen's existing handle model does not track per-handle
+  access rights; this change does not add that wider security model.
 
-BCryptResolveProviders returns CRYPT_PROVIDER_REFS, with provider references,
-properties and UM/KM image references. Existing response bytes at +0x34 are
-padding, not a documented algorithm abbreviation. Pointer fields in the wire
-response are offsets and use UINT64_MAX for null before bcrypt relocates them.
+  CNG configuration-writing operations are not implemented by this change.
+  Unknown operations fail explicitly. The driver publishes notifications after
+  successful CNG configuration APIs, not arbitrary registry writes; do not
+  claim raw registry edits provide that publication contract.
 
-bcrypt.dll+0x7140 implements an error transport that must be preserved:
-STATUS_BUFFER_OVERFLOW with a four-byte underlying status; a too-small result
-uses eight bytes containing STATUS_BUFFER_TOO_SMALL and the required size.
-Its caller retries an automatically allocated result using that size.
-Returning STATUS_BUFFER_TOO_SMALL directly makes this DLL return an internal
-error. The probe also captured startup operation 0x00010500, which Sogen
-currently acknowledges without output. Its full contract needs inspection.
+Version checks
+  All three files below are version 10.0.19041.7181 from the emulation root.
+  bcrypt.dll x64 SHA-256:
+    3032aac0c31e4242d24c3ef78d742bd3df368b1f868dc2d2796175c0704dc16a
+  bcrypt.dll x86 SHA-256:
+    dfd8e3c1db451cbd34fe485dd6e9c5ff5a35742d6d68c32821797aebf8c9069b
+  cng.sys x64 SHA-256:
+    80e3b701e4cfac714cfe51569d480e6610d169072996d3284008bd1467946cb3
+  Dawn's loaded CodeView GUID bytes 95234399ccd9d74a86584a191d99b243,
+  age 2, match the compiled PDB used for the AES wrapper.
 
-References checked:
-  Microsoft BCryptResolveProviders, CRYPT_PROVIDER_REFS, CRYPT_PROVIDER_REF,
-  CRYPT_PROPERTY_REF and CRYPT_IMAGE_REF documentation.
+Driver references (image-relative addresses)
+  cng.sys+0x82F0  BCryptResolveProviders
+  +0xB854 interface validation; +0xB834 provider-mode validation
+  +0x9E20 interface inference; +0x98C4 provider eligibility
+  +0x8A48 function references; +0x78FC interface references
+  +0x94A0 context references; +0x8BD0 provider references
+  +0x967C properties; +0x88CC image references
+  +0xB51C safeguarded I/O dispatch and status/size transport
+  +0xB78C header; +0xB884 resolution input; +0xBA90 string validation
+  +0x7874 register; +0x61818 unregister; +0x66320 publication
+  bcrypt.dll x64: +0x7140 I/O wrapper, +0x71EE call, +0x71F5 return;
+  +0x57C0 resolution packer; +0x4E2C configuration packer.
+  bcrypt.dll x86: +0x10717 resolution packer; +0x10471 configuration packer;
+  +0x10249 provider unpacker; +0x109AA I/O call; +0x109B0 return.
+
+Validation
+  26 CNG regressions pass in interpreter and JIT modes, including the actual
+  guest registry catalog, x64/WOW64 wire layout, properties, priority/isolation,
+  modes, selectors, malformed input, sizing/errors, event lifetime and snapshots.
+  47 affected snapshot, handle and mitigation regressions pass in both modes.
+
+  Fresh x64 guest DLL probe cng-contract-probe-1789491777667700600:
+  AES resolves to cipher interface 1, Microsoft Primitive Provider,
+  bcryptprimitives.dll and KeyLength 128. BCryptOpenAlgorithmProvider succeeds.
+  AES-128-GCM decryption produces the expected 16-byte plaintext. Changing the
+  authentication tag returns 0xC000A002. All probe assertions pass; guest exit W00.
+
+  The x86 guest API probe stops before issuing a CNG request at SysWOW64
+  ntdll.dll+0x75890, KiUserExceptionDispatcher, with a repeated mapping fault.
+  Its wire contract is statically cross-checked and regression-tested; complete
+  x86 API execution is not verified. This is separate from the x64 game test.
+
+  A fresh actual-game run must verify uncached resolution and authenticated
+  package decryption. Passing the probe does not establish game boot success.
+
+Sources
+  Exact guest DLL/driver disassembly and captured guest requests and returns.
+  Dawn source: Sunrise/src/middleware/crypto/aes_gcm_decrypt.cpp, matched PDB.
   ReactOS dll/win32/bcrypt/bcrypt.spec declares BCryptResolveProviders a stub;
-  it does not supply a resolver implementation to port.
-  Exact guest x64 bcrypt.dll disassembly and captured requests/returns.
-
-No resolver fix has been deployed at this checkpoint. Required work: replace
-the blobs with catalog-backed resolution, verify request/response validation,
-selectors, properties, sizing and error paths against the exact DLLs, then
-test an uncached actual-game lookup and authenticated package read. These
-findings establish a provider bug, not the cause of the whole white screen.
+  there is no resolver implementation there to port.
+  https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/nf-bcrypt-bcryptresolveproviders
+  https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/ns-bcrypt-crypt_provider_ref
+  https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/ns-bcrypt-crypt_property_ref
+  https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/ns-bcrypt-crypt_image_ref
