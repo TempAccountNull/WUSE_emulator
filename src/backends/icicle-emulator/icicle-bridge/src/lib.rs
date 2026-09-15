@@ -1,3 +1,4 @@
+mod aes;
 mod icicle;
 mod packed_max;
 mod reciprocal_sqrt;

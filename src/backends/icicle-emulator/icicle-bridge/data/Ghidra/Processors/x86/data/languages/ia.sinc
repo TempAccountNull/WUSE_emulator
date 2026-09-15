@@ -8879,9 +8879,15 @@ macro popcountflags(src){
 #### AESNI instructions
 ####
 
+define pcodeop sogen_aes_memory;
+AesMem: "xmmword ptr" Mem is Mem { export Mem; }
 define pcodeop aesdec;
-:AESDEC XmmReg1, XmmReg2_m128 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xde; XmmReg1 ... & XmmReg2_m128 {
-	XmmReg1 = aesdec(XmmReg1, XmmReg2_m128);
+:AESDEC XmmReg1, XmmReg2 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xde; mod=3 & XmmReg1 & XmmReg2 {
+	XmmReg1 = aesdec(XmmReg1, XmmReg2);
+}
+:AESDEC XmmReg1, AesMem is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xde; XmmReg1 ... & AesMem {
+    local source:16 = sogen_aes_memory(AesMem);
+	XmmReg1 = aesdec(XmmReg1, source);
 }
 :VAESDEC XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xde; (XmmReg1 & YmmReg1) ... & XmmReg2_m128 {
 	XmmReg1 = aesdec(vexVVVV_XmmReg, XmmReg2_m128);
@@ -8889,8 +8895,12 @@ define pcodeop aesdec;
 }
 
 define pcodeop aesdeclast;
-:AESDECLAST  XmmReg1, XmmReg2_m128 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdf; XmmReg1 ... & XmmReg2_m128 {
-	XmmReg1 = aesdeclast(XmmReg1, XmmReg2_m128);
+:AESDECLAST  XmmReg1, XmmReg2 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdf; mod=3 & XmmReg1 & XmmReg2 {
+	XmmReg1 = aesdeclast(XmmReg1, XmmReg2);
+}
+:AESDECLAST  XmmReg1, AesMem is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdf; XmmReg1 ... & AesMem {
+    local source:16 = sogen_aes_memory(AesMem);
+	XmmReg1 = aesdeclast(XmmReg1, source);
 }
 :VAESDECLAST XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xdf; (XmmReg1 & YmmReg1) ... & XmmReg2_m128 {
 	XmmReg1 = aesdeclast(vexVVVV_XmmReg, XmmReg2_m128);
@@ -8898,8 +8908,12 @@ define pcodeop aesdeclast;
 }
 
 define pcodeop aesenc;
-:AESENC XmmReg1, XmmReg2_m128 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdc; XmmReg1 ... & XmmReg2_m128 {
-	XmmReg1 = aesenc(XmmReg1, XmmReg2_m128);
+:AESENC XmmReg1, XmmReg2 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdc; mod=3 & XmmReg1 & XmmReg2 {
+	XmmReg1 = aesenc(XmmReg1, XmmReg2);
+}
+:AESENC XmmReg1, AesMem is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdc; XmmReg1 ... & AesMem {
+    local source:16 = sogen_aes_memory(AesMem);
+	XmmReg1 = aesenc(XmmReg1, source);
 }
 :VAESENC XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xdc; (XmmReg1 & YmmReg1) ... & XmmReg2_m128 {
 	XmmReg1 = aesenc(vexVVVV_XmmReg, XmmReg2_m128);
@@ -8907,8 +8921,12 @@ define pcodeop aesenc;
 }
 
 define pcodeop aesenclast;
-:AESENCLAST  XmmReg1, XmmReg2_m128 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdd; XmmReg1 ... & XmmReg2_m128 {
-	XmmReg1 = aesenclast(XmmReg1, XmmReg2_m128);
+:AESENCLAST  XmmReg1, XmmReg2 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdd; mod=3 & XmmReg1 & XmmReg2 {
+	XmmReg1 = aesenclast(XmmReg1, XmmReg2);
+}
+:AESENCLAST  XmmReg1, AesMem is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdd; XmmReg1 ... & AesMem {
+    local source:16 = sogen_aes_memory(AesMem);
+	XmmReg1 = aesenclast(XmmReg1, source);
 }
 :VAESENCLAST XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xdd; (XmmReg1 & YmmReg1) ... & XmmReg2_m128 {
 	XmmReg1 = aesenclast(vexVVVV_XmmReg, XmmReg2_m128);
@@ -8916,8 +8934,12 @@ define pcodeop aesenclast;
 }
 
 define pcodeop aesimc;
-:AESIMC XmmReg1, XmmReg2_m128  is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdb; XmmReg1 ... & XmmReg2_m128 {
-	XmmReg1 = aesimc(XmmReg2_m128);
+:AESIMC XmmReg1, XmmReg2  is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdb; mod=3 & XmmReg1 & XmmReg2 {
+	XmmReg1 = aesimc(XmmReg2);
+}
+:AESIMC XmmReg1, AesMem  is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdb; XmmReg1 ... & AesMem {
+    local source:16 = sogen_aes_memory(AesMem);
+	XmmReg1 = aesimc(source);
 }
 :VAESIMC XmmReg1, XmmReg2_m128 is $(VEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG); byte=0xdb; (XmmReg1 & YmmReg1) ... & XmmReg2_m128 {
 	XmmReg1 = aesimc(XmmReg2_m128);
@@ -8925,8 +8947,12 @@ define pcodeop aesimc;
 }
 
 define pcodeop aeskeygenassist;
-:AESKEYGENASSIST XmmReg1, XmmReg2_m128, imm8  is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x3A; byte=0xdf; XmmReg1 ... & XmmReg2_m128; imm8 {
-	XmmReg1 = aeskeygenassist(XmmReg2_m128, imm8:1);
+:AESKEYGENASSIST XmmReg1, XmmReg2, imm8  is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x3A; byte=0xdf; mod=3 & XmmReg1 & XmmReg2; imm8 {
+	XmmReg1 = aeskeygenassist(XmmReg2, imm8:1);
+}
+:AESKEYGENASSIST XmmReg1, AesMem, imm8  is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x3A; byte=0xdf; XmmReg1 ... & AesMem; imm8 {
+    local source:16 = sogen_aes_memory(AesMem);
+	XmmReg1 = aeskeygenassist(source, imm8:1);
 }
 :VAESKEYGENASSIST XmmReg1, XmmReg2_m128, imm8 is $(VEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F3A) & $(VEX_WIG); byte=0xdf; (XmmReg1 & YmmReg1) ... & XmmReg2_m128; imm8 {
 	XmmReg1 = aeskeygenassist(XmmReg2_m128, imm8:1);

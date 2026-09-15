@@ -18,6 +18,7 @@ fn create_x64_vm() -> icicle_vm::Vm {
     cpu_config.optimize_block = false;
 
     let mut vm = icicle_vm::build(&cpu_config).unwrap();
+    crate::aes::register(&mut vm.cpu);
     crate::packed_max::register(&mut vm.cpu);
     crate::reciprocal_sqrt::register(&mut vm.cpu);
     crate::xstate::register(&mut vm.cpu);
