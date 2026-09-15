@@ -720,7 +720,9 @@ impl X86RegisterNodes {
 
         for (index, element) in self.flags.iter().enumerate() {
             let flag = cpu.read_reg(*element);
-            res |= (flag & 1) << index;
+            let shift = index + usize::from(index > 12);
+            let mask = if index == 12 { 3 } else { 1 };
+            res |= (flag & mask) << shift;
         }
 
         res
@@ -728,7 +730,9 @@ impl X86RegisterNodes {
 
     pub fn set_flags(&self, cpu: &mut icicle_cpu::Cpu, value: u64) {
         for (index, element) in self.flags.iter().enumerate() {
-            let flag = (value >> index) & 1;
+            let shift = index + usize::from(index > 12);
+            let mask = if index == 12 { 3 } else { 1 };
+            let flag = (value >> shift) & mask;
             cpu.write_reg(*element, flag);
         }
     }

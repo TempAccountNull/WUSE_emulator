@@ -20,6 +20,7 @@ fn create_x64_vm() -> icicle_vm::Vm {
     let mut vm = icicle_vm::build(&cpu_config).unwrap();
     crate::aes::register(&mut vm.cpu);
     crate::packed_max::register(&mut vm.cpu);
+    crate::packed_sad::register(&mut vm.cpu);
     crate::reciprocal_sqrt::register(&mut vm.cpu);
     crate::xstate::register(&mut vm.cpu);
     vm
@@ -745,6 +746,9 @@ impl IcicleEmulator {
     }
 
     fn handle_environment(&mut self, value: u64) -> bool {
+        if value & !0xff == crate::packed_sad::ARCHITECTURAL_FAULT {
+            return self.handle_interrupt((value & 0xff) as i32);
+        }
         if value == CACHE_INVALIDATED {
             self.flush_pending_code();
             return true;
@@ -1098,6 +1102,7 @@ impl IcicleEmulator {
             self.vm.cpu.regs.write_at(0, buffer);
         };
         crate::xstate::restore_legacy_xcr0(&mut self.vm.cpu);
+        crate::packed_sad::restore_legacy_controls(&mut self.vm.cpu);
     }
 
     // Deserializing reuses the live VM, so any execution state that a freshly built VM would not carry must be

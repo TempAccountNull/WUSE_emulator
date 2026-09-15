@@ -2316,10 +2316,14 @@ define pcodeop vpor_avx ;
 }
 
 # PSADBW 4-408 PAGE 1528 LINE 79240
+SadVex128: XmmReg2 is xmmmod=3 & XmmReg2 { export XmmReg2; }
+SadVex128: Mem is Mem { local source:16 = sogen_sad_memory(Mem, 0:1); export source; }
 define pcodeop vpsadbw_avx ;
-:VPSADBW XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xF6; (XmmReg1 & YmmReg1) ... & XmmReg2_m128
+:VPSADBW XmmReg1, vexVVVV_XmmReg, SadVex128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xF6; (XmmReg1 & YmmReg1) ... & SadVex128
 {
-	local tmp:16 = vpsadbw_avx( vexVVVV_XmmReg, XmmReg2_m128 );
+    sogen_sad_check(2:1);
+    build SadVex128;
+	local tmp:16 = vpsadbw_avx( vexVVVV_XmmReg, SadVex128 );
 	YmmReg1 = zext(tmp);
 	# TODO ZmmReg1 = zext(XmmReg1)
 }

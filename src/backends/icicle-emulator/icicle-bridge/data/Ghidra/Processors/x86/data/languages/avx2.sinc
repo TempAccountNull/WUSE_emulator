@@ -571,10 +571,22 @@ define pcodeop vpor_avx2 ;
 }
 
 # PSADBW 4-408 PAGE 1528 LINE 79245
+SadVex256: YmmReg2 is xmmmod=3 & YmmReg2 { export YmmReg2; }
+SadVex256: Mem is Mem { local low:16 = sogen_sad_memory(Mem, 0:1);
+        local next:$(SIZE) = Mem + 16;
+        local high:16 = sogen_sad_memory(next, 0:1);
+        local source:32; source[0,128] = low; source[128,128] = high; export source; }
 define pcodeop vpsadbw_avx2 ;
-:VPSADBW YmmReg1, vexVVVV_YmmReg, YmmReg2_m256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0xF6; YmmReg1 ... & YmmReg2_m256
+:VPSADBW YmmReg1, vexVVVV_YmmReg, SadVex256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0xF6; YmmReg1 ... & SadVex256
 {
-	YmmReg1 = vpsadbw_avx2( vexVVVV_YmmReg, YmmReg2_m256 );
+    sogen_sad_check(2:1);
+    build SadVex256;
+    local left:32 = vexVVVV_YmmReg;
+    local right:32 = SadVex256;
+    local low:16 = vpsadbw_avx2(left[0,128], right[0,128]);
+    local high:16 = vpsadbw_avx2(left[128,128], right[128,128]);
+    YmmReg1[0,128] = low;
+    YmmReg1[128,128] = high;
 	# TODO ZmmReg1 = zext(YmmReg1)
 }
 

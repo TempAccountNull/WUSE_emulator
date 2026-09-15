@@ -1,0 +1,66 @@
+Packed byte absolute-difference sums
+
+Observed failure: windowscodecs.dll+0x480E2, m7_ownsAdler32_8u.
+  66 0F F6 D4  psadbw xmm2,xmm4
+  Icicle UnimplementedOp 0x100A, guest thread 108.
+
+Implemented MMX, legacy SSE2, VEX.128 and VEX.256 forms in the x64 backend.
+Each group of eight unsigned-byte differences produces one zero-extended word
+in its 64-bit lane. Legacy SSE preserves the upper YMM half; VEX.128 clears it.
+VEX.256 uses two 128-bit p-code calls because the lifter cannot pass 256-bit
+arguments to a helper. Both source halves are read before any destination write.
+
+MMX aliases now address the low 64 bits of x87 storage. Entry converts SLEIGH's
+logical x87 stack to physical register order. The instruction clears TOP, marks
+all tags valid and sets the destination exponent bits to ones. State restoration
+and existing XSAVE/XRSTOR tests cover the changed aliases.
+
+Exception checks cover CR0.EM/TS, CR4.OSFXSR/OSXSAVE, enabled AVX state, pending
+unmasked x87 exceptions, legacy SSE alignment, canonical addresses and stack
+segments, page permissions and MMX alignment checking. Failed reads preserve the
+destination. Explicit SLEIGH operand builds preserve exception priority.
+These are CPU exception-vector checks; they do not claim implementation of every
+Windows kernel exception-handler path or unsupported real/virtual-8086 modes.
+
+The Windows user-mode CPU baseline initializes CR0/CR4. Old snapshots with both
+registers zero migrate to that baseline; valid nonzero control states survive
+restore. AVX extended state is not enabled globally by this change. VEX execution
+requires XCR0[2:1]=3. AVX-512/EVEX is outside the configured backend's feature set.
+
+The alignment test exposed a flags-conversion error: IOPL occupies two bits,
+so later flags were displaced by one. The register bridge now preserves both
+IOPL bits and the proper NT/RF/VM/AC/VIF/VIP/ID positions. A guest PUSHFQ check
+also reproduced omitted IOPL and fixed bit 1 in SLEIGH's packed flags image;
+both are now included.
+
+Intel sources, read locally from docs/Intel docs:
+  325383-092-sdm-vol-2abcd.pdf, PDF 1121-1124: PSADBW/VPSADBW.
+  325383-092-sdm-vol-2abcd.pdf, PDF 1439: UD0/UD1/UD2/UDB.
+  253666-092-sdm-vol-2a-1.pdf, PDF 59: Table 2-21, Type 4 exceptions.
+  253669-092-sdm-vol-3b-1.pdf, PDF 473: Table 25-7, MMX exceptions.
+  325462-092-sdm-vol-1-2abcd-3abcd-4.pdf, PDF 250 and 3658-3660:
+    MMX register aliasing, tags, TOP and destination exponent.
+  Same combined manual, PDF 81-83: EFLAGS, IOPL and AC.
+  Same combined manual, PDF 1817-1818: PUSHF/PUSHFD/PUSHFQ.
+
+Validation:
+  All 65,536 unsigned byte pairs and 4,096 SSE2 reference vectors pass.
+  Release and final clang-tidy builds pass.
+  73 related tests pass in each interpreter and JIT mode, in both builds.
+  Guest CLI sample exits 0 in 33.38 seconds.
+
+Actual game replay:
+  XMM2 before: 01ffffff000000000000000000000000
+  XMM4 before: 00000000000000000000000000000000
+  XMM2 after:  fe020000000000000000000000000000 (766, 0)
+  RIP advances from windowscodecs.dll+0x480E2 to +0x480E6.
+  Other captured GDB registers and stack bytes are unchanged.
+  Before-execution GDB registers match the saved failing run.
+  Evidence: destiny-sogen-1789467453712800200-codec-psadbw-proof/packed-sad-proof.json
+  Continuation executes in d3dcompiler_47.dll and runs for the bounded observation
+  interval without another backend fault. This is not Dawn boot acceptance.
+
+UD implementation was left unchanged. Eleven existing UD encoding cases pass
+in interpreter and JIT modes, including UDB and nominal memory operands pointing
+at unmapped memory. Each raises #UD at its original address without changing
+the checked architectural state or reading the nominal operand.

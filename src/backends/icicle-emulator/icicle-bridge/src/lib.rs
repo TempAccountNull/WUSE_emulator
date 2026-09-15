@@ -1,6 +1,7 @@
 mod aes;
 mod icicle;
 mod packed_max;
+mod packed_sad;
 mod reciprocal_sqrt;
 mod registers;
 mod xstate;

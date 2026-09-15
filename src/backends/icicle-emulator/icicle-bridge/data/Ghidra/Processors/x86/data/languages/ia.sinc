@@ -98,8 +98,8 @@ define register offset=0x10c8 size=2  [ FPUPointerSelector FPUDataSelector]; #FC
 # YMM0 - YMM7    - available in 32 bit mode
 # YMM0 - YMM15   - available in 64 bit mode
 #                                      
-define register offset=0x1100 size=8   [ _ MM0 _ MM1 _ MM2 _ MM3 _ MM4 _ MM5 _ MM6 _ MM7 ];
-define register offset=0x1100 size=4   [
+define register offset=0x10fe size=8   [ _ MM0 _ MM1 _ MM2 _ MM3 _ MM4 _ MM5 _ MM6 _ MM7 ];
+define register offset=0x10fe size=4   [
   _ _ MM0_Da MM0_Db 
   _ _ MM1_Da MM1_Db 
   _ _ MM2_Da MM2_Db 
@@ -109,7 +109,7 @@ define register offset=0x1100 size=4   [
   _ _ MM6_Da MM6_Db 
   _ _ MM7_Da MM7_Db 
 ];
-define register offset=0x1100 size=2   [
+define register offset=0x10fe size=2   [
   _ _ _ _ MM0_Wa MM0_Wb MM0_Wc MM0_Wd 
   _ _ _ _ MM1_Wa MM1_Wb MM1_Wc MM1_Wd 
   _ _ _ _ MM2_Wa MM2_Wb MM2_Wc MM2_Wd 
@@ -119,7 +119,7 @@ define register offset=0x1100 size=2   [
   _ _ _ _ MM6_Wa MM6_Wb MM6_Wc MM6_Wd 
   _ _ _ _ MM7_Wa MM7_Wb MM7_Wc MM7_Wd 
 ];
-define register offset=0x1100 size=1   [
+define register offset=0x10fe size=1   [
   _ _ _ _ _ _ _ _ 
   MM0_Ba MM0_Bb MM0_Bc MM0_Bd MM0_Be MM0_Bf MM0_Bg MM0_Bh 
   _ _ _ _ _ _ _ _ 
@@ -1324,8 +1324,8 @@ macro unpackeflags(tmp) {
 }
 
 macro packflags(tmp) {
-  tmp=       (0x4000 * zext(NT&1))
-#                | (0x1000 * zext(IOPL&1))
+  tmp=       0x0002 | (0x4000 * zext(NT&1))
+                | (0x1000 * zext(IOPL&3))
                 | (0x0800 * zext(OF&1))
                 | (0x0400 * zext(DF&1)) | (0x0200 * zext(IF&1))   | (0x0100 * zext(TF&1))
                 | (0x0080 * zext(SF&1)) | (0x0040 * zext(ZF&1))   | (0x0010 * zext(AF&1))
@@ -7319,10 +7319,15 @@ macro pmulhw128(xmm1, xmm2) {
 :POR            XmmReg1, XmmReg2 is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0xEB; xmmmod = 3 & XmmReg1 & XmmReg2	{ XmmReg1 = XmmReg1 | XmmReg2; }
 
 define pcodeop psadbw;
-:PSADBW         mmxreg, m64      is vexMode=0 &  mandover=0 & byte=0x0F; byte=0xF6; mmxreg ... & m64 { mmxreg = psadbw(mmxreg, m64); }
-:PSADBW         mmxreg1, mmxreg2 is vexMode=0 &  mandover=0 & byte=0x0F; byte=0xF6; mmxmod = 3 & mmxreg1 & mmxreg2 { mmxreg1 = psadbw(mmxreg1, mmxreg2); }
-:PSADBW         XmmReg, m128     is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0xF6; XmmReg ... & m128 { XmmReg = psadbw(XmmReg, m128); }
-:PSADBW         XmmReg1, XmmReg2 is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0xF6; xmmmod = 3 & XmmReg1 & XmmReg2 { XmmReg1 = psadbw(XmmReg1, XmmReg2); }
+define pcodeop sogen_sad_check;
+define pcodeop sogen_sad_mmx_enter;
+define pcodeop sogen_sad_memory;
+SadMem: "xmmword ptr" Mem is Mem { export Mem; }
+SadMem64: "qword ptr" Mem is Mem { export Mem; }
+:PSADBW         mmxreg, SadMem64 is vexMode=0 & mandover=0 & byte=0x0F; byte=0xF6; mmxreg ... & SadMem64 { sogen_sad_check(0:1); local source:8 = sogen_sad_memory(SadMem64, 0:1); sogen_sad_mmx_enter(); mmxreg = psadbw(mmxreg, source); }
+:PSADBW         mmxreg1, mmxreg2 is vexMode=0 &  mandover=0 & byte=0x0F; byte=0xF6; mmxmod = 3 & mmxreg1 & mmxreg2 { sogen_sad_check(0:1); sogen_sad_mmx_enter(); mmxreg1 = psadbw(mmxreg1, mmxreg2); }
+:PSADBW         XmmReg, SadMem   is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0xF6; XmmReg ... & SadMem { sogen_sad_check(1:1); local source:16 = sogen_sad_memory(SadMem, 1:1); XmmReg = psadbw(XmmReg, source); }
+:PSADBW         XmmReg1, XmmReg2 is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0xF6; xmmmod = 3 & XmmReg1 & XmmReg2 { sogen_sad_check(1:1); XmmReg1 = psadbw(XmmReg1, XmmReg2); }
 
 # these byte and word shuffles need to be done also ?????
 define pcodeop pshufb;
