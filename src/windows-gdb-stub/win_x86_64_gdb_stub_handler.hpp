@@ -51,6 +51,7 @@ namespace sogen
 
         void on_interrupt() override
         {
+            this->interrupt_pending_ = true;
             this->win_emu_->stop();
         }
 
@@ -61,6 +62,10 @@ namespace sogen
 
         gdb_stub::action run() override
         {
+            if (this->interrupt_pending_)
+            {
+                return this->stop_action();
+            }
             try
             {
                 this->win_emu_->start();
@@ -73,11 +78,15 @@ namespace sogen
                 }
             }
 
-            return action;
+            return this->stop_action();
         }
 
         gdb_stub::action singlestep() override
         {
+            if (this->interrupt_pending_)
+            {
+                return this->stop_action();
+            }
             try
             {
                 auto& vcpu = this->win_emu_->vcpu(0);
@@ -100,7 +109,7 @@ namespace sogen
                 }
             }
 
-            return action;
+            return this->stop_action();
         }
 
         uint32_t get_current_thread_id() override
@@ -335,6 +344,17 @@ namespace sogen
         }
 
       private:
+        gdb_stub::action stop_action()
+        {
+            // Output packets auto-resume in the GDB stub; retain a concurrent interrupt until the following stop reply.
+            if (action != gdb_stub::action::output)
+            {
+                this->interrupt_pending_ = false;
+            }
+            return action;
+        }
+
+        std::atomic_bool interrupt_pending_{false};
         windows_emulator* win_emu_{};
         utils::optional_function<bool()> should_stop_{};
         windows_filesystem windows_filesystem_;
