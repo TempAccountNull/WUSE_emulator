@@ -126,6 +126,16 @@ namespace sogen
                         }
                     }
 
+                    uint32_t query_information(const uint32_t information_class, uint64_t& value, std::span<const std::byte>) override
+                    {
+                        if (information_class == 4)
+                        {
+                            value = 0;
+                            return 0;
+                        }
+                        return 0xc00000bb;
+                    }
+
                     int get_last_error() override
                     {
                         return this->error;

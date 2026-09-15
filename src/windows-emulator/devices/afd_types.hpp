@@ -16,6 +16,16 @@ namespace sogen
         CHAR sa_data[14];
     };
 
+    struct AFD_INFO
+    {
+        ULONG InformationClass;
+        ULONG Reserved;
+        uint64_t Information;
+    };
+
+    static_assert(sizeof(AFD_INFO) == 16);
+    static_assert(offsetof(AFD_INFO, Information) == 8);
+
     struct AFD_LISTEN_INFO
     {
         BOOLEAN SanActive;

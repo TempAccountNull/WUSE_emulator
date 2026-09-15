@@ -16,6 +16,16 @@ namespace sogen
 
             virtual int get_last_error() = 0;
 
+            virtual uint32_t query_information(uint32_t, uint64_t&, std::span<const std::byte> = {})
+            {
+                return 0xc00000bb;
+            }
+
+            virtual uint32_t set_information(uint32_t, uint64_t)
+            {
+                return 0xc00000bb;
+            }
+
             virtual bool is_ready(bool in_poll) = 0;
             virtual bool is_listening() = 0;
 

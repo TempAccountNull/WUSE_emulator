@@ -17,6 +17,8 @@ namespace sogen
             void set_blocking(bool blocking) override;
 
             int get_last_error() override;
+            uint32_t query_information(uint32_t information_class, uint64_t& value, std::span<const std::byte> parameters = {}) override;
+            uint32_t set_information(uint32_t information_class, uint64_t value) override;
 
             bool is_ready(bool in_poll) override;
             bool is_listening() override;

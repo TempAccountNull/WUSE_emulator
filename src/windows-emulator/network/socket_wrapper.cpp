@@ -1,5 +1,6 @@
 #include "socket_wrapper.hpp"
 #include <cassert>
+#include <utils/nt_handle.hpp>
 
 namespace sogen
 {
@@ -24,6 +25,80 @@ namespace sogen
         int socket_wrapper::get_last_error()
         {
             return GET_SOCKET_ERROR();
+        }
+
+        namespace
+        {
+            uint32_t socket_information(const SOCKET socket_handle, const bool set, const uint32_t information_class, uint64_t& value,
+                                        const std::span<const std::byte> parameters)
+            {
+#ifdef _WIN32
+                struct information_request
+                {
+                    uint32_t information_class;
+                    uint32_t reserved;
+                    uint64_t value;
+                };
+
+                struct io_status
+                {
+                    uintptr_t status;
+                    uintptr_t information;
+                };
+
+                using ioctl_function = LONG(WINAPI*)(HANDLE, HANDLE, void*, void*, io_status*, ULONG, void*, ULONG, void*, ULONG);
+                static const auto ioctl =
+                    reinterpret_cast<ioctl_function>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtDeviceIoControlFile"));
+                if (!ioctl)
+                {
+                    return 0xc00000bb;
+                }
+                const utils::nt::handle event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+                if (!event)
+                {
+                    return 0xc000009a;
+                }
+                information_request request{.information_class = information_class, .reserved = 0, .value = value};
+                std::vector<std::byte> input(sizeof(request) + parameters.size());
+                memcpy(input.data(), &request, sizeof(request));
+                if (!parameters.empty())
+                {
+                    memcpy(input.data() + sizeof(request), parameters.data(), parameters.size());
+                }
+                io_status completion{};
+                auto status = static_cast<uint32_t>(ioctl(reinterpret_cast<HANDLE>(socket_handle), event, nullptr, nullptr, &completion,
+                                                          set ? 0x1203b : 0x1207b, input.data(), static_cast<ULONG>(input.size()),
+                                                          set ? nullptr : &request, set ? 0 : sizeof(request)));
+                if (status == 0x103)
+                {
+                    WaitForSingleObject(event, INFINITE);
+                    status = static_cast<uint32_t>(completion.status);
+                }
+                if (status == 0 && !set)
+                {
+                    value = request.value;
+                }
+                return status;
+#else
+                (void)socket_handle;
+                (void)set;
+                (void)information_class;
+                (void)value;
+                (void)parameters;
+                return 0xc00000bb;
+#endif
+            }
+        }
+
+        uint32_t socket_wrapper::query_information(const uint32_t information_class, uint64_t& value,
+                                                   const std::span<const std::byte> parameters)
+        {
+            return socket_information(this->socket_.get_socket(), false, information_class, value, parameters);
+        }
+
+        uint32_t socket_wrapper::set_information(const uint32_t information_class, uint64_t value)
+        {
+            return socket_information(this->socket_.get_socket(), true, information_class, value, {});
         }
 
         bool socket_wrapper::is_ready(const bool in_poll)

@@ -372,12 +372,6 @@ namespace sogen
             ULONG event_select_mask_{0};
             ULONG triggered_events_{0};
 
-            // Reflects the guest socket's blocking mode (FIONBIO). mswsock keeps this in its per-socket
-            // SOCK_SHARED_INFO and pushes the whole structure to the kernel via AFD_SET_CONTEXT; the
-            // NonBlocking flag is bit 6 of the option bitfield at offset 0x2c. When set, an operation that
-            // would block must fail immediately with STATUS_DEVICE_NOT_READY (which mswsock maps to
-            // WSAEWOULDBLOCK) instead of pending, because the guest's synchronous recv/send call would
-            // otherwise wait forever on a packet that never arrives.
             bool non_blocking_{false};
 
             afd_endpoint()
@@ -454,12 +448,9 @@ namespace sogen
                 this->non_blocking_ = (option_flags & non_blocking_flag) != 0;
             }
 
-            // For a non-blocking socket an operation that would block must complete immediately with
-            // STATUS_DEVICE_NOT_READY (mapped to WSAEWOULDBLOCK by mswsock); a blocking socket instead pends
-            // the request and the delayed-ioctl machinery resumes it once the host socket is ready.
-            NTSTATUS pend_or_would_block(const io_device_context& c, const bool require_poll)
+            NTSTATUS pend_or_would_block(const io_device_context& c, const bool require_poll, const ULONG flags)
             {
-                if (this->non_blocking_)
+                if ((flags & 2) == 0 && ((flags & 4) != 0 || this->non_blocking_))
                 {
                     return STATUS_DEVICE_NOT_READY;
                 }
@@ -614,7 +605,9 @@ namespace sogen
                     this->update_shared_info(win_emu, c);
                     return STATUS_SUCCESS;
                 case AFD_GET_INFORMATION:
+                    return this->ioctl_information(win_emu, c, false);
                 case AFD_SET_INFORMATION:
+                    return this->ioctl_information(win_emu, c, true);
                 case AFD_QUERY_HANDLES:
                 case AFD_TRANSPORT_IOCTL:
                 case AFD_PARTIAL_DISCONNECT:
@@ -624,6 +617,88 @@ namespace sogen
                                       static_cast<uint32_t>(request));
                     return STATUS_NOT_SUPPORTED;
                 }
+            }
+
+            NTSTATUS ioctl_information(windows_emulator& win_emu, const io_device_context& c, const bool set)
+            {
+                if (!this->s_)
+                {
+                    return STATUS_INVALID_HANDLE;
+                }
+                if (!c.input_buffer || (!set && !c.output_buffer))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                if (c.input_buffer_length < sizeof(AFD_INFO) || (!set && c.output_buffer_length < sizeof(AFD_INFO)))
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+                auto request = win_emu.emu().read_memory<AFD_INFO>(c.input_buffer);
+                NTSTATUS status = STATUS_INVALID_PARAMETER;
+                if (set)
+                {
+                    switch (request.InformationClass)
+                    {
+                    case 2:
+                        this->non_blocking_ = (request.Information & 0xff) != 0;
+                        status = STATUS_SUCCESS;
+                        break;
+                    case 1:
+                    case 6:
+                    case 7:
+                    case 11:
+                    case 12:
+                    case 15:
+                        status = static_cast<NTSTATUS>(this->s_->set_information(request.InformationClass, request.Information));
+                        break;
+                    default:
+                        break;
+                    }
+                }
+                else
+                {
+                    switch (request.InformationClass)
+                    {
+                    case 4:
+                        status = static_cast<NTSTATUS>(this->s_->query_information(4, request.Information));
+                        if (status == STATUS_SUCCESS && this->delayed_ioctl_ &&
+                            (_AFD_REQUEST(this->delayed_ioctl_->io_control_code) == AFD_SEND ||
+                             _AFD_REQUEST(this->delayed_ioctl_->io_control_code) == AFD_SEND_DATAGRAM))
+                        {
+                            ++request.Information;
+                        }
+                        break;
+                    case 5:
+                        if (c.input_buffer_length > 0x10000)
+                        {
+                            return STATUS_INVALID_PARAMETER;
+                        }
+                        {
+                            const auto parameters =
+                                win_emu.emu().read_memory(c.input_buffer + sizeof(AFD_INFO), c.input_buffer_length - sizeof(AFD_INFO));
+                            status = static_cast<NTSTATUS>(this->s_->query_information(5, request.Information, parameters));
+                        }
+                        break;
+                    case 3:
+                    case 6:
+                    case 7:
+                    case 8:
+                    case 10:
+                    case 14:
+                        status = static_cast<NTSTATUS>(this->s_->query_information(request.InformationClass, request.Information));
+                        break;
+                    default:
+                        break;
+                    }
+                    if (status == STATUS_SUCCESS)
+                    {
+                        win_emu.emu().write_memory(c.output_buffer, request);
+                        c.io_status_block.access([](status_block& block) { block.Information = sizeof(AFD_INFO); });
+                    }
+                }
+                win_emu.log.info("AFD %s information: class %u, value 0x%" PRIx64 ", status 0x%08X\n", set ? "set" : "get",
+                                 request.InformationClass, request.Information, static_cast<uint32_t>(status));
+                return status;
             }
 
             NTSTATUS ioctl_connect(windows_emulator& win_emu, const io_device_context& c)
@@ -858,7 +933,7 @@ namespace sogen
                     const auto error = this->s_->get_last_error();
                     if (error == SERR(EWOULDBLOCK))
                     {
-                        return this->pend_or_would_block(c, true);
+                        return this->pend_or_would_block(c, true, receive_info.AfdFlags);
                     }
 
                     if (error == SERR(ECONNRESET))
@@ -929,7 +1004,7 @@ namespace sogen
                     const auto error = this->s_->get_last_error();
                     if (error == SERR(EWOULDBLOCK))
                     {
-                        return this->pend_or_would_block(c, false);
+                        return this->pend_or_would_block(c, false, send_info.AfdFlags);
                     }
 
                     if (error == SERR(ECONNRESET))
@@ -1129,7 +1204,7 @@ namespace sogen
                     const auto error = this->s_->get_last_error();
                     if (error == SERR(EWOULDBLOCK))
                     {
-                        return this->pend_or_would_block(c, true);
+                        return this->pend_or_would_block(c, true, receive_info.AfdFlags);
                     }
 
                     return STATUS_UNSUCCESSFUL;
@@ -1196,7 +1271,7 @@ namespace sogen
                     const auto error = this->s_->get_last_error();
                     if (error == SERR(EWOULDBLOCK))
                     {
-                        return this->pend_or_would_block(c, false);
+                        return this->pend_or_would_block(c, false, send_info.AfdFlags);
                     }
 
                     return STATUS_UNSUCCESSFUL;

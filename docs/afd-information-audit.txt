@@ -1,0 +1,116 @@
+// AFD INFORMATION AND BLOCKING MODE
+Sogen returned success for AFD_SET_INFORMATION without applying the request.
+The actual game therefore had a nonblocking socket in mswsock but a blocking
+endpoint in Sogen. A synchronous recvfrom became an indefinite pending receive.
+
+// ACTUAL WAIT
+Capture: destiny-sogen-1789451247834270800-startup-waits-continued
+Guest thread: 0x58 (88); socket: 0x1000009; completion event: 0x180013F.
+AFD_RECEIVE_DATAGRAM: IOCTL 0x1201B; input length 40.
+IO_STATUS_BLOCK 0xBACE04D838: Status=0x103, Information=0.
+Input at 0xBACE04D808:
+  +0x00 BufferArray = 0xBACE04D8F8 (guest WSABUF array)
+  +0x08 BufferCount = 1
+  +0x0C AfdFlags = 0 (synchronous)
+  +0x10 TdiFlags = 0x20
+  +0x18 Address = 0xBACE04DA08
+  +0x20 AddressLength = 0xBACE04D9B0 (guest length pointer)
+Guest socket object 0xBAEDC6AA50:
+  +0x08 handle = 0x1000009
+  +0x44 flags byte = 0x40 (nonblocking)
+Saved Sogen endpoint: AF_INET / SOCK_DGRAM / IPPROTO_UDP;
+non_blocking_=false; delayed receive waiting for POLLIN without a timeout.
+
+Caller: 0x6D4FCA343E = steam_api64.dll+0x15343E.
+Matching local PDB: sunrise::client::hooks::egress::winsock::reception::
+receive_bytes_from+0x5E. Its first 112 saved guest bytes match the on-disk DLL.
+The Dawn source wrapper forwards to the original recvfrom.
+Dawn DLL SHA-256:
+16cc91ec2c00a17e8330e95fe73491bbd3da40e45a509e1143799770c1988d3a
+
+// VERIFIED DLL CONTRACT
+Guest mswsock.dll version: 10.0.19041.5915.
+x64 SHA-256: c9e2f1db19b8cf9de4fec0425c43cf221c3b65db1d0eb43d5f0563474bce2909
+x86 SHA-256: 7737de64a4d0e2dd42343cfb6720744d9d54420e08bc69f13bf5f739de65c61d
+IDA databases: 13350 x64; 13351 x86, verified against the guest root files.
+
+x64 SockSetInformation: mswsock.dll+0x3D80.
+NtDeviceIoControlFile call: +0x3E0D, IOCTL 0x1203B, input length 16.
+WSPIoctl(FIONBIO=0x8004667E) enables mode at +0x5DE1, returns at +0x5DE6.
+It sets socket flags +0x44 bit 0x40 only after a successful request.
+x86 SockSetInformation: mswsock.dll+0x13F8B; syscall call site +0x14003.
+Both DLLs use the same request layout:
+  +0x00 ULONG InformationClass
+  +0x04 ULONG padding
+  +0x08 union: BOOLEAN / ULONG / ULONGLONG Information
+  sizeof = 16; BOOLEAN updates read only the first byte at +0x08.
+SockGetInformation: x64 +0xA0DC, IOCTL 0x1207B, output length 16.
+Class 5 appends an inline TDI address built by SockBuildTdiAddress (+0x26A0):
+  +0 ULONG count; +4 USHORT address length; +6 inline sockaddr bytes.
+This payload contains no guest pointers.
+
+// REACTOS CROSS-CHECK
+Reference root: F:\Part1\Reversal\reactos_functions
+drivers/network/afd/afd/info.c: blocking mode and information dispatch.
+drivers/network/afd/afd/read.c: nonblocking/immediate/overlapped precedence.
+drivers/network/afd/afd/write.c: send pending behavior.
+drivers/network/afd/afd/context.c: opaque socket context, distinct from mode.
+dll/win32/msafd/misc/dllmain.c: FIONBIO -> SetSocketInformation, class 2.
+sdk/include/reactos/drivers/afd/shared.h: structures and request flags.
+
+The implementation follows the verified Windows DLL ABI. ReactOS is a semantic
+reference, not a claim of matching every modern Windows information class.
+Native isolated UDP probes returned INVALID_PARAMETER for GET classes 1, 2,
+16 and 17, although ReactOS contains handlers for those classes. Unknown class
+0xFFFFFFFF also returns INVALID_PARAMETER. Input lengths below 16 returned
+BUFFER_TOO_SMALL. Native GET 3=65507, GET 4=0, GET 6/7=65536, GET 8=0xFFFFFFFF,
+GET 10=0. Native SET 6/7 succeeded but GET still returned 65536 over the tested
+values and bound/unbound sockets. No invented resized-window value is returned.
+
+// IMPLEMENTATION
+AFD_SET_INFORMATION class 2 now changes the guest endpoint blocking state.
+Synchronous empty I/O returns STATUS_DEVICE_NOT_READY for nonblocking or
+AFD_IMMEDIATE requests. AFD_OVERLAPPED retains pending completion precedence.
+This applies to stream/datagram receive and send paths.
+
+SET classes 1, 6, 7, 11, 12 and 15, and GET classes 3, 4, 5, 6, 7, 8, 10 and 14
+are routed through the socket backend. The Windows backend issues only these
+information controls against its owned native socket, using owned scalar/inline
+buffers and a completion event. It propagates the native status and value.
+No guest instruction is executed natively and no guest pointer is forwarded.
+GET class 4 also includes an outstanding Sogen send request.
+Successful GET writes exactly 16 bytes and sets IO_STATUS_BLOCK.Information=16.
+Invalid lengths/classes produce errors instead of the previous blanket success.
+Each completed information request logs its class, value and status.
+
+// VALIDATION
+Old implementation: 8 of 12 new blocking-mode regressions failed in each mode.
+Fixed implementation: 13 AFD tests pass in interpreter and Icicle JIT modes.
+Final regression suite: 29/29 pass in each mode, including WARP and GDB cases.
+Run: sogen-fixes/regression-1789455329735315900.
+Tests cover both guest structure layouts, Boolean padding, blocking restoration,
+pending completion, overlapped precedence, immediate I/O, invalid requests,
+native information results and output canaries.
+Final release build passed. CLI smoke exited 0 in 33.377 seconds.
+Final tidy build passed (tidy-1789455240511221800.log).
+
+// REPLAY INPUTS AND LIMITS
+Actual FIONBIO entry captured at mswsock.dll+0x5DE1 for socket 0x100000D:
+destiny-sogen-1789453349968629300-afd-mode-request-replay/guest.snap
+SHA-256: 53646f5ef7385737cbfdb3e6ad38eee3666594506c9d6787612399cba69d72bb
+This can verify the real request's corrected return. It retains the previously
+misconfigured socket 9 and therefore is not used as a complete boot input.
+
+Earlier game checkpoint:
+destiny-sogen-1789441138055988600-aeskeygenassist-completed/guest.snap
+SHA-256: 558070cd8463747a21f471a5c9c3931e47f88ed81852f70087ee2e16ae592015
+A read-only saved-state inspection found devices 1..8, including AFD endpoints
+7 and 8. Socket 9 does not exist yet, so its initialization will be replayed.
+No saved guest memory or registers were patched, and inspectors did not execute.
+
+This change covers the observed information-control family on the Windows
+socket backend; it does not implement the entire AFD driver. Static/non-Windows
+backends explicitly report unsupported information operations except static
+send count. Existing opaque context and socket restore behavior are unchanged.
+Snapshots do not reconstruct an external network conversation or all native
+socket binding/connection state. Full Dawn boot requires actual-game acceptance.
