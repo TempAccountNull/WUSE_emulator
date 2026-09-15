@@ -53,3 +53,27 @@ the separate unsupported XRSTOR at ntdll.dll+0xA1BC9. Sunrise boot is unconfirme
 Release and tidy builds passed 27 targeted tests in both interpreter and JIT
 modes, including eight new interface-list cases. CLI smoke still fails the
 existing Message Queue (Paint) test with C000041D.
+
+## 2026-09-15 DLL and enumeration cross-check
+
+Rechecked the guest-root cfgmgr32.dll IDBs: x64 CM_Get_Device_Interface_ListW
+at RVA 0x1D70 and its size helper at 0x2DB4; x86 list function at 0xB930.
+The inline GUID starts at input +8 in both layouts. Public ALL_DEVICES (1)
+maps to native flags 0; PRESENT (0) maps to 0x10000. Both callers copy from
+output +16 using the required-byte count at +8.
+
+x64 SHA-256: 7fefd329b398827d6babf33973eaa2c0dc580fe1f3b291efa4793e795e4df8fa
+x86 SHA-256: 8440d611230b121f525033b26d6774ec781ba4339b34ff82bb21f3f54b2c6eb0
+
+The after-afd-address-list capture contains 391,339 queries in the measured
+prefix. All 583 distinct class names exist in the guest SYSTEM hive. Of 671
+observed cycles, 667 contain each class once; four include interleaved queries.
+Pointer-shaped GUID names also occur verbatim in the hive. This rules out
+using those names alone as evidence of request corruption. It does not prove
+the final NtEnumerateKey status or explain why the caller repeats the sweep.
+
+ReactOS dll/win32/setupapi/cfgmgr.c uses PNP RPC for this public API. Its
+transport cannot substitute for the verified Windows 10 CMApi layout.
+Local evidence: sogen-fixes/cfgmgr-crosscheck-20260915.json and
+cmapi-current-{sample,cycle}-evidence.json. No handler change follows from
+this cross-check. Dawn boot remains unconfirmed.
