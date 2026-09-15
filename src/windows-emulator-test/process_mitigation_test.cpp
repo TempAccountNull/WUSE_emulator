@@ -261,7 +261,12 @@ namespace sogen::test
         utils::buffer_serializer output{};
         emu.serialize(output);
         auto bytes = output.move_buffer();
-        bytes.resize(bytes.size() - 23);
+        utils::buffer_serializer extensions{};
+        emu.memory.serialize_aslr_state(extensions);
+        const auto& suffix = extensions.get_buffer();
+        ASSERT_GE(bytes.size(), suffix.size());
+        ASSERT_TRUE(std::equal(suffix.rbegin(), suffix.rend(), bytes.rbegin()));
+        bytes.resize(bytes.size() - suffix.size());
         utils::buffer_deserializer restored{bytes};
         emu.deserialize(restored);
         EXPECT_EQ(query() & 0xb, 1u);

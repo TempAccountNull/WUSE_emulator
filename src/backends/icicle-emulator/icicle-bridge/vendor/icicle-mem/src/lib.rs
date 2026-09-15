@@ -54,6 +54,8 @@ pub struct PhysicalMapping {
 
     /// The physical index of this page associated with the mapping.
     pub index: physical::Index,
+
+    pub shared_perm: u8,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -231,3 +233,6 @@ pub fn align_down(value: u64, alignment: u64) -> u64 {
 
 #[cfg(test)]
 mod reclamation_tests;
+
+#[cfg(test)]
+mod shared_pages_tests;

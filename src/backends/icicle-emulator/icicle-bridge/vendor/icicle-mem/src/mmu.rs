@@ -459,11 +459,61 @@ impl Mmu {
         true
     }
 
+    pub fn map_shared(&mut self, dst: u64, src: u64, len: u64, permissions: u8) -> MemResult<()> {
+        let page_size = self.page_size();
+        if len == 0 || (dst | src | len) & (page_size - 1) != 0 {
+            return Err(MemError::Unaligned);
+        }
+        let end = dst.checked_add(len - 1).ok_or(MemError::AddressOverflow)?;
+        src.checked_add(len - 1).ok_or(MemError::AddressOverflow)?;
+        if self.mapping.overlapping_iter(dst..=end).any(|(_, _, entry)| entry.is_some()) {
+            return Err(MemError::Unmapped);
+        }
+        for offset in (0..len).step_by(page_size as usize) {
+            match self.mapping.get_with_range(src + offset) {
+                Some((start, end, MemoryMapping::Physical(_) | MemoryMapping::Unallocated(_)))
+                    if start <= src + offset && end >= src + offset + page_size - 1 => {}
+                _ => return Err(MemError::Unmapped),
+            }
+        }
+        let mut pages = Vec::new();
+        for offset in (0..len).step_by(page_size as usize) {
+            let address = src + offset;
+            let original_perm = self.get_perm(address) | perm::MAP | perm::INIT;
+            if let Some(index) = self.get_physical_index(address) {
+                if index.is_zero_page() {
+                    self.physical.get_mut(index).copy_on_write = true;
+                    self.tlb.remove_write(address);
+                }
+            }
+            let value = self.read::<1>(address, perm::NONE)?;
+            self.write(address, value, perm::NONE)?;
+            let index = self.get_physical_index(address).ok_or(MemError::Unmapped)?;
+            self.mapping.overlapping_mut::<_, MemError>(address..=address + page_size - 1,
+                |_, _, entry| {
+                    if let Some(MemoryMapping::Physical(mapping)) = entry {
+                        mapping.shared_perm = original_perm;
+                    }
+                    Ok(())
+                })?;
+            pages.push(index);
+        }
+        self.tlb.clear();
+        for (offset, index) in pages.into_iter().enumerate() {
+            let addr = dst + offset as u64 * page_size;
+            let mapping = PhysicalMapping {
+                addr, index, shared_perm: permissions | perm::MAP | perm::INIT,
+            };
+            assert!(self.map_memory_len(addr, page_size, MemoryMapping::Physical(mapping)));
+        }
+        Ok(())
+    }
+
     pub fn map_physical(&mut self, addr: u64, index: physical::Index) -> bool {
         self.map_memory_len(
             addr,
             self.page_size(),
-            MemoryMapping::Physical(PhysicalMapping { index, addr }),
+            MemoryMapping::Physical(PhysicalMapping { index, addr, shared_perm: 0 }),
         )
     }
 
@@ -496,7 +546,7 @@ impl Mmu {
             match entry.take() {
                 Some(MemoryMapping::Physical(inner)) => {
                     tlb.remove_range(start, len);
-                    if len == physical.page_size() {
+                    if inner.shared_perm != 0 || len == physical.page_size() {
                         return Ok(());
                     }
 
@@ -608,6 +658,10 @@ impl Mmu {
                 MemoryMapping::Physical(entry) => 'physical: {
                     tlb.remove_range(start, len);
 
+                    if entry.shared_perm != 0 {
+                        entry.shared_perm = perm;
+                        return Ok(());
+                    }
                     let offset = PageData::offset(start);
                     let len = len as usize;
 
@@ -642,6 +696,13 @@ impl Mmu {
         }
         let end = addr.checked_add(count - 1).ok_or(MemError::AddressOverflow)?;
         debug!("fill_mem: addr={:#0x}, count={:#0x}, value={:#0x}", addr, count, value);
+        if self.mapping.overlapping_iter(addr..=end).any(|(_, _, entry)|
+            matches!(entry, Some(MemoryMapping::Physical(page)) if page.shared_perm != 0)) {
+            for offset in 0..count {
+                self.write::<1>(addr + offset, [value], perm::NONE)?;
+            }
+            return Ok(());
+        }
 
         let physical = &mut self.physical;
         let tlb = &mut self.tlb;
@@ -822,6 +883,9 @@ impl Mmu {
         };
         match entry {
             MemoryMapping::Physical(entry) => {
+                if entry.shared_perm != 0 {
+                    return entry.shared_perm;
+                }
                 let page = self.physical.get(entry.index).data();
                 let (offset, _) = PageData::offset_and_len(addr, addr + 1);
                 page.perm[offset]
@@ -854,7 +918,8 @@ impl Mmu {
                     let len = len as usize;
                     let perm =
                         unsafe { page.write_ptr().ptr.as_mut().get_perm_unchecked(offset, len) };
-                    perm::check(perm, perm::INIT | perm::EXEC)?;
+                    perm::check(if mapping.shared_perm != 0 { mapping.shared_perm } else { perm },
+                        perm::INIT | perm::EXEC)?;
 
                     // Mark the page as executed
                     page.executed = true;
@@ -871,7 +936,8 @@ impl Mmu {
                         };
                     }
 
-                    tlb.remove_write(mapping.addr);
+                    if mapping.shared_perm != 0 { tlb.clear_write(); }
+                    else { tlb.remove_write(mapping.addr); }
                     Ok(())
                 }
                 _ => Err(MemError::ExecViolation),
@@ -888,6 +954,7 @@ impl Mmu {
         for (start, end, entry) in self.mapping.iter_mut() {
             match entry {
                 MemoryMapping::Physical(entry) => {
+                    if entry.shared_perm != 0 { continue; }
                     let (offset, len) = PageData::offset_and_len(start, end + 1);
                     let page = physical.get_mut(entry.index);
                     page.data_mut().perm[offset..offset + len].iter_mut().for_each(|p| {
@@ -921,6 +988,7 @@ impl Mmu {
                     *entry = Some(MemoryMapping::Physical(PhysicalMapping {
                         index: zero_page,
                         addr: page_start,
+                        shared_perm: 0,
                     }));
                     Ok(())
                 });
@@ -932,7 +1000,7 @@ impl Mmu {
         self.tlb.remove(page_start);
 
         tracing::trace!("init_physical: addr={:#0x}, index={:?}", page_start, index);
-        let new_mapping = PhysicalMapping { index, addr: page_start };
+        let new_mapping = PhysicalMapping { index, addr: page_start, shared_perm: 0 };
 
         let init_perm = if self.track_uninitialized { perm::NONE } else { perm::INIT };
 
@@ -1058,11 +1126,16 @@ impl Mmu {
     ) -> MemResult<[u8; N]> {
         let page_size = self.page_size();
         let page = self.physical.get_mut(index);
-        let result = page.data().read(addr, perm)?;
+        let shared_perm = match self.mapping.get(addr) {
+            Some(MemoryMapping::Physical(mapping)) => mapping.shared_perm,
+            _ => 0,
+        };
+        if shared_perm != 0 { perm::check(shared_perm, perm)?; }
+        let result = page.data().read(addr, if shared_perm != 0 { perm::NONE } else { perm })?;
 
         // If there is no memory hook set on the current page, cache the translated address in the
         // TLB.
-        let uncachable = self.read_hooks.contains_address(addr, page_size)
+        let uncachable = shared_perm != 0 || self.read_hooks.contains_address(addr, page_size)
             || self.read_after_hooks.contains_address(addr, page_size);
         if !uncachable {
             self.tlb.insert_read(addr, unsafe { page.read_ptr() });
@@ -1080,6 +1153,11 @@ impl Mmu {
         let page_start = self.page_aligned(addr);
         let page_size = self.page_size();
 
+        let shared_perm = match self.mapping.get(addr) {
+            Some(MemoryMapping::Physical(mapping)) => mapping.shared_perm,
+            _ => 0,
+        };
+        if shared_perm != 0 { perm::check(shared_perm, perm)?; }
         let mut page = self.physical.get_mut(index);
         if page.executed && self.detect_self_modifying_code {
             check_self_modifying_write(page.data(), addr, &value)?;
@@ -1088,16 +1166,27 @@ impl Mmu {
         if page.copy_on_write {
             // Make a copy and update the mapping to point to the new copy.
             let copy_index = self.physical.clone_page(index).ok_or(MemError::OutOfMemory)?;
-            let copy_mapping = PhysicalMapping { index: copy_index, addr: page_start };
+            let copy_mapping = PhysicalMapping { index: copy_index, addr: page_start, shared_perm: 0 };
             tracing::trace!("{:?} ({:#0x}) copy-on-write -> {copy_index:?}", index, page_start);
 
-            let page_end = page_start + (page_size - 1);
-            self.mapping.overlapping_mut(page_start..=page_end, |_start, _end, entry| {
-                if let Some(mapping @ MemoryMapping::Physical(_)) = entry {
-                    *mapping = MemoryMapping::Physical(copy_mapping);
+            if shared_perm != 0 {
+                for (_, _, entry) in self.mapping.iter_mut() {
+                    if let MemoryMapping::Physical(mapping) = entry {
+                        if mapping.index == index && mapping.shared_perm != 0 {
+                            mapping.index = copy_index;
+                        }
+                    }
                 }
-                Ok(())
-            })?;
+                self.tlb.clear();
+            } else {
+                let page_end = page_start + (page_size - 1);
+                self.mapping.overlapping_mut(page_start..=page_end, |_start, _end, entry| {
+                    if let Some(mapping @ MemoryMapping::Physical(_)) = entry {
+                        *mapping = MemoryMapping::Physical(copy_mapping);
+                    }
+                    Ok(())
+                })?;
+            }
 
             page = self.physical.get_mut(copy_index);
         }
@@ -1112,9 +1201,10 @@ impl Mmu {
             self.modified.insert(page_start);
         }
         page.modified = true;
-        page.data_mut().write(addr, value, perm)?;
+        page.data_mut().write(addr, value, if shared_perm != 0 { perm::NONE } else { perm })?;
 
-        let uncachable = self.write_hooks.contains_address(addr, page_size);
+        let uncachable = shared_perm != 0 || self.write_hooks.contains_address(addr, page_size);
+        if shared_perm != 0 { self.tlb.clear(); }
         if !uncachable {
             // Safety: `page.data_mut()` ensures the page is a unique copy of the underlying data.
             self.tlb.insert_write(page_start, unsafe { page.write_ptr() });

@@ -82,7 +82,7 @@ namespace sogen
             auto* handle_store = c.proc.get_handle_store(h);
             if (handle_store && handle_store->erase(h))
             {
-                if (section_backing_address != 0)
+                if (section_backing_address != 0 && !c.win_emu.memory.has_shared_views(section_backing_address))
                 {
                     c.win_emu.memory.release_memory(section_backing_address, 0);
                 }

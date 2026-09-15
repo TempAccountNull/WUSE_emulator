@@ -8,11 +8,20 @@ Use D:/Dawn/evil-ass-repo-of-doom-and-despair as the Dawn source reference.
 Match the compiled DLL to its PDB GUID and age before using symbols. Compare
 source, disassembly and actual guest state; distinguish source from build proof.
 
+ALWAYS Please use the intel manuals to support these asm instruction, unsupported operations that are unimplemented. Fully implement them. Read the documentation pdfs here. NEVER HALF-IMPLEMENT THEM
+D:\Emulation\sogen\docs\Intel docs
+
 Cross-check F:/Part1/Reversal/reactos_functions against the user's actual DLL
 versions when implementing unsupported Sogen behavior. Verify relevant classes,
 structures, layouts, field widths, x86/x64 differences, status codes, buffer
 contracts, lifetime and asynchronous behavior. ReactOS is a reference, not proof
 that a particular Windows DLL has the same contract.
+
+Read the relevant Intel manuals in D:/Emulation/sogen/docs/Intel docs before
+implementing missing assembly instructions or unsupported CPU operations. Read
+the PDF instruction definition and referenced exception rules. Implement the
+supported instruction forms completely, including operands, register effects,
+flags, memory access, and error paths. Do not substitute partial semantics.
 
 Implement the supported operation completely, including its error paths. Do not
 return fabricated success or substitute a basic stub. Identify remaining support

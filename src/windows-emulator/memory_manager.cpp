@@ -72,6 +72,8 @@ namespace sogen
         buffer.write<uint64_t>(0x31594c4f50524c41);
         buffer.write(this->aslr_policy_);
         buffer.write(this->aslr_random_state_);
+        buffer.write<uint64_t>(0x3157454956444853);
+        buffer.write_map(this->shared_views_);
     }
 
     void memory_manager::deserialize_aslr_state(utils::buffer_deserializer& buffer, const bool high_entropy, const bool is_32bit,
@@ -88,6 +90,16 @@ namespace sogen
         }
         buffer.read(this->aslr_policy_);
         buffer.read(this->aslr_random_state_);
+        this->shared_views_.clear();
+        if (buffer.get_remaining_size())
+        {
+            if (buffer.read<uint64_t>() != 0x3157454956444853)
+            {
+                throw std::runtime_error("Invalid shared view snapshot extension");
+            }
+            buffer.read_map(this->shared_views_);
+            this->restore_shared_views();
+        }
         if ((this->aslr_policy_ & ~0xfu) || ((this->aslr_policy_ & 8) && !(this->aslr_policy_ & 2)))
         {
             throw std::runtime_error("Invalid saved ASLR policy");
@@ -662,9 +674,135 @@ namespace sogen
         return true;
     }
 
+    bool memory_manager::allocate_shared_view(const uint64_t address, const uint64_t source, const size_t size,
+                                              const nt_memory_permission permissions)
+    {
+        const auto backing = this->find_reserved_region(source);
+        if (backing == this->reserved_regions_.end() || !size || source + size < source ||
+            source + size > backing->first + backing->second.length ||
+            !this->allocate_memory(address, size, permissions, true, memory_region_kind::pagefile_section_view))
+        {
+            return false;
+        }
+        auto& view = this->reserved_regions_.at(address);
+        for (const auto& [start, region] : backing->second.committed_regions)
+        {
+            const auto first = std::max(source, start);
+            const auto end = std::min(source + size, start + region.length);
+            if (first >= end)
+            {
+                continue;
+            }
+            const auto target = address + first - source;
+            const auto length = static_cast<size_t>(end - first);
+            if (!this->memory_->map_shared_memory(target, first, length, this->get_effective_permissions(permissions)))
+            {
+                this->release_memory(address, 0);
+                return false;
+            }
+            view.committed_regions.emplace(target, committed_region{.length = length, .permissions = permissions});
+        }
+        this->shared_views_.emplace(address, source);
+        this->update_layout_version();
+        return true;
+    }
+
+    uint64_t memory_manager::shared_view_source(const uint64_t address) const
+    {
+        const auto entry = this->shared_views_.find(address);
+        return entry == this->shared_views_.end() ? 0 : entry->second;
+    }
+
+    bool memory_manager::has_shared_views(const uint64_t backing) const
+    {
+        const auto region = this->reserved_regions_.find(backing);
+        if (region == this->reserved_regions_.end())
+        {
+            return false;
+        }
+        return std::ranges::any_of(this->shared_views_, [&](const auto& entry) {
+            return entry.second >= backing && entry.second - backing < region->second.length;
+        });
+    }
+
+    void memory_manager::restore_shared_views()
+    {
+        for (const auto& [address, source] : this->shared_views_)
+        {
+            const auto view = this->reserved_regions_.find(address);
+            const auto backing = this->find_reserved_region(source);
+            if (view == this->reserved_regions_.end() || backing == this->reserved_regions_.end() ||
+                view->second.kind != memory_region_kind::pagefile_section_view || source + view->second.length < source ||
+                source + view->second.length > backing->first + backing->second.length)
+            {
+                throw std::runtime_error("Invalid saved shared view");
+            }
+            for (const auto& [start, region] : view->second.committed_regions)
+            {
+                this->unmap_memory(start, region.length);
+                if (!this->memory_->map_shared_memory(start, source + start - address, region.length,
+                                                      this->get_effective_permissions(region.permissions)))
+                {
+                    throw std::runtime_error("Unable to restore shared view");
+                }
+            }
+        }
+    }
+
     bool memory_manager::commit_memory(const uint64_t address, const size_t size, const nt_memory_permission permissions)
     {
-        return this->commit_memory(address, size, permissions, false);
+        const auto view = this->find_reserved_region(address);
+        if (view == this->reserved_regions_.end() || view->second.kind != memory_region_kind::pagefile_section_view)
+        {
+            return this->commit_memory(address, size, permissions, false);
+        }
+        if (!size || address + size < address || address + size > view->first + view->second.length)
+        {
+            return false;
+        }
+        const auto source = this->shared_view_source(view->first);
+        const auto target = source ? source + address - view->first : address;
+        const auto backing = this->find_reserved_region(target);
+        if (backing == this->reserved_regions_.end() || !this->commit_memory(target, size, backing->second.initial_permission, true))
+        {
+            return false;
+        }
+        for (const auto& [base, origin] : this->shared_views_)
+        {
+            auto& region = this->reserved_regions_.at(base);
+            const auto first = std::max(target, origin);
+            const auto end = std::min(target + size, origin + region.length);
+            if (first >= end)
+            {
+                continue;
+            }
+            const auto begin = base + first - origin;
+            const auto finish = base + end - origin;
+            auto cursor = begin;
+            split_regions(region.committed_regions, {begin, finish});
+            auto existing = region.committed_regions.lower_bound(begin);
+            while (cursor < finish)
+            {
+                if (existing != region.committed_regions.end() && existing->first == cursor)
+                {
+                    cursor += existing->second.length;
+                    ++existing;
+                    continue;
+                }
+                const auto gap_end = existing == region.committed_regions.end() ? finish : std::min(finish, existing->first);
+                const auto length = static_cast<size_t>(gap_end - cursor);
+                if (!this->memory_->map_shared_memory(cursor, origin + cursor - base, length,
+                                                      this->get_effective_permissions(region.initial_permission)))
+                {
+                    throw std::runtime_error("Unable to commit shared view");
+                }
+                region.committed_regions.emplace(cursor, committed_region{.length = length, .permissions = region.initial_permission});
+                cursor = gap_end;
+            }
+            merge_regions(region.committed_regions);
+        }
+        this->update_layout_version();
+        return source ? this->protect_memory(address, size, permissions) : true;
     }
 
     bool memory_manager::commit_image_memory(const uint64_t address, const size_t size, const nt_memory_permission permissions)
@@ -693,7 +831,8 @@ namespace sogen
         }
 
         if (memory_region_policy::is_section_kind(entry->second.kind) &&
-            !(allow_image_section && entry->second.kind == memory_region_kind::section_image))
+            !(allow_image_section &&
+              (entry->second.kind == memory_region_kind::section_image || entry->second.kind == memory_region_kind::pagefile_section_view)))
         {
             return false;
         }
@@ -861,6 +1000,7 @@ namespace sogen
             }
 
             this->reserved_regions_.erase(entry);
+            this->shared_views_.erase(address);
             this->release_host_claims(address + entry_length);
             this->update_layout_version();
             return true;
@@ -953,6 +1093,7 @@ namespace sogen
 
     void memory_manager::unmap_all_memory()
     {
+        this->shared_views_.clear();
         for (const auto& reserved_region : this->reserved_regions_)
         {
             for (const auto& region : reserved_region.second.committed_regions)

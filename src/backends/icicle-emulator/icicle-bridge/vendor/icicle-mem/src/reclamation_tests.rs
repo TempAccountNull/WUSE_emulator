@@ -29,7 +29,7 @@ fn alias_pins_page_until_last_mapping_is_removed() {
     assert!(mem.map_memory_len(
         B,
         4096,
-        MemoryMapping::Physical(PhysicalMapping { addr: B, index: page })
+        MemoryMapping::Physical(PhysicalMapping { addr: B, index: page, shared_perm: 0 })
     ));
     assert!(mem.unmap_memory_len(A, 4096));
     assert_eq!(mem.reclaim_unmapped_physical(&[page], &[]), 0);

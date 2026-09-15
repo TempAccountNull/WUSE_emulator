@@ -123,6 +123,10 @@ namespace sogen
         bool allocate_memory(uint64_t address, size_t size, nt_memory_permission permissions, bool reserve_only = false,
                              memory_region_kind kind = memory_region_kind::private_allocation);
 
+        bool allocate_shared_view(uint64_t address, uint64_t source, size_t size, nt_memory_permission permissions);
+        uint64_t shared_view_source(uint64_t address) const;
+        bool has_shared_views(uint64_t backing) const;
+        void restore_shared_views();
         bool commit_memory(uint64_t address, size_t size, nt_memory_permission permissions);
         bool commit_image_memory(uint64_t address, size_t size, nt_memory_permission permissions);
         bool decommit_memory(uint64_t address, size_t size);
@@ -207,6 +211,7 @@ namespace sogen
       private:
         memory_interface* memory_{};
         reserved_region_map reserved_regions_{};
+        std::map<uint64_t, uint64_t> shared_views_{};
         std::atomic<std::uint64_t> layout_version_{0};
         std::uint64_t default_allocation_address_{0x100000000ULL};
         bool dep_enabled_{true};

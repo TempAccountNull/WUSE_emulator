@@ -1,0 +1,57 @@
+Coherent pagefile section views
+
+WindowsCodecs CreateFileMappingForCircularBuffer reserves and releases 192 KiB,
+then maps offset zero of one section into three consecutive 64 KiB views.
+Sogen returned the first view address for all three requests. The codec stored
+the requested middle address and faulted while clearing it.
+
+Observed x64 path:
+  windowscodecs.dll+0x58DA7  MapViewOfFileEx(..., FILE_MAP_WRITE, 0, 0, 0x10000, base)
+  windowscodecs.dll+0x1ECF0  SPNGREAD::FInitZlib calls memset(buffer, 0, 0x10000)
+  msvcrt.dll+0x746F8        0F 11 01  movups xmmword ptr [rcx], xmm0
+
+DLLs matched to the guest root and IDA bytes:
+  windowscodecs.dll SHA256 a582e1c5d921664cbab0abf5d55bb0b541e15bd48f5ec1e57faa5a8f26af8858
+  msvcrt.dll       SHA256 416508ebed1fc129dfe0e6aff43831d4b50c87f44f31b5d0afecfd39b67f9964
+
+The section syscall now creates distinct views with shared storage, requested
+addresses and lengths, per-view protections, and range/protection validation.
+Closing a section handle preserves its views. Unmapping one view preserves the
+others. The backing is released after the final view and handle are gone.
+SEC_RESERVE commitment propagates to overlapping views. Snapshots save and
+rebuild view aliases; older snapshots without the extension still load.
+
+Icicle keeps permissions in shared virtual mappings and bytes in shared physical
+pages. Shared mappings bypass permission-dependent TLB entries. Snapshot COW
+updates all aliases in the active address space. Executable-page tracking and
+unmapped-page reclamation continue to use the physical page identity.
+
+Scope: pagefile SEC_COMMIT/SEC_RESERVE read, write and execute views on Icicle.
+Write-copy and additional allocation flags explicitly return STATUS_NOT_SUPPORTED.
+Other backends need their own coherent shared-mapping implementation. This change
+does not claim complete file-backed, cross-process or NtMapViewOfSectionEx support.
+
+References:
+  ReactOS ntoskrnl/mm/section.c: MmMapViewOfSection, MmMapViewOfSegment;
+  shared segment pages, offset/size bounds, protection compatibility and view lifetime.
+  https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-mapviewoffileex
+  https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwmapviewofsection
+
+Validation:
+  Icicle memory suite: 43 passed, 1 existing ignored test.
+  C++ section, ASLR and Icicle regressions: 31 passed in interpreter and JIT modes.
+  Release and final clang-tidy builds passed; final tidy repeats all 31 cases per mode.
+  Repository CLI smoke: exit 0, 31.20 seconds.
+
+Actual game replay:
+  Before: BACCD20000, BACCD30000, BACCD40000 requests all returned BACCD20000.
+  After: all three requests returned the exact requested address and size.
+  The failing memset completed at windowscodecs.dll+0x1ECF5, preserving RSP.
+  All three complete 64 KiB views contained the same zero bytes.
+  Source snapshot SHA256 591240d3ff5476f979a6f66dc6ace236d8f0fa6d5422ffe659e150aa2be3fb33
+  After snapshot  SHA256 d78d81ef1b8052fd54799d22ff3f760b548d4fdee7a6dd150e1cc5e566b13e6c
+
+Continuation reached windowscodecs.dll+0x480E2, m7_ownsAdler32_8u:
+  66 0F F6 D4  psadbw xmm2, xmm4
+  Icicle UnimplementedOp (0x100A), thread 108. This is the next captured failure.
+  No Dawn boot milestone has been confirmed.

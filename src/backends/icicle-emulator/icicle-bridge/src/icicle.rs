@@ -970,6 +970,10 @@ impl IcicleEmulator {
         return self.get_mem().map_memory_len(address, length, mapping);
     }
 
+    pub fn map_shared_memory(&mut self, address: u64, source: u64, length: u64, permissions: u8) -> bool {
+        self.get_mem().map_shared(address, source, length, map_permissions(permissions)).is_ok()
+    }
+
     pub fn map_mmio(
         &mut self,
         address: u64,

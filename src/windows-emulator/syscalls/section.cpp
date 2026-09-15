@@ -344,12 +344,12 @@ namespace sogen
 
         NTSTATUS handle_NtMapViewOfSection(const syscall_context& c, const handle section_handle, const handle process_handle,
                                            const emulator_object<uint64_t> base_address,
-                                           const EMULATOR_CAST(EmulatorTraits<Emu64>::ULONG_PTR, ULONG_PTR) /*zero_bits*/,
-                                           const EMULATOR_CAST(EmulatorTraits<Emu64>::SIZE_T, SIZE_T) /*commit_size*/,
+                                           const EMULATOR_CAST(EmulatorTraits<Emu64>::ULONG_PTR, ULONG_PTR) zero_bits,
+                                           const EMULATOR_CAST(EmulatorTraits<Emu64>::SIZE_T, SIZE_T) commit_size,
                                            const emulator_object<LARGE_INTEGER> section_offset,
                                            const emulator_object<EMULATOR_CAST(EmulatorTraits<Emu64>::SIZE_T, SIZE_T)> view_size,
-                                           const SECTION_INHERIT /*inherit_disposition*/, const ULONG /*allocation_type*/,
-                                           const ULONG /*win32_protect*/)
+                                           const SECTION_INHERIT inherit_disposition, const ULONG allocation_type,
+                                           const ULONG win32_protect)
         {
             if (!c.proc.is_current_process_handle(process_handle))
             {
@@ -470,41 +470,108 @@ namespace sogen
 
             const auto protection = map_nt_to_emulator_protection(section_entry->section_page_protection);
 
-            // Pagefile-backed section: keep ONE persistent backing per section and hand out views into it
-            // (view = backing + offset). Real Windows shares the section's pages across every view; allocating
-            // a fresh region per map (the old behavior) broke view coherency and exhausted the 32-bit address
-            // space for callers like DXVK's D3D9 memory allocator, which maps one large section at many offsets.
             if (section_entry->file_name.empty())
             {
-                const auto backing_size = static_cast<size_t>(page_align_up(section_entry->maximum_size));
-                if (backing_size == 0)
+                if (!base_address || !view_size)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if (inherit_disposition != ViewShare && inherit_disposition != ViewUnmap)
                 {
                     return STATUS_INVALID_PARAMETER;
                 }
-
-                if (section_entry->backing_address == 0)
+                if (allocation_type != 0)
                 {
-                    const auto reserve_only = section_entry->allocation_attributes == SEC_RESERVE;
-                    const auto backing = c.win_emu.memory.allocate_memory(backing_size, protection, reserve_only, 0,
-                                                                          memory_region_kind::pagefile_section_view);
-                    if (!backing)
+                    return STATUS_NOT_SUPPORTED;
+                }
+                if (zero_bits > 21)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                const auto page_protection = win32_protect & 0xff;
+                if ((win32_protect & ~0x7ffu) || !std::has_single_bit(page_protection) || page_protection == PAGE_NOACCESS)
+                {
+                    return STATUS_INVALID_PAGE_PROTECTION;
+                }
+                if (page_protection == PAGE_WRITECOPY || page_protection == PAGE_EXECUTE_WRITECOPY)
+                {
+                    return STATUS_NOT_SUPPORTED;
+                }
+                const auto view_protection = map_nt_to_emulator_protection(win32_protect);
+                if ((view_protection.common & protection.common) != view_protection.common)
+                {
+                    return static_cast<NTSTATUS>(0xc000004e);
+                }
+                const auto section_size = section_entry->maximum_size;
+                const auto aligned_offset = align_down(static_cast<uint64_t>(offset), ALLOCATION_GRANULARITY);
+                const auto requested_size = view_size.read();
+                if (!section_size || section_size > MAX_ALLOCATION_END_EXCL || aligned_offset >= section_size ||
+                    requested_size > section_size - aligned_offset)
+                {
+                    return invalid_view_size;
+                }
+                const auto length = static_cast<size_t>(page_align_up(requested_size ? requested_size : section_size - aligned_offset));
+                if (commit_size > length)
+                {
+                    return invalid_view_size;
+                }
+                auto maximum_address = c.proc.is_wow64_process ? UINT32_MAX : MAX_ALLOCATION_ADDRESS;
+                if (zero_bits)
+                {
+                    maximum_address = (1ULL << (32 - zero_bits)) - 1;
+                }
+                const auto requested_base = base_address.read();
+                const auto address = requested_base ? align_down(requested_base, ALLOCATION_GRANULARITY)
+                                                    : c.win_emu.memory.find_free_host_allocation_base(length, 0, maximum_address);
+                if (!address || address > maximum_address || length - 1 > maximum_address - address ||
+                    c.win_emu.memory.overlaps_reserved_region(address, length))
+                {
+                    return STATUS_CONFLICTING_ADDRESSES;
+                }
+                // Claim the requested view before choosing the section's backing address.
+                if (!c.win_emu.memory.allocate_memory(address, length, view_protection, true, memory_region_kind::pagefile_section_view))
+                {
+                    return STATUS_CONFLICTING_ADDRESSES;
+                }
+                auto release_view = utils::finally([&] { c.win_emu.memory.release_memory(address, 0); });
+                const auto fresh_backing = section_entry->backing_address == 0;
+                if (fresh_backing)
+                {
+                    section_entry->backing_address =
+                        c.win_emu.memory.allocate_memory(static_cast<size_t>(page_align_up(section_size)), protection,
+                                                         (section_entry->allocation_attributes & SEC_RESERVE) != 0, MIN_ALLOCATION_ADDRESS,
+                                                         memory_region_kind::pagefile_section_view);
+                    if (!section_entry->backing_address)
                     {
                         return STATUS_NO_MEMORY;
                     }
-                    section_entry->backing_address = backing;
                 }
-
-                const auto aligned_offset = page_align_down(static_cast<uint64_t>(offset));
-                if (aligned_offset >= backing_size)
+                auto release_backing = utils::finally([&] {
+                    if (fresh_backing)
+                    {
+                        c.win_emu.memory.release_memory(section_entry->backing_address, 0);
+                        section_entry->backing_address = 0;
+                    }
+                });
+                if (commit_size && !c.win_emu.memory.commit_memory(section_entry->backing_address + aligned_offset,
+                                                                   static_cast<size_t>(page_align_up(commit_size)), protection))
                 {
-                    return STATUS_INVALID_PARAMETER;
+                    return STATUS_NO_MEMORY;
                 }
-
-                if (view_size)
+                c.win_emu.memory.release_memory(address, 0);
+                if (!c.win_emu.memory.allocate_shared_view(address, section_entry->backing_address + aligned_offset, length,
+                                                           view_protection))
                 {
-                    view_size.write(backing_size - aligned_offset);
+                    return STATUS_NOT_SUPPORTED;
                 }
-                base_address.write(section_entry->backing_address + aligned_offset);
+                base_address.write(address);
+                view_size.write(length);
+                if (section_offset)
+                {
+                    section_offset.write(LARGE_INTEGER{.QuadPart = static_cast<int64_t>(aligned_offset)});
+                }
+                release_view.cancel();
+                release_backing.cancel();
                 return STATUS_SUCCESS;
             }
 
@@ -729,14 +796,22 @@ namespace sogen
             const auto region_info = c.win_emu.memory.get_region_info(base_address);
             if (region_info.is_reserved && memory_region_policy::is_section_kind(region_info.kind))
             {
-                // A pagefile section keeps one persistent backing shared by every view, so unmapping a view
-                // must not free it (other views and open section handles may still reference it); it is released
-                // when the last section handle is closed.
+                if (const auto source = c.win_emu.memory.shared_view_source(region_info.allocation_base))
+                {
+                    const auto backing = c.win_emu.memory.get_region_info(source).allocation_base;
+                    c.win_emu.memory.release_memory(region_info.allocation_base, 0);
+                    const auto handle_alive =
+                        std::ranges::any_of(c.proc.sections, [&](const auto& entry) { return entry.second.backing_address == backing; });
+                    if (!handle_alive && !c.win_emu.memory.has_shared_views(backing))
+                    {
+                        c.win_emu.memory.release_memory(backing, 0);
+                    }
+                    return STATUS_SUCCESS;
+                }
                 if (region_info.kind == memory_region_kind::pagefile_section_view)
                 {
                     return STATUS_SUCCESS;
                 }
-
                 if (c.win_emu.memory.release_memory(region_info.allocation_base, 0))
                 {
                     return STATUS_SUCCESS;

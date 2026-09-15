@@ -108,6 +108,14 @@ pub fn icicle_map_memory(ptr: *mut c_void, address: u64, length: u64, permission
 }
 
 #[unsafe(no_mangle)]
+pub fn icicle_map_shared_memory(ptr: *mut c_void, address: u64, source: u64, length: u64, permissions: u8) -> i32 {
+    unsafe {
+        let emulator = &mut *(ptr as *mut IcicleEmulator);
+        to_cbool(emulator.map_shared_memory(address, source, length, permissions))
+    }
+}
+
+#[unsafe(no_mangle)]
 pub fn icicle_unmap_memory(ptr: *mut c_void, address: u64, length: u64) -> i32 {
     unsafe {
         let emulator = &mut *(ptr as *mut IcicleEmulator);

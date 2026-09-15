@@ -35,6 +35,7 @@ extern "C"
     int32_t icicle_map_memory(icicle_emulator*, uint64_t address, uint64_t length, uint8_t permissions);
     int32_t icicle_map_mmio(icicle_emulator*, uint64_t address, uint64_t length, icicle_mmio_read_func* read_callback, void* read_data,
                             icicle_mmio_write_func* write_callback, void* write_data);
+    int32_t icicle_map_shared_memory(icicle_emulator*, uint64_t address, uint64_t source, uint64_t length, uint8_t permissions);
     int32_t icicle_unmap_memory(icicle_emulator*, uint64_t address, uint64_t length);
     int32_t icicle_read_memory(icicle_emulator*, uint64_t address, void* data, size_t length);
     int32_t icicle_write_memory(icicle_emulator*, uint64_t address, const void* data, size_t length);
@@ -302,6 +303,12 @@ namespace sogen::icicle
         {
             const auto res = icicle_map_memory(this->emu_, address, size, static_cast<uint8_t>(permissions));
             ice(res, "Failed to map memory");
+        }
+
+        bool map_shared_memory(const uint64_t address, const uint64_t source, const size_t size,
+                               const memory_permission permissions) override
+        {
+            return icicle_map_shared_memory(this->emu_, address, source, size, static_cast<uint8_t>(permissions)) != 0;
         }
 
         void unmap_memory(const uint64_t address, const size_t size) override
