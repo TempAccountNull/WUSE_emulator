@@ -36,3 +36,7 @@ Actual-game replay passed: RIP advanced to 0xBACC5EE2F6 and XMM7 became
 eight zero words, matching the captured operands. All other captured
 registers and stack bytes were unchanged. Restored registers matched the
 original failure capture. The post-instruction checkpoint is retained.
+
+Continued-game observation: 804,976,485 guest instructions in 60.0445 seconds.
+The monitored interval had no new backend fault. This is not a matched
+performance comparison. Full boot still requires user confirmation.
