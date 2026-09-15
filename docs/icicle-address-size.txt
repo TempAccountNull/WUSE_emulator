@@ -35,5 +35,11 @@ Validation under PatchScanner/benchmarks/sogen-fixes:
 - vs2022-1789507502004493700 and tidy-1789507542779980700: builds passed.
 - sogen-cli-smoke-1789507219291767500: Icicle guest CLI smoke exited zero.
 
-These are regression and smoke results, not proof of game boot or an actual
-Destiny failure passing. Actual-game checkpoint replay is the next check.
+The actual game resumed from checkpoint SHA256
+43cd45693d4f89783a6d2632accf06f8440a0c02d45bbb3eb3cc80114465307a
+with the deployed build, explicit -e/-v and the saved live-log window. Samples
+reached WARP GetSub, WARP triangle rasterization and destiny2.exe+0x1A65BEC.
+The matched module identity and observations are in icicle-address-size-replay.json.
+Execution remains active at that observation. Visible-frame and boot acceptance
+remain unconfirmed. The 67h test defects are not established as the cause of
+the previous game termination.

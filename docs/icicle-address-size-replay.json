@@ -1,0 +1,68 @@
+{
+  "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789507727869529400-address-size-and-af-fix",
+  "observed_utc": "2026-09-15T21:33:48Z",
+  "command": [
+    "D:\\Sunrise\\D2\\sogen\\builds\\20260915-162819-icicle-startup\\analyzer.exe",
+    "--backend",
+    "icicle",
+    "-v",
+    "-e",
+    "D:\\Sunrise\\D2\\sogen\\root",
+    "-p",
+    "d:\\sunrise\\d2",
+    "D:\\Sunrise\\D2",
+    "--call-count",
+    "--first-exec",
+    "--report",
+    "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789507727869529400-address-size-and-af-fix\\events.jsonl",
+    "--stdout",
+    "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789507727869529400-address-size-and-af-fix\\guest-stdout.log",
+    "--debug",
+    "--port",
+    "28979",
+    "--snapshot-out",
+    "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789507727869529400-address-size-and-af-fix\\guest.snap",
+    "-a",
+    "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789503760812118200-debug-print-capture\\guest.snap",
+    "d:\\sunrise\\d2\\destiny2.exe"
+  ],
+  "source_commit": "d70120a41341c75a185f94819f6baf11a2a6f900",
+  "analyzer_sha256": "1200297d51218614c9112c0e9a73dc0f9e2310c7a18e19ee7cb1244c2c128f19",
+  "backend_sha256": "0cb26a6a7debd69f0dcb638f7d4d0dde0cc67a1373482d31a680923bd7603903",
+  "processor_spec_sha256": "d84974f590ac449d7bb21b11766e6d77ae9e47742a05bc71653673aed30f6352",
+  "snapshot_input_sha256": "43cd45693d4f89783a6d2632accf06f8440a0c02d45bbb3eb3cc80114465307a",
+  "state": "running",
+  "pid": 55808,
+  "elapsed_seconds": 299.1389116998762,
+  "cpu_seconds": 266.03125,
+  "observations": [
+    {
+      "event": "progress",
+      "rip": "0x91b5230a2",
+      "time": 1789507830.1537502,
+      "stop_reply": "T05thread:5c;"
+    },
+    {
+      "event": "progress",
+      "rip": "0x91b540544",
+      "time": 1789507890.201541,
+      "stop_reply": "T05thread:c;"
+    },
+    {
+      "event": "progress",
+      "rip": "0x141a65bec",
+      "time": 1789507950.2421148,
+      "stop_reply": "T05thread:84;"
+    }
+  ],
+  "matched_warp": {
+    "file_sha256": "ac35b849b483fc9196f24138a731c0739fc2f30b04792931de72cc5a7ce3053f",
+    "codeview_guid_bytes": "1718da83ea57a0d265039e810546b3aa",
+    "codeview_age": 1,
+    "sample_functions": {
+      "0x3830A2": "PixelJitProgram::GetSub",
+      "0x3A0544": "PixelJITRasterizeTriangleT<0,0>"
+    }
+  },
+  "scope": "Actual guest checkpoint resumed and execution progressed. These samples do not prove a visible frame, white-screen resolution or boot acceptance. The 67h defects were reproduced in regression tests, not identified as the previous game termination cause."
+}
