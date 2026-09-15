@@ -12,6 +12,7 @@ ALWAYS Please use the intel manuals to support these asm instruction, unsupporte
 D:\Emulation\sogen\docs\Intel docs
 
 Reference trees are strictly read-only research material:
+- D:/Dawn/game refs (third-party source, headers and DLL reference material)
 - D:/Dawn/refs, including D3D and other rendering components
 - F:/Part1/Reversal/reactos_functions
 - D:/Dawn/refs/wine
