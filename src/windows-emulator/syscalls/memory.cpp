@@ -167,7 +167,8 @@ namespace sogen
                 return STATUS_NOT_SUPPORTED;
             }
 
-            if (base_address < MIN_ALLOCATION_ADDRESS || base_address >= MAX_ALLOCATION_END_EXCL)
+            const bool basic_information = info_class == MemoryBasicInformation || info_class == MemoryPrivilegedBasicInformation;
+            if ((!basic_information && base_address < MIN_ALLOCATION_ADDRESS) || base_address >= MAX_ALLOCATION_END_EXCL)
             {
                 if (return_length)
                 {
@@ -178,7 +179,7 @@ namespace sogen
 
             // https://www.exploit-db.com/exploits/44464
             // Both information classes appear to return the same output structure, MEMORY_BASIC_INFORMATION
-            if (info_class == MemoryBasicInformation || info_class == MemoryPrivilegedBasicInformation)
+            if (basic_information)
             {
                 if (return_length)
                 {
@@ -204,7 +205,8 @@ namespace sogen
                     image_info.RegionSize = static_cast<int64_t>(region_info.length);
 
                     image_info.Protect = map_emulator_to_nt_protection(region_info.permissions);
-                    image_info.AllocationProtect = map_emulator_to_nt_protection(region_info.initial_permissions);
+                    image_info.AllocationProtect =
+                        region_info.is_reserved ? map_emulator_to_nt_protection(region_info.initial_permissions) : 0;
 
                     if (!region_info.is_reserved)
                     {
