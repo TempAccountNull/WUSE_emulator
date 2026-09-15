@@ -1014,46 +1014,21 @@ define pcodeop vmaskmovdqu_avx ;
 	# TODO missing destination or side effects
 }
 
-# MAXPD 4-12 PAGE 1132 LINE 59201
-define pcodeop vmaxpd_avx ;
-:VMAXPD XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5F; (XmmReg1 & YmmReg1) ... & XmmReg2_m128
-{
-	local tmp:16 = vmaxpd_avx( vexVVVV_XmmReg, XmmReg2_m128 );
-	YmmReg1 = zext(tmp);
-	# TODO ZmmReg1 = zext(XmmReg1)
-}
-
-# MAXPD 4-12 PAGE 1132 LINE 59203
-:VMAXPD YmmReg1, vexVVVV_YmmReg, YmmReg2_m256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0x5F; YmmReg1 ... & YmmReg2_m256
-{
-	YmmReg1 = vmaxpd_avx( vexVVVV_YmmReg, YmmReg2_m256 );
-	# TODO ZmmReg1 = zext(YmmReg1)
-}
-
 # MAXPS 4-15 PAGE 1135 LINE 59350
-define pcodeop vmaxps_avx ;
-:VMAXPS XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_NONE) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5F; (XmmReg1 & YmmReg1) ... & XmmReg2_m128
-{
-	local tmp:16 = vmaxps_avx( vexVVVV_XmmReg, XmmReg2_m128 );
-	YmmReg1 = zext(tmp);
-	# TODO ZmmReg1 = zext(XmmReg1)
-}
+:VMAXPS XmmReg1, vexVVVV_XmmReg, XmmReg2 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_NONE) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5F; mod=3 & XmmReg1 & XmmReg2 { sogen_minmax(inst_next:8); }
+:VMAXPS XmmReg1, vexVVVV_XmmReg, MinmaxMem is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_NONE) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5F; XmmReg1 ... & MinmaxMem { sogen_minmax(inst_next:8); }
+:VMAXPS YmmReg1, vexVVVV_YmmReg, YmmReg2 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_NONE) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0x5F; mod=3 & YmmReg1 & YmmReg2 { sogen_minmax(inst_next:8); }
+:VMAXPS YmmReg1, vexVVVV_YmmReg, MinmaxMem is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_NONE) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0x5F; YmmReg1 ... & MinmaxMem { sogen_minmax(inst_next:8); }
 
-# MAXPS 4-15 PAGE 1135 LINE 59353
-:VMAXPS YmmReg1, vexVVVV_YmmReg, YmmReg2_m256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_NONE) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0x5F; YmmReg1 ... & YmmReg2_m256
-{
-	YmmReg1 = vmaxps_avx( vexVVVV_YmmReg, YmmReg2_m256 );
-	# TODO ZmmReg1 = zext(YmmReg1)
-}
+# MAXPD 4-12 PAGE 1132 LINE 59201
+:VMAXPD XmmReg1, vexVVVV_XmmReg, XmmReg2 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5F; mod=3 & XmmReg1 & XmmReg2 { sogen_minmax(inst_next:8); }
+:VMAXPD XmmReg1, vexVVVV_XmmReg, MinmaxMem is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5F; XmmReg1 ... & MinmaxMem { sogen_minmax(inst_next:8); }
+:VMAXPD YmmReg1, vexVVVV_YmmReg, YmmReg2 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0x5F; mod=3 & YmmReg1 & YmmReg2 { sogen_minmax(inst_next:8); }
+:VMAXPD YmmReg1, vexVVVV_YmmReg, MinmaxMem is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0x5F; YmmReg1 ... & MinmaxMem { sogen_minmax(inst_next:8); }
 
 # MAXSD 4-18 PAGE 1138 LINE 59503
-define pcodeop vmaxsd_avx ;
-:VMAXSD XmmReg1, vexVVVV_XmmReg, XmmReg2_m64 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_F2) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5F; (XmmReg1 & YmmReg1) ... & XmmReg2_m64
-{
-	local tmp:16 = vmaxsd_avx( vexVVVV_XmmReg, XmmReg2_m64 );
-	YmmReg1 = zext(tmp);
-	# TODO ZmmReg1 = zext(XmmReg1)
-}
+:VMAXSD XmmReg1, vexVVVV_XmmReg, XmmReg2 is $(VEX_NDS) & $(VEX_LIG) & $(VEX_PRE_F2) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5F; mod=3 & XmmReg1 & XmmReg2 { sogen_minmax(inst_next:8); }
+:VMAXSD XmmReg1, vexVVVV_XmmReg, MinmaxMem is $(VEX_NDS) & $(VEX_LIG) & $(VEX_PRE_F2) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5F; XmmReg1 ... & MinmaxMem { sogen_minmax(inst_next:8); }
 
 # MAXSS 4-20 PAGE 1140 LINE 59606
 define pcodeop vmaxss_avx ;
@@ -1064,46 +1039,21 @@ define pcodeop vmaxss_avx ;
 	# TODO ZmmReg1 = zext(XmmReg1)
 }
 
-# MINPD 4-23 PAGE 1143 LINE 59765
-define pcodeop vminpd_avx ;
-:VMINPD XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5D; (XmmReg1 & YmmReg1) ... & XmmReg2_m128
-{
-	local tmp:16 = vminpd_avx( vexVVVV_XmmReg, XmmReg2_m128 );
-	YmmReg1 = zext(tmp);
-	# TODO ZmmReg1 = zext(XmmReg1)
-}
-
-# MINPD 4-23 PAGE 1143 LINE 59768
-:VMINPD YmmReg1, vexVVVV_YmmReg, YmmReg2_m256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0x5D; YmmReg1 ... & YmmReg2_m256
-{
-	YmmReg1 = vminpd_avx( vexVVVV_YmmReg, YmmReg2_m256 );
-	# TODO ZmmReg1 = zext(YmmReg1)
-}
-
 # MINPS 4-26 PAGE 1146 LINE 59909
-define pcodeop vminps_avx ;
-:VMINPS XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_NONE) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5D; (XmmReg1 & YmmReg1) ... & XmmReg2_m128
-{
-	local tmp:16 = vminps_avx( vexVVVV_XmmReg, XmmReg2_m128 );
-	YmmReg1 = zext(tmp);
-	# TODO ZmmReg1 = zext(XmmReg1)
-}
+:VMINPS XmmReg1, vexVVVV_XmmReg, XmmReg2 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_NONE) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5D; mod=3 & XmmReg1 & XmmReg2 { sogen_minmax(inst_next:8); }
+:VMINPS XmmReg1, vexVVVV_XmmReg, MinmaxMem is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_NONE) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5D; XmmReg1 ... & MinmaxMem { sogen_minmax(inst_next:8); }
+:VMINPS YmmReg1, vexVVVV_YmmReg, YmmReg2 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_NONE) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0x5D; mod=3 & YmmReg1 & YmmReg2 { sogen_minmax(inst_next:8); }
+:VMINPS YmmReg1, vexVVVV_YmmReg, MinmaxMem is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_NONE) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0x5D; YmmReg1 ... & MinmaxMem { sogen_minmax(inst_next:8); }
 
-# MINPS 4-26 PAGE 1146 LINE 59912
-:VMINPS YmmReg1, vexVVVV_YmmReg, YmmReg2_m256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_NONE) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0x5D; YmmReg1 ... & YmmReg2_m256
-{
-	YmmReg1 = vminps_avx( vexVVVV_YmmReg, YmmReg2_m256 );
-	# TODO ZmmReg1 = zext(YmmReg1)
-}
+# MINPD 4-23 PAGE 1143 LINE 59765
+:VMINPD XmmReg1, vexVVVV_XmmReg, XmmReg2 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5D; mod=3 & XmmReg1 & XmmReg2 { sogen_minmax(inst_next:8); }
+:VMINPD XmmReg1, vexVVVV_XmmReg, MinmaxMem is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5D; XmmReg1 ... & MinmaxMem { sogen_minmax(inst_next:8); }
+:VMINPD YmmReg1, vexVVVV_YmmReg, YmmReg2 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0x5D; mod=3 & YmmReg1 & YmmReg2 { sogen_minmax(inst_next:8); }
+:VMINPD YmmReg1, vexVVVV_YmmReg, MinmaxMem is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0x5D; YmmReg1 ... & MinmaxMem { sogen_minmax(inst_next:8); }
 
 # MINSD 4-29 PAGE 1149 LINE 60061
-define pcodeop vminsd_avx ;
-:VMINSD XmmReg1, vexVVVV_XmmReg, XmmReg2_m64 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_F2) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5D; (XmmReg1 & YmmReg1) ... & XmmReg2_m64
-{
-	local tmp:16 = vminsd_avx( vexVVVV_XmmReg, XmmReg2_m64 );
-	YmmReg1 = zext(tmp);
-	# TODO ZmmReg1 = zext(XmmReg1)
-}
+:VMINSD XmmReg1, vexVVVV_XmmReg, XmmReg2 is $(VEX_NDS) & $(VEX_LIG) & $(VEX_PRE_F2) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5D; mod=3 & XmmReg1 & XmmReg2 { sogen_minmax(inst_next:8); }
+:VMINSD XmmReg1, vexVVVV_XmmReg, MinmaxMem is $(VEX_NDS) & $(VEX_LIG) & $(VEX_PRE_F2) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0x5D; XmmReg1 ... & MinmaxMem { sogen_minmax(inst_next:8); }
 
 # MINSS 4-31 PAGE 1151 LINE 60164
 define pcodeop vminss_avx ;
@@ -3304,4 +3254,3 @@ define pcodeop vxorps_avx ;
 	YmmReg1 = vxorps_avx( vexVVVV_YmmReg, YmmReg2_m256 );
 	# TODO ZmmReg1 = zext(YmmReg1)
 }
-

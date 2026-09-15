@@ -1,0 +1,57 @@
+Floating-point minimum and maximum (Icicle x64)
+
+Reference: Intel SDM 325462-092-sdm-vol-1-2abcd-3abcd-4.pdf.
+PDF pages: MAXPD 1294-1296, MAXPS 1297-1299, MAXSD 1300-1301,
+MINPD 1305-1307, MINPS 1308-1310, MINSD 1311-1312.
+Exception tables 2-19/2-20 (643-644) and 2-48/2-49 (667-668).
+EVEX broadcast, masking and SAE rules: 658-661, tables 2-38 through 2-43.
+
+The saved game stopped at destiny2.exe+0x3B8A89 on
+44 0F 5D E9 (MINPS XMM13,XMM1). Icicle reported UnimplementedOp.
+
+Implemented 30 encoding forms:
+MINPS/MAXPS: legacy 128, VEX 128/256, EVEX 128/256/512.
+MINPD/MAXPD: legacy 128, VEX 128/256, EVEX 128/256/512.
+MINSD/MAXSD: legacy, VEX and EVEX scalar double precision.
+Register and memory operands use the same result/exception implementation.
+This replaces the previous narrow MAXPS helper and incomplete scalar p-code.
+
+Comparison uses IEEE bit patterns without host floating-point conversion.
+NaNs select the second operand, retaining its payload and signaling bit.
+Both quiet and signaling NaNs set invalid. Equal signed zeros select the
+second operand. DAZ converts denormal inputs to signed zero; FTZ does not
+flush a selected denormal. Invalid and denormal status flags accumulate
+across active lanes. Unmasked faults preserve the destination and RIP.
+EVEX SAE suppresses status updates and floating-point exceptions.
+
+Legacy forms preserve upper vector state. VEX/EVEX zero above their vector
+length. Scalar VEX/EVEX copy bits 127:64 from the first source and zero
+above 128, including when the low element is masked off. EVEX supports
+merge/zero masks, extended registers and packed memory broadcast.
+Scalar memory reads exactly eight bytes; broadcast reads one element.
+Inactive lanes neither access memory nor contribute floating-point faults.
+All active memory reads succeed before result/status updates commit.
+
+Legacy packed memory requires 16-byte alignment. VEX/EVEX packed memory
+accepts unaligned operands. Scalar and broadcast accesses implement #AC.
+Noncanonical active addresses, unreadable pages, CR0/CR4/XCR0 conditions,
+CR0.TS, illegal prefixes and reserved EVEX encodings follow the exception
+tables. The shared address decoder also handles aligned moves, including
+RIP/EIP-relative, SIB, segment bases and EVEX compressed displacement.
+
+Scalar LIG/LLIG fields are accepted. Software should still encode VEX.L=0,
+as Intel warns that L=1 behavior is not portable. Packed register-source
+SAE implies a 512-bit operation; its length bits do not narrow the result.
+Scalar memory does not support broadcast or SAE.
+
+The advertised CPU profile and default XCR0 remain unchanged. Tests enable
+AVX/AVX-512 state explicitly. These instruction implementations do not
+claim a complete AVX-512 CPU or expand the guest Windows XSAVE ABI.
+
+Validation details and actual-game replay evidence are in minmax-validation.json.
+Instruction regression success is separate from full game boot acceptance.
+
+Actual-game replay passed: RIP advanced to destiny2.exe+0x3B8A8D.
+Both operands contained four 1.0f values; XMM13 remained unchanged.
+All other captured registers and stack bytes were preserved.
+The checkpoint registers matched the original failure capture.

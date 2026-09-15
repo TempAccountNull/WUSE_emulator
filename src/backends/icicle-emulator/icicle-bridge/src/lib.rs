@@ -1,7 +1,8 @@
+mod simd_minmax;
+mod vector_operand;
 mod aes;
 mod aligned_move;
 mod icicle;
-mod packed_max;
 mod packed_sad;
 mod reciprocal_sqrt;
 mod registers;

@@ -5623,28 +5623,20 @@ define pcodeop lddqu;
 define pcodeop maskmovdqu;
 :MASKMOVDQU        XmmReg1, XmmReg2   is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0xF7; XmmReg1 & XmmReg2		{ XmmReg1 = maskmovdqu(XmmReg1, XmmReg2); }
 
-define pcodeop maxpd;
-:MAXPD        XmmReg, m128        is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x5F; XmmReg ... & m128 { XmmReg = maxpd(XmmReg, m128); }
-:MAXPD        XmmReg1, XmmReg2    is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x5F; xmmmod=3 & XmmReg1 & XmmReg2 { XmmReg1 = maxpd(XmmReg1, XmmReg2); }
-
-define pcodeop maxps;
-define pcodeop sogen_maxps_memory;
-MaxpsMem: "xmmword ptr" Mem is Mem { export Mem; }
-:MAXPS        XmmReg, MaxpsMem    is vexMode=0 &  mandover=0 & byte=0x0F; byte=0x5F; XmmReg ... & MaxpsMem { XmmReg = sogen_maxps_memory(XmmReg, MaxpsMem); }
-:MAXPS        XmmReg1, XmmReg2    is vexMode=0 &  mandover=0 & byte=0x0F; byte=0x5F; xmmmod=3 & XmmReg1 & XmmReg2 { XmmReg1 = maxps(XmmReg1, XmmReg2); }
-
-:MAXSD        XmmReg, m64         is vexMode=0 &  $(PRE_F2) & byte=0x0F; byte=0x5F; XmmReg ... & m64
-{
-    local tmp:8 = m64;
-    if (tmp f< XmmReg[0,64]) goto inst_next;
-    XmmReg[0,64] = tmp;
-}
-
-:MAXSD        XmmReg1, XmmReg2    is vexMode=0 &  $(PRE_F2) & byte=0x0F; byte=0x5F; xmmmod=3 & XmmReg1 & XmmReg2
-{
-    if (XmmReg2[0,64] f< XmmReg1[0,64]) goto inst_next;
-    XmmReg1[0,64] = XmmReg2[0,64];
-}
+define pcodeop sogen_minmax;
+MinmaxMem: Mem is Mem { export Mem; }
+:MINPS XmmReg, MinmaxMem is vexMode=0 & mandover=0 & byte=0x0F; byte=0x5D; XmmReg ... & MinmaxMem { sogen_minmax(inst_next:8); }
+:MINPS XmmReg1, XmmReg2 is vexMode=0 & mandover=0 & byte=0x0F; byte=0x5D; xmmmod=3 & XmmReg1 & XmmReg2 { sogen_minmax(inst_next:8); }
+:MINPD XmmReg, MinmaxMem is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x5D; XmmReg ... & MinmaxMem { sogen_minmax(inst_next:8); }
+:MINPD XmmReg1, XmmReg2 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x5D; xmmmod=3 & XmmReg1 & XmmReg2 { sogen_minmax(inst_next:8); }
+:MINSD XmmReg, MinmaxMem is vexMode=0 & $(PRE_F2) & byte=0x0F; byte=0x5D; XmmReg ... & MinmaxMem { sogen_minmax(inst_next:8); }
+:MINSD XmmReg1, XmmReg2 is vexMode=0 & $(PRE_F2) & byte=0x0F; byte=0x5D; xmmmod=3 & XmmReg1 & XmmReg2 { sogen_minmax(inst_next:8); }
+:MAXPS XmmReg, MinmaxMem is vexMode=0 & mandover=0 & byte=0x0F; byte=0x5F; XmmReg ... & MinmaxMem { sogen_minmax(inst_next:8); }
+:MAXPS XmmReg1, XmmReg2 is vexMode=0 & mandover=0 & byte=0x0F; byte=0x5F; xmmmod=3 & XmmReg1 & XmmReg2 { sogen_minmax(inst_next:8); }
+:MAXPD XmmReg, MinmaxMem is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x5F; XmmReg ... & MinmaxMem { sogen_minmax(inst_next:8); }
+:MAXPD XmmReg1, XmmReg2 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x5F; xmmmod=3 & XmmReg1 & XmmReg2 { sogen_minmax(inst_next:8); }
+:MAXSD XmmReg, MinmaxMem is vexMode=0 & $(PRE_F2) & byte=0x0F; byte=0x5F; XmmReg ... & MinmaxMem { sogen_minmax(inst_next:8); }
+:MAXSD XmmReg1, XmmReg2 is vexMode=0 & $(PRE_F2) & byte=0x0F; byte=0x5F; xmmmod=3 & XmmReg1 & XmmReg2 { sogen_minmax(inst_next:8); }
 
 :MAXSS        XmmReg, m32         is vexMode=0 &  $(PRE_F3) & byte=0x0F; byte=0x5F; XmmReg ... & m32
 {
@@ -5657,27 +5649,6 @@ MaxpsMem: "xmmword ptr" Mem is Mem { export Mem; }
 {
     if (XmmReg2[0,32] f< XmmReg1[0,32]) goto inst_next;
     XmmReg1[0,32] = XmmReg2[0,32];
-}
-
-define pcodeop minpd;
-:MINPD        XmmReg, m128        is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x5D; XmmReg ... & m128 { XmmReg = minpd(XmmReg, m128); }
-:MINPD        XmmReg1, XmmReg2    is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x5D; xmmmod=3 & XmmReg1 & XmmReg2 { XmmReg1 = minpd(XmmReg1, XmmReg2); }
-
-define pcodeop minps;
-:MINPS        XmmReg, m128        is vexMode=0 &  mandover=0 & byte=0x0F; byte=0x5D; XmmReg ... & m128 { XmmReg = minps(XmmReg, m128); }
-:MINPS        XmmReg1, XmmReg2    is vexMode=0 &  mandover=0 & byte=0x0F; byte=0x5D; xmmmod=3 & XmmReg1 & XmmReg2 { XmmReg1 = minps(XmmReg1, XmmReg2); }
-
-:MINSD        XmmReg, m64         is vexMode=0 &  $(PRE_F2) & byte=0x0F; byte=0x5D; XmmReg ... & m64
-{
-    local tmp:8 = m64;
-    if (XmmReg[0,64] f< tmp) goto inst_next;
-    XmmReg[0,64] = tmp;
-}
-
-:MINSD        XmmReg1, XmmReg2    is vexMode=0 &  $(PRE_F2) & byte=0x0F; byte=0x5D; xmmmod=3 & XmmReg1 & XmmReg2
-{
-    if (XmmReg1[0,64] f< XmmReg2[0,64]) goto inst_next;
-    XmmReg1[0,64] = XmmReg2[0,64];
 }
 
 :MINSS        XmmReg, m32         is vexMode=0 &  $(PRE_F3) & byte=0x0F; byte=0x5D; XmmReg ... & m32

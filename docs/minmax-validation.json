@@ -1,0 +1,372 @@
+{
+  "instruction_families": [
+    "MINPD",
+    "MINPS",
+    "MINSD",
+    "MAXPD",
+    "MAXPS",
+    "MAXSD"
+  ],
+  "encoding_forms": 30,
+  "instruction_regression_tests": 14,
+  "manual": "325462-092-sdm-vol-1-2abcd-3abcd-4.pdf",
+  "manual_pdf_pages": {
+    "MAXPD": [
+      1294,
+      1295,
+      1296
+    ],
+    "MAXPS": [
+      1297,
+      1298,
+      1299
+    ],
+    "MAXSD": [
+      1300,
+      1301
+    ],
+    "MINPD": [
+      1305,
+      1306,
+      1307
+    ],
+    "MINPS": [
+      1308,
+      1309,
+      1310
+    ],
+    "MINSD": [
+      1311,
+      1312
+    ]
+  },
+  "exception_tables": {
+    "2-19": 643,
+    "2-20": 644,
+    "2-48": 667,
+    "2-49": 668
+  },
+  "evex_rules_pdf_pages": [
+    658,
+    659,
+    660,
+    661
+  ],
+  "regression": {
+    "release": {
+      "interpreter": [
+        {
+          "tests": 104,
+          "failures": 0,
+          "errors": 0,
+          "time": "7.989s",
+          "capture": "regression-1789478911309481800",
+          "skipped": 2
+        },
+        {
+          "tests": 15,
+          "failures": 0,
+          "errors": 0,
+          "time": "1.721s",
+          "capture": "regression-1789479630766381500",
+          "skipped": 0
+        }
+      ],
+      "jit": [
+        {
+          "tests": 104,
+          "failures": 0,
+          "errors": 0,
+          "time": "34.387s",
+          "capture": "regression-1789478911309481800",
+          "skipped": 0
+        },
+        {
+          "tests": 15,
+          "failures": 0,
+          "errors": 0,
+          "time": "15.171s",
+          "capture": "regression-1789479630766381500",
+          "skipped": 0
+        }
+      ]
+    },
+    "tidy": {
+      "interpreter": [
+        {
+          "tests": 104,
+          "failures": 0,
+          "errors": 0,
+          "time": "7.645s",
+          "capture": "regression-1789479492158663400",
+          "skipped": 2
+        },
+        {
+          "tests": 15,
+          "failures": 0,
+          "errors": 0,
+          "time": "1.724s",
+          "capture": "regression-1789479430971116100",
+          "skipped": 0
+        }
+      ],
+      "jit": [
+        {
+          "tests": 104,
+          "failures": 0,
+          "errors": 0,
+          "time": "33.447s",
+          "capture": "regression-1789479492158663400",
+          "skipped": 0
+        },
+        {
+          "tests": 15,
+          "failures": 0,
+          "errors": 0,
+          "time": "15.077s",
+          "capture": "regression-1789479430971116100",
+          "skipped": 0
+        }
+      ]
+    }
+  },
+  "hardware_arithmetic": {
+    "capture": "rust-tests-1789478256147143900.log",
+    "comparisons": 3600,
+    "scope": "Single and double precision, minimum and maximum, 15 operand patterns, four DAZ/FTZ settings"
+  },
+  "hardware_simultaneous_exceptions": {
+    "capture": "minmax-hardware-1789479198404446900",
+    "cases": [
+      {
+        "maximum": false,
+        "element": 4,
+        "control": 8064,
+        "flags": 8067,
+        "exception": 0,
+        "exception_mxcsr": 0,
+        "result_low": 1065353216,
+        "result_high": 0
+      },
+      {
+        "maximum": false,
+        "element": 4,
+        "control": 7936,
+        "flags": 0,
+        "exception": 3221225616,
+        "exception_mxcsr": 7939,
+        "result_low": 0,
+        "result_high": 0
+      },
+      {
+        "maximum": false,
+        "element": 4,
+        "control": 7808,
+        "flags": 0,
+        "exception": 3221225616,
+        "exception_mxcsr": 7811,
+        "result_low": 0,
+        "result_high": 0
+      },
+      {
+        "maximum": false,
+        "element": 4,
+        "control": 7680,
+        "flags": 0,
+        "exception": 3221225616,
+        "exception_mxcsr": 7683,
+        "result_low": 0,
+        "result_high": 0
+      },
+      {
+        "maximum": false,
+        "element": 8,
+        "control": 8064,
+        "flags": 8067,
+        "exception": 0,
+        "exception_mxcsr": 0,
+        "result_low": 4607182418800017408,
+        "result_high": 0
+      },
+      {
+        "maximum": false,
+        "element": 8,
+        "control": 7936,
+        "flags": 0,
+        "exception": 3221225616,
+        "exception_mxcsr": 7939,
+        "result_low": 0,
+        "result_high": 0
+      },
+      {
+        "maximum": false,
+        "element": 8,
+        "control": 7808,
+        "flags": 0,
+        "exception": 3221225616,
+        "exception_mxcsr": 7811,
+        "result_low": 0,
+        "result_high": 0
+      },
+      {
+        "maximum": false,
+        "element": 8,
+        "control": 7680,
+        "flags": 0,
+        "exception": 3221225616,
+        "exception_mxcsr": 7683,
+        "result_low": 0,
+        "result_high": 0
+      },
+      {
+        "maximum": true,
+        "element": 4,
+        "control": 8064,
+        "flags": 8067,
+        "exception": 0,
+        "exception_mxcsr": 0,
+        "result_low": 5360320512,
+        "result_high": 0
+      },
+      {
+        "maximum": true,
+        "element": 4,
+        "control": 7936,
+        "flags": 0,
+        "exception": 3221225616,
+        "exception_mxcsr": 7939,
+        "result_low": 0,
+        "result_high": 0
+      },
+      {
+        "maximum": true,
+        "element": 4,
+        "control": 7808,
+        "flags": 0,
+        "exception": 3221225616,
+        "exception_mxcsr": 7811,
+        "result_low": 0,
+        "result_high": 0
+      },
+      {
+        "maximum": true,
+        "element": 4,
+        "control": 7680,
+        "flags": 0,
+        "exception": 3221225616,
+        "exception_mxcsr": 7683,
+        "result_low": 0,
+        "result_high": 0
+      },
+      {
+        "maximum": true,
+        "element": 8,
+        "control": 8064,
+        "flags": 8067,
+        "exception": 0,
+        "exception_mxcsr": 0,
+        "result_low": 4607182418800017408,
+        "result_high": 1
+      },
+      {
+        "maximum": true,
+        "element": 8,
+        "control": 7936,
+        "flags": 0,
+        "exception": 3221225616,
+        "exception_mxcsr": 7939,
+        "result_low": 0,
+        "result_high": 0
+      },
+      {
+        "maximum": true,
+        "element": 8,
+        "control": 7808,
+        "flags": 0,
+        "exception": 3221225616,
+        "exception_mxcsr": 7811,
+        "result_low": 0,
+        "result_high": 0
+      },
+      {
+        "maximum": true,
+        "element": 8,
+        "control": 7680,
+        "flags": 0,
+        "exception": 3221225616,
+        "exception_mxcsr": 7683,
+        "result_low": 0,
+        "result_high": 0
+      }
+    ],
+    "source": "D:\\source\\repos\\test_research\\PatchScanner\\scripts\\minmax_hardware_exceptions.cpp",
+    "source_sha256": "25f47921d2fceac52aff0a96421badcd034c96b57d3efff548ac0c5c3e6af260"
+  },
+  "tidy_build": {
+    "log": "tidy-1789479379680037300.log",
+    "exit_code": 0
+  },
+  "release_build": {
+    "log": "vs2022-1789479719209903900.log",
+    "exit_code": 0
+  },
+  "cli_smoke": {
+    "capture": "sogen-cli-smoke-1789479590337420200",
+    "exit_code": 0,
+    "seconds": 27.6620068999473,
+    "command": [
+      "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo\\analyzer.exe",
+      "--backend",
+      "icicle",
+      "-v",
+      "-e",
+      "D:\\Sunrise\\D2\\sogen\\root",
+      "-p",
+      "c:\\sogen-tests",
+      "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo",
+      "--env",
+      "EMULATOR_ICICLE",
+      "1",
+      "--report",
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-cli-smoke-1789479590337420200\\events.jsonl",
+      "--stdout",
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-cli-smoke-1789479590337420200\\guest-stdout.log",
+      "c:\\sogen-tests\\test-sample.exe"
+    ]
+  },
+  "actual_game_replay": {
+    "result": "PASS",
+    "instruction": "minps xmm13, xmm1",
+    "bytes": "44 0F 5D E9",
+    "module_rva": "destiny2.exe+0x3B8A89",
+    "after_rva": "destiny2.exe+0x3B8A8D",
+    "source_snapshot": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789477536655285400-after-movemask-support\\guest.snap",
+    "memory_limit_mib": 4096,
+    "destination": "xmm13",
+    "before_xmm13": "0000803f0000803f0000803f0000803f",
+    "after_xmm13": "0000803f0000803f0000803f0000803f",
+    "expected": "0000803f0000803f0000803f0000803f",
+    "source_xmm1": "0000803f0000803f0000803f0000803f",
+    "general_changes": {
+      "rip": [
+        "0x1403b8a89",
+        "0x1403b8a8d"
+      ]
+    },
+    "vector_state_unchanged": true,
+    "stack_unchanged": true,
+    "restored_registers_match_original": true,
+    "scope": "Actual-game saved instruction replay with an explicit backing limit; full boot remains unconfirmed.",
+    "analyzer.exe_sha256": "deca39ac592c5c45c991f776b2281ec6d1b12546c01cce6f2672c3d8784ab302",
+    "icicle-emulator.dll_sha256": "87b677731ead68f2f92a36c1c6c11a25e6237756a2fc878666303c8bf8deb101",
+    "Ghidra/Processors/x86/data/languages/ia.sinc_sha256": "9d37142e7f680dbdd80443b882edfd27171760774bc44bb855b6dae089011da9",
+    "Ghidra/Processors/x86/data/languages/avx.sinc_sha256": "81029537433a37de84f8ae95ebc37f45eb7d2983ef2281cb4c27f2f1d4e656f8",
+    "Ghidra/Processors/x86/data/languages/aligned_move.sinc_sha256": "9baade75c4e623ff5f076c15c3a89cfd5d507a712dfdd95bbc3950f343380e4d"
+  },
+  "continuation_checkpoint": {
+    "capture": "destiny-sogen-1789479765844451800-minmax-proof",
+    "bytes": 313393732,
+    "sha256": "d2b5d513594523bc13c8019759d3782ce35fae495799de17e177cdd79d7690be"
+  },
+  "boot_acceptance": "Unconfirmed"
+}

@@ -19,11 +19,11 @@ fn create_x64_vm() -> icicle_vm::Vm {
 
     let mut vm = icicle_vm::build(&cpu_config).unwrap();
     crate::aes::register(&mut vm.cpu);
-    crate::packed_max::register(&mut vm.cpu);
     crate::packed_sad::register(&mut vm.cpu);
     crate::reciprocal_sqrt::register(&mut vm.cpu);
     crate::xstate::register(&mut vm.cpu);
     crate::aligned_move::register(&mut vm.cpu);
+    crate::simd_minmax::register(&mut vm.cpu);
     vm
 }
 
@@ -793,9 +793,6 @@ impl IcicleEmulator {
         if value == CACHE_INVALIDATED {
             self.flush_pending_code();
             return true;
-        }
-        if value == crate::packed_max::SIMD_EXCEPTION {
-            return self.handle_interrupt(19);
         }
         if value == crate::xstate::GENERAL_PROTECTION {
             return self.handle_interrupt(13);
