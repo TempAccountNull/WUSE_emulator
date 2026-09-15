@@ -185,6 +185,41 @@ namespace sogen::test
         EXPECT_TRUE(calls.empty());
     }
 
+    TEST_F(AnalysisObservation, UnnamedInstructionsStillContributeToSelectedSummaries)
+    {
+        auto& module = *win_emu.mod_manager.ntdll;
+        const auto target = module.image_base + 0x500;
+        module.address_names.erase(target);
+        win_emu.emu().write_memory<uint8_t>(target, 0x90);
+        logging_settings.instruction_summary = true;
+        observe(target + 0x40, target);
+        EXPECT_TRUE(analysis.instructions.empty());
+        logging_settings.modules.insert(module.name);
+        observe(target + 0x40, target);
+        ASSERT_EQ(analysis.instructions.size(), 1U);
+        EXPECT_EQ(analysis.instructions.begin()->second, 1U);
+        EXPECT_TRUE(calls.empty());
+        EXPECT_TRUE(entries.empty());
+        EXPECT_TRUE(transitions.empty());
+    }
+
+    TEST_F(AnalysisObservation, FirstAnonymousInstructionDoesNotMakeAnUnselectedCallInteresting)
+    {
+        const auto target = win_emu.mod_manager.ntdll->image_base + 0x500;
+        win_emu.mod_manager.ntdll->address_names[target] = "ObservedFunction";
+        auto& thread = win_emu.current_thread();
+        thread.previous_ip = stack;
+        thread.executed_instructions = 1;
+        win_emu.emu().reg(x86_register::rip, target);
+        win_emu.callbacks.on_instruction(target);
+        ASSERT_EQ(calls.size(), 1U);
+        EXPECT_FALSE(calls.front().interesting);
+        calls.clear();
+        logging_settings.verbose_logging = false;
+        win_emu.callbacks.on_instruction(target);
+        EXPECT_TRUE(calls.empty());
+    }
+
     TEST_F(AnalysisObservation, ThreadExitReportsTargetAndFullStatusWithoutExitingProcess)
     {
         for (const auto status : std::array<NTSTATUS, 2>{STATUS_SUCCESS, STATUS_ACCESS_VIOLATION})

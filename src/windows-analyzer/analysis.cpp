@@ -527,91 +527,69 @@ namespace sogen
             }
 #endif
 
-            const auto& current_thread = c.win_emu->current_thread();
+            const auto& current_thread = win_emu.current_thread();
             const auto previous_ip = current_thread.previous_ip;
-            [[maybe_unused]] const auto current_ip = current_thread.current_ip;
-            const auto is_main_exe = win_emu.mod_manager.executable->contains(address);
-            const auto is_previous_main_exe = win_emu.mod_manager.executable->contains(previous_ip);
+            const auto* main = win_emu.mod_manager.executable;
+            const auto is_main_exe = main->contains(address);
+            const auto* binary = is_main_exe ? main : win_emu.mod_manager.find_by_address(address);
 
-            if (is_main_exe && is_previous_main_exe && !c.settings->instruction_summary &&
-                address != win_emu.mod_manager.executable->entry_point && !win_emu.mod_manager.executable->address_names.contains(address))
-            {
-                return;
-            }
-
-            const auto binary = utils::make_lazy([&] {
-                if (is_main_exe)
-                {
-                    return win_emu.mod_manager.executable;
-                }
-
-                return win_emu.mod_manager.find_by_address(address); //
-            });
-
-            const auto previous_binary = utils::make_lazy([&] {
-                if (is_previous_main_exe)
-                {
-                    return win_emu.mod_manager.executable;
-                }
-
-                return win_emu.mod_manager.find_by_address(previous_ip); //
-            });
-
-            const auto is_current_binary_interesting = utils::make_lazy([&] {
-                return is_main_exe || (binary && c.settings->modules.contains(binary->name)); //
-            });
-
-            const auto is_in_interesting_module = [&] {
-                if (c.settings->modules.empty())
-                {
-                    return false;
-                }
-
-                return is_current_binary_interesting || (previous_binary && c.settings->modules.contains(previous_binary->name));
-            };
-
-            if (c.settings->instruction_summary && (is_current_binary_interesting || !binary))
+            if (c.settings->instruction_summary && (is_main_exe || !binary || c.settings->modules.contains(binary->name)))
             {
                 record_instruction(c, address);
             }
-
-            const auto is_interesting_call = utils::make_lazy([&] {
-                return is_previous_main_exe || (!previous_binary && current_thread.executed_instructions > 1) || is_in_interesting_module();
-            });
-
-            if ((!c.settings->verbose_logging && !is_interesting_call) || !binary)
+            if (!binary)
             {
                 return;
             }
 
             const auto export_entry = binary->address_names.find(address);
-            if (export_entry != binary->address_names.end())
+            const auto is_named = export_entry != binary->address_names.end();
+            const auto is_entry = address == binary->entry_point;
+            const auto is_previous_main_exe = main->contains(previous_ip);
+            const auto is_foreign = is_previous_main_exe && !is_main_exe;
+            if ((!is_named && !is_entry && !is_foreign) || (is_named && c.settings->ignored_functions.contains(export_entry->second)))
             {
-                if (!c.settings->ignored_functions.contains(export_entry->second))
-                {
-                    auto details = collect_function_details(c, export_entry->second);
-                    const auto call_count = next_traced_call_count(c);
-                    c.emit_observation<function_execution_event>([&](auto& event) {
-                        event.call_count = call_count;
-                        event.function_name = export_entry->second;
-                        event.interesting = is_interesting_call;
-                        event.details = std::move(details);
-                    });
-                    (void)break_before_traced_call(c, call_count);
-                }
+                return;
             }
-            else if (address == binary->entry_point)
+
+            const auto is_interesting_call = [&] {
+                if (is_previous_main_exe)
+                {
+                    return true;
+                }
+                const auto* previous_binary = win_emu.mod_manager.find_by_address(previous_ip);
+                return (!previous_binary && current_thread.executed_instructions > 1) ||
+                       (!c.settings->modules.empty() && (is_main_exe || c.settings->modules.contains(binary->name) ||
+                                                         (previous_binary && c.settings->modules.contains(previous_binary->name))));
+            }();
+            if (!c.settings->verbose_logging && !is_interesting_call)
+            {
+                return;
+            }
+
+            if (is_named)
+            {
+                auto details = collect_function_details(c, export_entry->second);
+                const auto call_count = next_traced_call_count(c);
+                c.emit_observation<function_execution_event>([&](auto& event) {
+                    event.call_count = call_count;
+                    event.function_name = export_entry->second;
+                    event.interesting = is_interesting_call;
+                    event.details = std::move(details);
+                });
+                (void)break_before_traced_call(c, call_count);
+            }
+            else if (is_entry)
             {
                 c.emit_observation<entry_point_execution_event>([&](auto& event) { event.interesting = is_interesting_call; });
             }
-            else if (is_previous_main_exe && binary != previous_binary && !is_return(c.d, c.win_emu->emu(), previous_ip))
+            else if (is_foreign && !is_return(c.d, win_emu.emu(), previous_ip))
             {
                 auto nearest_entry = binary->address_names.upper_bound(address);
                 if (nearest_entry == binary->address_names.begin())
                 {
                     return;
                 }
-
                 --nearest_entry;
                 c.emit_observation<foreign_code_transition_event>([&](auto& event) {
                     event.function_name = nearest_entry->second;
