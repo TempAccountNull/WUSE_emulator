@@ -5842,11 +5842,29 @@ define pcodeop movdq2q;
 
 :MOVLPS       m64, XmmReg         is vexMode=0 &  mandover=0 & byte=0x0F; byte=0x13; XmmReg ... & m64 { m64 = XmmReg[0,64]; }
 
-define pcodeop movmskpd;
-:MOVMSKPD     Reg32, XmmReg2      is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x50; XmmReg2 & Reg32 { Reg32 = movmskpd(Reg32, XmmReg2); }
+define pcodeop sogen_sad_check;
 
-define pcodeop movmskps;
-:MOVMSKPS     Reg32, XmmReg2      is vexMode=0 &  mandover=0 & byte=0x0F; byte=0x50; XmmReg2 & Reg32 { Reg32 = movmskps(Reg32, XmmReg2); }
+:MOVMSKPD Reg32, XmmReg2 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x50; mod=3 & XmmReg2 & Reg32 & check_Reg32_dest
+{
+	sogen_sad_check(1:1);
+	local sign_mask:4 = 0;
+	sign_mask[0,1] = XmmReg2[63,1];
+	sign_mask[1,1] = XmmReg2[127,1];
+	Reg32 = sign_mask;
+	build check_Reg32_dest;
+}
+
+:MOVMSKPS Reg32, XmmReg2 is vexMode=0 & mandover=0 & byte=0x0F; byte=0x50; mod=3 & XmmReg2 & Reg32 & check_Reg32_dest
+{
+	sogen_sad_check(1:1);
+	local sign_mask:4 = 0;
+	sign_mask[0,1] = XmmReg2[31,1];
+	sign_mask[1,1] = XmmReg2[63,1];
+	sign_mask[2,1] = XmmReg2[95,1];
+	sign_mask[3,1] = XmmReg2[127,1];
+	Reg32 = sign_mask;
+	build check_Reg32_dest;
+}
 
 :MOVNTQ       m64, mmxreg      is vexMode=0 & mandover=0 & byte=0x0F; byte=0xE7; mmxreg ... & m64   { m64 = mmxreg; }
 
@@ -7322,7 +7340,6 @@ macro pmulhw128(xmm1, xmm2) {
 :POR            XmmReg1, XmmReg2 is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0xEB; xmmmod = 3 & XmmReg1 & XmmReg2	{ XmmReg1 = XmmReg1 | XmmReg2; }
 
 define pcodeop psadbw;
-define pcodeop sogen_sad_check;
 define pcodeop sogen_sad_mmx_enter;
 define pcodeop sogen_sad_memory;
 SadMem: "xmmword ptr" Mem is Mem { export Mem; }

@@ -1,0 +1,93 @@
+{
+  "instruction_family": "MOVMSKPS / MOVMSKPD / VMOVMSKPS / VMOVMSKPD",
+  "manual": "325462-092-sdm-vol-1-2abcd-3abcd-4.pdf",
+  "manual_pdf_pages": [
+    1373,
+    1374,
+    1375,
+    1376
+  ],
+  "exception_table": {
+    "name": "2-24, Type 7",
+    "pdf_page": 648
+  },
+  "regression": {
+    "release": {
+      "interpreter": {
+        "tests": 104,
+        "failures": 0,
+        "errors": 0,
+        "time": "8.32s",
+        "skipped": 2,
+        "capture": "regression-1789477163695667600"
+      },
+      "jit": {
+        "tests": 104,
+        "failures": 0,
+        "errors": 0,
+        "time": "35.757s",
+        "skipped": 0,
+        "capture": "regression-1789477163695667600"
+      }
+    },
+    "tidy": {
+      "interpreter": {
+        "tests": 104,
+        "failures": 0,
+        "errors": 0,
+        "time": "7.752s",
+        "skipped": 2,
+        "capture": "regression-1789477279584053400"
+      },
+      "jit": {
+        "tests": 104,
+        "failures": 0,
+        "errors": 0,
+        "time": "34.703s",
+        "skipped": 0,
+        "capture": "regression-1789477279584053400"
+      }
+    }
+  },
+  "actual_game_replay": {
+    "result": "PASS",
+    "instruction": "movmskps eax, xmm4",
+    "bytes": "0F 50 C4",
+    "module_rva": "destiny2.exe+0x1374C5F",
+    "after_rva": "destiny2.exe+0x1374C62",
+    "source_snapshot": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789475961969372900-after-aligned-move-support\\guest.snap",
+    "memory_limit_mib": 4096,
+    "destination": "rax",
+    "before_rax": 802304616320,
+    "after_rax": 8,
+    "expected": 8,
+    "source_xmm4": "000000000000000000000000ffffffff",
+    "general_changes": {
+      "rax": [
+        "0xbacd14e780",
+        "0x8"
+      ],
+      "rip": [
+        "0x141374c5f",
+        "0x141374c62"
+      ]
+    },
+    "vector_state_unchanged": true,
+    "stack_unchanged": true,
+    "restored_registers_match_original": true,
+    "scope": "Actual-game saved instruction replay with an explicit backing limit; full boot remains unconfirmed.",
+    "analyzer.exe_sha256": "1db9134ff450077e1b7efa63cabf85770f4cf1c4fdabd6d80fc06e579ebfb919",
+    "icicle-emulator.dll_sha256": "8e2cf6e72c4b1ad6b0f154d5c3553ed188bc1591143a1afee046fbddac8b1475",
+    "Ghidra/Processors/x86/data/languages/ia.sinc_sha256": "b73c7e18a45d7e4e38e188270a4f7b0ffcb32ad1a015b4667b56e98bd37c7a13",
+    "Ghidra/Processors/x86/data/languages/avx.sinc_sha256": "16dfef65f23784b541718330eb0ddd8d9ddeb8a9d606d1bcf1f9a65de528e0cb"
+  },
+  "decoder_check": "rust-tests-1789477077606935700.log",
+  "saved_register_layout_check": "rust-tests-1789477278190826900.log",
+  "tidy_build": "tidy-1789477194497210200.log",
+  "cli_smoke": {
+    "exit_code": 0,
+    "seconds": 28.70798259996809,
+    "capture": "sogen-cli-smoke-1789477315470584900"
+  },
+  "boot_acceptance": "Unconfirmed"
+}

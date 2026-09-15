@@ -1617,3 +1617,21 @@ mod aligned_move_decode_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod movemask_decode_tests {
+    use super::*;
+    #[test]
+    fn move_masks_decode() {
+        let mut emu = IcicleEmulator::new();
+        assert!(emu.map_memory(0x10000, 4096, 7));
+        for bytes in [&[0x0f,0x50,0xc4][..], &[0x66,0x0f,0x50,0xc4][..], &[0xc5,0xf8,0x50,0xc4][..]] {
+            assert!(emu.write_memory(0x10000, bytes));
+            emu.vm.cpu.write_pc(0x10000);
+            let mut lifter = icicle_cpu::lifter::InstructionLifter::new();
+            lifter.set_context(emu.vm.cpu.arch.isa_mode_context[0]);
+            let next = lifter.lift(&mut *emu.vm.cpu, 0x10000).unwrap_or_else(|e| panic!("{bytes:x?}: {e:?}"));
+            assert_eq!(next, 0x10000 + bytes.len() as u64, "{}", lifter.disasm);
+        }
+    }
+}

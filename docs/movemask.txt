@@ -1,0 +1,43 @@
+Packed floating-point sign masks (Icicle x64)
+
+Reference: Intel SDM 325462-092-sdm-vol-1-2abcd-3abcd-4.pdf,
+PDF pages 1373-1376; Type 7 exception table 2-24 on PDF page 648.
+
+The game stopped on MOVMSKPS EAX,XMM4 at destiny2.exe+0x1374C5F.
+The SLEIGH definition called an unimplemented operation.
+
+Implemented forms:
+MOVMSKPS: legacy SSE, four single-precision sign bits.
+MOVMSKPD: legacy SSE2, two double-precision sign bits.
+VMOVMSKPS: VEX 128/256 bits, four/eight single-precision sign bits.
+VMOVMSKPD: VEX 128/256 bits, two/four double-precision sign bits.
+
+The implementation extracts raw bits with integer p-code. It clears all
+remaining destination GPR bits and leaves the source vector, RFLAGS and
+MXCSR unchanged. Negative zero, denormals, infinities and NaNs do not raise
+floating-point exceptions. Extended registers and ignored W bits are handled.
+
+Memory encodings, LOCK and reserved VEX.vvvv encodings raise #UD.
+REX/F2/F3/66 before VEX also raise #UD. The shared SSE/AVX state check
+implements Type 7 CR0/CR4/XCR0 conditions and #NM for CR0.TS.
+The existing advertised CPU profile and default XCR0 are unchanged.
+AVX tests explicitly enable the required state; this does not advertise
+a complete AVX CPU or expand Windows XSAVE support.
+
+The shared state-check operation must be declared before these constructors.
+256-bit extraction uses 128-bit halves because Icicle does not implement
+general 256-bit integer shifts. The instruction performs no memory access.
+
+Validation: seven instruction tests include all 312 possible masks across
+the six forms, exceptional encodings/state, source preservation, special
+floating-point bit patterns and a mixed vector/integer instruction block.
+The complete 104-test selection passes in Release and tidy builds, in
+interpreter and JIT modes. Two JIT-only tests skip in interpreter mode.
+The saved-register-layout check and explicit-root verbose CLI smoke pass.
+
+Actual-game replay: bytes 0F 50 C4; XMM4's sign mask was 8.
+RAX changed from 0xBACD14E780 to 8; RIP advanced from +0x1374C5F to
++0x1374C62. All other captured general registers, vector state and stack
+stayed unchanged. Restored registers matched the original fault capture.
+See movemask-validation.json for executable/specification hashes and evidence.
+Full game boot remains unconfirmed.
