@@ -22,6 +22,8 @@ namespace sogen::test
         analysis_context analysis{.settings = &logging_settings, .win_emu = &win_emu, .reporters = {this}};
         std::vector<function_execution_event> calls{};
         std::vector<execution_progress_event> progress{};
+        std::vector<entry_point_execution_event> entries{};
+        std::vector<foreign_code_transition_event> transitions{};
         std::vector<thread_terminated_event> terminated{};
         uint64_t caller{};
         uint64_t callee{};
@@ -33,6 +35,14 @@ namespace sogen::test
             {
                 calls.push_back(*call);
             }
+            if (const auto* entry = std::get_if<entry_point_execution_event>(&event))
+            {
+                entries.push_back(*entry);
+            }
+            if (const auto* transition = std::get_if<foreign_code_transition_event>(&event))
+            {
+                transitions.push_back(*transition);
+            }
             if (const auto* exit = std::get_if<thread_terminated_event>(&event))
             {
                 terminated.push_back(*exit);
@@ -41,6 +51,16 @@ namespace sogen::test
             {
                 progress.push_back(*update);
             }
+        }
+
+        void observe(const uint64_t previous, const uint64_t current)
+        {
+            auto& thread = win_emu.current_thread();
+            thread.previous_ip = previous;
+            thread.current_ip = current;
+            thread.executed_instructions = 2;
+            win_emu.emu().reg(x86_register::rip, current);
+            win_emu.callbacks.on_instruction(current);
         }
 
         void SetUp() override
@@ -84,6 +104,85 @@ namespace sogen::test
         EXPECT_EQ(win_emu.emu().reg<uint64_t>(x86_register::rax), 0x800B0100U);
         ASSERT_EQ(calls.size(), 1U);
         EXPECT_EQ(calls.front().execution.rip, callee);
+    }
+
+    TEST_F(AnalysisObservation, VerboseIncludesUnselectedModuleCalls)
+    {
+        const auto target = win_emu.mod_manager.ntdll->image_base + 0x500;
+        win_emu.mod_manager.ntdll->address_names[target] = "ObservedFunction";
+        observe(target + 0x40, target);
+        ASSERT_EQ(calls.size(), 1U);
+        EXPECT_FALSE(calls.front().interesting);
+        EXPECT_EQ(calls.front().function_name, "ObservedFunction");
+        calls.clear();
+        logging_settings.verbose_logging = false;
+        observe(target + 0x40, target);
+        EXPECT_TRUE(calls.empty());
+    }
+
+    TEST_F(AnalysisObservation, SelectedModulesRetainIncomingAndOutgoingCalls)
+    {
+        logging_settings.verbose_logging = false;
+        const auto target = win_emu.mod_manager.ntdll->image_base + 0x500;
+        win_emu.mod_manager.ntdll->address_names[target] = "ObservedFunction";
+        logging_settings.modules.insert(win_emu.mod_manager.ntdll->name);
+        observe(target + 0x40, target);
+        observe(target + 0x40, callee);
+        observe(caller, target);
+        ASSERT_EQ(calls.size(), 3U);
+        for (const auto& call : calls)
+        {
+            EXPECT_TRUE(call.interesting);
+        }
+    }
+
+    TEST_F(AnalysisObservation, AnonymousCallerIsInteresting)
+    {
+        logging_settings.verbose_logging = false;
+        const auto target = win_emu.mod_manager.ntdll->image_base + 0x500;
+        win_emu.mod_manager.ntdll->address_names[target] = "ObservedFunction";
+        ASSERT_EQ(win_emu.mod_manager.find_by_address(stack), nullptr);
+        observe(stack, target);
+        ASSERT_EQ(calls.size(), 1U);
+        EXPECT_TRUE(calls.front().interesting);
+    }
+
+    TEST_F(AnalysisObservation, EntryPointPreservesCallClassification)
+    {
+        auto& module = *win_emu.mod_manager.ntdll;
+        const auto target = module.image_base + 0x500;
+        module.entry_point = target;
+        module.address_names.erase(target);
+        observe(target + 0x40, target);
+        observe(caller, target);
+        ASSERT_EQ(entries.size(), 2U);
+        EXPECT_FALSE(entries.front().interesting);
+        EXPECT_TRUE(entries.back().interesting);
+        EXPECT_TRUE(calls.empty());
+    }
+
+    TEST_F(AnalysisObservation, ForeignTransitionDistinguishesBranchFromReturn)
+    {
+        const auto target = win_emu.mod_manager.ntdll->image_base + 0x500;
+        win_emu.mod_manager.ntdll->address_names[target] = "ObservedFunction";
+        win_emu.mod_manager.ntdll->address_names.erase(target + 3);
+        const std::array<uint8_t, 5> branch{0xE9, 0, 0, 0, 0};
+        win_emu.emu().write_memory(caller, branch.data(), branch.size());
+        observe(caller, target + 3);
+        ASSERT_EQ(transitions.size(), 1U);
+        EXPECT_TRUE(transitions.front().interesting);
+        EXPECT_EQ(transitions.front().function_name, "ObservedFunction");
+        EXPECT_EQ(transitions.front().function_offset, 3U);
+        win_emu.emu().write_memory<uint8_t>(caller, 0xC3);
+        observe(caller, target + 3);
+        EXPECT_EQ(transitions.size(), 1U);
+    }
+
+    TEST_F(AnalysisObservation, IgnoredFunctionsRemainAbsentInVerboseMode)
+    {
+        logging_settings.ignored_functions.insert("WinVerifyTrust");
+        observe(caller, callee);
+        EXPECT_TRUE(calls.empty());
     }
 
     TEST_F(AnalysisObservation, ThreadExitReportsTargetAndFullStatusWithoutExitingProcess)

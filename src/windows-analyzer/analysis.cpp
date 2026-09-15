@@ -575,9 +575,9 @@ namespace sogen
                 record_instruction(c, address);
             }
 
-            const auto is_interesting_call = is_previous_main_exe                                              //
-                                             || (!previous_binary && current_thread.executed_instructions > 1) //
-                                             || is_in_interesting_module();
+            const auto is_interesting_call = utils::make_lazy([&] {
+                return is_previous_main_exe || (!previous_binary && current_thread.executed_instructions > 1) || is_in_interesting_module();
+            });
 
             if ((!c.settings->verbose_logging && !is_interesting_call) || !binary)
             {
