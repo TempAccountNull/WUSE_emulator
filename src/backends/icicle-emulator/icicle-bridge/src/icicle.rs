@@ -500,6 +500,14 @@ pub struct IcicleEmulator {
     )>,
 }
 
+impl Drop for IcicleEmulator {
+    fn drop(&mut self) {
+        assert!(!self.vm_running);
+        // JITModule deliberately retains published pointers unless explicitly freed.
+        unsafe { self.vm.jit.reset() };
+    }
+}
+
 struct MemoryHook {
     callback: Box<dyn Fn(u64, &[u8])>,
 }
@@ -716,8 +724,10 @@ impl IcicleEmulator {
 
     fn flush_pending_code(&mut self) {
         if self.invalidate_code.replace(false) {
+            assert!(!self.vm_running);
             self.vm.code.flush_code();
-            self.vm.jit.clear();
+            // Vm::run has returned, so no generated-code frame still references this module.
+            unsafe { self.vm.jit.reset() };
             self.vm.cpu.block_id = u64::MAX;
             self.vm.cpu.block_offset = 0;
         }

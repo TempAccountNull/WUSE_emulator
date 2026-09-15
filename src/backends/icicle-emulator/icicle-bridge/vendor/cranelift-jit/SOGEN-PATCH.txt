@@ -1,0 +1,10 @@
+cranelift-jit 0.129.1, from crates.io (see .cargo_vcs_info.json).
+License: Apache-2.0 WITH LLVM-exception; original LICENSE retained.
+
+Local changes in src/memory/system.rs:
+- Release Windows VirtualAlloc regions with VirtualFree(MEM_RELEASE).
+- Explicit free releases current allocations as well as finalized allocations,
+  resets allocation state, and remains safe to call again.
+- Implicit provider destruction preserves all published pointers, including
+  writable/current allocations, as required by the existing provider contract.
+- Windows tests verify release, reuse, empty state and implicit-drop lifetime.

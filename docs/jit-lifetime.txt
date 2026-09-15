@@ -1,0 +1,39 @@
+JIT allocation lifetime
+
+Code-cache invalidation cleared Icicle's lookup tables but retained the compiled
+module. Replacing the module also leaked on Windows: cranelift-jit 0.129.1 had no
+Drop implementation for its VirtualAlloc-backed PtrLen allocations.
+
+Sogen now resets the JIT only after Vm::run returns. Emulator destruction also
+explicitly releases the module. The local cranelift-jit patch releases each
+reservation using VirtualFree(original_base, 0, MEM_RELEASE). Explicit release
+includes current and finalized allocations and permits reuse. Ordinary provider
+destruction still preserves published pointers, as the provider API requires.
+
+Windows contract:
+https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualfree
+The vendored package retains its original version, license and provenance.
+
+Validation (2026-09-15):
+- Three Windows allocator tests: current/finalized code, read-only and writable
+  allocations; explicit release, repeated release, reuse and implicit lifetime.
+- 512 code replacements, 4,096 executions: private executable allocations grew
+  from 32 KiB to 16 MiB before the fix and remained at 32 KiB after it.
+- Sixteen emulator create/execute/destroy cycles returned executable allocation
+  usage to the initial value after every destruction.
+- Release and tidy: 76 JIT tests passed; 74 interpreter tests passed with the two
+  JIT-only allocation tests skipped. CPU state, self-modifying code, shared page
+  views and snapshot restoration were included.
+- Tidy guest CLI smoke: exit 0, 28.464 seconds.
+
+Actual game replay resumed the saved post-shader-startup checkpoint with Icicle,
+-e D:/Sunrise/D2/sogen/root and -v. The recorded 1,070,510,604-byte event prefix
+contains 437 allocations and 169 protection changes. Those protection changes
+are data pages; they are not claimed as executable-code invalidation proof.
+The backend regression provides that proof. The guest continued executing and
+its periodic thread-state reads preserved the selected thread and registers.
+
+The game still requires user-confirmed boot acceptance. These results establish
+allocation-lifetime correctness, not an overall game speedup or a memory cap.
+Measurements, replay command, checkpoint and deployed binary hashes are in
+jit-lifetime-validation.json.

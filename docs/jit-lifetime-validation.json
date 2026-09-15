@@ -1,0 +1,320 @@
+{
+  "baseline": {
+    "name": "IcicleJitLifetime",
+    "tests": 1,
+    "failures": 1,
+    "disabled": 0,
+    "errors": 0,
+    "timestamp": "2026-09-15T05:55:50Z",
+    "time": "0.43s",
+    "testsuite": [
+      {
+        "name": "RepeatedCodeReplacementReclaimsExecutableAllocations",
+        "file": "D:\\Emulation\\sogen\\src\\windows-emulator-test\\icicle_jit_lifetime_test.cpp",
+        "line": 46,
+        "status": "RUN",
+        "result": "COMPLETED",
+        "timestamp": "2026-09-15T05:55:50Z",
+        "time": "0.43s",
+        "classname": "IcicleJitLifetime",
+        "rounds": "512",
+        "block_executions": "4096",
+        "private_executable_bytes_before": "0",
+        "private_executable_bytes_warmed": "32768",
+        "private_executable_bytes_after": "16777216",
+        "failures": [
+          {
+            "failure": "D:\\Emulation\\sogen\\src\\windows-emulator-test\\icicle_jit_lifetime_test.cpp:95\nExpected: (after) <= (warmed + 4 * 1024 * 1024), actual: 16777216 vs 4227072\n",
+            "type": ""
+          }
+        ]
+      }
+    ]
+  },
+  "release": {
+    "name": "IcicleJitLifetime",
+    "tests": 2,
+    "failures": 0,
+    "disabled": 0,
+    "errors": 0,
+    "timestamp": "2026-09-15T06:10:30Z",
+    "time": "1.237s",
+    "testsuite": [
+      {
+        "name": "RepeatedCodeReplacementReclaimsExecutableAllocations",
+        "file": "D:\\Emulation\\sogen\\src\\windows-emulator-test\\icicle_jit_lifetime_test.cpp",
+        "line": 46,
+        "status": "RUN",
+        "result": "COMPLETED",
+        "timestamp": "2026-09-15T06:10:30Z",
+        "time": "0.405s",
+        "classname": "IcicleJitLifetime",
+        "rounds": "512",
+        "block_executions": "4096",
+        "private_executable_bytes_before": "0",
+        "private_executable_bytes_warmed": "32768",
+        "private_executable_bytes_after": "32768"
+      },
+      {
+        "name": "EmulatorDestructionReleasesGeneratedCode",
+        "file": "D:\\Emulation\\sogen\\src\\windows-emulator-test\\icicle_jit_lifetime_test.cpp",
+        "line": 98,
+        "status": "RUN",
+        "result": "COMPLETED",
+        "timestamp": "2026-09-15T06:10:30Z",
+        "time": "0.831s",
+        "classname": "IcicleJitLifetime"
+      }
+    ]
+  },
+  "tidy": {
+    "name": "IcicleJitLifetime",
+    "tests": 2,
+    "failures": 0,
+    "disabled": 0,
+    "errors": 0,
+    "timestamp": "2026-09-15T06:13:15Z",
+    "time": "1.217s",
+    "testsuite": [
+      {
+        "name": "RepeatedCodeReplacementReclaimsExecutableAllocations",
+        "file": "D:\\Emulation\\sogen\\src\\windows-emulator-test\\icicle_jit_lifetime_test.cpp",
+        "line": 46,
+        "status": "RUN",
+        "result": "COMPLETED",
+        "timestamp": "2026-09-15T06:13:15Z",
+        "time": "0.404s",
+        "classname": "IcicleJitLifetime",
+        "rounds": "512",
+        "block_executions": "4096",
+        "private_executable_bytes_before": "0",
+        "private_executable_bytes_warmed": "32768",
+        "private_executable_bytes_after": "32768"
+      },
+      {
+        "name": "EmulatorDestructionReleasesGeneratedCode",
+        "file": "D:\\Emulation\\sogen\\src\\windows-emulator-test\\icicle_jit_lifetime_test.cpp",
+        "line": 98,
+        "status": "RUN",
+        "result": "COMPLETED",
+        "timestamp": "2026-09-15T06:13:15Z",
+        "time": "0.813s",
+        "classname": "IcicleJitLifetime"
+      }
+    ]
+  },
+  "release_tests": [
+    {
+      "mode": "interpreter",
+      "command": [
+        "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo\\windows-emulator-test.exe",
+        "--gtest_filter=IcicleJitLifetime.*:IciclePackedSad.*:*IcicleXstate*:IcicleAes.*:IciclePackedMax.*:IcicleReciprocalSqrt.*:PagefileSectionViewTest.*:IcicleBootSupport.*:EmulationTest.SectionFirstExecutionSurvivesSnapshotRestore",
+        "--gtest_color=no",
+        "--gtest_output=json:D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789470608571486700\\interpreter.json"
+      ],
+      "exit_code": 0,
+      "seconds": 6.007628600113094
+    },
+    {
+      "mode": "jit",
+      "command": [
+        "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo\\windows-emulator-test.exe",
+        "--gtest_filter=IcicleJitLifetime.*:IciclePackedSad.*:*IcicleXstate*:IcicleAes.*:IciclePackedMax.*:IcicleReciprocalSqrt.*:PagefileSectionViewTest.*:IcicleBootSupport.*:EmulationTest.SectionFirstExecutionSurvivesSnapshotRestore",
+        "--gtest_color=no",
+        "--gtest_output=json:D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789470608571486700\\jit.json"
+      ],
+      "exit_code": 0,
+      "seconds": 23.35014589992352
+    }
+  ],
+  "tidy_tests": [
+    {
+      "mode": "interpreter",
+      "command": [
+        "D:\\Emulation\\sogen\\build\\tidy\\artifacts\\windows-emulator-test.exe",
+        "--gtest_filter=IcicleJitLifetime.*:IciclePackedSad.*:*IcicleXstate*:IcicleAes.*:IciclePackedMax.*:IcicleReciprocalSqrt.*:PagefileSectionViewTest.*:IcicleBootSupport.*:EmulationTest.SectionFirstExecutionSurvivesSnapshotRestore",
+        "--gtest_color=no",
+        "--gtest_output=json:D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789470773797397100\\interpreter.json"
+      ],
+      "exit_code": 0,
+      "seconds": 5.759028399828821
+    },
+    {
+      "mode": "jit",
+      "command": [
+        "D:\\Emulation\\sogen\\build\\tidy\\artifacts\\windows-emulator-test.exe",
+        "--gtest_filter=IcicleJitLifetime.*:IciclePackedSad.*:*IcicleXstate*:IcicleAes.*:IciclePackedMax.*:IcicleReciprocalSqrt.*:PagefileSectionViewTest.*:IcicleBootSupport.*:EmulationTest.SectionFirstExecutionSurvivesSnapshotRestore",
+        "--gtest_color=no",
+        "--gtest_output=json:D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789470773797397100\\jit.json"
+      ],
+      "exit_code": 0,
+      "seconds": 23.34577180002816
+    }
+  ],
+  "cli_smoke": {
+    "command": [
+      "D:\\Emulation\\sogen\\build\\tidy\\artifacts\\analyzer.exe",
+      "--backend",
+      "icicle",
+      "-v",
+      "-e",
+      "D:\\Sunrise\\D2\\sogen\\root",
+      "-p",
+      "c:\\sogen-tests",
+      "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo",
+      "--env",
+      "EMULATOR_ICICLE",
+      "1",
+      "--report",
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-cli-smoke-1789470825533603500\\events.jsonl",
+      "--stdout",
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-cli-smoke-1789470825533603500\\guest-stdout.log",
+      "c:\\sogen-tests\\test-sample.exe"
+    ],
+    "purpose": "Repository CLI smoke test; distinct from actual Destiny boot acceptance",
+    "pid": 53528,
+    "exit_code": 0,
+    "seconds": 28.463802699930966
+  },
+  "windows_allocator_tests": {
+    "passed": 3,
+    "log": "rust-tests-1789470693820043000.log"
+  },
+  "replay": {
+    "time": 1789471147.4627151,
+    "scan_seconds": 2.3941391999833286,
+    "source": "benchmarks\\destiny-sogen-1789470957335282400-after-jit-memory-release\\events.jsonl",
+    "sampled_bytes": 1070510604,
+    "complete_record_bytes": 1070510604,
+    "prefix_sha256": "b79bd2c64082869f7a82f7feab4ffc2264947e0fcb964744502396804f1ebe86",
+    "event_counts": {
+      "memory_allocate": 437,
+      "memory_protect": 169
+    },
+    "protection_counts": {
+      "rw-": 84,
+      "r--": 84,
+      "---": 1
+    },
+    "first": {
+      "memory_allocate": {
+        "type": "memory_allocate",
+        "ic": "137466162260",
+        "tid": 84,
+        "rip": "0x18009d952",
+        "mod": "ntdll.dll",
+        "prev": "0x18009d950",
+        "prevMod": "ntdll.dll",
+        "addr": "0xbb67540000",
+        "len": "1458176",
+        "perms": "rw-",
+        "commit": false,
+        "source_offset": 7123234
+      },
+      "memory_protect": {
+        "type": "memory_protect",
+        "ic": "137495955585",
+        "tid": 84,
+        "rip": "0x18009e052",
+        "mod": "ntdll.dll",
+        "prev": "0x18009e050",
+        "prevMod": "ntdll.dll",
+        "addr": "0x180181000",
+        "len": "16384",
+        "perms": "rw-",
+        "source_offset": 21005111
+      }
+    },
+    "last": {
+      "memory_allocate": {
+        "type": "memory_allocate",
+        "ic": "139822239880",
+        "tid": 84,
+        "rip": "0x18009d952",
+        "mod": "ntdll.dll",
+        "prev": "0x18009d950",
+        "prevMod": "ntdll.dll",
+        "addr": "0xbb6b740000",
+        "len": "1413120",
+        "perms": "rw-",
+        "commit": false,
+        "source_offset": 1065634921
+      },
+      "memory_protect": {
+        "type": "memory_protect",
+        "ic": "139755683723",
+        "tid": 88,
+        "rip": "0x18009e052",
+        "mod": "ntdll.dll",
+        "prev": "0x18009e050",
+        "prevMod": "ntdll.dll",
+        "addr": "0x180181000",
+        "len": "16384",
+        "perms": "r--",
+        "source_offset": 1034431201
+      }
+    },
+    "scope": "Fixed file prefix while the real game continues; counts only the listed event types.",
+    "boot_accepted": false
+  },
+  "replay_memory_samples": [
+    {
+      "time": 1789471005.7029674,
+      "pid": 74592,
+      "elapsed_seconds": 47.83294486999512,
+      "private_executable_bytes": 205144064,
+      "executable_regions": 46475,
+      "queried_regions": 146041,
+      "query_seconds": 0.3655189999844879,
+      "working_set_bytes": 7144210432,
+      "private_bytes": 7432122368,
+      "scope": "Host private committed executable pages; separate from guest allocations and total process memory."
+    },
+    {
+      "time": 1789471072.3171508,
+      "pid": 74592,
+      "elapsed_seconds": 114.44712805747986,
+      "private_executable_bytes": 342450176,
+      "executable_regions": 68358,
+      "queried_regions": 190043,
+      "query_seconds": 0.4596007999498397,
+      "working_set_bytes": 7342895104,
+      "private_bytes": 7632838656,
+      "scope": "Host private committed executable pages; separate from guest allocations and total process memory."
+    }
+  ],
+  "replay_command": [
+    "D:\\Sunrise\\D2\\sogen\\builds\\20260915-061528-icicle-startup\\analyzer.exe",
+    "--backend",
+    "icicle",
+    "-v",
+    "-e",
+    "D:\\Sunrise\\D2\\sogen\\root",
+    "-p",
+    "d:\\sunrise\\d2",
+    "D:\\Sunrise\\D2",
+    "--call-count",
+    "--first-exec",
+    "--report",
+    "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789470957335282400-after-jit-memory-release\\events.jsonl",
+    "--stdout",
+    "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789470957335282400-after-jit-memory-release\\guest-stdout.log",
+    "--debug",
+    "--port",
+    "28978",
+    "--snapshot-out",
+    "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789470957335282400-after-jit-memory-release\\guest.snap",
+    "-a",
+    "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789467879720496300-after-verified-packed-sad\\guest.snap",
+    "d:\\sunrise\\d2\\destiny2.exe"
+  ],
+  "replay_input": {
+    "sha256": "be5480112bbead6d0a3ab87dbf613f0fe6e83ff974226661fe8880937ab95f9e",
+    "bytes": 141822374
+  },
+  "boot_accepted": false,
+  "deployed_artifacts": {
+    "analyzer.exe": "9386313725dd9d23c48059e8d0f5c7fde21dcc4a970324fbe7aafab06962d82e",
+    "icicle-emulator.dll": "d7df0d8cb5c998e4bade2b03d05ddccaf2eee3b23f6c6191a84811fe6668ff6f"
+  }
+}
