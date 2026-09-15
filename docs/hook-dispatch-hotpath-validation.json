@@ -1,0 +1,47 @@
+{
+  "result": "PASS",
+  "baseline_seconds": [
+    0.1622661,
+    0.1633205,
+    0.1614477,
+    0.1629987,
+    0.1609767
+  ],
+  "candidate_seconds": [
+    0.1011232,
+    0.0968501,
+    0.1008559,
+    0.1000059,
+    0.0995717
+  ],
+  "median_baseline_seconds": 0.1622661,
+  "median_candidate_seconds": 0.1000059,
+  "median_time_reduction_percent": 38.36919726301428,
+  "median_throughput_increase_percent": 62.25652686491499,
+  "iterations_per_sample": 20000000,
+  "callbacks_per_sample": 50156250,
+  "dispatch_workload": "Two generic callbacks, one range callback, one exact-address callback. Counts and address sums asserted in each sample.",
+  "scope": "Isolated optimized Rust hook dispatch; not a whole-emulator or game-boot speed measurement.",
+  "baseline_source_commit": "c31c8ffa9a8e96600a9d27d33841284b734461e1",
+  "profile": {
+    "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789482555715647300-after-cpuid-shader-fix",
+    "file": "cpu-profile-1789483344716945500.json",
+    "samples": 2083,
+    "seconds": 8.00337,
+    "suspension_seconds": 0.0633043,
+    "hotspot": "icicle-emulator.dll+0x35A90; 418 samples. Identified by the executed function body, not the unrelated nearest public PDB symbol.",
+    "assembly_evidence": "native-hotspot-code.json"
+  },
+  "tests": {
+    "rust": "rust-tests-1789483936125783600.log",
+    "rust_passed": 7,
+    "release": "regression-1789484077579132500",
+    "tidy": "regression-1789484173164401200",
+    "native_passed_per_configuration_and_mode": 14,
+    "release_build": "vs2022-1789484028690995300.log",
+    "tidy_build": "tidy-1789484098057116500.log",
+    "guest_smoke": "sogen-cli-smoke-1789484112035331700",
+    "guest_smoke_exit": 0
+  },
+  "game_acceptance": false
+}

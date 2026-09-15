@@ -216,12 +216,18 @@ impl<Func: ?Sized> HookContainer<Func> {
         return was_iterating;
     }
 
+    #[inline]
     fn do_post_access_work(&mut self, was_iterating: bool) {
         self.is_iterating = was_iterating;
-        if self.is_iterating {
-            return;
+        if !self.is_iterating && (!self.hooks_to_remove.is_empty() || !self.hooks_to_add.is_empty())
+        {
+            self.apply_pending_changes();
         }
+    }
 
+    #[cold]
+    #[inline(never)]
+    fn apply_pending_changes(&mut self) {
         if !self.hooks_to_remove.is_empty() {
             let to_remove = std::mem::take(&mut self.hooks_to_remove);
             self.hooks.retain(|(id, _)| !to_remove.contains(id));
@@ -366,12 +372,18 @@ impl ExecutionHooks {
         (bit / 64, 1 << (bit % 64))
     }
 
+    #[cold]
+    #[inline(never)]
+    fn run_scheduled_callbacks(&mut self) {
+        let callbacks = std::mem::take(&mut self.one_time_callbacks);
+        for cb in callbacks {
+            cb.as_ref()();
+        }
+    }
+
     fn run_hooks(&mut self, address: u64) {
         if !self.one_time_callbacks.is_empty() {
-            let callbacks = std::mem::take(&mut self.one_time_callbacks);
-            for cb in callbacks {
-                cb.as_ref()();
-            }
+            self.run_scheduled_callbacks();
         }
 
         self.generic_hooks.for_each_hook(|func| {
@@ -1012,8 +1024,16 @@ impl IcicleEmulator {
         return self.get_mem().map_memory_len(address, length, mapping);
     }
 
-    pub fn map_shared_memory(&mut self, address: u64, source: u64, length: u64, permissions: u8) -> bool {
-        self.get_mem().map_shared(address, source, length, map_permissions(permissions)).is_ok()
+    pub fn map_shared_memory(
+        &mut self,
+        address: u64,
+        source: u64,
+        length: u64,
+        permissions: u8,
+    ) -> bool {
+        self.get_mem()
+            .map_shared(address, source, length, map_permissions(permissions))
+            .is_ok()
     }
 
     pub fn map_mmio(
@@ -1445,6 +1465,61 @@ mod execution_hook_filter_tests {
     }
 
     #[test]
+    fn scheduled_callbacks_precede_instruction_callbacks() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut hooks = hooks();
+        for index in 0..2 {
+            let calls = calls.clone();
+            hooks.schedule(Box::new(move || calls.borrow_mut().push(index)));
+        }
+        let observed = calls.clone();
+        hooks.add_generic_hook(Box::new(move |_| observed.borrow_mut().push(2)));
+        hooks.run_hooks(0x1000);
+        hooks.run_hooks(0x1001);
+        assert_eq!(*calls.borrow(), vec![0, 1, 2, 2]);
+        assert!(hooks.one_time_callbacks.is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn instruction_dispatch_throughput() {
+        let iterations = 20_000_000u64;
+        let mut hooks = hooks();
+        let total = Rc::new(Cell::new(0u64));
+        let addresses = Rc::new(Cell::new(0u64));
+        for _ in 0..2 {
+            let total = total.clone();
+            let addresses = addresses.clone();
+            hooks.add_generic_hook(Box::new(move |address| {
+                total.set(total.get() + 1);
+                addresses.set(addresses.get().wrapping_add(address));
+            }));
+        }
+        let ranged = total.clone();
+        hooks.add_range_hook(0x1000, 64, Box::new(move |_| ranged.set(ranged.get() + 1)));
+        let exact = total.clone();
+        hooks.add_specific_hook(0x1020, Box::new(move |_| exact.set(exact.get() + 1)));
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            total.set(0);
+            addresses.set(0);
+            let started = std::time::Instant::now();
+            for index in 0..iterations {
+                std::hint::black_box(&mut hooks).run_hooks(0x1000 + (index & 127));
+            }
+            times.push(started.elapsed().as_secs_f64());
+            assert_eq!(
+                total.get(),
+                iterations * 2 + iterations / 2 + iterations / 128
+            );
+            assert_eq!(addresses.get(), iterations * 2 * 0x1000 + iterations * 127);
+        }
+        eprintln!(
+            "instruction_dispatch_seconds={times:?}; iterations={iterations}; callbacks_verified=true"
+        );
+    }
+
+    #[test]
     fn empty_exact_filter_preserves_generic_and_range_callbacks() {
         let calls = Rc::new(RefCell::new(Vec::new()));
         let mut hooks = hooks();
@@ -1559,7 +1634,10 @@ mod vm_exit_tests {
         assert_eq!(stop.kind, IcicleStopInfo::OTHER);
         assert_eq!(stop.code, ExceptionCode::OutOfMemory as u32);
         assert_eq!(stop.value, 0x20000);
-        assert!(emu.vm_exit_description().starts_with("OutOfMemory; physical_pages=3/3;"));
+        assert!(
+            emu.vm_exit_description()
+                .starts_with("OutOfMemory; physical_pages=3/3;")
+        );
         assert_eq!(emu.vm.cpu.read_pc(), 0x10000);
         assert!(emu.vm.cpu.mem.set_capacity(4));
         emu.start(1);
@@ -1600,16 +1678,34 @@ mod aligned_move_decode_tests {
             let old_id: i16 = parts[1].parse().unwrap();
             let old_offset: u8 = parts[2].parse().unwrap();
             let old_size: u8 = parts[3].parse().unwrap();
-            let current = emu.vm.cpu.arch.sleigh.get_reg(parts[0]).unwrap().get_raw_var();
-            assert_eq!(current, pcode::VarNode::new(old_id, old_offset + old_size).slice(old_offset, old_size), "{}", parts[0]);
+            let current = emu
+                .vm
+                .cpu
+                .arch
+                .sleigh
+                .get_reg(parts[0])
+                .unwrap()
+                .get_raw_var();
+            assert_eq!(
+                current,
+                pcode::VarNode::new(old_id, old_offset + old_size).slice(old_offset, old_size),
+                "{}",
+                parts[0]
+            );
         }
         assert!(emu.map_memory(0x10000, 4096, 7));
-        for bytes in [&[0x66, 0x0f, 0x6f, 0xca][..], &[0xc5, 0xf9, 0x6f, 0xca][..], &[0x62,0xf1,0x7d,0x48,0x6f,0xca][..]] {
+        for bytes in [
+            &[0x66, 0x0f, 0x6f, 0xca][..],
+            &[0xc5, 0xf9, 0x6f, 0xca][..],
+            &[0x62, 0xf1, 0x7d, 0x48, 0x6f, 0xca][..],
+        ] {
             assert!(emu.write_memory(0x10000, bytes));
             emu.vm.cpu.write_pc(0x10000);
             let mut lifter = icicle_cpu::lifter::InstructionLifter::new();
             lifter.set_context(emu.vm.cpu.arch.isa_mode_context[0]);
-            let next = lifter.lift(&mut *emu.vm.cpu, 0x10000).unwrap_or_else(|e| panic!("{bytes:x?}: {e:?}"));
+            let next = lifter
+                .lift(&mut *emu.vm.cpu, 0x10000)
+                .unwrap_or_else(|e| panic!("{bytes:x?}: {e:?}"));
             assert_eq!(next, 0x10000 + bytes.len() as u64, "{}", lifter.disasm);
         }
     }
@@ -1622,12 +1718,18 @@ mod movemask_decode_tests {
     fn move_masks_decode() {
         let mut emu = IcicleEmulator::new();
         assert!(emu.map_memory(0x10000, 4096, 7));
-        for bytes in [&[0x0f,0x50,0xc4][..], &[0x66,0x0f,0x50,0xc4][..], &[0xc5,0xf8,0x50,0xc4][..]] {
+        for bytes in [
+            &[0x0f, 0x50, 0xc4][..],
+            &[0x66, 0x0f, 0x50, 0xc4][..],
+            &[0xc5, 0xf8, 0x50, 0xc4][..],
+        ] {
             assert!(emu.write_memory(0x10000, bytes));
             emu.vm.cpu.write_pc(0x10000);
             let mut lifter = icicle_cpu::lifter::InstructionLifter::new();
             lifter.set_context(emu.vm.cpu.arch.isa_mode_context[0]);
-            let next = lifter.lift(&mut *emu.vm.cpu, 0x10000).unwrap_or_else(|e| panic!("{bytes:x?}: {e:?}"));
+            let next = lifter
+                .lift(&mut *emu.vm.cpu, 0x10000)
+                .unwrap_or_else(|e| panic!("{bytes:x?}: {e:?}"));
             assert_eq!(next, 0x10000 + bytes.len() as u64, "{}", lifter.disasm);
         }
     }

@@ -1,0 +1,28 @@
+Instruction hook dispatch
+
+An eight-second sample of the running game recorded 418 of 2083 samples in
+icicle-emulator.dll+0x35A90. The matching function body contains ExecutionHooks
+dispatch: scheduled callbacks, generic and range callbacks, the exact-address
+filter, and stop checks. The nearest public PDB label belongs to another function.
+
+Scheduled callbacks and deferred container changes now run in separate cold
+functions. The common path checks whether work is pending before calling either.
+Callback ordering, address filtering, deferred changes, stop checks, and code
+invalidation retain their existing behavior. Log production and rendering are
+unchanged.
+
+Five optimized Rust samples each dispatched 20 million addresses through two
+generic callbacks, one range callback and one exact hook. Every sample checked
+50,156,250 callbacks and the sum of observed addresses. Median time changed from
+0.1622661 to 0.1000059 seconds (38.4% less time).
+This measures isolated dispatch overhead, not overall emulation or game boot.
+
+Validation: seven Rust hook tests; 14 native tests in both interpreter and JIT
+for Release and tidy; Release and tidy builds; explicit-root verbose guest CLI
+smoke, exit 0. Native tests cover callback self-removal, timestamp hook results,
+kernel callback ownership and section observations across a snapshot restore.
+The added regression checks that scheduled callbacks precede instruction hooks
+and run once. The ignored throughput test is invoked explicitly for measurement.
+
+Raw timings, build/test records and profile locations are listed in
+hook-dispatch-hotpath-validation.json. Game boot remains unconfirmed.
