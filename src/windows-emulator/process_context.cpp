@@ -18,6 +18,8 @@ namespace sogen
     namespace
     {
 
+        constexpr int64_t default_critical_section_timeout = -30LL * 24 * 60 * 60 * 10'000'000;
+
         std::vector<uint8_t> sid_string_to_bytes(const std::string& sid_string)
         {
             if (!sid_string.starts_with("S-"))
@@ -362,6 +364,7 @@ namespace sogen
             p.HeapDeCommitFreeBlockThreshold = 0x0000000000001000;
             p.NumberOfHeaps = 0x00000000;
             p.MaximumNumberOfHeaps = 0x00000010;
+            p.CriticalSectionTimeout.QuadPart = static_cast<uint64_t>(default_critical_section_timeout);
             p.NumberOfProcessors = fake_env.number_of_processors;
             p.ImageSubsystemMajorVersion = 6;
 
@@ -455,6 +458,7 @@ namespace sogen
                 p32.HeapDeCommitFreeBlockThreshold = 0x00001000;
                 p32.NumberOfHeaps = 0;
                 p32.MaximumNumberOfHeaps = 0x10;
+                p32.CriticalSectionTimeout.QuadPart = static_cast<uint64_t>(default_critical_section_timeout);
                 p32.NumberOfProcessors = fake_env.number_of_processors;
                 p32.ImageSubsystemMajorVersion = 6;
 
