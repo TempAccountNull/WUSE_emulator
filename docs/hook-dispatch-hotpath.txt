@@ -26,3 +26,10 @@ and run once. The ignored throughput test is invoked explicitly for measurement.
 
 Raw timings, build/test records and profile locations are listed in
 hook-dispatch-hotpath-validation.json. Game boot remains unconfirmed.
+
+Actual-game continuation: restored checkpoint 106f213ad7cd7e9c9dd05bae106bcbbc8485785095d26ba184184fee5309e102.
+The first recorded interval advanced 1,453,634,513 guest instructions
+in 60.053 seconds (24.21 million/s).
+The game remains under Icicle with -e and -v; the colored viewer reopened at
+left -5, top 726, width 1282, height 665. This continuation is runtime evidence,
+not a controlled speed comparison. Full boot still needs user confirmation.

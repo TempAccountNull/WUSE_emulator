@@ -43,5 +43,104 @@
     "guest_smoke": "sogen-cli-smoke-1789484112035331700",
     "guest_smoke_exit": 0
   },
-  "game_acceptance": false
+  "game_acceptance": false,
+  "actual_game": {
+    "result": "PASS: saved guest restored and continues executing",
+    "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789484352677458100-after-hook-dispatch-optimization",
+    "runtime_commit": "171049675c08ade3eadc49e8d2836b4aa8744311",
+    "backend_sha256": "0e7a479c184dc562fc94b8af23c296f700fbd600e9c70ed855024752e505d1b7",
+    "snapshot_sha256": "106f213ad7cd7e9c9dd05bae106bcbbc8485785095d26ba184184fee5309e102",
+    "snapshot_bytes": 109362250,
+    "command": [
+      "D:\\Sunrise\\D2\\sogen\\builds\\20260915-095903-icicle-startup\\analyzer.exe",
+      "--backend",
+      "icicle",
+      "-v",
+      "-e",
+      "D:\\Sunrise\\D2\\sogen\\root",
+      "-p",
+      "d:\\sunrise\\d2",
+      "D:\\Sunrise\\D2",
+      "--call-count",
+      "--first-exec",
+      "--report",
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789484352677458100-after-hook-dispatch-optimization\\events.jsonl",
+      "--stdout",
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789484352677458100-after-hook-dispatch-optimization\\guest-stdout.log",
+      "--debug",
+      "--port",
+      "28978",
+      "--snapshot-out",
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789484352677458100-after-hook-dispatch-optimization\\guest.snap",
+      "-a",
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789482555715647300-after-cpuid-shader-fix\\guest.snap",
+      "d:\\sunrise\\d2\\destiny2.exe"
+    ],
+    "pid": 2788,
+    "process_creation_time": 1789484353.1629217,
+    "observation": {
+      "first": "state-00000-threads.json",
+      "last": "state-00001-threads.json",
+      "seconds": 60.05335879325867,
+      "guest_instructions": 1453634513,
+      "guest_instructions_per_second": 24205715.42058658,
+      "scope": "Continued-game observation, not a matched workload speed comparison"
+    },
+    "viewer": {
+      "pid": 42308,
+      "ansiEnabled": true,
+      "started": "2026-09-15T09:59:13.6775277-05:00",
+      "positioned": true,
+      "topmost": true,
+      "left": -5,
+      "top": 726,
+      "width": 1282,
+      "height": 665
+    },
+    "saved_caller": {
+      "inspection": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-thread-frame-inspection-1789484318049785200",
+      "thread": "58",
+      "instruction": "steam_api64.dll+0x4E5903 (memchr)",
+      "returns": [
+        {
+          "stack_offset": "0x0",
+          "module": "steam_api64.dll",
+          "rva": "0x2a54a6"
+        },
+        {
+          "stack_offset": "0xd0",
+          "module": "steam_api64.dll",
+          "rva": "0x2a5914"
+        },
+        {
+          "stack_offset": "0xd80",
+          "module": "steam_api64.dll",
+          "rva": "0x168993"
+        }
+      ],
+      "description": "memchr -> resolve_all -> scan_main_image_unique -> teleport::install",
+      "stack_basis": "Original compiled prologues: resolve_all pushes RBX and reserves 0xC0; scan_main_image_unique pushes RBP and reserves 0xCA0. Matching PDB names, source lines and call targets retained.",
+      "caveat": "Static prologues matched against saved stack offsets; not a complete OS unwinder or whole-image byte comparison."
+    },
+    "cleanup": {
+      "retained_checkpoint_sha256": "106f213ad7cd7e9c9dd05bae106bcbbc8485785095d26ba184184fee5309e102",
+      "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789482555715647300-after-cpuid-shader-fix",
+      "files": [
+        {
+          "name": "console.log",
+          "removed": true,
+          "bytes": 4809245852,
+          "sha256": "88275a6e7da069d30cb39035c4d8a29e2b26f50ad6741b338b4183b1b64dff6a"
+        },
+        {
+          "name": "events.jsonl",
+          "removed": true,
+          "bytes": 10304331216,
+          "sha256": "d78a66d2b0198743888a8b1ec4efa8c3487ad8aec5c2e2610fa8ec1c74fcd711"
+        }
+      ]
+    },
+    "profile": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789484352677458100-after-hook-dispatch-optimization\\cpu-profile-1789484512031820400.json",
+    "game_boot_accepted": false
+  }
 }
