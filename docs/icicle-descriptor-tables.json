@@ -1,0 +1,310 @@
+{
+  "scope": "Descriptor metadata and exception-route correction; x86 decoder mode is still incorrect",
+  "guest_module_sha256": "9dbf249b38dc2eded87b5d92b5e4035a2480f478586c9b3986dc4574f22cc5cb",
+  "before": {
+    "command": [
+      "D:\\Sunrise\\D2\\sogen\\builds\\20260915-123308-icicle-startup\\analyzer.exe",
+      "--backend",
+      "icicle",
+      "-v",
+      "-e",
+      "D:\\Sunrise\\D2\\sogen\\root",
+      "-p",
+      "c:\\cng-probe",
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\cng-resolver-probe-x86",
+      "--debug",
+      "--port",
+      "28987",
+      "c:\\cng-probe\\cng-resolver-probe.exe"
+    ],
+    "scope": "Isolated x86 guest fault observation; main game untouched",
+    "pid": 68536,
+    "module": {
+      "path": "c:\\windows\\syswow64\\ntdll.dll",
+      "base": 1260912640,
+      "size": 1724416,
+      "dos_header": "4d5a90000300000004000000ffff0000b800000000000000400000000000000000000000000000000000000000000000000000000000000000000000f0000000",
+      "pe_header": "504500004c010800d07013ba0000000000000000e00002210b010e140006120000f00700000000000000000000100000003012000000284b00100000000200000a0000000a0000000a0000000000000000501a00",
+      "codeview": [
+        {
+          "rva": "0x25c84",
+          "guid_bytes": "b7feffed820ea40f77d46e14970951a5",
+          "age": 1,
+          "pdb_path": "wntdll.pdb"
+        }
+      ]
+    },
+    "rip": "0x4b2e6cdf",
+    "cs": "0x23",
+    "gdt_entry_address": "0x35020",
+    "descriptor_hex": "ffff000000fbcf00",
+    "descriptor_long": false,
+    "descriptor_default32": true,
+    "instruction_bytes": "803df5683a4b00",
+    "expected_read_address": "0x4b3a68f5",
+    "expected_read_value": "00",
+    "erroneous_rip_relative_address": "0x9668d5db",
+    "before": {
+      "rax": 4198956,
+      "rbx": 0,
+      "rcx": 0,
+      "rdx": 26279204,
+      "rsi": 0,
+      "rdi": 0,
+      "rbp": 26279180,
+      "rsp": 26279164,
+      "r8": 1261333680,
+      "r9": 716,
+      "r10": 18446744073709551614,
+      "r11": 70,
+      "r12": 2818048,
+      "r13": 4124016,
+      "r14": 4118992,
+      "r15": 4300752480,
+      "rip": 1261333727,
+      "eflags": 0
+    },
+    "step_reply": "T05thread:8;",
+    "after": {
+      "rax": 4198956,
+      "rbx": 0,
+      "rcx": 0,
+      "rdx": 26279204,
+      "rsi": 0,
+      "rdi": 0,
+      "rbp": 26279180,
+      "rsp": 26277632,
+      "r8": 1261333680,
+      "r9": 716,
+      "r10": 18446744073709551614,
+      "r11": 70,
+      "r12": 2818048,
+      "r13": 4124016,
+      "r14": 4118992,
+      "r15": 4300752480,
+      "rip": 6443111680,
+      "eflags": 0
+    },
+    "analyzer_exit": 1,
+    "termination": "Closed this isolated analyzer after observation",
+    "input_sha256": "6531cd707a8e61edd0e0c842174f8af2822788b1b6b978ed6fb8f2051277f1bd"
+  },
+  "after": {
+    "command": [
+      "D:\\Sunrise\\D2\\sogen\\builds\\20260915-134203-icicle-startup\\analyzer.exe",
+      "--backend",
+      "icicle",
+      "-v",
+      "-e",
+      "D:\\Sunrise\\D2\\sogen\\root",
+      "-p",
+      "c:\\cng-probe",
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\cng-resolver-probe-x86",
+      "--debug",
+      "--port",
+      "28987",
+      "c:\\cng-probe\\cng-resolver-probe.exe"
+    ],
+    "scope": "Isolated x86 guest fault observation; main game untouched",
+    "pid": 66960,
+    "module": {
+      "path": "c:\\windows\\syswow64\\ntdll.dll",
+      "base": 1260912640,
+      "size": 1724416,
+      "dos_header": "4d5a90000300000004000000ffff0000b800000000000000400000000000000000000000000000000000000000000000000000000000000000000000f0000000",
+      "pe_header": "504500004c010800d07013ba0000000000000000e00002210b010e140006120000f00700000000000000000000100000003012000000284b00100000000200000a0000000a0000000a0000000000000000501a00",
+      "codeview": [
+        {
+          "rva": "0x25c84",
+          "guid_bytes": "b7feffed820ea40f77d46e14970951a5",
+          "age": 1,
+          "pdb_path": "wntdll.pdb"
+        }
+      ]
+    },
+    "rip": "0x4b2e6cdf",
+    "cs": "0x23",
+    "gdt_entry_address": "0x35020",
+    "descriptor_hex": "ffff000000fbcf00",
+    "descriptor_long": false,
+    "descriptor_default32": true,
+    "instruction_bytes": "803df5683a4b00",
+    "expected_read_address": "0x4b3a68f5",
+    "expected_read_value": "00",
+    "erroneous_rip_relative_address": "0x9668d5db",
+    "before": {
+      "rax": 4198956,
+      "rbx": 0,
+      "rcx": 0,
+      "rdx": 27786532,
+      "rsi": 0,
+      "rdi": 0,
+      "rbp": 27786508,
+      "rsp": 27786492,
+      "r8": 1261333680,
+      "r9": 716,
+      "r10": 18446744073709551614,
+      "r11": 70,
+      "r12": 25427968,
+      "r13": 26733936,
+      "r14": 26728912,
+      "r15": 4303636064,
+      "rip": 1261333727,
+      "eflags": 0
+    },
+    "step_reply": "T05thread:8;",
+    "after": {
+      "rax": 6443111680,
+      "rbx": 27784960,
+      "rcx": 51,
+      "rdx": 43,
+      "rsi": 0,
+      "rdi": 0,
+      "rbp": 27786508,
+      "rsp": 4282449920,
+      "r8": 1261333680,
+      "r9": 716,
+      "r10": 18446744073709551614,
+      "r11": 70,
+      "r12": 25427968,
+      "r13": 26733936,
+      "r14": 26728912,
+      "r15": 4303636064,
+      "rip": 4281335808,
+      "eflags": 0
+    },
+    "analyzer_exit": 1,
+    "termination": "Closed this isolated analyzer after observation",
+    "input_sha256": "6531cd707a8e61edd0e0c842174f8af2822788b1b6b978ed6fb8f2051277f1bd"
+  },
+  "tests": [
+    {
+      "run": "regression-1789497390208653300",
+      "mode": "interpreter",
+      "tests": 13,
+      "failures": 0
+    },
+    {
+      "run": "regression-1789497390208653300",
+      "mode": "jit",
+      "tests": 13,
+      "failures": 0
+    },
+    {
+      "run": "regression-1789497469191122400",
+      "mode": "interpreter",
+      "tests": 42,
+      "failures": 0
+    },
+    {
+      "run": "regression-1789497469191122400",
+      "mode": "jit",
+      "tests": 42,
+      "failures": 0
+    }
+  ],
+  "smoke": {
+    "command": [
+      "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo\\analyzer.exe",
+      "--backend",
+      "icicle",
+      "-v",
+      "-e",
+      "D:\\Sunrise\\D2\\sogen\\root",
+      "-p",
+      "c:\\sogen-tests",
+      "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo",
+      "--env",
+      "EMULATOR_ICICLE",
+      "1",
+      "--report",
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-cli-smoke-1789497671312300400\\events.jsonl",
+      "--stdout",
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-cli-smoke-1789497671312300400\\guest-stdout.log",
+      "c:\\sogen-tests\\test-sample.exe"
+    ],
+    "purpose": "Repository CLI smoke test; distinct from actual Destiny boot acceptance",
+    "pid": 73500,
+    "exit_code": 0,
+    "seconds": 29.25211469992064
+  },
+  "restricted_smoke": {
+    "result": {
+      "command": [
+        "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo\\analyzer.exe",
+        "--backend",
+        "icicle",
+        "-v",
+        "-e",
+        "D:\\Sunrise\\D2\\sogen\\root",
+        "-p",
+        "c:\\sogen-tests",
+        "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo",
+        "--env",
+        "EMULATOR_ICICLE",
+        "1",
+        "--report",
+        "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-cli-smoke-1789497545242941800\\events.jsonl",
+        "--stdout",
+        "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-cli-smoke-1789497545242941800\\guest-stdout.log",
+        "c:\\sogen-tests\\test-sample.exe"
+      ],
+      "purpose": "Repository CLI smoke test; distinct from actual Destiny boot acceptance",
+      "pid": 32108,
+      "exit_code": 1,
+      "seconds": 27.846908799838275
+    },
+    "failures": [
+      "I/O file creation",
+      "File Locking file creation"
+    ],
+    "follow_up": "Same guest smoke passed after allowing writes to the mapped test directory"
+  },
+  "deployment": "D:\\Sunrise\\D2\\sogen\\builds\\20260915-134203-icicle-startup",
+  "deployed_binaries": {
+    "analyzer.exe": "29824cb3971de7556b947a5b0174da1f4dfcaea8683c17443063d97f3f221c8c",
+    "icicle-emulator.dll": "8cc2bc33d2202f2808b466895960df49c0f77f16adfea53a73d551375b7f9e85"
+  },
+  "evidence_files": [
+    {
+      "path": "benchmarks\\icicle-x86-mode-1789496009865357400\\mode-proof.json",
+      "sha256": "e2b0b3d5571c01c19098d972c0fe04c72dbe81cf088032660c7874dd0f45af8c"
+    },
+    {
+      "path": "benchmarks\\icicle-x86-mode-1789497729357228300\\mode-proof.json",
+      "sha256": "873b658c858e7042b7e60e03bba170ddd14d51a874bdeea1068a851d9e1063e8"
+    },
+    {
+      "path": "benchmarks\\sogen-fixes\\regression-1789497390208653300\\interpreter.json",
+      "sha256": "92ad4d923419a591e5d1a51f647398b5c7ddd45cebad5358f9b3b0e2b57aace0"
+    },
+    {
+      "path": "benchmarks\\sogen-fixes\\regression-1789497390208653300\\jit.json",
+      "sha256": "7035defa434f0e65b3b139538e931c32d3f448ec919207638bb11ceb848dc2f6"
+    },
+    {
+      "path": "benchmarks\\sogen-fixes\\regression-1789497469191122400\\interpreter.json",
+      "sha256": "de1d88fb20efbed78d37f309a9cf6f2a6e4ffac453eb844a2af201d56344315a"
+    },
+    {
+      "path": "benchmarks\\sogen-fixes\\regression-1789497469191122400\\jit.json",
+      "sha256": "f553d4efa605f3900568fc2348de73406ed56200ec5b12bc8f927959b264f2d3"
+    },
+    {
+      "path": "benchmarks\\sogen-cli-smoke-1789497671312300400\\smoke.json",
+      "sha256": "febcaec55479d86b5f8ac49825df46b0a929b98d59664e57c97cb7ad6d3ddc1a"
+    },
+    {
+      "path": "benchmarks\\sogen-cli-smoke-1789497545242941800\\smoke.json",
+      "sha256": "777415a2d5c66260dbe77cde68ecc8bfbb3f1e5e305710b3592b8a342865284c"
+    },
+    {
+      "path": "benchmarks\\sogen-fixes\\vs2022-1789497327467954200.log",
+      "sha256": "b546a945d689b6b446d2dd9a82b103a5db862408e629c8d4da06adc912e66328"
+    },
+    {
+      "path": "benchmarks\\sogen-fixes\\tidy-1789497421801003300.log",
+      "sha256": "2e34f1c39265a2c8a53cbfa6dffddfe11a0de551069e0368d565785cb0f280f5"
+    }
+  ]
+}

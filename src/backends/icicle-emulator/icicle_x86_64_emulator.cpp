@@ -285,7 +285,10 @@ namespace sogen::icicle
 
             gdtr entry{};
             static_assert(sizeof(gdtr) - offsetof(gdtr, limit) == 12);
-            this->read_register(x86_register::gdtr, &entry.limit, 12);
+            if (this->read_raw_register(reg, &entry.limit, 12) != 12)
+            {
+                return false;
+            }
 
             table.base = entry.address;
             table.limit = entry.limit;

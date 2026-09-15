@@ -1,0 +1,28 @@
+Icicle descriptor-register reads
+
+Icicle's 12-byte GDTR and IDTR read as zero because read_dynamic does not
+handle that width. Read the missing 11..15-byte widths directly. The C++
+descriptor accessor now reads the requested register and checks its width;
+previously an IDTR request read GDTR. Ghidra's x86-64 register representation
+uses a four-byte limit and eight-byte base, not the architectural SGDT image.
+
+Matched SysWOW64 ntdll.dll, RVA 0x66CDF: 80 3D F5 68 3A 4B 00.
+CS 0x23 selects descriptor ffff000000fbcf00: L=0, D=1. Intel SDM vol. 3A,
+section 3.4.5, defines this as compatibility mode. The instruction should
+read absolute address 0x4B3A68F5; the decoder instead uses RIP-relative
+address 0x9668D5DB. See vol. 2A, section 2.2.1.6, for that distinction.
+
+Before this fix the exception bypassed the WOW64 transition and entered
+native ntdll+0xA1500 directly. Repeating the same instruction now selects
+Sogen's WOW64 exception transition at 0xFF300000. The instruction still
+faults: execution-mode selection remains to be implemented. This is not
+an x86 CNG runtime pass or a game-boot result.
+
+Validation: GDTR/IDTR and segment lookup failures reproduced before the fix.
+Three descriptor tests and ten boot-support tests pass in interpreter and
+JIT modes. Another 42 CNG and exception-context tests pass in each mode.
+Release build, clang-tidy build and CLI guest smoke pass. An initial sandboxed
+smoke failed its two file-creation checks; the same smoke passed with write
+access to its mapped test directory. The deployed build repeats the same
+WOW64 transition result. Exact commands,
+guest registers, module identity and evidence hashes are in the JSON file.

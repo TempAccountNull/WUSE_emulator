@@ -1182,6 +1182,11 @@ impl IcicleEmulator {
                 .copy_from_slice(&self.vm.cpu.read::<[u8; 16]>(reg_node.slice(0, 16).into()));
             bytes[16..]
                 .copy_from_slice(&self.vm.cpu.read::<[u8; 16]>(reg_node.slice(16, 16).into()));
+        } else if (11..=15).contains(&reg_node.size) {
+            bytes[..8].copy_from_slice(&self.vm.cpu.read::<[u8; 8]>(reg_node.slice(0, 8).into()));
+            for offset in 8..reg_node.size {
+                bytes[usize::from(offset)] = self.vm.cpu.read_var::<u8>(reg_node.slice(offset, 1));
+            }
         } else {
             bytes = self.vm.cpu.read_dynamic(pcode::Value::Var(reg_node)).zxt();
         }
