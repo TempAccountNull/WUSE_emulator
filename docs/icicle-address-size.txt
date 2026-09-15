@@ -40,6 +40,6 @@ The actual game resumed from checkpoint SHA256
 with the deployed build, explicit -e/-v and the saved live-log window. Samples
 reached WARP GetSub, WARP triangle rasterization and destiny2.exe+0x1A65BEC.
 The matched module identity and observations are in icicle-address-size-replay.json.
-Execution remains active at that observation. Visible-frame and boot acceptance
-remain unconfirmed. The 67h test defects are not established as the cause of
-the previous game termination.
+Execution was active at that observation. The user subsequently confirmed a
+white screen; visible-frame and boot acceptance were not achieved. The 67h
+test defects are not established as the cause of the previous game termination.

@@ -64,5 +64,8 @@
       "0x3A0544": "PixelJITRasterizeTriangleT<0,0>"
     }
   },
-  "scope": "Actual guest checkpoint resumed and execution progressed. These samples do not prove a visible frame, white-screen resolution or boot acceptance. The 67h defects were reproduced in regression tests, not identified as the previous game termination cause."
+  "scope": "Actual guest checkpoint resumed and execution progressed. These samples do not prove a visible frame, white-screen resolution or boot acceptance. The 67h defects were reproduced in regression tests, not identified as the previous game termination cause.",
+  "user_observation": "Still a white screen",
+  "acceptance": "Not achieved",
+  "follow_up": "Saved lock and thread-event evidence identifies WARP worker termination followed by pending render waits; see warp-startup-waits.md."
 }
