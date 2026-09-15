@@ -157,5 +157,29 @@ Final clang-tidy build passed (tidy-1789446790058006000.log).
 regression-1789446465322458100: 4/4 failed in interpreter and JIT
 regression-1789446777880359600: 22/22 passed in interpreter and JIT
 CLI smoke: exit 0, 37.152 seconds; capture sogen-cli-smoke-1789447471509370700.
-Actual-game replay is running. Passing the old fault and reaching the game menu are separate pending checks.
+Actual-game allocation replay passed; see the before/after proof below. Game menu acceptance remains pending.
 No snapshot registers, instructions, lock fields, or allocation state were patched.
+
+// ACTUAL GAME REPLAY: 15 SEPTEMBER 2026
+Captured the complete original 96-byte descriptor before NtGdiDdDDICreateAllocation.
+Dimension=4, width=32, height=160, depth=8, format=0x22, row pitch=128,
+allocation bytes=0x28000, array size=1, mip levels=1, flags=0x200080.
+The old and fixed builds used the identical saved guest state, request, and source bytes.
+Snapshot SHA-256: 2689190f7b2ba486db01fc12fcb022650bd9869d5a3b524ec43ef78ad259e29b
+Old build: f2007c30286675bbab864d7242f262902a908bb7
+Fixed build: 0bb358ad1338953329778927ab702468bf019c86
+Actual allocation handle: 0x9438; thread 0x5C (92).
+Syscall: 0x1000047A2 (win32u.dll+0x47A2), 0F 05 syscall.
+Both syscall returns: 0xA9EBE03890 (gdi32.dll+0x3890), STATUS_SUCCESS; RSP advanced by 8.
+Copy call: 0xC13B996A29 (d3d10warp.dll+0xE6A29), E8 65 A8 4B 00.
+Old result: access violation at 0xE9CB968D54 (ucrtbase.dll+0x48D54),
+0F 29 49 F0 / movaps xmmword ptr [rcx-0x10], xmm1.
+Old destination base=0xbaff680000; fault address=0xbaff681000; offset=0x1000.
+Old memcpy did not return. The complete saved exception and register context are preserved.
+Fixed destination base=0xbb4f840000; all 163840 destination bytes equal all source bytes.
+Copy returned to 0xC13B996A2E (d3d10warp.dll+0xE6A2E), with unchanged RSP.
+Source and destination SHA-256: abf801dcdf3ef8f79ef637a53f6bd6971eccf43aa9dd219765d8ec2067a27394
+Raw data: captured-warp-allocation.json, old-allocation-copy-proof.json,
+fixed-allocation-copy-proof.json, fixed-copy-source.bin, fixed-copy-destination.bin.
+The allocation fault is passed in the actual game. Full boot remains unverified.
+Execution continues from the successful copy-return checkpoint.
