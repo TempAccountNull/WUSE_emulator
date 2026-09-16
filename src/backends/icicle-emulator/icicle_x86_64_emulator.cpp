@@ -1,5 +1,6 @@
 #define ICICLE_EMULATOR_IMPL
 #include "icicle_x86_64_emulator.hpp"
+#include "execution_hook.hpp"
 
 #include <cstdio>
 #include <charconv>
@@ -82,30 +83,7 @@ namespace sogen::icicle
             }
         }
 
-        class hook_scope
-        {
-          public:
-            explicit hook_scope(bool* state) noexcept
-                : state_(state),
-                  previous_(state ? std::exchange(*state, true) : false)
-            {
-            }
-
-            ~hook_scope()
-            {
-                if (this->state_)
-                {
-                    *this->state_ = this->previous_;
-                }
-            }
-
-            hook_scope(const hook_scope&) = delete;
-            hook_scope& operator=(const hook_scope&) = delete;
-
-          private:
-            bool* state_;
-            bool previous_;
-        };
+        using detail::hook_scope;
 
         template <typename T>
         struct function_object : utils::object
@@ -466,7 +444,7 @@ namespace sogen::icicle
 
         emulator_hook* hook_memory_execution(const uint64_t address, memory_execution_hook_callback callback) override
         {
-            auto object = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
+            auto object = std::make_unique<detail::execution_hook>(*this, std::move(callback), this->is_in_hook_);
             auto* ptr = object.get();
             auto* wrapper = +[](void* user, const uint64_t addr) {
                 const auto& func = *static_cast<decltype(ptr)>(user);
@@ -487,7 +465,7 @@ namespace sogen::icicle
                 return this->hook_memory_execution(address, std::move(callback));
             }
 
-            auto object = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
+            auto object = std::make_unique<detail::execution_hook>(*this, std::move(callback), this->is_in_hook_);
             auto* ptr = object.get();
             auto* wrapper = +[](void* user, const uint64_t addr) {
                 const auto& func = *static_cast<decltype(ptr)>(user);
@@ -502,7 +480,7 @@ namespace sogen::icicle
 
         emulator_hook* hook_memory_execution(memory_execution_hook_callback callback) override
         {
-            auto object = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
+            auto object = std::make_unique<detail::execution_hook>(*this, std::move(callback), this->is_in_hook_);
             auto* ptr = object.get();
             auto* wrapper = +[](void* user, const uint64_t addr) {
                 const auto& func = *static_cast<decltype(ptr)>(user);

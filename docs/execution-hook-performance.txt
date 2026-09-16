@@ -1,0 +1,30 @@
+Execution callback dispatch
+
+Icicle execution hooks bound the CPU into a second std::function before
+invoking the original callback. Store the original callback and CPU pointer
+in the owning hook object instead. Exact, ranged and generic hooks retain
+their registration, address filtering, hook-state guard and deferred deletion.
+No instruction callbacks, trace events, breakpoints or logger output are removed.
+
+The matched DLL/PDB shows all three registrations use the wrapper at RVA
+0x4E6710, which reaches the guarded callback body at 0x4E4E70. Its call at
+0x4E4ED2 invokes the original callback. The redundant outer binding is absent.
+Previous-state restoration, the C++ cleanup funclet and empty-callback failure
+remain. CPU base conversion occurs once when constructing the hook object.
+
+Four 60-second game-checkpoint replays in candidate/baseline/baseline/candidate
+order measured 34.1004 versus 37.9586 million instructions/s:
+11.31% more throughput. The analyzer, guest state, processor specification,
+graphics and verbose observations were identical. The main guest was already
+saved at the Vulkan-loader checkpoint during all four selected intervals.
+Restore and snapshot writing were excluded. An earlier pair is retained in
+the validation JSON but excluded because its first interval overlapped the
+main guest reaching that checkpoint. All six restores and sampled SHA states
+matched. These measurements cover the image-hash loop, not game rendering.
+
+Release and required tidy builds passed. The 51 callback, boot-support,
+observation, debug-print and kernel-scope tests passed in interpreter and JIT
+modes for both builds (204 executions). New tests cover CPU/address identity,
+large callback ownership, self/peer removal lifetime, nested state restoration,
+exceptions and empty callbacks. Exception checks stay within C++; no support
+for unwinding through the Rust extern-C boundary is claimed.
