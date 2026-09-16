@@ -207,6 +207,7 @@ namespace sogen::gpu_bridge
         cmd_end_render_pass2 = 0x8A8,
         get_render_area_granularity = 0x8A9,
         cmd_begin_render_pass_full = 0x8AB,
+        create_render_pass_full = 0x8AC,
         cmd_extended_dynamic = 0x8B0,
         get_multisample_properties = 0x8B1,
         cmd_synchronization = 0x8C0,
@@ -216,12 +217,14 @@ namespace sogen::gpu_bridge
     inline constexpr uint32_t ioctl_get_event_status_owned = make_ioctl(static_cast<uint32_t>(command::get_event_status_owned));
 
     inline constexpr uint32_t ioctl_get_multisample_properties = make_ioctl(static_cast<uint32_t>(command::get_multisample_properties));
+
     struct get_multisample_properties_request
     {
         uint64_t physical_device;
         uint32_t samples;
         uint32_t reserved;
     };
+
     struct get_multisample_properties_response
     {
         int32_t vk_result;
@@ -229,6 +232,7 @@ namespace sogen::gpu_bridge
         uint32_t height;
         uint32_t reserved;
     };
+
     static_assert(sizeof(get_multisample_properties_request) == 16);
     static_assert(sizeof(get_multisample_properties_response) == 16);
 
@@ -315,6 +319,7 @@ namespace sogen::gpu_bridge
     inline constexpr uint32_t ioctl_get_query_pool_results = make_ioctl(static_cast<uint32_t>(command::get_query_pool_results));
     inline constexpr uint32_t ioctl_reset_query_pool = make_ioctl(static_cast<uint32_t>(command::reset_query_pool));
     inline constexpr uint32_t ioctl_create_render_pass = make_ioctl(static_cast<uint32_t>(command::create_render_pass));
+    inline constexpr uint32_t ioctl_create_render_pass_full = make_ioctl(static_cast<uint32_t>(command::create_render_pass_full));
     inline constexpr uint32_t ioctl_create_render_pass2 = make_ioctl(static_cast<uint32_t>(command::create_render_pass2));
     inline constexpr uint32_t ioctl_create_framebuffer_full = make_ioctl(static_cast<uint32_t>(command::create_framebuffer_full));
     inline constexpr uint32_t ioctl_get_render_area_granularity = make_ioctl(static_cast<uint32_t>(command::get_render_area_granularity));

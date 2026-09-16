@@ -450,14 +450,15 @@ namespace sogen
         int32_t cmd_copy_query_pool_results(uint64_t command_buffer, uint64_t query_pool, uint32_t first_query, uint32_t query_count,
                                             uint64_t destination_buffer, uint64_t destination_offset, uint64_t stride, uint32_t flags);
 
-        // One color attachment + an optional depth attachment (depth_format == 0 => color only), single
-        // subpass (initial/final layouts as given; PRESENT_SRC_KHR is mapped to TRANSFER_SRC_OPTIMAL).
+        int32_t create_render_pass_full(uint64_t device, std::span<const std::byte> packet, uint64_t& out_render_pass);
         int32_t create_render_pass2(uint64_t device, std::span<const std::byte> packet, uint64_t& out_render_pass);
         int32_t create_framebuffer_full(uint64_t device, std::span<const std::byte> packet, uint64_t& out_framebuffer);
         int32_t cmd_synchronization(uint64_t command_buffer, std::span<const std::byte> packet);
         int32_t render_pass_command(uint32_t command, uint64_t command_buffer, std::span<const std::byte> packet);
         int32_t get_render_area_granularity(uint64_t device, uint64_t render_pass, uint32_t& width, uint32_t& height);
 
+        // One color attachment + an optional depth attachment (depth_format == 0 => color only), single
+        // subpass (initial/final layouts as given; PRESENT_SRC_KHR is mapped to TRANSFER_SRC_OPTIMAL).
         int32_t create_render_pass(uint64_t device, uint32_t format, uint32_t load_op, uint32_t store_op, uint32_t initial_layout,
                                    uint32_t final_layout, uint32_t depth_format, uint64_t& out_render_pass);
         void destroy_render_pass(uint64_t device, uint64_t render_pass);

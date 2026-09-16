@@ -12,6 +12,10 @@ bool test_render_pass2(PFN_vkGetInstanceProcAddr get_proc, VkInstance instance, 
     const auto name = reinterpret_cast<PFN_##name>(get_proc(instance, #name)); \
     if (!name)                                                                 \
     return false
+    LOAD(vkCreateRenderPass);
+    LOAD(vkCmdBeginRenderPass);
+    LOAD(vkCmdNextSubpass);
+    LOAD(vkCmdEndRenderPass);
     LOAD(vkCreateRenderPass2);
     LOAD(vkCreateRenderPass2KHR);
     LOAD(vkCmdBeginRenderPass2);
@@ -62,6 +66,8 @@ bool test_render_pass2(PFN_vkGetInstanceProcAddr get_proc, VkInstance instance, 
     std::array<VkDeviceMemory, 2> buffer_memory{};
     VkRenderPass render_pass{};
     VkRenderPass alias_pass{};
+    VkRenderPass legacy_pass{};
+    VkRenderPass empty_pass{};
     VkFramebuffer framebuffer{};
     VkCommandPool pool{};
     VkFence fence{};
@@ -186,6 +192,69 @@ bool test_render_pass2(PFN_vkGetInstanceProcAddr get_proc, VkInstance instance, 
         {
             return false;
         }
+        std::array<VkAttachmentDescription, 2> legacy_attachments{};
+        std::array<VkAttachmentReference, 2> legacy_references{};
+        for (uint32_t i = 0; i < attachments.size(); ++i)
+        {
+            const auto& a = attachments[i];
+            legacy_attachments[i] = {.flags = a.flags,
+                                     .format = a.format,
+                                     .samples = a.samples,
+                                     .loadOp = a.loadOp,
+                                     .storeOp = a.storeOp,
+                                     .stencilLoadOp = a.stencilLoadOp,
+                                     .stencilStoreOp = a.stencilStoreOp,
+                                     .initialLayout = a.initialLayout,
+                                     .finalLayout = a.finalLayout};
+            legacy_references[i] = {.attachment = references[i].attachment, .layout = references[i].layout};
+        }
+        std::array<VkSubpassDescription, 2> legacy_subpasses{};
+        for (auto& subpass : legacy_subpasses)
+        {
+            subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            subpass.colorAttachmentCount = 2;
+            subpass.pColorAttachments = legacy_references.data();
+        }
+        std::array<VkSubpassDependency, 3> legacy_dependencies{};
+        for (uint32_t i = 0; i < dependencies.size(); ++i)
+        {
+            const auto& d = dependencies[i];
+            legacy_dependencies[i] = {.srcSubpass = d.srcSubpass,
+                                      .dstSubpass = d.dstSubpass,
+                                      .srcStageMask = d.srcStageMask,
+                                      .dstStageMask = d.dstStageMask,
+                                      .srcAccessMask = d.srcAccessMask,
+                                      .dstAccessMask = d.dstAccessMask,
+                                      .dependencyFlags = d.dependencyFlags};
+        }
+        VkRenderPassCreateInfo legacy{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        legacy.attachmentCount = static_cast<uint32_t>(legacy_attachments.size());
+        legacy.pAttachments = legacy_attachments.data();
+        legacy.subpassCount = static_cast<uint32_t>(legacy_subpasses.size());
+        legacy.pSubpasses = legacy_subpasses.data();
+        legacy.dependencyCount = static_cast<uint32_t>(legacy_dependencies.size());
+        legacy.pDependencies = legacy_dependencies.data();
+        if (vkCreateRenderPass(device, &legacy, nullptr, &legacy_pass) != VK_SUCCESS)
+        {
+            return false;
+        }
+        // An attachmentless pass must not read pAttachments[0], including through the x86 entry point.
+        VkSubpassDescription empty_subpass{};
+        empty_subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        VkRenderPassCreateInfo empty{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        empty.subpassCount = 1;
+        empty.pSubpasses = &empty_subpass;
+        if (vkCreateRenderPass(device, &empty, nullptr, &empty_pass) != VK_SUCCESS)
+        {
+            return false;
+        }
+        VkBaseInStructure unsupported_create{VK_STRUCTURE_TYPE_APPLICATION_INFO, nullptr};
+        empty.pNext = &unsupported_create;
+        VkRenderPass rejected{};
+        if (vkCreateRenderPass(device, &empty, nullptr, &rejected) != VK_ERROR_FEATURE_NOT_PRESENT || rejected != VK_NULL_HANDLE)
+        {
+            return false;
+        }
         VkExtent2D granularity{};
         vkGetRenderAreaGranularity(device, render_pass, &granularity);
         if (!granularity.width || !granularity.height)
@@ -247,6 +316,19 @@ bool test_render_pass2(PFN_vkGetInstanceProcAddr get_proc, VkInstance instance, 
         vkCmdBeginRenderPass2KHR(command, &begin, &subpass_begin);
         vkCmdNextSubpass2(command, &subpass_begin, &subpass_end);
         vkCmdEndRenderPass2KHR(command, &subpass_end);
+        // The legacy pass is compatible with the render-pass-2 framebuffer; its second attachment must survive transport too.
+        clears[0].color.uint32[0] = 0x19;
+        clears[0].color.uint32[1] = 0x28;
+        clears[0].color.uint32[2] = 0x37;
+        clears[0].color.uint32[3] = 0x46;
+        clears[1].color.uint32[0] = 0xab;
+        clears[1].color.uint32[1] = 0xcd;
+        clears[1].color.uint32[2] = 0xef;
+        clears[1].color.uint32[3] = 0x90;
+        begin.renderPass = legacy_pass;
+        vkCmdBeginRenderPass(command, &begin, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdNextSubpass(command, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdEndRenderPass(command);
         VkBufferImageCopy region{};
         region.imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1};
         region.imageExtent = {.width = width, .height = height, .depth = 1};
@@ -278,7 +360,7 @@ bool test_render_pass2(PFN_vkGetInstanceProcAddr get_proc, VkInstance instance, 
         {
             return false;
         }
-        const std::array<uint32_t, 2> expected{0x78563412, 0x21436587};
+        const std::array<uint32_t, 2> expected{0x46372819, 0x90efcdab};
         for (uint32_t i = 0; i < buffers.size(); ++i)
         {
             void* mapped = nullptr;
@@ -333,6 +415,14 @@ bool test_render_pass2(PFN_vkGetInstanceProcAddr get_proc, VkInstance instance, 
     {
         vkDestroyRenderPass(device, render_pass, nullptr);
     }
+    if (legacy_pass)
+    {
+        vkDestroyRenderPass(device, legacy_pass, nullptr);
+    }
+    if (empty_pass)
+    {
+        vkDestroyRenderPass(device, empty_pass, nullptr);
+    }
     if (alias_pass)
     {
         vkDestroyRenderPass(device, alias_pass, nullptr);
@@ -360,7 +450,7 @@ bool test_render_pass2(PFN_vkGetInstanceProcAddr get_proc, VkInstance instance, 
             vkFreeMemory(device, buffer_memory[i], nullptr);
         }
     }
-    std::printf("[shim-test] render-pass2 core/KHR MRT, two layers, offset integer clear/readback and error propagation -> %s\n",
+    std::printf("[shim-test] legacy + render-pass2 core/KHR MRT, two-layer framebuffer, layer-0 offset integer readback and errors -> %s\n",
                 ok ? "PASS" : "FAIL");
     return ok;
 }

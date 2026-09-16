@@ -234,6 +234,7 @@ namespace sogen
                     return handle_get_query_pool_results(win_emu, context);
                 case gpu_bridge::ioctl_reset_query_pool:
                     return handle_reset_query_pool(win_emu, context);
+                case gpu_bridge::ioctl_create_render_pass_full:
                 case gpu_bridge::ioctl_create_render_pass2:
                 case gpu_bridge::ioctl_create_framebuffer_full:
                     return handle_render_pass_packet(win_emu, context, context.io_control_code);
@@ -2341,9 +2342,19 @@ namespace sogen
                     win_emu.emu().read_memory(context.input_buffer + sizeof(request), packet.data(), packet.size());
                 }
                 uint64_t object = 0;
-                const int32_t result = code == gpu_bridge::ioctl_create_render_pass2
-                                           ? this->vulkan_.create_render_pass2(request.object, packet, object)
-                                           : this->vulkan_.create_framebuffer_full(request.object, packet, object);
+                int32_t result{};
+                if (code == gpu_bridge::ioctl_create_render_pass_full)
+                {
+                    result = this->vulkan_.create_render_pass_full(request.object, packet, object);
+                }
+                else if (code == gpu_bridge::ioctl_create_render_pass2)
+                {
+                    result = this->vulkan_.create_render_pass2(request.object, packet, object);
+                }
+                else
+                {
+                    result = this->vulkan_.create_framebuffer_full(request.object, packet, object);
+                }
                 return write_output(win_emu, context, gpu_bridge::object_response{.vk_result = result, .reserved = 0, .object = object});
             }
 

@@ -422,6 +422,128 @@ namespace sogen::gpu_bridge::render_pass_wire
         value(a, v.dstAccessMask3);
     }
 
+    template <typename A>
+    void fields(A& a, VkAttachmentDescription& v)
+    {
+        value(a, v.flags);
+        value(a, v.format);
+        value(a, v.samples);
+        value(a, v.loadOp);
+        value(a, v.storeOp);
+        value(a, v.stencilLoadOp);
+        value(a, v.stencilStoreOp);
+        value(a, v.initialLayout);
+        value(a, v.finalLayout);
+    }
+
+    template <typename A>
+    void fields(A& a, VkSubpassDescription& v)
+    {
+        value(a, v.flags);
+        value(a, v.pipelineBindPoint);
+        value(a, v.inputAttachmentCount);
+        array(a, v.pInputAttachments, v.inputAttachmentCount);
+        value(a, v.colorAttachmentCount);
+        array(a, v.pColorAttachments, v.colorAttachmentCount);
+        array(a, v.pResolveAttachments, v.colorAttachmentCount, true);
+        array(a, v.pDepthStencilAttachment, 1, true);
+        value(a, v.preserveAttachmentCount);
+        array(a, v.pPreserveAttachments, v.preserveAttachmentCount);
+    }
+
+    template <typename A>
+    void fields(A& a, VkSubpassDependency& v)
+    {
+        value(a, v.srcSubpass);
+        value(a, v.dstSubpass);
+        value(a, v.srcStageMask);
+        value(a, v.dstStageMask);
+        value(a, v.srcAccessMask);
+        value(a, v.dstAccessMask);
+        value(a, v.dependencyFlags);
+    }
+
+    template <>
+    struct structure_type<VkRenderPassCreateInfo>
+    {
+        static constexpr auto type = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    };
+
+    template <typename A>
+    void fields(A& a, VkRenderPassCreateInfo& v)
+    {
+        value(a, v.flags);
+        value(a, v.attachmentCount);
+        array(a, v.pAttachments, v.attachmentCount);
+        value(a, v.subpassCount);
+        array(a, v.pSubpasses, v.subpassCount);
+        value(a, v.dependencyCount);
+        array(a, v.pDependencies, v.dependencyCount);
+    }
+
+    template <typename A>
+    void fields(A& a, VkInputAttachmentAspectReference& v)
+    {
+        value(a, v.subpass);
+        value(a, v.inputAttachmentIndex);
+        value(a, v.aspectMask);
+    }
+
+    template <>
+    struct structure_type<VkRenderPassMultiviewCreateInfo>
+    {
+        static constexpr auto type = VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO;
+    };
+
+    template <typename A>
+    void fields(A& a, VkRenderPassMultiviewCreateInfo& v)
+    {
+        value(a, v.subpassCount);
+        array(a, v.pViewMasks, v.subpassCount);
+        value(a, v.dependencyCount);
+        array(a, v.pViewOffsets, v.dependencyCount);
+        value(a, v.correlationMaskCount);
+        array(a, v.pCorrelationMasks, v.correlationMaskCount);
+    }
+
+    template <>
+    struct structure_type<VkRenderPassInputAttachmentAspectCreateInfo>
+    {
+        static constexpr auto type = VK_STRUCTURE_TYPE_RENDER_PASS_INPUT_ATTACHMENT_ASPECT_CREATE_INFO;
+    };
+
+    template <typename A>
+    void fields(A& a, VkRenderPassInputAttachmentAspectCreateInfo& v)
+    {
+        value(a, v.aspectReferenceCount);
+        array(a, v.pAspectReferences, v.aspectReferenceCount);
+    }
+
+    template <>
+    struct structure_type<VkTileMemorySizeInfoQCOM>
+    {
+        static constexpr auto type = VK_STRUCTURE_TYPE_TILE_MEMORY_SIZE_INFO_QCOM;
+    };
+
+    template <typename A>
+    void fields(A& a, VkTileMemorySizeInfoQCOM& v)
+    {
+        value(a, v.size);
+    }
+
+    template <>
+    struct structure_type<VkRenderPassTileShadingCreateInfoQCOM>
+    {
+        static constexpr auto type = VK_STRUCTURE_TYPE_RENDER_PASS_TILE_SHADING_CREATE_INFO_QCOM;
+    };
+
+    template <typename A>
+    void fields(A& a, VkRenderPassTileShadingCreateInfoQCOM& v)
+    {
+        value(a, v.flags);
+        value(a, v.tileApronSize);
+    }
+
     template <>
     struct structure_type<VkAttachmentDescription2>
     {
@@ -828,8 +950,13 @@ namespace sogen::gpu_bridge::render_pass_wire
             return parent == VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         case VK_STRUCTURE_TYPE_RENDER_PASS_SAMPLE_LOCATIONS_BEGIN_INFO_EXT:
             return parent == VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        case VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO:
+        case VK_STRUCTURE_TYPE_RENDER_PASS_INPUT_ATTACHMENT_ASPECT_CREATE_INFO:
+            return parent == VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        case VK_STRUCTURE_TYPE_TILE_MEMORY_SIZE_INFO_QCOM:
+        case VK_STRUCTURE_TYPE_RENDER_PASS_TILE_SHADING_CREATE_INFO_QCOM:
         case VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT:
-            return parent == VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2;
+            return parent == VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO || parent == VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2;
         case VK_STRUCTURE_TYPE_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR:
             return parent == VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2;
         case VK_STRUCTURE_TYPE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT:
@@ -1135,6 +1262,98 @@ namespace sogen::gpu_bridge::render_pass_wire
                 else
                 {
                     auto node = *reinterpret_cast<const VkRenderPassSampleLocationsBeginInfoEXT*>(nodes[i]);
+                    fields(archive, node);
+                }
+                break;
+            case VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO:
+                if constexpr (A::reading)
+                {
+                    auto* node = archive.template allocate<VkRenderPassMultiviewCreateInfo>(1);
+                    node->sType = type;
+                    fields(archive, *node);
+                    auto* base = reinterpret_cast<VkBaseOutStructure*>(node);
+                    if (previous)
+                    {
+                        previous->pNext = base;
+                    }
+                    else
+                    {
+                        next = node;
+                    }
+                    previous = base;
+                }
+                else
+                {
+                    auto node = *reinterpret_cast<const VkRenderPassMultiviewCreateInfo*>(nodes[i]);
+                    fields(archive, node);
+                }
+                break;
+            case VK_STRUCTURE_TYPE_RENDER_PASS_INPUT_ATTACHMENT_ASPECT_CREATE_INFO:
+                if constexpr (A::reading)
+                {
+                    auto* node = archive.template allocate<VkRenderPassInputAttachmentAspectCreateInfo>(1);
+                    node->sType = type;
+                    fields(archive, *node);
+                    auto* base = reinterpret_cast<VkBaseOutStructure*>(node);
+                    if (previous)
+                    {
+                        previous->pNext = base;
+                    }
+                    else
+                    {
+                        next = node;
+                    }
+                    previous = base;
+                }
+                else
+                {
+                    auto node = *reinterpret_cast<const VkRenderPassInputAttachmentAspectCreateInfo*>(nodes[i]);
+                    fields(archive, node);
+                }
+                break;
+            case VK_STRUCTURE_TYPE_TILE_MEMORY_SIZE_INFO_QCOM:
+                if constexpr (A::reading)
+                {
+                    auto* node = archive.template allocate<VkTileMemorySizeInfoQCOM>(1);
+                    node->sType = type;
+                    fields(archive, *node);
+                    auto* base = reinterpret_cast<VkBaseOutStructure*>(node);
+                    if (previous)
+                    {
+                        previous->pNext = base;
+                    }
+                    else
+                    {
+                        next = node;
+                    }
+                    previous = base;
+                }
+                else
+                {
+                    auto node = *reinterpret_cast<const VkTileMemorySizeInfoQCOM*>(nodes[i]);
+                    fields(archive, node);
+                }
+                break;
+            case VK_STRUCTURE_TYPE_RENDER_PASS_TILE_SHADING_CREATE_INFO_QCOM:
+                if constexpr (A::reading)
+                {
+                    auto* node = archive.template allocate<VkRenderPassTileShadingCreateInfoQCOM>(1);
+                    node->sType = type;
+                    fields(archive, *node);
+                    auto* base = reinterpret_cast<VkBaseOutStructure*>(node);
+                    if (previous)
+                    {
+                        previous->pNext = base;
+                    }
+                    else
+                    {
+                        next = node;
+                    }
+                    previous = base;
+                }
+                else
+                {
+                    auto node = *reinterpret_cast<const VkRenderPassTileShadingCreateInfoQCOM*>(nodes[i]);
                     fields(archive, node);
                 }
                 break;

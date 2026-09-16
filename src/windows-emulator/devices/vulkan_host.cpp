@@ -5221,6 +5221,51 @@ namespace sogen
 
     namespace
     {
+        void translate_render_pass_reference(const VkAttachmentReference* reference)
+        {
+            if (reference)
+            {
+                auto& value = *const_cast<VkAttachmentReference*>(reference);
+                value.layout = translate_layout(value.layout);
+            }
+        }
+
+        void translate_render_pass_layouts(VkRenderPassCreateInfo& info)
+        {
+            // The legacy structures keep their native semantics; only virtual swapchain PRESENT layouts need translation.
+            for (uint32_t i = 0; i < info.attachmentCount; ++i)
+            {
+                auto& attachment = const_cast<VkAttachmentDescription&>(info.pAttachments[i]);
+                attachment.initialLayout = translate_layout(attachment.initialLayout);
+                attachment.finalLayout = translate_layout(attachment.finalLayout);
+            }
+            for (uint32_t i = 0; i < info.subpassCount; ++i)
+            {
+                const auto& subpass = info.pSubpasses[i];
+                for (uint32_t j = 0; j < subpass.inputAttachmentCount; ++j)
+                {
+                    translate_render_pass_reference(&subpass.pInputAttachments[j]);
+                }
+                for (uint32_t j = 0; j < subpass.colorAttachmentCount; ++j)
+                {
+                    translate_render_pass_reference(&subpass.pColorAttachments[j]);
+                    if (subpass.pResolveAttachments)
+                    {
+                        translate_render_pass_reference(&subpass.pResolveAttachments[j]);
+                    }
+                }
+                translate_render_pass_reference(subpass.pDepthStencilAttachment);
+            }
+            for (const auto* node = static_cast<const VkBaseInStructure*>(info.pNext); node; node = node->pNext)
+            {
+                if (node->sType == VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT)
+                {
+                    const auto* map = reinterpret_cast<const VkRenderPassFragmentDensityMapCreateInfoEXT*>(node);
+                    translate_render_pass_reference(&map->fragmentDensityMapAttachment);
+                }
+            }
+        }
+
         void translate_render_pass_reference(const VkAttachmentReference2* reference)
         {
             if (!reference)
@@ -5296,6 +5341,57 @@ namespace sogen
                     map.fragmentDensityMapAttachment.layout = translate_layout(map.fragmentDensityMapAttachment.layout);
                 }
             }
+        }
+    }
+
+    int32_t vulkan_host::create_render_pass_full(uint64_t device, std::span<const std::byte> packet, uint64_t& out_render_pass)
+    {
+        namespace wire = gpu_bridge::render_pass_wire;
+        out_render_pass = 0;
+        const auto dev = this->impl_->devices.find(device);
+        if (dev == this->impl_->devices.end() || !dev->second.create_render_pass || !dev->second.destroy_render_pass)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        try
+        {
+            wire::reader reader(packet);
+            VkRenderPassCreateInfo info{};
+            wire::decode(reader, info);
+            translate_render_pass_layouts(info);
+            VkRenderPass render_pass{};
+            const VkResult result = dev->second.create_render_pass(dev->second.handle, &info, nullptr, &render_pass);
+            if (result != VK_SUCCESS)
+            {
+                return result;
+            }
+            bool has_depth = false;
+            for (uint32_t i = 0; i < info.subpassCount; ++i)
+            {
+                has_depth |= info.pSubpasses[i].pDepthStencilAttachment &&
+                             info.pSubpasses[i].pDepthStencilAttachment->attachment != VK_ATTACHMENT_UNUSED;
+            }
+            const uint64_t id = this->impl_->next_id++;
+            try
+            {
+                this->impl_->render_passes.emplace(
+                    id, impl::render_pass_data{.handle = render_pass, .device_id = device, .has_depth = has_depth});
+            }
+            catch (...)
+            {
+                dev->second.destroy_render_pass(dev->second.handle, render_pass, nullptr);
+                throw;
+            }
+            out_render_pass = id;
+            return VK_SUCCESS;
+        }
+        catch (const wire::error& error)
+        {
+            return error.result;
+        }
+        catch (const std::bad_alloc&)
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
         }
     }
 

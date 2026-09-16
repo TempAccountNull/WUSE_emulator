@@ -4907,38 +4907,13 @@ extern "C"
     }
 
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo* pCreateInfo,
-                                                                            const VkAllocationCallbacks*, VkRenderPass* pRenderPass)
+                                                                            const VkAllocationCallbacks* pAllocator,
+                                                                            VkRenderPass* pRenderPass)
     {
+        // The original reduced packet used the interpretation below; the full packet now retains every attachment and subpass.
         // The first attachment drives the color attachment; a subpass depth-stencil attachment (if any)
         // contributes its format so the bridge adds a matching depth attachment.
-        const VkAttachmentDescription& a = pCreateInfo->pAttachments[0];
-        gb::create_render_pass_request request{};
-        request.device = to_object_id(device);
-        request.format = static_cast<uint32_t>(a.format);
-        request.load_op = static_cast<uint32_t>(a.loadOp);
-        request.store_op = static_cast<uint32_t>(a.storeOp);
-        request.initial_layout = static_cast<uint32_t>(a.initialLayout);
-        request.final_layout = static_cast<uint32_t>(a.finalLayout);
-        if (pCreateInfo->subpassCount > 0 && pCreateInfo->pSubpasses[0].pDepthStencilAttachment)
-        {
-            const uint32_t depth_index = pCreateInfo->pSubpasses[0].pDepthStencilAttachment->attachment;
-            if (depth_index != VK_ATTACHMENT_UNUSED && depth_index < pCreateInfo->attachmentCount)
-            {
-                request.depth_format = static_cast<uint32_t>(pCreateInfo->pAttachments[depth_index].format);
-            }
-        }
-
-        gb::object_response response{};
-        if (!bridge_call(gb::ioctl_create_render_pass, &request, sizeof(request), &response, sizeof(response)))
-        {
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
-        if (response.vk_result != VK_SUCCESS)
-        {
-            return static_cast<VkResult>(response.vk_result);
-        }
-        *pRenderPass = to_handle<VkRenderPass>(response.object);
-        return VK_SUCCESS;
+        return create_render_pass_object(gb::ioctl_create_render_pass_full, device, pCreateInfo, pAllocator, pRenderPass);
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkDestroyRenderPass(VkDevice device, VkRenderPass renderPass,
