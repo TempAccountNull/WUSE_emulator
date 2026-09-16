@@ -22,6 +22,18 @@ namespace sogen
 
     namespace
     {
+        // Register reads and exception construction materialize temporary objects. Keep them out of
+        // the instruction observer's common path without weakening its callback or error handling.
+        NO_INLINE void capture_callback_return(vcpu_context& vcpu, emulator_thread& thread)
+        {
+            thread.callback_return_rax = vcpu.cpu.reg<uint64_t>(x86_register::rax);
+        }
+
+        [[noreturn]] NO_INLINE void throw_missing_execution_thread()
+        {
+            throw std::runtime_error("No active thread!");
+        }
+
         void adjust_working_directory(application_settings& app_settings)
         {
             if (!app_settings.working_directory.empty())
@@ -713,7 +725,8 @@ namespace sogen
           process(*this->emu_, memory, *this->clock_, this->callbacks),
           use_relative_time_(settings.use_relative_time),
           instruction_precision_(settings.use_instruction_precision && this->emu_->supports_instruction_counting()),
-          vcpu_count_(static_cast<uint32_t>(this->emu_->vcpu_count()))
+          vcpu_count_(static_cast<uint32_t>(this->emu_->vcpu_count())),
+          use_section_first_execution_hooks_(!this->emu_->supports_global_memory_execution_hooks())
     {
         if (this->vcpu_count_ == 0)
         {
@@ -929,11 +942,15 @@ namespace sogen
 
     void windows_emulator::on_instruction_execution(vcpu_context& vcpu, const uint64_t address)
     {
-        auto& thread = vcpu.thread();
+        if (!vcpu.active_thread)
+        {
+            throw_missing_execution_thread();
+        }
+        auto& thread = *vcpu.active_thread;
 
         if (!thread.callback_stack.empty() && address == this->process.zw_callback_return)
         {
-            thread.callback_return_rax = vcpu.cpu.reg<uint64_t>(x86_register::rax);
+            capture_callback_return(vcpu, thread);
         }
 
         ++this->executed_instructions_;
@@ -946,7 +963,10 @@ namespace sogen
         thread.previous_ip = thread.current_ip;
         thread.current_ip = address;
 
-        if (!this->uses_section_first_execution_hooks())
+        // A cache hit needs no module lookup, hook removal, or first-execution event construction.
+        // Keep the range test here so it also avoids entering the larger tracking function.
+        if (!this->use_section_first_execution_hooks_ &&
+            address - this->last_executed_section_.start >= this->last_executed_section_.length)
         {
             this->track_section_first_execution(address);
         }
@@ -956,10 +976,10 @@ namespace sogen
 
     bool windows_emulator::uses_section_first_execution_hooks() const
     {
-        return !this->emu().supports_global_memory_execution_hooks();
+        return this->use_section_first_execution_hooks_;
     }
 
-    void windows_emulator::track_section_first_execution(const uint64_t address)
+    NO_INLINE void windows_emulator::track_section_first_execution(const uint64_t address)
     {
         if (address - this->last_executed_section_.start < this->last_executed_section_.length)
         {

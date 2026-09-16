@@ -174,15 +174,26 @@ impl<Func: ?Sized> HookContainer<Func> {
     where
         F: FnMut(&Func),
     {
-        if self.hooks.is_empty() {
-            return;
+        match self.hooks.len() {
+            0 => (),
+            1 => {
+                let was_iterating = self.do_pre_access_work();
+                callback(self.hooks[0].1.as_ref());
+                self.do_post_access_work(was_iterating);
+            }
+            _ => self.for_each_multiple_hook(callback),
         }
-        let was_iterating = self.do_pre_access_work();
+    }
 
+    #[inline(never)]
+    fn for_each_multiple_hook<F>(&mut self, mut callback: F)
+    where
+        F: FnMut(&Func),
+    {
+        let was_iterating = self.do_pre_access_work();
         for (_, func) in &self.hooks {
             callback(func.as_ref());
         }
-
         self.do_post_access_work(was_iterating);
     }
 
@@ -391,15 +402,25 @@ impl ExecutionHooks {
             func(address);
         });
 
+        if !self.ranged_hooks.is_empty() {
+            self.run_ranged_hooks(address);
+        }
+
+        let (word, bit) = Self::address_filter_bit(address);
+        if self.address_filter[word] & bit != 0 {
+            self.run_specific_hooks(address);
+        }
+    }
+
+    #[inline(never)]
+    fn run_ranged_hooks(&mut self, address: u64) {
         self.ranged_hooks.for_each_hook(|func| {
             func(address);
         });
+    }
 
-        let (word, bit) = Self::address_filter_bit(address);
-        if self.address_filter[word] & bit == 0 {
-            return;
-        }
-
+    #[inline(never)]
+    fn run_specific_hooks(&mut self, address: u64) {
         let mapping = self.address_mapping.get(&address);
         if mapping.is_none() {
             return;
@@ -1752,6 +1773,174 @@ mod movemask_decode_tests {
                 .lift(&mut *emu.vm.cpu, 0x10000)
                 .unwrap_or_else(|e| panic!("{bytes:x?}: {e:?}"));
             assert_eq!(next, 0x10000 + bytes.len() as u64, "{}", lifter.disasm);
+        }
+    }
+}
+
+#[cfg(test)]
+mod hook_hotpath_tests {
+    use super::*;
+
+    #[test]
+    fn single_and_multiple_dispatch_preserve_deferred_changes_and_order() {
+        for count in [1, 3] {
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let mut hooks: HookContainer<dyn Fn()> = HookContainer::new();
+            let mut ids = Vec::new();
+            for index in 0..count {
+                let seen = seen.clone();
+                ids.push(hooks.add_hook(Box::new(move || seen.borrow_mut().push(index))));
+            }
+            let outer = hooks.do_pre_access_work();
+            hooks.remove_hook(ids[0]);
+            let added_seen = seen.clone();
+            let added = hooks.add_hook(Box::new(move || added_seen.borrow_mut().push(99)));
+            hooks.for_each_hook(|callback| callback());
+            assert_eq!(*seen.borrow(), (0..count).collect::<Vec<_>>());
+            assert!(hooks.is_iterating);
+            assert_eq!(hooks.hooks_to_remove.len(), 1);
+            assert_eq!(hooks.hooks_to_add.len(), 1);
+            hooks.access_hook(added, |_| panic!("deferred addition visible early"));
+            hooks.do_post_access_work(outer);
+            assert!(!hooks.is_iterating);
+            assert!(hooks.hooks_to_remove.is_empty());
+            assert!(hooks.hooks_to_add.is_empty());
+            seen.borrow_mut().clear();
+            hooks.for_each_hook(|callback| callback());
+            let mut expected: Vec<_> = (1..count).collect();
+            expected.push(99);
+            assert_eq!(*seen.borrow(), expected);
+        }
+    }
+
+    #[test]
+    fn scheduled_generic_range_and_exact_order_survives_cardinality_changes() {
+        for generic_count in [0, 1, 3] {
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let mut hooks =
+                ExecutionHooks::new(Rc::new(RefCell::new(false)), Rc::new(Cell::new(false)));
+            let address = 0xffff_0123_4567_89abu64;
+            let scheduled = seen.clone();
+            hooks.schedule(Box::new(move || scheduled.borrow_mut().push((0, 0))));
+            let mut ids = Vec::new();
+            for index in 0..generic_count {
+                let seen = seen.clone();
+                ids.push(hooks.add_generic_hook(Box::new(move |actual| {
+                    seen.borrow_mut().push((10 + index, actual));
+                })));
+            }
+            for index in 0..2 {
+                let seen = seen.clone();
+                hooks.add_range_hook(
+                    address,
+                    2,
+                    Box::new(move |actual| {
+                        seen.borrow_mut().push((20 + index, actual));
+                    }),
+                );
+            }
+            for index in 0..2 {
+                let seen = seen.clone();
+                hooks.add_specific_hook(
+                    address,
+                    Box::new(move |actual| {
+                        seen.borrow_mut().push((30 + index, actual));
+                    }),
+                );
+            }
+            hooks.run_hooks(address);
+            let mut expected = vec![(0, 0)];
+            expected.extend((0..generic_count).map(|index| (10 + index, address)));
+            expected.extend([(20, address), (21, address), (30, address), (31, address)]);
+            assert_eq!(*seen.borrow(), expected);
+            for id in ids {
+                hooks.remove_generic_hook(id);
+            }
+            seen.borrow_mut().clear();
+            hooks.run_hooks(address + 1);
+            assert_eq!(*seen.borrow(), vec![(20, address + 1), (21, address + 1)]);
+        }
+    }
+
+    #[test]
+    fn block_callbacks_keep_full_address_and_instruction_count() {
+        for count in [0, 1, 3] {
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let mut hooks =
+                ExecutionHooks::new(Rc::new(RefCell::new(false)), Rc::new(Cell::new(false)));
+            for index in 0..count {
+                let seen = seen.clone();
+                hooks.add_block_hook(Box::new(move |address, instructions| {
+                    seen.borrow_mut().push((index, address, instructions));
+                }));
+            }
+            hooks.on_block(0xffff_1234_5678_9abc, 0x1_0000_0001);
+            assert_eq!(
+                *seen.borrow(),
+                (0..count)
+                    .map(|index| (index, 0xffff_1234_5678_9abc, 0x1_0000_0001))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn invalidation_before_dispatch_suppresses_every_callback() {
+        let mut vm = create_x64_vm();
+        let mut hooks = ExecutionHooks::new(Rc::new(RefCell::new(true)), Rc::new(Cell::new(true)));
+        hooks.schedule(Box::new(|| panic!("scheduled callback after invalidation")));
+        hooks.add_generic_hook(Box::new(|_| panic!("generic callback after invalidation")));
+        hooks.execute(&mut vm.cpu, 0x1_0000_0000);
+        assert_eq!(vm.cpu.exception.code, ExceptionCode::Environment as u32);
+        assert_eq!(vm.cpu.exception.value, CACHE_INVALIDATED);
+        assert_eq!(hooks.one_time_callbacks.len(), 1);
+    }
+
+    #[test]
+    fn callback_stop_keeps_remaining_callbacks_and_precedes_invalidation() {
+        for stop_requested in [false, true] {
+            let mut vm = create_x64_vm();
+            let stop = Rc::new(RefCell::new(false));
+            let invalidate = Rc::new(Cell::new(false));
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let mut hooks = ExecutionHooks::new(stop.clone(), invalidate.clone());
+            let address = 0x1234_5678_9abcu64;
+            let requested = seen.clone();
+            hooks.add_generic_hook(Box::new(move |actual| {
+                requested.borrow_mut().push((0, actual));
+                *stop.borrow_mut() = stop_requested;
+                invalidate.set(true);
+            }));
+            let generic = seen.clone();
+            hooks.add_generic_hook(Box::new(move |actual| {
+                generic.borrow_mut().push((1, actual))
+            }));
+            let ranged = seen.clone();
+            hooks.add_range_hook(
+                address,
+                2,
+                Box::new(move |actual| ranged.borrow_mut().push((2, actual))),
+            );
+            let exact = seen.clone();
+            hooks.add_specific_hook(
+                address,
+                Box::new(move |actual| exact.borrow_mut().push((3, actual))),
+            );
+            hooks.execute(&mut vm.cpu, address);
+            assert_eq!(
+                *seen.borrow(),
+                vec![(0, address), (1, address), (2, address), (3, address)]
+            );
+            if stop_requested {
+                assert_eq!(
+                    vm.cpu.exception.code,
+                    ExceptionCode::InstructionLimit as u32
+                );
+                assert_eq!(vm.cpu.exception.value, address);
+            } else {
+                assert_eq!(vm.cpu.exception.code, ExceptionCode::Environment as u32);
+                assert_eq!(vm.cpu.exception.value, CACHE_INVALIDATED);
+            }
         }
     }
 }

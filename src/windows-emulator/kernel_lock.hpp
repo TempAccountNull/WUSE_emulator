@@ -1,5 +1,7 @@
 #pragma once
 
+#include <platform/compiler.hpp>
+
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -73,18 +75,7 @@ namespace sogen
                 guest_callback_active_ = true;
                 return;
             }
-            assert(!this->is_held_by_current_thread() && "The kernel lock is not recursive");
-
-            if (profiling_enabled())
-            {
-                this->lock_profiled();
-            }
-            else
-            {
-                this->mutex_.lock();
-            }
-
-            this->owner_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+            this->lock_slow();
         }
 
         // Acquire only if the lock is free. Lets a host-owned thread touch kernel state without ever stalling
@@ -122,14 +113,7 @@ namespace sogen
                 guest_callback_active_ = false;
                 return;
             }
-            this->owner_.store({}, std::memory_order_relaxed);
-
-            if (profiling_enabled())
-            {
-                this->held_nanos_.fetch_add(nanos_since(this->held_since_), std::memory_order_relaxed);
-            }
-
-            this->mutex_.unlock();
+            this->unlock_slow();
         }
 
         bool is_held_by_current_thread() const
@@ -157,6 +141,36 @@ namespace sogen
 
       private:
         using clock = std::chrono::steady_clock;
+
+        // A borrowed callback only changes the thread-local borrowing flag. The real mutex and
+        // profiling work stay out of that path; the surrounding quantum still owns the mutex.
+        NO_INLINE void lock_slow()
+        {
+            assert(!this->is_held_by_current_thread() && "The kernel lock is not recursive");
+
+            if (profiling_enabled())
+            {
+                this->lock_profiled();
+            }
+            else
+            {
+                this->mutex_.lock();
+            }
+
+            this->owner_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        }
+
+        NO_INLINE void unlock_slow()
+        {
+            this->owner_.store({}, std::memory_order_relaxed);
+
+            if (profiling_enabled())
+            {
+                this->held_nanos_.fetch_add(nanos_since(this->held_since_), std::memory_order_relaxed);
+            }
+
+            this->mutex_.unlock();
+        }
 
         static uint64_t nanos_since(const clock::time_point start)
         {

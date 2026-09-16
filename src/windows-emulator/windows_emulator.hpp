@@ -436,6 +436,9 @@ namespace sogen
         bool use_relative_time_{false}; // TODO: Get rid of that
         bool instruction_precision_{true};
         uint32_t vcpu_count_{1};
+        // This capability is constant for the selected backend's lifetime. It is derived on
+        // construction, not serialized guest state, including when a snapshot is restored.
+        const bool use_section_first_execution_hooks_;
         std::atomic_bool should_stop{false};
 
         // The emulator kernel lock: held by all code touching shared kernel state,

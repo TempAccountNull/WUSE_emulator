@@ -28,3 +28,31 @@ modes for both builds (204 executions). New tests cover CPU/address identity,
 large callback ownership, self/peer removal lifetime, nested state restoration,
 exceptions and empty callbacks. Exception checks stay within C++; no support
 for unwinding through the Rust extern-C boundary is claimed.
+
+
+Instruction observer common paths
+
+Cache the backend's immutable global-execution-hook capability. Keep section
+cache hits, borrowed kernel locking and the single registered Rust callback
+on short paths; retain the original slower paths for the other cases. Callback
+ordering, mutation deferral, locks, instruction counts, quantum and trace
+events remain in place. No compiler security instrumentation is disabled.
+
+Four 60-second real-game integrity-checkpoint replays in baseline/candidate/
+candidate/baseline order measured 37.8124 versus 46.3645 million instructions/s,
+22.62% more throughput. Both candidates and both baselines restored the same
+snapshot and processor specification. Verbose reporting and all observers
+remained enabled. All restore checks and sampled SHA states matched. Restore
+and snapshot output were outside the measured interval. This does not measure
+whole-startup duration or frame presentation.
+
+Release and final tidy builds passed. The 44 focused observation, kernel-scope
+and execution-hook tests passed in both interpreter and JIT modes. Rust tests
+passed 33 with one explicitly ignored throughput fixture. The new tests cover
+single/multiple callback mutation and ordering, stop/invalidation precedence,
+callback ownership, section cache replacement and real unload/reload.
+
+Measurement: integrity-callback-benchmark-1789555910253601600.json in the local
+PatchScanner audit artifacts. Native baseline/candidate analyzer hashes:
+4cce07c9df12bbe6ef3e39ffc7ae0e6322328df17d8cae93a0dc4884c8589c83 /
+519d58ac6becf05677b03c0caa500f42e01b4651b027741e8f4775bdec14055d.
