@@ -464,6 +464,22 @@ namespace sogen::gpu_bridge::render_pass_wire
     }
 
     template <>
+    struct structure_type<VkRenderingAreaInfo>
+    {
+        static constexpr auto type = VK_STRUCTURE_TYPE_RENDERING_AREA_INFO;
+    };
+
+    template <typename A>
+    void fields(A& a, VkRenderingAreaInfo& v)
+    {
+        value(a, v.viewMask);
+        value(a, v.colorAttachmentCount);
+        array(a, v.pColorAttachmentFormats, v.colorAttachmentCount);
+        value(a, v.depthAttachmentFormat);
+        value(a, v.stencilAttachmentFormat);
+    }
+
+    template <>
     struct structure_type<VkRenderPassCreateInfo>
     {
         static constexpr auto type = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -542,6 +558,62 @@ namespace sogen::gpu_bridge::render_pass_wire
     {
         value(a, v.flags);
         value(a, v.tileApronSize);
+    }
+
+    template <typename A>
+    void fields(A& a, VkBufferImageCopy2& v)
+    {
+        value(a, v.bufferOffset);
+        value(a, v.bufferRowLength);
+        value(a, v.bufferImageHeight);
+        value(a, v.imageSubresource.aspectMask);
+        value(a, v.imageSubresource.mipLevel);
+        value(a, v.imageSubresource.baseArrayLayer);
+        value(a, v.imageSubresource.layerCount);
+        value(a, v.imageOffset.x);
+        value(a, v.imageOffset.y);
+        value(a, v.imageOffset.z);
+        value(a, v.imageExtent.width);
+        value(a, v.imageExtent.height);
+        value(a, v.imageExtent.depth);
+    }
+
+    template <>
+    struct structure_type<VkBufferImageCopy2>
+    {
+        static constexpr auto type = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
+    };
+
+    template <>
+    struct structure_type<VkCopyImageToBufferInfo2>
+    {
+        static constexpr auto type = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2;
+    };
+
+    template <typename A>
+    void fields(A& a, VkCopyImageToBufferInfo2& v)
+    {
+        handle(a, v.srcImage);
+        value(a, v.srcImageLayout);
+        handle(a, v.dstBuffer);
+        value(a, v.regionCount);
+        if (!v.regionCount)
+        {
+            throw error("image-to-buffer copy requires at least one region");
+        }
+        array(a, v.pRegions, v.regionCount);
+    }
+
+    template <>
+    struct structure_type<VkCopyCommandTransformInfoQCOM>
+    {
+        static constexpr auto type = VK_STRUCTURE_TYPE_COPY_COMMAND_TRANSFORM_INFO_QCOM;
+    };
+
+    template <typename A>
+    void fields(A& a, VkCopyCommandTransformInfoQCOM& v)
+    {
+        value(a, v.transform);
     }
 
     template <>
@@ -926,6 +998,8 @@ namespace sogen::gpu_bridge::render_pass_wire
     {
         switch (type)
         {
+        case VK_STRUCTURE_TYPE_COPY_COMMAND_TRANSFORM_INFO_QCOM:
+            return parent == VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
         case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_ACQUIRE_UNMODIFIED_EXT:
             return parent == VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER || parent == VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 ||
                    parent == VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER || parent == VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -1012,6 +1086,29 @@ namespace sogen::gpu_bridge::render_pass_wire
             seen[i] = type;
             switch (type)
             {
+            case VK_STRUCTURE_TYPE_COPY_COMMAND_TRANSFORM_INFO_QCOM:
+                if constexpr (A::reading)
+                {
+                    auto* node = archive.template allocate<VkCopyCommandTransformInfoQCOM>(1);
+                    node->sType = type;
+                    fields(archive, *node);
+                    auto* base = reinterpret_cast<VkBaseOutStructure*>(node);
+                    if (previous)
+                    {
+                        previous->pNext = base;
+                    }
+                    else
+                    {
+                        next = node;
+                    }
+                    previous = base;
+                }
+                else
+                {
+                    auto node = *reinterpret_cast<const VkCopyCommandTransformInfoQCOM*>(nodes[i]);
+                    fields(archive, node);
+                }
+                break;
             case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_ACQUIRE_UNMODIFIED_EXT:
                 if constexpr (A::reading)
                 {

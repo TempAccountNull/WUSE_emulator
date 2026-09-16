@@ -16,6 +16,7 @@
 bool test_synchronization(PFN_vkGetInstanceProcAddr, VkInstance, VkDevice, VkQueue, uint32_t, bool);
 
 bool test_render_pass2(PFN_vkGetInstanceProcAddr, VkInstance, VkPhysicalDevice, VkDevice, VkQueue, uint32_t);
+bool test_layered_resolve_readback(PFN_vkGetInstanceProcAddr);
 
 namespace
 {
@@ -1128,7 +1129,16 @@ int main(int argc, char** argv)
 
     VkApplicationInfo app_info{};
     app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    app_info.apiVersion = VK_API_VERSION_1_0;
+    uint32_t loader_version = VK_API_VERSION_1_0;
+    const auto enumerate_version =
+        reinterpret_cast<PFN_vkEnumerateInstanceVersion>(get_instance_proc(nullptr, "vkEnumerateInstanceVersion"));
+    if (enumerate_version && enumerate_version(&loader_version) != VK_SUCCESS)
+    {
+        std::printf("[shim-test] vkEnumerateInstanceVersion failed\n");
+        return 3;
+    }
+    // Core 1.2/1.3 test calls require that version to be requested, in addition to physical-device support.
+    app_info.apiVersion = loader_version < VK_API_VERSION_1_3 ? loader_version : VK_API_VERSION_1_3;
 
     VkInstanceCreateInfo create_info{};
     create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -1155,6 +1165,7 @@ int main(int argc, char** argv)
     bool persistent_coherent_ok = false;
     bool synchronization_test_ok = false;
     bool render_pass_test_ok = false;
+    bool layered_resolve_test_ok = false;
     bool image_readback_ok = false;
     bool dynamic_commands_ok = false;
     uint32_t count = 0;
@@ -1267,8 +1278,12 @@ int main(int argc, char** argv)
             }
         }
 
+        VkPhysicalDeviceProperties selected_properties{};
+        get_properties(devices[0], &selected_properties);
+        const bool core12_supported = app_info.apiVersion >= VK_API_VERSION_1_2 && selected_properties.apiVersion >= VK_API_VERSION_1_2;
+        const bool core13_supported = app_info.apiVersion >= VK_API_VERSION_1_3 && selected_properties.apiVersion >= VK_API_VERSION_1_3;
         bool synchronization2_supported = false;
-        if (get_features2)
+        if (get_features2 && core13_supported)
         {
             VkPhysicalDeviceVulkan13Features vulkan13_features{};
             vulkan13_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
@@ -1443,7 +1458,16 @@ int main(int argc, char** argv)
                 }
                 synchronization_test_ok =
                     test_synchronization(get_instance_proc, instance, device, queue, graphics_family, timestamp2_test_supported);
-                render_pass_test_ok = test_render_pass2(get_instance_proc, instance, devices[0], device, queue, graphics_family);
+                if (core12_supported)
+                {
+                    render_pass_test_ok = test_render_pass2(get_instance_proc, instance, devices[0], device, queue, graphics_family);
+                }
+                else
+                {
+                    std::printf("[shim-test] render-pass2 core fixture -> SKIP (requested/device Vulkan 1.2 unavailable)\n");
+                    render_pass_test_ok = true;
+                }
+                layered_resolve_test_ok = test_layered_resolve_readback(get_instance_proc);
                 pipeline_cache_test_ok = test_pipeline_cache(get_instance_proc, instance, device);
                 dynamic_commands_ok = test_dynamic_commands(get_instance_proc, instance, devices[0], graphics_family);
 
@@ -1457,10 +1481,10 @@ int main(int argc, char** argv)
         destroy_instance(instance, nullptr);
     }
 
-    const bool all_ok = synchronization_test_ok && render_pass_test_ok && dynamic_commands_ok && timestamp2_test_ok &&
-                        calibrated_timestamps_test_ok && transform_feedback_test_ok && transform_feedback_capabilities_ok &&
-                        shader_identifier_test_ok && pipeline_cache_test_ok && fill_readback_ok && persistent_coherent_ok &&
-                        image_readback_ok;
+    const bool all_ok = synchronization_test_ok && render_pass_test_ok && layered_resolve_test_ok && dynamic_commands_ok &&
+                        timestamp2_test_ok && calibrated_timestamps_test_ok && transform_feedback_test_ok &&
+                        transform_feedback_capabilities_ok && shader_identifier_test_ok && pipeline_cache_test_ok && fill_readback_ok &&
+                        persistent_coherent_ok && image_readback_ok;
     std::printf("[shim-test] %s\n", all_ok ? "ok" : "FAILED");
     return all_ok ? 0 : 6;
 }

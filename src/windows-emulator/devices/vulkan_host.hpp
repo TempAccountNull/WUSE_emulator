@@ -34,6 +34,8 @@ namespace sogen
         // Creates a bare instance (no layers/extensions). out_instance is set to a fresh object id
         // on success, or 0 on failure.
         int32_t create_instance(uint64_t& out_instance);
+        // Reports the version used for this native instance, not the loader's maximum supported version.
+        int32_t get_instance_api_version(uint64_t instance, uint32_t& out_version) const;
         void destroy_instance(uint64_t instance);
         bool owns_device(uint64_t instance, uint64_t device) const;
 
@@ -270,6 +272,8 @@ namespace sogen
                                       size_t data_size);
         int32_t cmd_clear_depth_stencil_image(uint64_t command_buffer, uint64_t image, uint32_t image_layout, float depth, uint32_t stencil,
                                               const subresource_range& range);
+        // Decodes all region fields and validates resource ownership before recording one native copy call.
+        int32_t cmd_copy_image_to_buffer_full(uint64_t command_buffer, std::span<const std::byte> packet, bool copy2);
         // Copies mip 0 / layer 0 of the image (tightly packed) into the buffer at offset 0.
         int32_t cmd_copy_image_to_buffer(uint64_t command_buffer, uint64_t image, uint32_t image_layout, uint64_t buffer, uint32_t width,
                                          uint32_t height, uint32_t aspect_mask);
@@ -456,6 +460,7 @@ namespace sogen
         int32_t cmd_synchronization(uint64_t command_buffer, std::span<const std::byte> packet);
         int32_t render_pass_command(uint32_t command, uint64_t command_buffer, std::span<const std::byte> packet);
         int32_t get_render_area_granularity(uint64_t device, uint64_t render_pass, uint32_t& width, uint32_t& height);
+        int32_t get_rendering_area_granularity(uint64_t device, std::span<const std::byte> packet, uint32_t& width, uint32_t& height);
 
         // One color attachment + an optional depth attachment (depth_format == 0 => color only), single
         // subpass (initial/final layouts as given; PRESENT_SRC_KHR is mapped to TRANSFER_SRC_OPTIMAL).

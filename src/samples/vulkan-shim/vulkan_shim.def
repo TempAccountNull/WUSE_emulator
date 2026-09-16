@@ -41,6 +41,7 @@ EXPORTS
     vkCmdCopyImage2
     vkCmdCopyImageToBuffer
     vkCmdCopyImageToBuffer2
+    vkCmdCopyImageToBuffer2KHR
     vkCmdResolveImage
     vkCmdResolveImage2
     vkCmdUpdateBuffer
@@ -122,6 +123,8 @@ EXPORTS
     vkCmdEndRenderPass2
     vkCmdEndRenderPass2KHR
     vkGetRenderAreaGranularity
+    vkGetRenderingAreaGranularity
+    vkGetRenderingAreaGranularityKHR
     vkCreateSampler
     vkCreateShaderModule
     vkCreateSwapchainKHR

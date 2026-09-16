@@ -208,10 +208,13 @@ namespace sogen::gpu_bridge
         get_render_area_granularity = 0x8A9,
         cmd_begin_render_pass_full = 0x8AB,
         create_render_pass_full = 0x8AC,
+        get_rendering_area_granularity = 0x8AD,
         cmd_extended_dynamic = 0x8B0,
         get_multisample_properties = 0x8B1,
         cmd_synchronization = 0x8C0,
         get_event_status_owned = 0x8C1,
+        cmd_copy_image_to_buffer_full = 0x8D0,
+        cmd_copy_image_to_buffer2_full = 0x8D1,
     };
 
     inline constexpr uint32_t ioctl_get_event_status_owned = make_ioctl(static_cast<uint32_t>(command::get_event_status_owned));
@@ -323,6 +326,8 @@ namespace sogen::gpu_bridge
     inline constexpr uint32_t ioctl_create_render_pass2 = make_ioctl(static_cast<uint32_t>(command::create_render_pass2));
     inline constexpr uint32_t ioctl_create_framebuffer_full = make_ioctl(static_cast<uint32_t>(command::create_framebuffer_full));
     inline constexpr uint32_t ioctl_get_render_area_granularity = make_ioctl(static_cast<uint32_t>(command::get_render_area_granularity));
+    inline constexpr uint32_t ioctl_get_rendering_area_granularity =
+        make_ioctl(static_cast<uint32_t>(command::get_rendering_area_granularity));
     inline constexpr uint32_t ioctl_destroy_render_pass = make_ioctl(static_cast<uint32_t>(command::destroy_render_pass));
     inline constexpr uint32_t ioctl_create_framebuffer = make_ioctl(static_cast<uint32_t>(command::create_framebuffer));
     inline constexpr uint32_t ioctl_destroy_framebuffer = make_ioctl(static_cast<uint32_t>(command::destroy_framebuffer));

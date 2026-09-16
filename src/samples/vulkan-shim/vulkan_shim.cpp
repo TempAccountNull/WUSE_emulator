@@ -3382,24 +3382,51 @@ extern "C"
         }
     }
 
+    // The retained compatibility opcode has the historical limitations below; this entry point now sends full regions.
     // Copies are remoted assuming tight packing of mip 0 / layer 0 at image offset 0 to buffer offset 0
     // (bufferRowLength/bufferImageHeight/imageOffset are not yet honored).
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage srcImage,
                                                                             VkImageLayout srcImageLayout, VkBuffer dstBuffer,
                                                                             uint32_t regionCount, const VkBufferImageCopy* pRegions)
     {
-        for (uint32_t i = 0; i < regionCount; ++i)
+        auto* const stream = find_command_stream(to_object_id(commandBuffer));
+        if (!stream || stream->error != VK_SUCCESS)
         {
-            const VkBufferImageCopy& r = pRegions[i];
-            gb::cmd_copy_image_to_buffer_request request{};
-            request.command_buffer = to_object_id(commandBuffer);
-            request.image = to_object_id(srcImage);
-            request.buffer = to_object_id(dstBuffer);
-            request.image_layout = static_cast<uint32_t>(srcImageLayout);
-            request.width = r.imageExtent.width;
-            request.height = r.imageExtent.height;
-            request.aspect_mask = r.imageSubresource.aspectMask;
-            record_command(request.command_buffer, gb::command::cmd_copy_image_to_buffer, &request, sizeof(request));
+            return;
+        }
+        try
+        {
+            // The versioned full packet shares the pointer-free region codec with copy-2, but keeps the legacy native call.
+            if (!regionCount || !pRegions || regionCount > gb::render_pass_wire::max_elements ||
+                regionCount > gb::render_pass_wire::max_bytes / sizeof(VkBufferImageCopy2))
+            {
+                throw gb::render_pass_wire::error("invalid or excessive image-to-buffer copy regions");
+            }
+            std::vector<VkBufferImageCopy2> regions(regionCount);
+            for (uint32_t i = 0; i < regionCount; ++i)
+            {
+                const auto& region = pRegions[i];
+                regions[i] = {.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
+                              .pNext = nullptr,
+                              .bufferOffset = region.bufferOffset,
+                              .bufferRowLength = region.bufferRowLength,
+                              .bufferImageHeight = region.bufferImageHeight,
+                              .imageSubresource = region.imageSubresource,
+                              .imageOffset = region.imageOffset,
+                              .imageExtent = region.imageExtent};
+            }
+            const VkCopyImageToBufferInfo2 info{
+                VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2, nullptr, srcImage, srcImageLayout, dstBuffer, regionCount, regions.data()};
+            record_render_pass(commandBuffer, gb::command::cmd_copy_image_to_buffer_full, &info);
+        }
+        catch (const gb::render_pass_wire::error& error)
+        {
+            OutputDebugStringA(error.what());
+            stream->error = error.result;
+        }
+        catch (const std::bad_alloc&)
+        {
+            stream->error = VK_ERROR_OUT_OF_HOST_MEMORY;
         }
     }
 
@@ -3675,19 +3702,13 @@ extern "C"
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
                                                                              const VkCopyImageToBufferInfo2* pCopyImageToBufferInfo)
     {
-        for (uint32_t i = 0; i < pCopyImageToBufferInfo->regionCount; ++i)
-        {
-            const VkBufferImageCopy2& r = pCopyImageToBufferInfo->pRegions[i];
-            gb::cmd_copy_image_to_buffer_request request{};
-            request.command_buffer = to_object_id(commandBuffer);
-            request.image = to_object_id(pCopyImageToBufferInfo->srcImage);
-            request.buffer = to_object_id(pCopyImageToBufferInfo->dstBuffer);
-            request.image_layout = static_cast<uint32_t>(pCopyImageToBufferInfo->srcImageLayout);
-            request.width = r.imageExtent.width;
-            request.height = r.imageExtent.height;
-            request.aspect_mask = r.imageSubresource.aspectMask;
-            record_command(request.command_buffer, gb::command::cmd_copy_image_to_buffer, &request, sizeof(request));
-        }
+        record_render_pass(commandBuffer, gb::command::cmd_copy_image_to_buffer2_full, pCopyImageToBufferInfo);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdCopyImageToBuffer2KHR(VkCommandBuffer commandBuffer,
+                                                                                const VkCopyImageToBufferInfo2* pCopyImageToBufferInfo)
+    {
+        vkCmdCopyImageToBuffer2(commandBuffer, pCopyImageToBufferInfo);
     }
 
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateWin32SurfaceKHR(VkInstance, const VkWin32SurfaceCreateInfoKHR* pCreateInfo,
@@ -4904,6 +4925,53 @@ extern "C"
         {
             OutputDebugStringA("[vulkan-shim] vkGetRenderAreaGranularity failed\n");
         }
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkGetRenderingAreaGranularity(VkDevice device,
+                                                                                   const VkRenderingAreaInfo* pRenderingAreaInfo,
+                                                                                   VkExtent2D* pGranularity)
+    {
+        if (!pGranularity)
+        {
+            OutputDebugStringA("[vulkan-shim] vkGetRenderingAreaGranularity: null output\n");
+            return;
+        }
+        *pGranularity = {};
+        if (!pRenderingAreaInfo)
+        {
+            OutputDebugStringA("[vulkan-shim] vkGetRenderingAreaGranularity: null input\n");
+            return;
+        }
+        try
+        {
+            const auto packet = render_pass_packet(to_object_id(device), *pRenderingAreaInfo);
+            gb::render_area_granularity_response response{};
+            if (bridge_call(gb::ioctl_get_rendering_area_granularity, packet.data(), static_cast<DWORD>(packet.size()), &response,
+                            sizeof(response)) &&
+                response.vk_result == VK_SUCCESS)
+            {
+                *pGranularity = {.width = response.width, .height = response.height};
+            }
+            else
+            {
+                OutputDebugStringA("[vulkan-shim] vkGetRenderingAreaGranularity: native query unavailable or bridge failure\n");
+            }
+        }
+        catch (const gb::render_pass_wire::error& error)
+        {
+            OutputDebugStringA(error.what());
+        }
+        catch (const std::bad_alloc&)
+        {
+            OutputDebugStringA("[vulkan-shim] vkGetRenderingAreaGranularity: out of memory\n");
+        }
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkGetRenderingAreaGranularityKHR(VkDevice device,
+                                                                                      const VkRenderingAreaInfo* pRenderingAreaInfo,
+                                                                                      VkExtent2D* pGranularity)
+    {
+        vkGetRenderingAreaGranularity(device, pRenderingAreaInfo, pGranularity);
     }
 
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo* pCreateInfo,
@@ -6753,7 +6821,7 @@ extern "C"
             {.name = "vkCmdClearDepthStencilImage", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdClearDepthStencilImage)},
             {.name = "vkCmdCopyImageToBuffer", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdCopyImageToBuffer)},
             {.name = "vkCmdCopyImageToBuffer2", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdCopyImageToBuffer2)},
-            {.name = "vkCmdCopyImageToBuffer2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdCopyImageToBuffer2)},
+            {.name = "vkCmdCopyImageToBuffer2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdCopyImageToBuffer2KHR)},
             {.name = "vkCmdCopyBufferToImage", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdCopyBufferToImage)},
             {.name = "vkCmdCopyBufferToImage2", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdCopyBufferToImage2)},
             {.name = "vkCmdCopyBufferToImage2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdCopyBufferToImage2)},
@@ -6792,6 +6860,8 @@ extern "C"
             {.name = "vkCmdEndRenderPass2", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdEndRenderPass2)},
             {.name = "vkCmdEndRenderPass2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdEndRenderPass2KHR)},
             {.name = "vkGetRenderAreaGranularity", .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetRenderAreaGranularity)},
+            {.name = "vkGetRenderingAreaGranularity", .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetRenderingAreaGranularity)},
+            {.name = "vkGetRenderingAreaGranularityKHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetRenderingAreaGranularityKHR)},
             {.name = "vkDestroyRenderPass", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyRenderPass)},
             {.name = "vkCreateFramebuffer", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateFramebuffer)},
             {.name = "vkDestroyFramebuffer", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyFramebuffer)},

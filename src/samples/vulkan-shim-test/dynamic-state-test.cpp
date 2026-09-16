@@ -6,8 +6,15 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan_core.h>
 
+bool test_rendering_granularity(PFN_vkGetInstanceProcAddr get, VkInstance instance, VkPhysicalDevice physical, uint32_t family);
+
 bool test_dynamic_commands(PFN_vkGetInstanceProcAddr get, VkInstance instance, VkPhysicalDevice physical, uint32_t family)
 {
+    if (!test_rendering_granularity(get, instance, physical, family))
+    {
+        return false;
+    }
+
     const auto enumerate =
         reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(get(instance, "vkEnumerateDeviceExtensionProperties"));
     const auto get_features = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(get(instance, "vkGetPhysicalDeviceFeatures2"));

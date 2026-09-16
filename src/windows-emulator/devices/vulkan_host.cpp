@@ -205,6 +205,7 @@ namespace sogen
         struct instance_data
         {
             VkInstance handle{};
+            uint32_t api_version{};
             PFN_vkDestroyInstance destroy_instance{};
             PFN_vkEnumeratePhysicalDevices enumerate_physical_devices{};
             PFN_vkGetPhysicalDeviceProperties get_physical_device_properties{};
@@ -296,6 +297,7 @@ namespace sogen
             PFN_vkCmdClearAttachments cmd_clear_attachments{};
             PFN_vkCmdClearDepthStencilImage cmd_clear_depth_stencil_image{};
             PFN_vkCmdCopyImageToBuffer cmd_copy_image_to_buffer{};
+            PFN_vkCmdCopyImageToBuffer2 cmd_copy_image_to_buffer2{};
             PFN_vkCmdResolveImage cmd_resolve_image{};
             PFN_vkCmdUpdateBuffer cmd_update_buffer{};
             PFN_vkCmdCopyBufferToImage cmd_copy_buffer_to_image{};
@@ -334,6 +336,7 @@ namespace sogen
             PFN_vkCmdNextSubpass2 cmd_next_subpass2{};
             PFN_vkCmdEndRenderPass2 cmd_end_render_pass2{};
             PFN_vkGetRenderAreaGranularity get_render_area_granularity{};
+            PFN_vkGetRenderingAreaGranularity get_rendering_area_granularity{};
             PFN_vkDestroyRenderPass destroy_render_pass{};
             PFN_vkCreateFramebuffer create_framebuffer{};
             PFN_vkDestroyFramebuffer destroy_framebuffer{};
@@ -1110,6 +1113,7 @@ namespace sogen
 
         impl::instance_data data{};
         data.handle = instance;
+        data.api_version = api_version;
         data.destroy_instance = this->impl_->load_instance_proc<PFN_vkDestroyInstance>(instance, "vkDestroyInstance");
         data.enumerate_physical_devices =
             this->impl_->load_instance_proc<PFN_vkEnumeratePhysicalDevices>(instance, "vkEnumeratePhysicalDevices");
@@ -1152,6 +1156,18 @@ namespace sogen
         const uint64_t id = this->impl_->next_id++;
         this->impl_->instances.emplace(id, data);
         out_instance = id;
+        return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::get_instance_api_version(uint64_t instance, uint32_t& out_version) const
+    {
+        out_version = 0;
+        const auto entry = this->impl_->instances.find(instance);
+        if (entry == this->impl_->instances.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        out_version = entry->second.api_version;
         return VK_SUCCESS;
     }
 
@@ -2113,6 +2129,11 @@ namespace sogen
             data.cmd_clear_attachments = reinterpret_cast<PFN_vkCmdClearAttachments>(resolve("vkCmdClearAttachments"));
             data.cmd_clear_depth_stencil_image = reinterpret_cast<PFN_vkCmdClearDepthStencilImage>(resolve("vkCmdClearDepthStencilImage"));
             data.cmd_copy_image_to_buffer = reinterpret_cast<PFN_vkCmdCopyImageToBuffer>(resolve("vkCmdCopyImageToBuffer"));
+            data.cmd_copy_image_to_buffer2 = reinterpret_cast<PFN_vkCmdCopyImageToBuffer2>(resolve("vkCmdCopyImageToBuffer2"));
+            if (!data.cmd_copy_image_to_buffer2)
+            {
+                data.cmd_copy_image_to_buffer2 = reinterpret_cast<PFN_vkCmdCopyImageToBuffer2>(resolve("vkCmdCopyImageToBuffer2KHR"));
+            }
             data.cmd_resolve_image = reinterpret_cast<PFN_vkCmdResolveImage>(resolve("vkCmdResolveImage"));
             data.cmd_update_buffer = reinterpret_cast<PFN_vkCmdUpdateBuffer>(resolve("vkCmdUpdateBuffer"));
             data.cmd_copy_buffer_to_image = reinterpret_cast<PFN_vkCmdCopyBufferToImage>(resolve("vkCmdCopyBufferToImage"));
@@ -2176,6 +2197,15 @@ namespace sogen
                 data.cmd_end_render_pass2 = reinterpret_cast<PFN_vkCmdEndRenderPass2>(resolve("vkCmdEndRenderPass2KHR"));
             }
             data.get_render_area_granularity = reinterpret_cast<PFN_vkGetRenderAreaGranularity>(resolve("vkGetRenderAreaGranularity"));
+            // Native instances currently negotiate at most Vulkan 1.3. The promoted query is
+            // available here only when this device enabled its maintenance5 extension.
+            if (std::ranges::any_of(extensions,
+                                    [](const char* name) { return std::strcmp(name, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0; }))
+            {
+                data.get_rendering_area_granularity =
+                    reinterpret_cast<PFN_vkGetRenderingAreaGranularity>(resolve("vkGetRenderingAreaGranularityKHR"));
+            }
+
             data.destroy_render_pass = reinterpret_cast<PFN_vkDestroyRenderPass>(resolve("vkDestroyRenderPass"));
             data.create_framebuffer = reinterpret_cast<PFN_vkCreateFramebuffer>(resolve("vkCreateFramebuffer"));
             data.destroy_framebuffer = reinterpret_cast<PFN_vkDestroyFramebuffer>(resolve("vkDestroyFramebuffer"));
@@ -3863,6 +3893,79 @@ namespace sogen
         return VK_SUCCESS;
     }
 
+    int32_t vulkan_host::cmd_copy_image_to_buffer_full(uint64_t command_buffer, std::span<const std::byte> packet, bool copy2)
+    {
+        namespace wire = gpu_bridge::render_pass_wire;
+        const auto cb = this->impl_->command_buffers.find(command_buffer);
+        if (cb == this->impl_->command_buffers.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev == this->impl_->devices.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        try
+        {
+            wire::reader reader(packet);
+            VkCopyImageToBufferInfo2 info{};
+            wire::decode(reader, info);
+            const auto image = this->impl_->images.find(wire::handle_id(info.srcImage));
+            const auto buffer = this->impl_->buffers.find(wire::handle_id(info.dstBuffer));
+            if (image == this->impl_->images.end() || buffer == this->impl_->buffers.end() ||
+                image->second.device_id != cb->second.device_id || buffer->second.device_id != cb->second.device_id)
+            {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            info.srcImage = image->second.handle;
+            info.dstBuffer = buffer->second.handle;
+            info.srcImageLayout = translate_layout(info.srcImageLayout);
+            if (copy2)
+            {
+                if (!dev->second.cmd_copy_image_to_buffer2)
+                {
+                    return VK_ERROR_FEATURE_NOT_PRESENT;
+                }
+                dev->second.cmd_copy_image_to_buffer2(cb->second.handle, &info);
+            }
+            else
+            {
+                if (!dev->second.cmd_copy_image_to_buffer)
+                {
+                    return VK_ERROR_FEATURE_NOT_PRESENT;
+                }
+                std::vector<VkBufferImageCopy> regions(info.regionCount);
+                for (uint32_t i = 0; i < info.regionCount; ++i)
+                {
+                    const auto& region = info.pRegions[i];
+                    // Legacy calls cannot express extension nodes. Reject a forged full packet instead of losing that state.
+                    if (region.pNext)
+                    {
+                        return VK_ERROR_FEATURE_NOT_PRESENT;
+                    }
+                    regions[i] = {.bufferOffset = region.bufferOffset,
+                                  .bufferRowLength = region.bufferRowLength,
+                                  .bufferImageHeight = region.bufferImageHeight,
+                                  .imageSubresource = region.imageSubresource,
+                                  .imageOffset = region.imageOffset,
+                                  .imageExtent = region.imageExtent};
+                }
+                dev->second.cmd_copy_image_to_buffer(cb->second.handle, info.srcImage, info.srcImageLayout, info.dstBuffer,
+                                                     info.regionCount, regions.data());
+            }
+            return VK_SUCCESS;
+        }
+        catch (const wire::error& error)
+        {
+            return error.result;
+        }
+        catch (const std::bad_alloc&)
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+
     int32_t vulkan_host::cmd_copy_image_to_buffer(uint64_t command_buffer, uint64_t image, uint32_t image_layout, uint64_t buffer,
                                                   uint32_t width, uint32_t height, uint32_t aspect_mask)
     {
@@ -5522,6 +5625,41 @@ namespace sogen
         width = granularity.width;
         height = granularity.height;
         return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::get_rendering_area_granularity(uint64_t device, std::span<const std::byte> packet, uint32_t& width,
+                                                        uint32_t& height)
+    {
+        namespace wire = gpu_bridge::render_pass_wire;
+        width = height = 0;
+        const auto dev = this->impl_->devices.find(device);
+        if (dev == this->impl_->devices.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (!dev->second.get_rendering_area_granularity)
+        {
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        try
+        {
+            wire::reader reader(packet);
+            VkRenderingAreaInfo info{};
+            wire::decode(reader, info);
+            VkExtent2D granularity{};
+            dev->second.get_rendering_area_granularity(dev->second.handle, &info, &granularity);
+            width = granularity.width;
+            height = granularity.height;
+            return VK_SUCCESS;
+        }
+        catch (const wire::error& error)
+        {
+            return error.result;
+        }
+        catch (const std::bad_alloc&)
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
     }
 
     int32_t vulkan_host::render_pass_command(uint32_t command, uint64_t command_buffer, std::span<const std::byte> packet)

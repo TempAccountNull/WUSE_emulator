@@ -234,6 +234,7 @@ namespace sogen
                     return handle_get_query_pool_results(win_emu, context);
                 case gpu_bridge::ioctl_reset_query_pool:
                     return handle_reset_query_pool(win_emu, context);
+                case gpu_bridge::ioctl_get_rendering_area_granularity:
                 case gpu_bridge::ioctl_create_render_pass_full:
                 case gpu_bridge::ioctl_create_render_pass2:
                 case gpu_bridge::ioctl_create_framebuffer_full:
@@ -2341,6 +2342,13 @@ namespace sogen
                 {
                     win_emu.emu().read_memory(context.input_buffer + sizeof(request), packet.data(), packet.size());
                 }
+                if (code == gpu_bridge::ioctl_get_rendering_area_granularity)
+                {
+                    gpu_bridge::render_area_granularity_response response{};
+                    response.vk_result =
+                        this->vulkan_.get_rendering_area_granularity(request.object, packet, response.width, response.height);
+                    return write_output(win_emu, context, response);
+                }
                 uint64_t object = 0;
                 int32_t result{};
                 if (code == gpu_bridge::ioctl_create_render_pass_full)
@@ -3155,6 +3163,18 @@ namespace sogen
                         return vk_error_initialization_failed;
                     }
                     return this->vulkan_.end_command_buffer(req.command_buffer);
+                }
+                case gpu_bridge::command::cmd_copy_image_to_buffer_full:
+                case gpu_bridge::command::cmd_copy_image_to_buffer2_full: {
+                    gpu_bridge::render_pass_packet request{};
+                    if (!read(request) || request.version != 1 || request.payload_size > 16 * 1024 * 1024 ||
+                        request.payload_size != size - sizeof(request))
+                    {
+                        return vk_error_initialization_failed;
+                    }
+                    return this->vulkan_.cmd_copy_image_to_buffer_full(
+                        request.object, {payload + sizeof(request), request.payload_size},
+                        command == static_cast<uint32_t>(gpu_bridge::command::cmd_copy_image_to_buffer2_full));
                 }
                 case gpu_bridge::command::cmd_synchronization: {
                     gpu_bridge::render_pass_packet request{};
