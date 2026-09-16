@@ -1,5 +1,8 @@
 #include "../std_include.hpp"
 #include <platform/ui_backend.hpp>
+#include "sdl_native_presentation_window.hpp"
+#include "gpu_window_title.hpp"
+#include <cstdio>
 
 #include <SDL3/SDL.h>
 
@@ -660,13 +663,15 @@ namespace sogen
             struct window_state
             {
                 ui_window_desc desc{};
-                SDL_Window* window{};
-                SDL_Renderer* renderer{};
-                SDL_Texture* texture{};
-                int texture_width{};
-                int texture_height{};
-                ui_surface_format texture_format{ui_surface_format::bgra8};
-                bool has_surface{};
+                std::shared_ptr<sdl_native_presentation_window> resources{
+                    std::make_shared<sdl_native_presentation_window>(nullptr, nullptr)};
+                SDL_Window*& window{resources->window};
+                SDL_Renderer*& renderer{resources->renderer};
+                SDL_Texture*& texture{resources->texture};
+                int& texture_width{resources->texture_width};
+                int& texture_height{resources->texture_height};
+                ui_surface_format& texture_format{resources->texture_format};
+                bool& has_surface{resources->has_surface};
             };
 
             struct pending_key_release
@@ -681,7 +686,12 @@ namespace sogen
 
             ~sdl_ui_backend() override
             {
+                this->completion_queue_->close();
                 this->reset();
+                if (this->native_windows_ && !this->native_windows_->drained())
+                {
+                    std::terminate();
+                }
 
                 if (this->initialized_)
                 {
@@ -694,10 +704,17 @@ namespace sogen
                 for (auto& [guest, state] : this->windows_)
                 {
                     (void)guest;
-                    destroy_window_resources(state);
+                    if (this->native_windows_)
+                    {
+                        this->native_windows_->retire(guest);
+                    }
                 }
 
                 this->windows_.clear();
+                if (this->native_windows_)
+                {
+                    this->native_windows_->collect();
+                }
                 this->guest_by_window_id_.clear();
                 this->active_window_ = 0;
                 this->mouse_button_state_ = 0;
@@ -707,6 +724,62 @@ namespace sogen
                 if (this->initialized_)
                 {
                     SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+                }
+            }
+
+            std::shared_ptr<ui_completion_queue> activate_native_presentation() override
+            {
+#ifdef _WIN32
+                if (!this->completion_queue_->owner_matches_current())
+                {
+                    return {};
+                }
+                this->native_active_ = true;
+                return this->completion_queue_;
+#else
+                return {};
+#endif
+            }
+
+            native_window_acquisition acquire_native_window_on_ui(const uint64_t window) override
+            {
+                if (!this->native_windows_)
+                {
+                    return {.status = native_window_acquire_status::unknown_window, .lease = {}};
+                }
+                return this->native_windows_->acquire(window);
+            }
+
+            bool native_presentation_active() const override
+            {
+                return this->native_active_;
+            }
+
+            void retain_native_presentation_until_exit() noexcept override
+            {
+                this->native_quarantined_ = true;
+            }
+
+            bool native_presentation_quarantined() const override
+            {
+                return this->native_quarantined_;
+            }
+
+            void drain_native_shutdown() override
+            {
+                while (this->completion_queue_->pending())
+                {
+                    this->drain_commands();
+                }
+                this->reset();
+                if (this->native_windows_)
+                {
+                    this->native_windows_->close();
+                    this->native_windows_->collect();
+                }
+                if (this->native_windows_ && !this->native_windows_->drained() && !this->native_quarantined_)
+                {
+                    throw std::runtime_error("Native GPU window leases did not drain at shutdown");
                 }
             }
 
@@ -732,6 +805,7 @@ namespace sogen
                 }
 
                 this->drain_commands();
+                this->refresh_gpu_window_title();
                 this->deliver_pending_key_releases();
 
                 SDL_Event event{};
@@ -952,14 +1026,27 @@ namespace sogen
                     return;
                 }
 
+                if (const auto old = this->windows_.find(desc.handle); old != this->windows_.end())
+                {
+                    if (old->second.window)
+                    {
+                        this->guest_by_window_id_.erase(SDL_GetWindowID(old->second.window));
+                    }
+                    this->native_windows_->retire(desc.handle);
+                    this->windows_.erase(old);
+                    this->native_windows_->collect();
+                }
+
                 if (!desc.top_level)
                 {
                     auto& state = this->windows_[desc.handle];
                     state.desc = desc;
+                    this->native_windows_->publish(desc.handle, false);
                     this->redraw_related(desc.handle);
                     return;
                 }
 
+                this->windows_.try_emplace(desc.handle);
                 Uint64 flags = 0;
                 if (!desc.visible)
                 {
@@ -1015,6 +1102,8 @@ namespace sogen
                 state.desc = desc;
                 state.window = window;
                 state.renderer = renderer;
+                state.resources->refresh_native_target();
+                this->native_windows_->publish(desc.handle, true, std::make_unique<shared_sdl_presentation_window>(state.resources));
                 this->guest_by_window_id_[SDL_GetWindowID(window)] = desc.handle;
                 render_window(state);
             }
@@ -1043,8 +1132,9 @@ namespace sogen
                             SDL_StopTextInput(it->second.window);
                             this->guest_by_window_id_.erase(SDL_GetWindowID(it->second.window));
                         }
-                        destroy_window_resources(it->second);
+                        this->native_windows_->retire(window);
                         this->windows_.erase(it);
+                        this->native_windows_->collect();
                         if (focus_fallback)
                         {
                             apply_x11_focus_fallback(focus_fallback);
@@ -1118,7 +1208,7 @@ namespace sogen
                         state->desc.title = title;
                         if (state->desc.top_level)
                         {
-                            const auto host_title = make_host_window_title(title);
+                            const auto host_title = this->host_window_title(*state);
                             SDL_SetWindowTitle(state->window, host_title.c_str());
                         }
                         this->redraw_related(window);
@@ -1202,34 +1292,37 @@ namespace sogen
             // cross-thread SendMessage that host calls such as SDL_ShowWindow issue, so every SDL
             // operation must run on the one thread that calls pump_events. With multiple vCPUs the
             // syscall handlers run on different worker threads, so operations they trigger are queued
-            // here and executed on the pump thread. Every ui_backend method returns void, so the
-            // callers never need a result and this can stay fully asynchronous.
+            // here and executed on the pump thread. Legacy void commands remain asynchronous; native
+            // result-bearing operations use completion tickets on the same FIFO.
             void queue_or_run(std::function<void()> task)
             {
-                {
-                    const std::lock_guard lock(this->command_mutex_);
-                    if (this->ui_thread_known_ && this->ui_thread_id_ != std::this_thread::get_id())
+                auto completion = this->completion_queue_->post([task = std::move(task)](const ui_cancellation_token&) {
+                    try
                     {
-                        this->commands_.emplace_back(std::move(task));
-                        return;
+                        task();
                     }
-                }
-
-                task();
+                    catch (const std::exception& error)
+                    {
+                        std::fprintf(stderr, "[ui] queued command failed: %s\n", error.what());
+                    }
+                    return 0;
+                });
+                completion.detach();
             }
 
             void drain_commands()
             {
-                std::vector<std::function<void()>> pending;
+                if (!this->native_windows_)
                 {
-                    const std::lock_guard lock(this->command_mutex_);
-                    pending.swap(this->commands_);
+                    this->native_windows_ = std::make_unique<native_presentation_window_registry>();
                 }
-
-                for (auto& task : pending)
+                this->completion_queue_->pump();
+                const auto collected = this->native_windows_->collect();
+                if (collected.restore_failed != 0 && !this->restore_failure_logged_)
                 {
-                    task();
+                    std::fprintf(stderr, "[ui] SDL renderer restoration failed; will retry on the owner thread\n");
                 }
+                this->restore_failure_logged_ = collected.restore_failed != 0;
             }
 
             void deliver_pending_key_releases(const std::optional<size_t> forced_scancode = std::nullopt)
@@ -1382,27 +1475,6 @@ namespace sogen
                 }
             }
 
-            static void destroy_window_resources(window_state& state)
-            {
-                if (state.texture)
-                {
-                    SDL_DestroyTexture(state.texture);
-                    state.texture = nullptr;
-                }
-                if (state.renderer)
-                {
-                    SDL_DestroyRenderer(state.renderer);
-                    state.renderer = nullptr;
-                }
-                if (state.window)
-                {
-                    SDL_DestroyWindow(state.window);
-                    state.window = nullptr;
-                }
-                state.texture_width = 0;
-                state.texture_height = 0;
-            }
-
             static void ensure_texture(window_state& state, const ui_surface_desc& surface)
             {
                 if (state.texture && state.texture_width == surface.width && state.texture_height == surface.height &&
@@ -1434,6 +1506,11 @@ namespace sogen
 
             static void update_surface_texture(window_state& state, const ui_surface_desc& surface)
             {
+                if (!state.resources->allows_legacy_presentation())
+                {
+                    return;
+                }
+
                 state.has_surface = true;
                 if (!surface.pixels || surface.width <= 0 || surface.height <= 0 || surface.stride <= 0)
                 {
@@ -1451,6 +1528,11 @@ namespace sogen
 
             static void render_window(window_state& state)
             {
+                if (!state.resources->allows_legacy_presentation())
+                {
+                    return;
+                }
+
                 if (state.has_surface && state.texture)
                 {
                     // The guest renders at a fixed resolution; fit it into the (independently sized) host window
@@ -1555,6 +1637,97 @@ namespace sogen
                 }
             }
 
+            static uint64_t current_unix_milliseconds()
+            {
+                return static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+            }
+
+            std::string host_window_title(const window_state& state) const
+            {
+                auto base = make_host_window_title(state.desc.title);
+#ifdef _WIN32
+                if (this->gpu_title_record_)
+                {
+                    const auto composed = ui::compose_gpu_window_title(base, *this->gpu_title_record_, GetCurrentProcessId(),
+                                                                       state.desc.handle, current_unix_milliseconds());
+                    if (composed)
+                    {
+                        return *composed;
+                    }
+                }
+#endif
+                return base;
+            }
+
+            void refresh_gpu_window_title()
+            {
+#ifdef _WIN32
+                static const std::filesystem::path directory = [] {
+                    const char* configured = std::getenv("SOGEN_GPU_STATUS_DIR");
+                    return configured && *configured ? std::filesystem::path(configured) : std::filesystem::path{};
+                }();
+                if (directory.empty())
+                {
+                    return;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (now < this->next_gpu_title_refresh_)
+                {
+                    return;
+                }
+                this->next_gpu_title_refresh_ = now + std::chrono::seconds(1);
+                try
+                {
+                    std::ifstream input(directory / "gpu-window-title.txt", std::ios::binary);
+                    if (input)
+                    {
+                        std::array<char, 4097> bytes{};
+                        input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                        const auto length = static_cast<size_t>(input.gcount());
+                        // Atomic empty publication invalidates a dead/replaced process immediately.
+                        if (length == 0)
+                        {
+                            this->gpu_title_record_.reset();
+                        }
+                        else if (length <= 4096)
+                        {
+                            auto record = ui::decode_gpu_window_title_record(std::string_view(bytes.data(), length));
+                            if (record && record->host_pid == GetCurrentProcessId())
+                            {
+                                this->gpu_title_record_ = std::move(record);
+                            }
+                        }
+                    }
+                    for (const auto& [guest, state] : this->windows_)
+                    {
+                        (void)guest;
+                        if (state.desc.top_level && state.window)
+                        {
+                            const auto title = this->host_window_title(state);
+                            const char* current = SDL_GetWindowTitle(state.window);
+                            if (!current || title != current)
+                            {
+                                SDL_SetWindowTitle(state.window, title.c_str());
+                            }
+                        }
+                    }
+                }
+                catch (...)
+                {
+                    // A telemetry reader must not change guest execution or presentation results.
+                }
+#endif
+            }
+
+            std::optional<ui::gpu_window_title_record> gpu_title_record_;
+            std::chrono::steady_clock::time_point next_gpu_title_refresh_{};
+
+            std::shared_ptr<ui_completion_queue> completion_queue_{std::make_shared<ui_completion_queue>()};
+            std::unique_ptr<native_presentation_window_registry> native_windows_;
+            bool native_active_{};
+            bool native_quarantined_{};
+            bool restore_failure_logged_{};
             event_sink sink_{};
             bool initialized_{};
             hwnd active_window_{};

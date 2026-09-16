@@ -6,6 +6,7 @@ target_sources(gpu-bridge-protocol INTERFACE
   vk_feature_layouts.hpp
   vk_render_pass.hpp
   vk_synchronization.hpp
+  vk_queue_submit.hpp
   vk_dynamic_state.hpp
 )
 

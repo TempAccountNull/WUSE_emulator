@@ -18,10 +18,15 @@
 #include <vulkan/vulkan_core.h>
 
 #include <gpu_bridge_protocol.hpp>
+#include <native_wsi_wire.hpp>
+#include "native_present_sync.hpp"
+#include <chrono>
+#include <stdexcept>
 #include <vk_feature_chain.hpp>
 #include <vk_render_pass.hpp>
 #include <vk_synchronization.hpp>
 #include <vk_dynamic_state.hpp>
+#include "legacy_queue_submit.hpp"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -31,6 +36,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <vulkan/vulkan_win32.h>
 #else
 #include <dlfcn.h>
 #endif
@@ -55,6 +61,22 @@ namespace sogen
         bool is_unsupported_extension_name(const std::string_view name)
         {
             return std::ranges::find(unsupported_device_extensions, name) != unsupported_device_extensions.end();
+        }
+
+        bool unsupported_native_wsi_extension(const std::string_view name)
+        {
+            constexpr std::array names{std::string_view{"VK_KHR_present_id"},
+                                       std::string_view{"VK_KHR_present_id2"},
+                                       std::string_view{"VK_KHR_present_wait"},
+                                       std::string_view{"VK_KHR_present_wait2"},
+                                       std::string_view{"VK_EXT_swapchain_maintenance1"},
+                                       std::string_view{"VK_KHR_swapchain_maintenance1"},
+                                       std::string_view{"VK_KHR_incremental_present"},
+                                       std::string_view{"VK_EXT_hdr_metadata"},
+                                       std::string_view{"VK_GOOGLE_display_timing"},
+                                       std::string_view{"VK_EXT_present_timing"},
+                                       std::string_view{"VK_NV_present_barrier"}};
+            return std::ranges::find(names, name) != names.end();
         }
 
         bool is_unsupported_device_extension(const VkExtensionProperties& extension)
@@ -196,8 +218,12 @@ namespace sogen
         }
     }
 
+    using native_copy_error = native_present_sync::error;
+
     struct vulkan_host::impl
     {
+        bool native_wsi{};
+        bool gpu_copy{};
         library_handle loader{};
         PFN_vkGetInstanceProcAddr get_instance_proc_addr{};
         PFN_vkCreateInstance create_instance{};
@@ -207,6 +233,7 @@ namespace sogen
         {
             VkInstance handle{};
             uint32_t api_version{};
+            bool native_surface_khr{}, native_surface_ext{};
             PFN_vkDestroyInstance destroy_instance{};
             PFN_vkEnumeratePhysicalDevices enumerate_physical_devices{};
             PFN_vkGetPhysicalDeviceProperties get_physical_device_properties{};
@@ -237,6 +264,17 @@ namespace sogen
         struct device_data
         {
             VkDevice handle{};
+            PFN_vkCreateSwapchainKHR native_create_swapchain{};
+            PFN_vkDestroySwapchainKHR native_destroy_swapchain{};
+            PFN_vkGetSwapchainImagesKHR native_images{};
+            PFN_vkAcquireNextImageKHR native_acquire{};
+            PFN_vkQueuePresentKHR native_present{};
+            bool native_present_fences{}, native_presentation_failed{};
+            bool native_shutdown_started{};
+            uint64_t native_present_serial{};
+            VkDeviceSize native_copy_allocation_bytes{};
+            std::vector<std::shared_ptr<native_present_sync::acquisition>> native_acquisitions;
+            std::vector<std::pair<VkQueue, std::shared_ptr<native_present_sync::acquisition>>> native_shutdown_fences;
             uint64_t instance_id{};
             VkPhysicalDevice physical_device{}; // the device this was created from (for memory queries)
             render_device_info identity;
@@ -257,6 +295,7 @@ namespace sogen
             PFN_vkDestroyFence destroy_fence{};
             PFN_vkResetFences reset_fences{};
             PFN_vkGetFenceStatus get_fence_status{};
+            PFN_vkWaitForFences wait_for_fences{};
             PFN_vkCreateEvent create_event{};
             PFN_vkDestroyEvent destroy_event{};
             PFN_vkGetEventStatus get_event_status{};
@@ -417,13 +456,27 @@ namespace sogen
         struct surface_data
         {
             uint64_t hwnd{};
+            VkSurfaceKHR native{};
+            uint64_t instance_id{};
+            native_presentation_window_lease lease;
         };
 
         // A swapchain is modeled as N offscreen images plus a host-visible readback buffer. "Presenting"
         // copies the chosen image into the readback buffer; the bridge then hands those pixels to the
         // guest window via the UI backend. No real presentation engine is involved.
+#include "native_copy_submission.inc"
+
         struct swapchain_data
         {
+            VkSwapchainKHR native{};
+            uint64_t surface_id{};
+            native_presentation_window_lease lease;
+            bool retired{};
+            bool destroy_requested{};
+            VkDeviceSize native_copy_allocation_bytes{};
+            uint32_t array_layers{1};
+            std::vector<VkImage> native_images;
+            std::vector<std::shared_ptr<native_copy_submission>> copies;
             uint64_t device_id{};
             uint64_t hwnd{};
             uint32_t width{};
@@ -450,6 +503,7 @@ namespace sogen
         {
             VkQueue handle{};
             uint64_t device_id{};
+            uint32_t family{};
         };
 
         struct command_pool_data
@@ -469,6 +523,7 @@ namespace sogen
         {
             VkFence handle{};
             uint64_t device_id{};
+            bool native_destroy_requested{};
         };
 
         struct event_data
@@ -479,8 +534,10 @@ namespace sogen
 
         struct semaphore_data
         {
+            VkSemaphoreType type{VK_SEMAPHORE_TYPE_BINARY};
             VkSemaphore handle{};
             uint64_t device_id{};
+            bool native_destroy_requested{};
         };
 
         struct memory_data
@@ -506,6 +563,8 @@ namespace sogen
             VkImage handle{};
             uint64_t device_id{};
             uint32_t samples{1};
+            bool borrowed{};
+            bool swapchain_image{};
         };
 
         struct sampler_data
@@ -762,6 +821,40 @@ namespace sogen
                 return;
             }
             device_data& dev = dev_it->second;
+            if (sc.native)
+            {
+                const auto status = this->retire_native_presentations(sc, false);
+                if (status != VK_SUCCESS)
+                {
+                    throw native_copy_error{status};
+                }
+                if (!sc.copies.empty())
+                {
+                    throw native_copy_error{VK_NOT_READY};
+                }
+                dev.native_copy_allocation_bytes -= sc.native_copy_allocation_bytes;
+                sc.native_copy_allocation_bytes = 0;
+                for (const auto id : sc.image_ids)
+                {
+                    const auto image = this->images.find(id);
+                    if (image != this->images.end())
+                    {
+                        if (!image->second.borrowed)
+                        {
+                            dev.destroy_image(dev.handle, image->second.handle, nullptr);
+                        }
+                        this->images.erase(image);
+                    }
+                }
+                for (const VkDeviceMemory memory : sc.image_memory)
+                {
+                    dev.free_memory(dev.handle, memory, nullptr);
+                }
+                dev.native_destroy_swapchain(dev.handle, sc.native, nullptr);
+                sc.native = VK_NULL_HANDLE;
+                sc.lease = {};
+                return;
+            }
 
             // A deferred present copy may still be in flight on the GPU; wait it out before tearing down
             // the command pool / fence / buffer it uses.
@@ -821,18 +914,30 @@ namespace sogen
                 return;
             }
 
+            if (this->native_wsi)
+            {
+                const auto status = this->drain_native_device(device_id);
+                if (status != VK_SUCCESS)
+                {
+                    throw native_copy_error{status};
+                }
+            }
+
             // Tear down swapchains first: they own offscreen images (in the `images` table), a readback
             // buffer, and a present command pool/fence that must go before the device.
-            for (auto sc = this->swapchains.begin(); sc != this->swapchains.end();)
+            if (!this->native_wsi)
             {
-                if (sc->second.device_id == device_id)
+                for (auto sc = this->swapchains.begin(); sc != this->swapchains.end();)
                 {
-                    this->destroy_swapchain_resources(sc->second);
-                    sc = this->swapchains.erase(sc);
-                }
-                else
-                {
-                    ++sc;
+                    if (sc->second.device_id == device_id)
+                    {
+                        this->destroy_swapchain_resources(sc->second);
+                        sc = this->swapchains.erase(sc);
+                    }
+                    else
+                    {
+                        ++sc;
+                    }
                 }
             }
 
@@ -926,6 +1031,21 @@ namespace sogen
             this->erase_owned(this->pipeline_layouts, [&](const pipeline_layout_data& d) { return d.device_id == device_id; });
             this->erase_owned(this->render_passes, [&](const render_pass_data& d) { return d.device_id == device_id; });
             this->erase_owned(this->image_views, [&](const image_view_data& d) { return d.device_id == device_id; });
+            if (this->native_wsi)
+            {
+                for (auto sc = this->swapchains.begin(); sc != this->swapchains.end();)
+                {
+                    if (sc->second.device_id == device_id)
+                    {
+                        this->destroy_swapchain_resources(sc->second);
+                        sc = this->swapchains.erase(sc);
+                    }
+                    else
+                    {
+                        ++sc;
+                    }
+                }
+            }
             this->erase_owned(this->buffer_views, [&](const buffer_view_data& d) { return d.device_id == device_id; });
             this->erase_owned(this->query_pools, [&](const query_pool_data& d) { return d.device_id == device_id; });
             this->erase_owned(this->shader_modules, [&](const shader_module_data& d) { return d.device_id == device_id; });
@@ -1009,6 +1129,8 @@ namespace sogen
             this->devices.erase(it);
         }
 
+#include "native_copy_commands.inc"
+
         impl()
         {
             if constexpr (sizeof(size_t) != 8)
@@ -1077,7 +1199,70 @@ namespace sogen
     {
     }
 
-    vulkan_host::~vulkan_host() = default;
+    vulkan_host::~vulkan_host()
+    {
+        // Native owners must use try_shutdown_native before destruction; unresolved owners retain their UI lease and loader.
+        if (this->impl_->native_wsi && !this->try_shutdown_native())
+        {
+            std::terminate();
+        }
+    }
+
+    bool vulkan_host::has_pending_native_presentations() const
+    {
+        for (const auto& [id, device] : this->impl_->devices)
+        {
+            if (device.native_presentation_failed || !device.native_acquisitions.empty() || !device.native_shutdown_fences.empty())
+            {
+                return true;
+            }
+        }
+        for (const auto& [id, swapchain] : this->impl_->swapchains)
+        {
+            if (!swapchain.copies.empty())
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool vulkan_host::try_shutdown_native() noexcept
+    {
+        if (!this->impl_->native_wsi)
+        {
+            return true;
+        }
+        try
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+            for (const auto& [id, device] : this->impl_->devices)
+            {
+                VkResult result{};
+                do
+                {
+                    result = this->impl_->drain_native_device(id);
+                } while (result == VK_NOT_READY && std::chrono::steady_clock::now() < deadline);
+                if (result != VK_SUCCESS)
+                {
+                    std::fprintf(stderr,
+                                 "[gpu-bridge] native shutdown retains unresolved resources until process exit: device=%llu result=%d\n",
+                                 static_cast<unsigned long long>(id), result);
+                    return false;
+                }
+            }
+            while (!this->impl_->instances.empty())
+            {
+                this->destroy_instance(this->impl_->instances.begin()->first);
+            }
+            return true;
+        }
+        catch (...)
+        {
+            std::fprintf(stderr, "[gpu-bridge] native shutdown failed; preserving host, loader and window leases until process exit\n");
+            return false;
+        }
+    }
 
     bool vulkan_host::available() const
     {
@@ -1110,6 +1295,22 @@ namespace sogen
         VkInstanceCreateInfo create_info{};
         create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         create_info.pApplicationInfo = &app_info;
+        native_present_sync::surface_support native_extensions;
+        if (this->impl_->native_wsi)
+        {
+            try
+            {
+                const auto enumerate = this->impl_->load_instance_proc<PFN_vkEnumerateInstanceExtensionProperties>(
+                    VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
+                native_extensions = native_present_sync::surface_extensions(enumerate, api_version);
+            }
+            catch (const native_copy_error& error)
+            {
+                return error.result;
+            }
+            create_info.enabledExtensionCount = static_cast<uint32_t>(native_extensions.names.size());
+            create_info.ppEnabledExtensionNames = native_extensions.names.data();
+        }
 
         VkInstance instance{};
         const VkResult result = this->impl_->create_instance(&create_info, nullptr, &instance);
@@ -1121,6 +1322,8 @@ namespace sogen
         impl::instance_data data{};
         data.handle = instance;
         data.api_version = api_version;
+        data.native_surface_khr = native_extensions.khr;
+        data.native_surface_ext = native_extensions.ext;
         data.destroy_instance = this->impl_->load_instance_proc<PFN_vkDestroyInstance>(instance, "vkDestroyInstance");
         data.enumerate_physical_devices =
             this->impl_->load_instance_proc<PFN_vkEnumeratePhysicalDevices>(instance, "vkEnumeratePhysicalDevices");
@@ -1186,6 +1389,12 @@ namespace sogen
 
     void vulkan_host::destroy_instance(uint64_t instance)
     {
+        if (std::ranges::any_of(this->impl_->devices, [&](const auto& entry) {
+                return entry.second.instance_id == instance && entry.second.native_presentation_failed;
+            }))
+        {
+            throw native_copy_error{VK_ERROR_DEVICE_LOST};
+        }
         const auto it = this->impl_->instances.find(instance);
         if (it == this->impl_->instances.end())
         {
@@ -1204,6 +1413,23 @@ namespace sogen
         for (const uint64_t device_id : owned_devices)
         {
             this->impl_->erase_device(device_id);
+        }
+
+        if (this->impl_->native_wsi)
+        {
+            for (auto surface = this->impl_->surfaces.begin(); surface != this->impl_->surfaces.end();)
+            {
+                if (surface->second.instance_id == instance)
+                {
+                    const auto id = surface->first;
+                    ++surface;
+                    this->destroy_surface(id);
+                }
+                else
+                {
+                    ++surface;
+                }
+            }
         }
 
         if (it->second.handle && it->second.destroy_instance)
@@ -1285,6 +1511,7 @@ namespace sogen
             return false;
         }
         out = dev->second.identity;
+        out.guest_window = sc->second.hwnd;
         return true;
     }
 
@@ -1497,7 +1724,10 @@ namespace sogen
             extensions.resize(count);
         }
 
-        const auto removed = std::ranges::remove_if(extensions, is_unsupported_device_extension);
+        const auto removed = std::ranges::remove_if(extensions, [&](const VkExtensionProperties& extension) {
+            return is_unsupported_device_extension(extension) ||
+                   (this->impl_->native_wsi && unsupported_native_wsi_extension(extension.extensionName));
+        });
         extensions.erase(removed.begin(), removed.end());
 
         out_count = static_cast<uint32_t>(extensions.size());
@@ -1691,6 +1921,10 @@ namespace sogen
     {
         max_deviation = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || time_domains.size() != timestamps.size())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -1915,6 +2149,10 @@ namespace sogen
                                        const void* feature_blob, size_t feature_blob_size, uint32_t feature_struct_count,
                                        uint64_t& out_device)
     {
+        if (std::ranges::any_of(this->impl_->devices, [](const auto& entry) { return entry.second.native_presentation_failed; }))
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         out_device = 0;
 
         const auto pd = this->impl_->physical_devices.find(physical_device);
@@ -1976,6 +2214,10 @@ namespace sogen
                 if (!terminator)
                 {
                     break;
+                }
+                if (this->impl_->native_wsi && unsupported_native_wsi_extension(cursor))
+                {
+                    return VK_ERROR_EXTENSION_NOT_PRESENT;
                 }
                 if (!is_unsupported_extension_name(std::string_view{cursor}))
                 {
@@ -2041,6 +2283,22 @@ namespace sogen
             }
         }
 
+        VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR present_features{};
+        bool native_present_fences{};
+        if (this->impl_->native_wsi)
+        {
+            try
+            {
+                native_present_fences =
+                    native_present_sync::enable_device(pd->second.handle, instance->second.enumerate_device_extension_properties,
+                                                       instance->second.get_physical_device_features2, instance->second.native_surface_khr,
+                                                       instance->second.native_surface_ext, extensions, features2, present_features);
+            }
+            catch (const native_copy_error& error)
+            {
+                return error.result;
+            }
+        }
         VkDeviceCreateInfo create_info{};
         create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         create_info.queueCreateInfoCount = static_cast<uint32_t>(queue_infos.size());
@@ -2049,7 +2307,7 @@ namespace sogen
         create_info.ppEnabledExtensionNames = extensions.empty() ? nullptr : extensions.data();
         // Enabled features ride the pNext chain (VkPhysicalDeviceFeatures2 + the chained structs); a
         // chain present means pEnabledFeatures must stay null.
-        if (has_features || feature_tail != reinterpret_cast<VkBaseOutStructure*>(&features2))
+        if (has_features || features2.pNext || feature_tail != reinterpret_cast<VkBaseOutStructure*>(&features2))
         {
             create_info.pNext = &features2;
         }
@@ -2081,7 +2339,31 @@ namespace sogen
                          .type = static_cast<uint32_t>(properties.deviceType),
                          .vendor_id = properties.vendorID,
                          .device_id = properties.deviceID};
+        // A valid Windows LUID correlates this Vulkan adapter with process GPU counters.
+        // Cache it once; presentation and telemetry must not query driver properties per frame.
+        if (instance->second.api_version >= VK_API_VERSION_1_1 && properties.apiVersion >= VK_API_VERSION_1_1 &&
+            instance->second.get_physical_device_properties2)
+        {
+            VkPhysicalDeviceIDProperties ids{};
+            ids.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+            VkPhysicalDeviceProperties2 identity{};
+            identity.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            identity.pNext = &ids;
+            instance->second.get_physical_device_properties2(pd->second.handle, &identity);
+            data.identity.device_luid_valid = ids.deviceLUIDValid == VK_TRUE;
+            if (data.identity.device_luid_valid)
+            {
+                data.identity.device_node_mask = ids.deviceNodeMask;
+                constexpr std::string_view hex = "0123456789abcdef";
+                for (const uint8_t value : ids.deviceLUID)
+                {
+                    data.identity.device_luid_hex += hex[value >> 4];
+                    data.identity.device_luid_hex += hex[value & 15];
+                }
+            }
+        }
         data.queue_family_index = primary_family;
+        data.native_present_fences = native_present_fences;
         const auto enabled_extension = [&](const char* name) {
             return std::ranges::any_of(extensions, [&](const char* enabled) { return std::strcmp(enabled, name) == 0; });
         };
@@ -2101,6 +2383,14 @@ namespace sogen
             const auto resolve = [&](const char* name) { return gdpa(device, name); };
 
             data.destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(resolve("vkDestroyDevice"));
+            if (this->impl_->native_wsi && enabled_extension("VK_KHR_swapchain"))
+            {
+                data.native_create_swapchain = reinterpret_cast<PFN_vkCreateSwapchainKHR>(resolve("vkCreateSwapchainKHR"));
+                data.native_destroy_swapchain = reinterpret_cast<PFN_vkDestroySwapchainKHR>(resolve("vkDestroySwapchainKHR"));
+                data.native_images = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(resolve("vkGetSwapchainImagesKHR"));
+                data.native_acquire = reinterpret_cast<PFN_vkAcquireNextImageKHR>(resolve("vkAcquireNextImageKHR"));
+                data.native_present = reinterpret_cast<PFN_vkQueuePresentKHR>(resolve("vkQueuePresentKHR"));
+            }
             data.get_device_queue = reinterpret_cast<PFN_vkGetDeviceQueue>(resolve("vkGetDeviceQueue"));
             data.queue_wait_idle = reinterpret_cast<PFN_vkQueueWaitIdle>(resolve("vkQueueWaitIdle"));
             data.device_wait_idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(resolve("vkDeviceWaitIdle"));
@@ -2127,6 +2417,7 @@ namespace sogen
             data.wait_semaphores = reinterpret_cast<PFN_vkWaitSemaphores>(resolve("vkWaitSemaphores"));
             data.get_buffer_device_address = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(resolve("vkGetBufferDeviceAddress"));
             data.get_fence_status = reinterpret_cast<PFN_vkGetFenceStatus>(resolve("vkGetFenceStatus"));
+            data.wait_for_fences = reinterpret_cast<PFN_vkWaitForFences>(resolve("vkWaitForFences"));
             data.queue_submit = reinterpret_cast<PFN_vkQueueSubmit>(resolve("vkQueueSubmit"));
             data.queue_submit2 = reinterpret_cast<PFN_vkQueueSubmit2>(resolve("vkQueueSubmit2"));
             data.allocate_memory = reinterpret_cast<PFN_vkAllocateMemory>(resolve("vkAllocateMemory"));
@@ -2354,6 +2645,23 @@ namespace sogen
         }
 
         const uint64_t id = this->impl_->next_id++;
+        if (this->impl_->native_wsi && (!data.create_fence || !data.destroy_fence || !data.get_fence_status || !data.wait_for_fences ||
+                                        !data.queue_submit || !data.queue_wait_idle || !data.create_semaphore || !data.destroy_semaphore))
+        {
+            if (data.destroy_device)
+            {
+                data.destroy_device(device, nullptr);
+            }
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        if (this->impl_->native_wsi)
+        {
+            std::fprintf(stderr,
+                         "[gpu-bridge] native present synchronization: device=%llu strategy=%s record-limit=256 acquisition-limit=256 "
+                         "swapchain-limit=16 image-limit=64\n",
+                         static_cast<unsigned long long>(id),
+                         native_present_fences ? "maintenance1-present-fences" : "reacquire-fences-with-process-exit-quarantine");
+        }
         this->impl_->devices.emplace(id, data);
         out_device = id;
         return VK_SUCCESS;
@@ -2369,6 +2677,10 @@ namespace sogen
         out_queue = 0;
 
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.get_device_queue)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -2382,7 +2694,7 @@ namespace sogen
         }
 
         const uint64_t id = this->impl_->next_id++;
-        this->impl_->queues.emplace(id, impl::queue_data{.handle = queue, .device_id = device});
+        this->impl_->queues.emplace(id, impl::queue_data{.handle = queue, .device_id = device, .family = queue_family_index});
         out_queue = id;
         return VK_SUCCESS;
     }
@@ -2392,6 +2704,10 @@ namespace sogen
         out_pool = 0;
 
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_command_pool)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -2417,6 +2733,11 @@ namespace sogen
 
     void vulkan_host::destroy_command_pool(uint64_t device, uint64_t pool)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->command_pools.find(pool);
         if (it == this->impl_->command_pools.end() || it->second.device_id != device)
@@ -2439,6 +2760,10 @@ namespace sogen
         out_command_buffer = 0;
 
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto pool_it = this->impl_->command_pools.find(pool);
         if (dev == this->impl_->devices.end() || pool_it == this->impl_->command_pools.end() || pool_it->second.device_id != device ||
             !dev->second.allocate_command_buffers)
@@ -2467,6 +2792,11 @@ namespace sogen
 
     void vulkan_host::free_command_buffer(uint64_t device, uint64_t pool, uint64_t command_buffer)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto pool_it = this->impl_->command_pools.find(pool);
         const auto cb = this->impl_->command_buffers.find(command_buffer);
@@ -2495,6 +2825,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.begin_command_buffer)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -2543,6 +2877,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_execute_commands)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -2573,6 +2911,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.end_command_buffer)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -2584,6 +2926,10 @@ namespace sogen
     int32_t vulkan_host::reset_command_pool(uint64_t device, uint64_t pool, uint32_t flags)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.reset_command_pool)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -2607,6 +2953,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.reset_command_buffer)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -2628,6 +2978,10 @@ namespace sogen
         {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
+        if (dev->second.native_presentation_failed || dev->second.native_shutdown_started)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
 
         return dev->second.queue_wait_idle(queue_it->second.handle);
     }
@@ -2639,6 +2993,10 @@ namespace sogen
         {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
+        if (dev->second.native_presentation_failed || dev->second.native_shutdown_started)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
 
         return dev->second.device_wait_idle(dev->second.handle);
     }
@@ -2648,6 +3006,10 @@ namespace sogen
         out_fence = 0;
 
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_fence)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -2672,10 +3034,21 @@ namespace sogen
 
     void vulkan_host::destroy_fence(uint64_t device, uint64_t fence)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->fences.find(fence);
         if (it == this->impl_->fences.end() || it->second.device_id != device)
         {
+            return;
+        }
+
+        if (dev != this->impl_->devices.end() && this->impl_->native_references_fence(device, it->second.handle))
+        {
+            it->second.native_destroy_requested = true;
             return;
         }
 
@@ -2693,6 +3066,10 @@ namespace sogen
         out_semaphore = 0;
 
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_semaphore)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -2719,7 +3096,8 @@ namespace sogen
         }
 
         const uint64_t id = this->impl_->next_id++;
-        this->impl_->semaphores.emplace(id, impl::semaphore_data{.handle = semaphore, .device_id = device});
+        this->impl_->semaphores.emplace(
+            id, impl::semaphore_data{.type = static_cast<VkSemaphoreType>(semaphore_type), .handle = semaphore, .device_id = device});
         out_semaphore = id;
         return VK_SUCCESS;
     }
@@ -2728,6 +3106,10 @@ namespace sogen
     {
         out_value = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto it = this->impl_->semaphores.find(semaphore);
         if (dev == this->impl_->devices.end() || it == this->impl_->semaphores.end() || it->second.device_id != device ||
             !dev->second.get_semaphore_counter_value)
@@ -2740,6 +3122,10 @@ namespace sogen
     int32_t vulkan_host::signal_semaphore(uint64_t device, uint64_t semaphore, uint64_t value)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto it = this->impl_->semaphores.find(semaphore);
         if (dev == this->impl_->devices.end() || it == this->impl_->semaphores.end() || it->second.device_id != device ||
             !dev->second.signal_semaphore)
@@ -2759,6 +3145,10 @@ namespace sogen
         if (dev == this->impl_->devices.end() || !dev->second.wait_semaphores)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (dev->second.native_presentation_failed || dev->second.native_shutdown_started)
+        {
+            return VK_ERROR_DEVICE_LOST;
         }
 
         const auto* records = static_cast<const gpu_bridge::wait_semaphore_entry*>(entries);
@@ -2803,10 +3193,21 @@ namespace sogen
 
     void vulkan_host::destroy_semaphore(uint64_t device, uint64_t semaphore)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->semaphores.find(semaphore);
         if (it == this->impl_->semaphores.end() || it->second.device_id != device)
         {
+            return;
+        }
+
+        if (dev != this->impl_->devices.end() && this->impl_->native_references(device, it->second.handle))
+        {
+            it->second.native_destroy_requested = true;
             return;
         }
 
@@ -2821,6 +3222,10 @@ namespace sogen
     int32_t vulkan_host::reset_fence(uint64_t device, uint64_t fence)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto it = this->impl_->fences.find(fence);
         if (dev == this->impl_->devices.end() || it == this->impl_->fences.end() || it->second.device_id != device ||
             !dev->second.reset_fences)
@@ -2844,6 +3249,10 @@ namespace sogen
         {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
+        if (dev->second.native_presentation_failed || dev->second.native_shutdown_started)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
 
         return dev->second.get_fence_status(dev->second.handle, it->second.handle);
     }
@@ -2853,6 +3262,10 @@ namespace sogen
         out_event = 0;
 
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_event)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -2877,6 +3290,11 @@ namespace sogen
 
     void vulkan_host::destroy_event(uint64_t device, uint64_t event)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->events.find(event);
         if (it == this->impl_->events.end() || it->second.device_id != device)
@@ -2912,6 +3330,10 @@ namespace sogen
     {
         const auto it = this->impl_->events.find(event);
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (it == this->impl_->events.end() || dev == this->impl_->devices.end() || it->second.device_id != device ||
             !dev->second.get_event_status)
         {
@@ -2923,6 +3345,10 @@ namespace sogen
     int32_t vulkan_host::set_event(uint64_t device, uint64_t event)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto it = this->impl_->events.find(event);
         if (dev == this->impl_->devices.end() || it == this->impl_->events.end() || it->second.device_id != device ||
             !dev->second.set_event)
@@ -2936,6 +3362,10 @@ namespace sogen
     int32_t vulkan_host::reset_event(uint64_t device, uint64_t event)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto it = this->impl_->events.find(event);
         if (dev == this->impl_->devices.end() || it == this->impl_->events.end() || it->second.device_id != device ||
             !dev->second.reset_event)
@@ -2958,6 +3388,10 @@ namespace sogen
         if (dev == this->impl_->devices.end() || !dev->second.queue_submit)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (dev->second.native_presentation_failed || dev->second.native_shutdown_started)
+        {
+            return VK_ERROR_DEVICE_LOST;
         }
 
         VkFence fence_handle = VK_NULL_HANDLE;
@@ -2991,6 +3425,38 @@ namespace sogen
         return dev->second.queue_submit(queue_it->second.handle, 1, &submit, fence_handle);
     }
 
+    int32_t vulkan_host::queue_submit_full(const std::span<const std::byte> packet)
+    {
+        try
+        {
+            const auto decoded = gpu_bridge::queue_submit_wire::decode(packet);
+            const auto queue = this->impl_->queues.find(decoded.info.queue);
+            if (queue == this->impl_->queues.end())
+            {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            const auto device = this->impl_->devices.find(queue->second.device_id);
+            if (device == this->impl_->devices.end())
+            {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            if (device->second.native_presentation_failed || device->second.native_shutdown_started)
+            {
+                return VK_ERROR_DEVICE_LOST;
+            }
+            return legacy_queue_submit::execute_owned(decoded, queue->second, device->second.queue_submit, this->impl_->semaphores,
+                                                      this->impl_->command_buffers, this->impl_->fences);
+        }
+        catch (const gpu_bridge::queue_submit_wire::error& error)
+        {
+            return error.result;
+        }
+        catch (const std::bad_alloc&)
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+
     int32_t vulkan_host::queue_submit2(uint64_t queue, uint64_t fence, const void* wait_entries, uint32_t wait_count,
                                        const void* command_buffer_ids, uint32_t command_buffer_count, const void* signal_entries,
                                        uint32_t signal_count)
@@ -3005,6 +3471,10 @@ namespace sogen
         if (dev == this->impl_->devices.end() || !dev->second.queue_submit2)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (dev->second.native_presentation_failed || dev->second.native_shutdown_started)
+        {
+            return VK_ERROR_DEVICE_LOST;
         }
 
         VkFence fence_handle = VK_NULL_HANDLE;
@@ -3144,6 +3614,10 @@ namespace sogen
         out_memory = 0;
 
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.allocate_memory)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -3226,6 +3700,10 @@ namespace sogen
         namespace wire = gpu_bridge::render_pass_wire;
         out_memory = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -3292,6 +3770,10 @@ namespace sogen
     int32_t vulkan_host::set_device_memory_priority(uint64_t device, uint64_t memory, float priority)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto mem = this->impl_->memories.find(memory);
         if (dev == this->impl_->devices.end() || mem == this->impl_->memories.end() || mem->second.device_id != device)
         {
@@ -3314,6 +3796,11 @@ namespace sogen
 
     void vulkan_host::free_memory(uint64_t device, uint64_t memory)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->memories.find(memory);
         // Only the owning device may free the memory; ignore a cross-device free request.
@@ -3334,6 +3821,10 @@ namespace sogen
     {
         out_committed_bytes = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto mem = this->impl_->memories.find(memory);
         if (dev == this->impl_->devices.end() || mem == this->impl_->memories.end() || mem->second.device_id != device)
         {
@@ -3355,6 +3846,10 @@ namespace sogen
         out_buffer = 0;
 
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_buffer)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -3381,6 +3876,11 @@ namespace sogen
 
     void vulkan_host::destroy_buffer(uint64_t device, uint64_t buffer)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->buffers.find(buffer);
         if (it == this->impl_->buffers.end() || it->second.device_id != device)
@@ -3404,6 +3904,10 @@ namespace sogen
         out_memory_type_bits = 0;
 
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto buf = this->impl_->buffers.find(buffer);
         if (dev == this->impl_->devices.end() || buf == this->impl_->buffers.end() || buf->second.device_id != device ||
             !dev->second.get_buffer_memory_requirements)
@@ -3423,6 +3927,10 @@ namespace sogen
     int32_t vulkan_host::bind_buffer_memory(uint64_t device, uint64_t buffer, uint64_t memory, uint64_t offset)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto buf = this->impl_->buffers.find(buffer);
         const auto mem = this->impl_->memories.find(memory);
         if (dev == this->impl_->devices.end() || buf == this->impl_->buffers.end() || mem == this->impl_->memories.end() ||
@@ -3446,6 +3954,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_fill_buffer)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -3458,6 +3970,10 @@ namespace sogen
     int32_t vulkan_host::download_memory(uint64_t device, uint64_t memory, uint64_t offset, uint64_t size, void* out, size_t out_size)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto mem = this->impl_->memories.find(memory);
         if (dev == this->impl_->devices.end() || mem == this->impl_->memories.end() || mem->second.device_id != device ||
             !dev->second.map_memory || !dev->second.unmap_memory)
@@ -3487,6 +4003,10 @@ namespace sogen
     int32_t vulkan_host::upload_memory(uint64_t device, uint64_t memory, uint64_t offset, uint64_t size, const void* data, size_t data_size)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto mem = this->impl_->memories.find(memory);
         if (dev == this->impl_->devices.end() || mem == this->impl_->memories.end() || mem->second.device_id != device ||
             !dev->second.map_memory || !dev->second.unmap_memory)
@@ -3516,6 +4036,10 @@ namespace sogen
     int32_t vulkan_host::flush_mapped_memory_range(uint64_t device, uint64_t memory, uint64_t offset, uint64_t size)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto mem = this->impl_->memories.find(memory);
         if (dev == this->impl_->devices.end() || mem == this->impl_->memories.end() || mem->second.device_id != device ||
             !dev->second.flush_mapped_memory_ranges)
@@ -3539,6 +4063,10 @@ namespace sogen
     int32_t vulkan_host::invalidate_mapped_memory_range(uint64_t device, uint64_t memory, uint64_t offset, uint64_t size)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto mem = this->impl_->memories.find(memory);
         if (dev == this->impl_->devices.end() || mem == this->impl_->memories.end() || mem->second.device_id != device ||
             !dev->second.invalidate_mapped_memory_ranges)
@@ -3564,6 +4092,10 @@ namespace sogen
         out_host_pointer = nullptr;
         out_size = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto mem = this->impl_->memories.find(memory);
         if (dev == this->impl_->devices.end() || mem == this->impl_->memories.end() || mem->second.device_id != device ||
             !dev->second.map_memory)
@@ -3595,6 +4127,11 @@ namespace sogen
 
     void vulkan_host::unmap_memory(uint64_t device, uint64_t memory)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto mem = this->impl_->memories.find(memory);
         if (dev == this->impl_->devices.end() || mem == this->impl_->memories.end() || mem->second.device_id != device ||
@@ -3614,6 +4151,10 @@ namespace sogen
         out_image = 0;
 
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_image)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -3649,9 +4190,14 @@ namespace sogen
 
     void vulkan_host::destroy_image(uint64_t device, uint64_t image)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->images.find(image);
-        if (it == this->impl_->images.end() || it->second.device_id != device)
+        if (it == this->impl_->images.end() || it->second.swapchain_image || it->second.device_id != device)
         {
             return;
         }
@@ -3672,6 +4218,10 @@ namespace sogen
         out_memory_type_bits = 0;
 
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto img = this->impl_->images.find(image);
         if (dev == this->impl_->devices.end() || img == this->impl_->images.end() || img->second.device_id != device ||
             !dev->second.get_image_memory_requirements)
@@ -3699,6 +4249,10 @@ namespace sogen
         out_depth_pitch = 0;
 
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto img = this->impl_->images.find(image);
         if (dev == this->impl_->devices.end() || img == this->impl_->images.end() || img->second.device_id != device ||
             !dev->second.get_image_subresource_layout)
@@ -3725,6 +4279,10 @@ namespace sogen
     int32_t vulkan_host::bind_image_memory(uint64_t device, uint64_t image, uint64_t memory, uint64_t offset)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto img = this->impl_->images.find(image);
         const auto mem = this->impl_->memories.find(memory);
         if (dev == this->impl_->devices.end() || img == this->impl_->images.end() || mem == this->impl_->memories.end() ||
@@ -3753,9 +4311,9 @@ namespace sogen
         // engine, so the host driver would reject VK_IMAGE_LAYOUT_PRESENT_SRC_KHR. Map it to
         // TRANSFER_SRC_OPTIMAL (the layout the present-time readback copy reads from), keeping the guest
         // a faithful WSI app while the real driver stays valid.
-        VkImageLayout translate_layout(uint32_t layout)
+        VkImageLayout translate_layout(uint32_t layout, const bool native = false)
         {
-            if (layout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+            if (!native && layout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
             {
                 return VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             }
@@ -3773,6 +4331,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -3811,9 +4373,16 @@ namespace sogen
                     {
                         throw codec::error("image does not belong to command-buffer device", VK_ERROR_INITIALIZATION_FAILED);
                     }
+                    if (this->impl_->gpu_copy && object->second.swapchain_image &&
+                        barrier.srcQueueFamilyIndex != barrier.dstQueueFamilyIndex &&
+                        barrier.srcQueueFamilyIndex != VK_QUEUE_FAMILY_IGNORED && barrier.dstQueueFamilyIndex != VK_QUEUE_FAMILY_IGNORED)
+                    {
+                        throw codec::error("GPU-copy swapchain queue-family ownership transfer is not supported",
+                                           VK_ERROR_FEATURE_NOT_PRESENT);
+                    }
                     barrier.image = object->second.handle;
-                    barrier.oldLayout = translate_layout(barrier.oldLayout);
-                    barrier.newLayout = translate_layout(barrier.newLayout);
+                    barrier.oldLayout = translate_layout(barrier.oldLayout, this->impl_->native_wsi && !this->impl_->gpu_copy);
+                    barrier.newLayout = translate_layout(barrier.newLayout, this->impl_->native_wsi && !this->impl_->gpu_copy);
                 }
             };
             const auto dependency2 = [&](const VkDependencyInfo& dependency) {
@@ -3950,6 +4519,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_pipeline_barrier)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -3959,8 +4532,8 @@ namespace sogen
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         barrier.srcAccessMask = src_access_mask;
         barrier.dstAccessMask = dst_access_mask;
-        barrier.oldLayout = translate_layout(old_layout);
-        barrier.newLayout = translate_layout(new_layout);
+        barrier.oldLayout = translate_layout(old_layout, this->impl_->native_wsi && !this->impl_->gpu_copy);
+        barrier.newLayout = translate_layout(new_layout, this->impl_->native_wsi && !this->impl_->gpu_copy);
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.image = img->second.handle;
@@ -3981,6 +4554,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_clear_color_image)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -3993,7 +4570,9 @@ namespace sogen
         clear.float32[3] = a;
 
         const VkImageSubresourceRange vk_range = to_vk_range(range);
-        dev->second.cmd_clear_color_image(cb->second.handle, img->second.handle, translate_layout(image_layout), &clear, 1, &vk_range);
+        dev->second.cmd_clear_color_image(cb->second.handle, img->second.handle,
+                                          translate_layout(image_layout, this->impl_->native_wsi && !this->impl_->gpu_copy), &clear, 1,
+                                          &vk_range);
         return VK_SUCCESS;
     }
 
@@ -4013,6 +4592,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_clear_attachments)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4037,6 +4620,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_clear_depth_stencil_image)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4047,8 +4634,9 @@ namespace sogen
         clear.stencil = stencil;
 
         const VkImageSubresourceRange vk_range = to_vk_range(range);
-        dev->second.cmd_clear_depth_stencil_image(cb->second.handle, img->second.handle, translate_layout(image_layout), &clear, 1,
-                                                  &vk_range);
+        dev->second.cmd_clear_depth_stencil_image(cb->second.handle, img->second.handle,
+                                                  translate_layout(image_layout, this->impl_->native_wsi && !this->impl_->gpu_copy), &clear,
+                                                  1, &vk_range);
         return VK_SUCCESS;
     }
 
@@ -4061,6 +4649,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4079,7 +4671,7 @@ namespace sogen
             }
             info.srcImage = image->second.handle;
             info.dstBuffer = buffer->second.handle;
-            info.srcImageLayout = translate_layout(info.srcImageLayout);
+            info.srcImageLayout = translate_layout(info.srcImageLayout, this->impl_->native_wsi && !this->impl_->gpu_copy);
             if (copy2)
             {
                 if (!dev->second.cmd_copy_image_to_buffer2)
@@ -4138,6 +4730,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_copy_image_to_buffer)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4154,8 +4750,9 @@ namespace sogen
         region.imageOffset = {.x = 0, .y = 0, .z = 0};
         region.imageExtent = {.width = width, .height = height, .depth = 1};
 
-        dev->second.cmd_copy_image_to_buffer(cb->second.handle, img->second.handle, translate_layout(image_layout), buf->second.handle, 1,
-                                             &region);
+        dev->second.cmd_copy_image_to_buffer(cb->second.handle, img->second.handle,
+                                             translate_layout(image_layout, this->impl_->native_wsi && !this->impl_->gpu_copy),
+                                             buf->second.handle, 1, &region);
         return VK_SUCCESS;
     }
 
@@ -4172,6 +4769,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_resolve_image)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4184,8 +4785,9 @@ namespace sogen
         region.dstOffset = {.x = 0, .y = 0, .z = 0};
         region.extent = {.width = width, .height = height, .depth = 1};
 
-        dev->second.cmd_resolve_image(cb->second.handle, src->second.handle, translate_layout(src_layout), dst->second.handle,
-                                      translate_layout(dst_layout), 1, &region);
+        dev->second.cmd_resolve_image(cb->second.handle, src->second.handle,
+                                      translate_layout(src_layout, this->impl_->native_wsi && !this->impl_->gpu_copy), dst->second.handle,
+                                      translate_layout(dst_layout, this->impl_->native_wsi && !this->impl_->gpu_copy), 1, &region);
         return VK_SUCCESS;
     }
 
@@ -4199,6 +4801,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_update_buffer)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4221,6 +4827,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_copy_buffer_to_image)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4237,8 +4847,8 @@ namespace sogen
         region.imageOffset = {.x = r.image_offset_x, .y = r.image_offset_y, .z = r.image_offset_z};
         region.imageExtent = {.width = r.width, .height = r.height, .depth = r.depth ? r.depth : 1};
 
-        dev->second.cmd_copy_buffer_to_image(cb->second.handle, buf->second.handle, img->second.handle, translate_layout(image_layout), 1,
-                                             &region);
+        dev->second.cmd_copy_buffer_to_image(cb->second.handle, buf->second.handle, img->second.handle,
+                                             translate_layout(image_layout, this->impl_->native_wsi && !this->impl_->gpu_copy), 1, &region);
         return VK_SUCCESS;
     }
 
@@ -4255,6 +4865,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_copy_image)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4273,8 +4887,9 @@ namespace sogen
         region.dstOffset = {.x = r.dst_offset_x, .y = r.dst_offset_y, .z = r.dst_offset_z};
         region.extent = {.width = r.width, .height = r.height, .depth = r.depth ? r.depth : 1};
 
-        dev->second.cmd_copy_image(cb->second.handle, src->second.handle, translate_layout(src_layout), dst->second.handle,
-                                   translate_layout(dst_layout), 1, &region);
+        dev->second.cmd_copy_image(cb->second.handle, src->second.handle,
+                                   translate_layout(src_layout, this->impl_->native_wsi && !this->impl_->gpu_copy), dst->second.handle,
+                                   translate_layout(dst_layout, this->impl_->native_wsi && !this->impl_->gpu_copy), 1, &region);
         return VK_SUCCESS;
     }
 
@@ -4291,6 +4906,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_blit_image)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4310,8 +4929,10 @@ namespace sogen
         region.dstOffsets[0] = {.x = r.dst_offset_x0, .y = r.dst_offset_y0, .z = r.dst_offset_z0};
         region.dstOffsets[1] = {.x = r.dst_offset_x1, .y = r.dst_offset_y1, .z = r.dst_offset_z1};
 
-        dev->second.cmd_blit_image(cb->second.handle, src->second.handle, translate_layout(src_layout), dst->second.handle,
-                                   translate_layout(dst_layout), 1, &region, static_cast<VkFilter>(r.filter));
+        dev->second.cmd_blit_image(cb->second.handle, src->second.handle,
+                                   translate_layout(src_layout, this->impl_->native_wsi && !this->impl_->gpu_copy), dst->second.handle,
+                                   translate_layout(dst_layout, this->impl_->native_wsi && !this->impl_->gpu_copy), 1, &region,
+                                   static_cast<VkFilter>(r.filter));
         return VK_SUCCESS;
     }
 
@@ -4322,6 +4943,10 @@ namespace sogen
     {
         out_sampler = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_sampler)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4369,6 +4994,11 @@ namespace sogen
 
     void vulkan_host::destroy_sampler(uint64_t device, uint64_t sampler)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->samplers.find(sampler);
         if (it == this->impl_->samplers.end() || it->second.device_id != device)
@@ -4392,6 +5022,13 @@ namespace sogen
 
     void vulkan_host::destroy_surface(uint64_t surface)
     {
+        const auto it = this->impl_->surfaces.find(surface);
+        if (it != this->impl_->surfaces.end() && it->second.native)
+        {
+            const auto& instance = this->impl_->instances.at(it->second.instance_id);
+            const auto destroy = this->impl_->load_instance_proc<PFN_vkDestroySurfaceKHR>(instance.handle, "vkDestroySurfaceKHR");
+            destroy(instance.handle, it->second.native, nullptr);
+        }
         this->impl_->surfaces.erase(surface);
     }
 
@@ -4437,6 +5074,10 @@ namespace sogen
         out_image_count = 0;
 
         const auto dev_it = this->impl_->devices.find(device);
+        if (dev_it != this->impl_->devices.end() && dev_it->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto surf_it = this->impl_->surfaces.find(surface);
         if (dev_it == this->impl_->devices.end() || surf_it == this->impl_->surfaces.end())
         {
@@ -4610,6 +5251,25 @@ namespace sogen
         {
             return;
         }
+        if (it->second.native)
+        {
+            it->second.destroy_requested = it->second.retired = true;
+            if (this->impl_->devices.at(device).native_presentation_failed)
+            {
+                return;
+            }
+            const auto result = this->impl_->retire_native_presentations(it->second, false);
+            if (result != VK_SUCCESS)
+            {
+                throw native_copy_error{result};
+            }
+            if (!it->second.copies.empty())
+            {
+                std::fprintf(stderr, "[gpu-bridge] native swapchain destruction deferred: device=%llu swapchain=%llu records=%zu\n",
+                             static_cast<unsigned long long>(device), static_cast<unsigned long long>(swapchain), it->second.copies.size());
+                return;
+            }
+        }
         this->impl_->destroy_swapchain_resources(it->second);
         this->impl_->swapchains.erase(it);
     }
@@ -4653,6 +5313,10 @@ namespace sogen
         // can run; with no present engine to signal them, an empty submit does so now that the image is ready.
         // Otherwise that submit -- and the frame fence it signals -- would never complete, deadlocking DXVK.
         const auto dev_it = this->impl_->devices.find(it->second.device_id);
+        if (dev_it != this->impl_->devices.end() && dev_it->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev_it == this->impl_->devices.end() || !dev_it->second.queue_submit)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4735,6 +5399,10 @@ namespace sogen
         uint64_t source_image_id = sc.image_ids[image_index];
 
         const auto dev_it = this->impl_->devices.find(sc.device_id);
+        if (dev_it != this->impl_->devices.end() && dev_it->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto img_it = this->impl_->images.find(source_image_id);
         if (dev_it == this->impl_->devices.end() || img_it == this->impl_->images.end() || img_it->second.device_id != sc.device_id)
         {
@@ -4876,6 +5544,10 @@ namespace sogen
     {
         out_module = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_shader_module)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4902,6 +5574,11 @@ namespace sogen
 
     void vulkan_host::destroy_shader_module(uint64_t device, uint64_t shader_module)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->shader_modules.find(shader_module);
         if (it == this->impl_->shader_modules.end() || it->second.device_id != device)
@@ -4920,6 +5597,10 @@ namespace sogen
     {
         identifier_size = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto module = this->impl_->shader_modules.find(shader_module);
         if (dev == this->impl_->devices.end() || module == this->impl_->shader_modules.end() || module->second.device_id != device ||
             !dev->second.get_shader_module_identifier)
@@ -4940,6 +5621,10 @@ namespace sogen
     {
         identifier_size = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.get_shader_module_create_info_identifier)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4966,6 +5651,10 @@ namespace sogen
     {
         out_view = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto img = this->impl_->images.find(image);
         if (dev == this->impl_->devices.end() || img == this->impl_->images.end() || img->second.device_id != device ||
             !dev->second.create_image_view)
@@ -5003,6 +5692,11 @@ namespace sogen
 
     void vulkan_host::destroy_image_view(uint64_t device, uint64_t image_view)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->image_views.find(image_view);
         if (it == this->impl_->image_views.end() || it->second.device_id != device)
@@ -5021,6 +5715,10 @@ namespace sogen
     {
         out_view = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto buf = this->impl_->buffers.find(buffer);
         if (dev == this->impl_->devices.end() || buf == this->impl_->buffers.end() || buf->second.device_id != device ||
             !dev->second.create_buffer_view)
@@ -5050,6 +5748,11 @@ namespace sogen
 
     void vulkan_host::destroy_buffer_view(uint64_t device, uint64_t buffer_view)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->buffer_views.find(buffer_view);
         if (it == this->impl_->buffer_views.end() || it->second.device_id != device)
@@ -5076,6 +5779,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_copy_buffer || regions.empty())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -5098,6 +5805,10 @@ namespace sogen
     {
         out_pool = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_query_pool)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -5126,6 +5837,11 @@ namespace sogen
 
     void vulkan_host::destroy_query_pool(uint64_t device, uint64_t query_pool)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->query_pools.find(query_pool);
         if (it == this->impl_->query_pools.end() || it->second.device_id != device)
@@ -5142,6 +5858,10 @@ namespace sogen
     int32_t vulkan_host::reset_query_pool(uint64_t device, uint64_t query_pool, uint32_t first_query, uint32_t query_count)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto qp = this->impl_->query_pools.find(query_pool);
         if (dev == this->impl_->devices.end() || qp == this->impl_->query_pools.end() || qp->second.device_id != device ||
             !dev->second.reset_query_pool)
@@ -5157,6 +5877,10 @@ namespace sogen
     {
         out_written = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto qp = this->impl_->query_pools.find(query_pool);
         if (dev == this->impl_->devices.end() || qp == this->impl_->query_pools.end() || qp->second.device_id != device ||
             !dev->second.get_query_pool_results)
@@ -5204,6 +5928,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_reset_query_pool)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -5222,6 +5950,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_begin_query)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -5240,6 +5972,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_end_query)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -5259,6 +5995,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_begin_query_indexed)
         {
             return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -5277,6 +6017,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_end_query_indexed)
         {
             return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -5296,6 +6040,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_bind_transform_feedback_buffers)
         {
             return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -5330,6 +6078,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() ||
             (begin ? !dev->second.cmd_begin_transform_feedback : !dev->second.cmd_end_transform_feedback))
         {
@@ -5407,6 +6159,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_draw_indirect_byte_count)
         {
             return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -5426,6 +6182,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_write_timestamp)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -5444,6 +6204,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -5471,6 +6235,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_copy_query_pool_results)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -5611,6 +6379,10 @@ namespace sogen
         namespace wire = gpu_bridge::render_pass_wire;
         out_render_pass = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_render_pass || !dev->second.destroy_render_pass)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -5620,7 +6392,10 @@ namespace sogen
             wire::reader reader(packet);
             VkRenderPassCreateInfo info{};
             wire::decode(reader, info);
-            translate_render_pass_layouts(info);
+            if (!this->impl_->native_wsi || this->impl_->gpu_copy)
+            {
+                translate_render_pass_layouts(info);
+            }
             VkRenderPass render_pass{};
             const VkResult result = dev->second.create_render_pass(dev->second.handle, &info, nullptr, &render_pass);
             if (result != VK_SUCCESS)
@@ -5662,6 +6437,10 @@ namespace sogen
         namespace wire = gpu_bridge::render_pass_wire;
         out_render_pass = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_render_pass2 || !dev->second.destroy_render_pass)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -5671,7 +6450,10 @@ namespace sogen
             wire::reader reader(packet);
             VkRenderPassCreateInfo2 info{};
             wire::decode(reader, info);
-            translate_render_pass_layouts(info);
+            if (!this->impl_->native_wsi || this->impl_->gpu_copy)
+            {
+                translate_render_pass_layouts(info);
+            }
             VkRenderPass render_pass{};
             const VkResult result = dev->second.create_render_pass2(dev->second.handle, &info, nullptr, &render_pass);
             if (result != VK_SUCCESS)
@@ -5713,6 +6495,10 @@ namespace sogen
         namespace wire = gpu_bridge::render_pass_wire;
         out_framebuffer = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_framebuffer || !dev->second.destroy_framebuffer)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -5773,6 +6559,10 @@ namespace sogen
     {
         width = height = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto rp = this->impl_->render_passes.find(render_pass);
         if (dev == this->impl_->devices.end() || rp == this->impl_->render_passes.end() || rp->second.device_id != device ||
             !dev->second.get_render_area_granularity)
@@ -5792,6 +6582,10 @@ namespace sogen
         namespace wire = gpu_bridge::render_pass_wire;
         width = height = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -5830,6 +6624,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -5928,6 +6726,10 @@ namespace sogen
     {
         out_render_pass = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_render_pass)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -5942,8 +6744,8 @@ namespace sogen
         attachments[0].storeOp = static_cast<VkAttachmentStoreOp>(store_op);
         attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        attachments[0].initialLayout = translate_layout(initial_layout);
-        attachments[0].finalLayout = translate_layout(final_layout);
+        attachments[0].initialLayout = translate_layout(initial_layout, this->impl_->native_wsi && !this->impl_->gpu_copy);
+        attachments[0].finalLayout = translate_layout(final_layout, this->impl_->native_wsi && !this->impl_->gpu_copy);
         // Depth attachment is cleared on load and not stored (transient).
         attachments[1].format = static_cast<VkFormat>(depth_format);
         attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
@@ -6006,6 +6808,11 @@ namespace sogen
 
     void vulkan_host::destroy_render_pass(uint64_t device, uint64_t render_pass)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->render_passes.find(render_pass);
         if (it == this->impl_->render_passes.end() || it->second.device_id != device)
@@ -6024,6 +6831,10 @@ namespace sogen
     {
         out_framebuffer = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto rp = this->impl_->render_passes.find(render_pass);
         const auto view = this->impl_->image_views.find(image_view);
         if (dev == this->impl_->devices.end() || rp == this->impl_->render_passes.end() || view == this->impl_->image_views.end() ||
@@ -6069,6 +6880,11 @@ namespace sogen
 
     void vulkan_host::destroy_framebuffer(uint64_t device, uint64_t framebuffer)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->framebuffers.find(framebuffer);
         if (it == this->impl_->framebuffers.end() || it->second.device_id != device)
@@ -6087,6 +6903,10 @@ namespace sogen
     {
         out_layout = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_pipeline_layout)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -6134,6 +6954,11 @@ namespace sogen
 
     void vulkan_host::destroy_pipeline_layout(uint64_t device, uint64_t pipeline_layout)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->pipeline_layouts.find(pipeline_layout);
         if (it == this->impl_->pipeline_layouts.end() || it->second.device_id != device)
@@ -6152,6 +6977,10 @@ namespace sogen
     {
         out_layout = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_descriptor_set_layout)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -6204,6 +7033,10 @@ namespace sogen
         max_variable_descriptor_count = 0;
 
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.get_descriptor_set_layout_support)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -6249,6 +7082,11 @@ namespace sogen
 
     void vulkan_host::destroy_descriptor_set_layout(uint64_t device, uint64_t layout)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->descriptor_set_layouts.find(layout);
         if (it == this->impl_->descriptor_set_layouts.end() || it->second.device_id != device)
@@ -6268,6 +7106,10 @@ namespace sogen
     {
         out_pool = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_descriptor_pool)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -6311,6 +7153,10 @@ namespace sogen
     int32_t vulkan_host::reset_descriptor_pool(uint64_t device, uint64_t pool, uint32_t flags)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto it = this->impl_->descriptor_pools.find(pool);
         if (dev == this->impl_->devices.end() || it == this->impl_->descriptor_pools.end() || it->second.device_id != device ||
             !dev->second.reset_descriptor_pool)
@@ -6330,6 +7176,11 @@ namespace sogen
 
     void vulkan_host::destroy_descriptor_pool(uint64_t device, uint64_t pool)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->descriptor_pools.find(pool);
         if (it == this->impl_->descriptor_pools.end() || it->second.device_id != device)
@@ -6351,6 +7202,10 @@ namespace sogen
     {
         out_count = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto pool_it = this->impl_->descriptor_pools.find(pool);
         if (dev == this->impl_->devices.end() || pool_it == this->impl_->descriptor_pools.end() || pool_it->second.device_id != device ||
             !dev->second.allocate_descriptor_sets ||
@@ -6410,6 +7265,10 @@ namespace sogen
     int32_t vulkan_host::free_descriptor_sets(uint64_t device, uint64_t pool, std::span<const uint64_t> sets)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto pool_it = this->impl_->descriptor_pools.find(pool);
         if (dev == this->impl_->devices.end() || pool_it == this->impl_->descriptor_pools.end() || pool_it->second.device_id != device ||
             !dev->second.free_descriptor_sets)
@@ -6444,6 +7303,10 @@ namespace sogen
     int32_t vulkan_host::update_descriptor_sets(uint64_t device, std::span<const descriptor_write> writes)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.update_descriptor_sets)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -6589,6 +7452,10 @@ namespace sogen
     {
         out_pipeline_cache = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.create_pipeline_cache)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -6615,6 +7482,11 @@ namespace sogen
 
     void vulkan_host::destroy_pipeline_cache(uint64_t device, uint64_t pipeline_cache)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto cache = this->impl_->pipeline_caches.find(pipeline_cache);
         if (cache == this->impl_->pipeline_caches.end() || cache->second.device_id != device)
@@ -6634,6 +7506,10 @@ namespace sogen
     {
         data_size = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto cache = this->impl_->pipeline_caches.find(pipeline_cache);
         if (dev == this->impl_->devices.end() || cache == this->impl_->pipeline_caches.end() || cache->second.device_id != device)
         {
@@ -6663,6 +7539,10 @@ namespace sogen
     int32_t vulkan_host::merge_pipeline_caches(uint64_t device, uint64_t destination_cache, std::span<const uint64_t> source_caches)
     {
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto destination = this->impl_->pipeline_caches.find(destination_cache);
         if (dev == this->impl_->devices.end() || destination == this->impl_->pipeline_caches.end() ||
             destination->second.device_id != device)
@@ -6703,6 +7583,10 @@ namespace sogen
     {
         out_pipeline = 0;
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto layout = this->impl_->pipeline_layouts.find(pipeline_layout);
         if (dev == this->impl_->devices.end() || layout == this->impl_->pipeline_layouts.end() || layout->second.device_id != device ||
             !dev->second.create_graphics_pipelines)
@@ -7030,6 +7914,10 @@ namespace sogen
         out_pipeline = 0;
 
         const auto dev = this->impl_->devices.find(device);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         const auto layout = this->impl_->pipeline_layouts.find(pipeline_layout);
         if (dev == this->impl_->devices.end() || layout == this->impl_->pipeline_layouts.end() || layout->second.device_id != device ||
             !dev->second.create_compute_pipelines)
@@ -7099,6 +7987,11 @@ namespace sogen
 
     void vulkan_host::destroy_pipeline(uint64_t device, uint64_t pipeline)
     {
+        const auto retained_device = this->impl_->devices.find(device);
+        if (retained_device != this->impl_->devices.end() && retained_device->second.native_presentation_failed)
+        {
+            return;
+        }
         const auto dev = this->impl_->devices.find(device);
         const auto it = this->impl_->pipelines.find(pipeline);
         if (it == this->impl_->pipelines.end() || it->second.device_id != device)
@@ -7124,6 +8017,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_begin_render_pass)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7160,6 +8057,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_bind_pipeline)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7176,6 +8077,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_dispatch)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7193,6 +8098,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_dispatch_indirect)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7210,6 +8119,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_draw)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7227,6 +8140,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_bind_vertex_buffers)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7265,6 +8182,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_bind_vertex_buffers2)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7315,6 +8236,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_bind_index_buffer)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7332,6 +8257,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_draw_indexed)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7351,6 +8280,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_draw_indexed_indirect)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7374,6 +8307,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_draw_indexed_indirect_count)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7394,6 +8331,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_draw_indirect)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7417,6 +8358,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_draw_indirect_count)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7439,6 +8384,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_bind_descriptor_sets)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7470,6 +8419,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_end_render_pass)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7487,6 +8440,10 @@ namespace sogen
         }
 
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_next_subpass)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7507,6 +8464,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_begin_rendering)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7590,6 +8551,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_end_rendering)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7609,6 +8574,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_push_constants)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7626,6 +8595,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7670,6 +8643,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7711,6 +8688,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_set_depth_bias)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7732,6 +8713,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_set_blend_constants)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7748,6 +8733,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_set_depth_bounds)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7764,6 +8753,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_set_line_width)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7780,6 +8773,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7823,6 +8820,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end() || !dev->second.cmd_set_stencil_op)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7846,6 +8847,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7868,6 +8873,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
         if (dev == this->impl_->devices.end())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -7964,4 +8973,6 @@ namespace sogen
         }
         return VK_SUCCESS;
     }
+
+#include "vulkan_native_wsi.inc"
 }

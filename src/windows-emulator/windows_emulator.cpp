@@ -779,7 +779,26 @@ namespace sogen
         this->setup_hooks();
     }
 
-    windows_emulator::~windows_emulator() = default;
+    windows_emulator::~windows_emulator()
+    {
+        if (this->ui().native_presentation_active())
+        {
+            for (auto& [id, thread] : this->process.threads)
+            {
+                (void)id;
+                thread.await_host_condition = {};
+            }
+            this->process.devices = {};
+            this->ui().drain_native_shutdown();
+            if (this->ui().native_presentation_quarantined())
+            {
+                auto* const quarantined_backend = this->ui_backend_.release();
+                this->log.warn("Native Vulkan presentation completion is unresolved; retaining host and hidden HWND ownership at %p until "
+                               "process exit\n",
+                               static_cast<void*>(quarantined_backend));
+            }
+        }
+    }
 
     void windows_emulator::setup_process_if_necessary()
     {
@@ -1859,6 +1878,11 @@ namespace sogen
 
     void windows_emulator::deserialize(utils::buffer_deserializer& buffer)
     {
+        if (this->ui().native_presentation_active())
+        {
+            throw std::runtime_error("Cannot restore over active native Vulkan presentation; use a fresh pre-GPU emulator");
+        }
+
         this->register_factories(buffer);
 
         buffer.read(this->application_settings_);
@@ -1941,6 +1965,11 @@ namespace sogen
 
     void windows_emulator::restore_snapshot()
     {
+        if (this->ui().native_presentation_active())
+        {
+            throw std::runtime_error("Cannot restore over active native Vulkan presentation; use a fresh pre-GPU emulator");
+        }
+
         if (this->process_snapshot_.empty())
         {
             throw std::runtime_error("No snapshot saved");

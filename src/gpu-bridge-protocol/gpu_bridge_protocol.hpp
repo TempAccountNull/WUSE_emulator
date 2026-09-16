@@ -217,6 +217,7 @@ namespace sogen::gpu_bridge
         cmd_copy_image_to_buffer2_full = 0x8D1,
         set_device_memory_priority = 0x8D2,
         allocate_memory_full = 0x8D3,
+        queue_submit_full = 0x8DE,
     };
 
     inline constexpr uint32_t ioctl_get_event_status_owned = make_ioctl(static_cast<uint32_t>(command::get_event_status_owned));
@@ -854,6 +855,25 @@ namespace sogen::gpu_bridge
         object_id event;
     };
 
+    inline constexpr uint32_t ioctl_queue_submit_full = make_ioctl(static_cast<uint32_t>(command::queue_submit_full));
+    inline constexpr uint32_t max_queue_submit_full_bytes = 16 * 1024 * 1024;
+
+    struct alignas(8) queue_submit_full_header
+    {
+        uint32_t protocol;
+        uint32_t bytes;
+        uint64_t queue;
+        uint64_t fence;
+        uint32_t batch_count;
+        uint32_t reserved;
+    };
+
+    static_assert(sizeof(queue_submit_full_header) == 32);
+
+    // Historical reduced-transport behavior, retained for older shim compatibility:
+    // Count the command buffers so the fence can be attached to the final submission only.
+    // A zero-batch submission (no command buffers) is still a valid fence signal in Vulkan. Forward
+    // a fence-only submit so a later vkWaitForFences doesn't spin forever on an unsignaled fence.
     struct queue_submit_request
     {
         object_id queue;

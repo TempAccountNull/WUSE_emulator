@@ -1,6 +1,8 @@
 #pragma once
 
 #include "window.hpp"
+#include "native_presentation_window.hpp"
+#include "ui_completion_queue.hpp"
 
 #include <functional>
 #include <memory>
@@ -68,6 +70,34 @@ namespace sogen
 
         virtual void set_event_sink(event_sink sink) = 0;
         virtual void pump_events() = 0;
+
+        virtual std::shared_ptr<ui_completion_queue> activate_native_presentation()
+        {
+            return {};
+        }
+
+        virtual native_window_acquisition acquire_native_window_on_ui(uint64_t)
+        {
+            return {.status = native_window_acquire_status::native_target_unavailable, .lease = {}};
+        }
+
+        virtual bool native_presentation_active() const
+        {
+            return false;
+        }
+
+        virtual void retain_native_presentation_until_exit() noexcept
+        {
+        }
+
+        virtual bool native_presentation_quarantined() const
+        {
+            return false;
+        }
+
+        virtual void drain_native_shutdown()
+        {
+        }
 
         virtual void reset()
         {

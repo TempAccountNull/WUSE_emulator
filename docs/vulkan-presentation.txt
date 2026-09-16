@@ -1,0 +1,89 @@
+Vulkan presentation and GPU telemetry
+
+Select SOGEN_VULKAN_PRESENT=native, gpu-copy, or readback before launching
+analyzer. Native uses a Win32 Vulkan swapchain directly. GPU-copy renders into
+device-local intermediate images and copies them into the native swapchain.
+Readback preserves the existing GPU-to-CPU-to-SDL path. Native and GPU-copy
+currently require the SDL backend and one emulated vCPU.
+
+Native operations run on the window's owner thread. The guest waits for a
+completion object while the UI thread drains its FIFO outside the kernel lock.
+The GDB connection pumps this queue on its owner thread while the guest runs;
+it also continues pumping during an idle connection and after disconnect.
+Results and output arrays are committed only when the operation completes.
+
+The fixed-width native wire protocol validates sizes, counts, ownership and
+extension chains before invoking Vulkan. Both guest architectures compile.
+GPU-copy currently requires matching source/destination format, extent and
+array layers on the selected primary queue family; it performs no conversion.
+Unsupported chains are rejected rather than reported as successful.
+
+Legacy vkQueueSubmit forwards the complete batch array, wait-stage masks,
+signal semaphores, fence, timeline values, device groups and protected flags.
+The host calls native vkQueueSubmit once after validating all ownership.
+The existing shortened submission protocol remains compatible with old shims.
+
+Presentation resources are retired from observed completion. Reacquiring an
+image index alone is insufficient evidence. The host uses supported present
+fences or a private acquisition witness. If final presentation completion
+cannot be proved during bounded shutdown, it retains the host/loader/hidden
+window owner until process exit. This is explicit in the log and bounded;
+it is not a claim of immediate reclamation. Live GPU snapshots remain rejected.
+
+Adapter identity is cached when the device is created. The record includes
+Vulkan device type/name and valid Windows LUID bytes, allowing the logger to
+match process GPU counters to the actual renderer instead of guessing by name.
+SOGEN_GPU_STATUS_DIR optionally enables two small host-written status files:
+render-device-live.txt and presentation-live.txt. Their complete timestamped
+lines can be read without scanning the verbose audit stream. Presentation
+records are rate-limited to once per second and describe accepted requests,
+not display scanout or CPU execution time. Observer failures do not alter
+completed Vulkan results.
+
+Windows telemetry uses cached PDH queries for process GPU engines and memory.
+It validates PID creation time and liveness; selected-adapter utilization is
+the busiest individual engine, never a sum of overlapping engines. Dedicated
+and shared memory are process MiB, not a fabricated percentage of GPU capacity.
+The observer preserves unavailable/warm-up/stale states and all engine samples.
+
+The created game window retains its guest title and appends renderer type,
+adapter, utilization, selected process GPU-memory allocation and host RAM
+working set. The caption consumer runs on the SDL owner thread at one-second
+intervals and changes the title only when needed. Its bounded three-line
+gpu-window-title.txt record must name this host PID and the swapchain's guest
+window handle; unrelated windows receive no metrics. Future or older-than-three-
+second records retain identity but replace measurements with Telemetry: stale.
+The logger title shows only the renderer type and adapter; its status body has
+no utilization/memory strip. Full counters remain in the per-run journal.
+
+The x64 guest shader stress test passed native, GPU-copy and readback with the
+same 240-frame workload, 512 arithmetic iterations per fragment, alternating
+acquisition fences/semaphores and two surface sizes (1914x1074 then 1434x804).
+All 720 GPU timestamp samples were valid; all acquire/present results were zero.
+The selected adapter was AMD Radeon RX 6700, LUID 0x00000000_0x00013A77.
+
+Mode       Median GPU render submission    Peak process GPU utilization
+native     17.448 ms                       43.899%
+gpu-copy   17.678 ms                       41.749%
+readback   18.170 ms                       42.378%
+
+GPU timestamps bracket TOP_OF_PIPE through BOTTOM_OF_PIPE, including an acquire
+wait encountered within that span. They exclude the bridge copy/readback and
+presentation work. These measurements prove a submitted GPU workload, not game
+FPS or a controlled throughput ranking. Mean counter sampling cost was below
+0.8 ms once per second, excluding journal I/O. The latest presentation record
+was observed within 0.315-0.785 seconds of emission in these three captures.
+
+The x86 fixture currently faults in WOW64 startup before its main function.
+The first instruction at ntdll+0x66CDF, CS=0x23, is decoded as RIP-relative after
+IRETQ although it requires absolute 32-bit addressing. This pre-existing CPU
+mode transition defect prevents x86 runtime acceptance; building both shims
+does not establish x86 runtime correctness. The actual game remains a separate
+acceptance target, with its held first-heap-failure process preserved.
+
+Detailed hashes, commands and counters: vulkan-presentation-validation.json.
+
+Validation completed: Release and tidy builds; 156 selected C++ tests in
+both Icicle interpreter and JIT modes. The external workspace sampler and
+PowerShell viewer supply the caption record; they are separate from the
+Sogen host caption consumer committed here. No game boot is claimed.

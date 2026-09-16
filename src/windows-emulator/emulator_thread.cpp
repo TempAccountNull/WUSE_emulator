@@ -667,6 +667,7 @@ namespace sogen
         this->await_msg_mask = {};
         this->await_io_completion = {};
         this->await_host_condition = {};
+        this->await_host_status = STATUS_SUCCESS;
 
         // TODO: Find out if this is correct
         if (this->waiting_for_alert)
@@ -1136,7 +1137,7 @@ namespace sogen
             // otherwise stay parked.
             if (this->await_host_condition())
             {
-                this->mark_as_ready(STATUS_SUCCESS);
+                this->mark_as_ready(this->await_host_status);
                 return true;
             }
 

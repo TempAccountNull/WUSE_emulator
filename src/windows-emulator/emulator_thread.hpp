@@ -314,8 +314,10 @@ namespace sogen
         // When set, the thread is parked until this host-side predicate returns true. Used by the GPU
         // bridge to wait on a Vulkan semaphore cooperatively (other guest threads run while the GPU works)
         // instead of blocking the single VP. Polled by is_thread_ready and completed via
-        // mark_as_ready(STATUS_SUCCESS). Not serialized: the only user (GPU bridge) is not snapshotable.
+        // mark_as_ready(await_host_status), which defaults to success for ordinary predicates. Neither
+        // field is serialized: the only user (GPU bridge) is not snapshotable.
         std::function<bool()> await_host_condition{};
+        NTSTATUS await_host_status{STATUS_SUCCESS};
 
         bool apc_alertable{false};
         std::vector<pending_apc> pending_apcs{};

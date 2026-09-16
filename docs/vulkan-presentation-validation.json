@@ -1,0 +1,223 @@
+{
+  "scope": "x64 renderer fixtures and focused regressions; not game boot acceptance",
+  "builds": {
+    "release_log": "benchmarks/sogen-fixes/vs2022-1789564785182929100.log",
+    "tidy_log": "benchmarks\\sogen-fixes\\tidy-1789565620759772900.log",
+    "tidy_exit_code": 0,
+    "analyzer_sha256": "4c48b01979314fc88f99afef9ad1f98aedbc0bae15f0e00e5cd5f1b4e0d63003",
+    "shim_x64_sha256": "184f9d226fb90ff9f7343b6124055c03d969091879d4b8b33e91fc32ec1a7ad9",
+    "shim_x86_sha256": "64e74f75c81ab19c732cdf3781fad7ce7a402fb99bb5cb77a3a2db325a11f400"
+  },
+  "regressions": {
+    "capture": "benchmarks\\sogen-fixes\\regression-1789565727202863400",
+    "tests_per_mode": 156,
+    "runs": [
+      {
+        "mode": "interpreter",
+        "command": [
+          "D:\\Emulation\\sogen\\build\\tidy\\artifacts\\windows-emulator-test.exe",
+          "--gtest_filter=GpuWindowTitleTest.*:Vulkan*:Native*:UiCompletionQueue.*:UiOwnedCompletion.*:HostWaitCompletionTest.*:GdbUiIdle.*:GdbReconnect.*:GdbWatchpointLifecycle.*:HostDeviceLifetime.*:GraphicsQueue*",
+          "--gtest_color=no",
+          "--gtest_output=json:D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789565727202863400\\interpreter.json"
+        ],
+        "exit_code": 0,
+        "seconds": 8.297898299992085
+      },
+      {
+        "mode": "jit",
+        "command": [
+          "D:\\Emulation\\sogen\\build\\tidy\\artifacts\\windows-emulator-test.exe",
+          "--gtest_filter=GpuWindowTitleTest.*:Vulkan*:Native*:UiCompletionQueue.*:UiOwnedCompletion.*:HostWaitCompletionTest.*:GdbUiIdle.*:GdbReconnect.*:GdbWatchpointLifecycle.*:HostDeviceLifetime.*:GraphicsQueue*",
+          "--gtest_color=no",
+          "--gtest_output=json:D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789565727202863400\\jit.json"
+        ],
+        "exit_code": 0,
+        "seconds": 7.014281099895015
+      }
+    ]
+  },
+  "gpu_stress": {
+    "scope": "Renderer fixtures, not game performance or boot acceptance",
+    "runs": [
+      {
+        "mode": "native",
+        "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\gpu-stress-fixture-native-x64-1789563143661124100",
+        "passed": true,
+        "pid": 61052,
+        "analyzer_sha256": "ac0b05e2cd1aaa0ac00c5b6819fec97fb12ffef87935c4c5a70afffb243b3541",
+        "shim_sha256": "7b513235af867a3db299bd022ac30ff0ba3bcc7864e2f852c955f139435233d9",
+        "host_elapsed_including_startup_and_hold_seconds": 31.548801299883053,
+        "frames": 240,
+        "generations": 2,
+        "failures": 0,
+        "gpu_timestamp_samples": 240,
+        "gpu_render_submission_median_ms": 17.44771,
+        "gpu_render_submission_max_ms": 25.00614,
+        "gpu_scope": "TOP to BOTTOM render submission; may include acquire wait; excludes bridge copy/readback/presentation",
+        "adapter": {
+          "status": "verified_luid",
+          "description": "Discrete GPU | AMD Radeon RX 6700 | Vulkan device ID 0x5 | Vulkan swapchain ID 0x22 | presentation: native direct Win32 Vulkan WSI | device_luid_valid=true | device_luid_hex=773a010000000000 | device_node_mask=1",
+          "name": "AMD Radeon RX 6700",
+          "kind": "Discrete GPU",
+          "adapter_luid": "0x00000000_0x00013A77",
+          "reason": "Vulkan deviceLUID bytes matched to Windows adapter LUID",
+          "device_luid_hex": "773a010000000000",
+          "device_node_mask": 1,
+          "node_attribution": "Adapter LUID only; physical-node equivalence is not inferred"
+        },
+        "sample_count": 29,
+        "selected_valid_samples": 22,
+        "selected_positive_samples": 11,
+        "gpu_peak_percent": 43.89936749331396,
+        "gpu_mean_positive_sample_percent": 37.788087034426354,
+        "sampling_mean_ms": 0.6533620702423926,
+        "sampling_max_ms": 2.8723999857902527,
+        "last_presentation_observer_delay_ms": 784.9717140197754,
+        "presentation_scope": "Accepted presentation requests; not display scanout, CPU work time or GPU execution time",
+        "configuration": "[gpu-stress] CONFIG seconds=20 max_frames=240 iterations=512 requested_outer=1920x1080 hold_ms=10000 timestamps=required guest_qpc_frequency=1000000000 shader_vertex_sha256=58a13742238c0651b8eeda455ba8962c12f41d9d627cd90480d3ed38cdf90a5c shader_fragment_sha256=d1c1f846f12dfa12748c9ed8a662228f54cc3b847b288a8bfeb3a761a3915d46",
+        "fixture_summary": [
+          "[gpu-stress] DEVICE name=AMD Radeon RX 6700 type=2 vendor=0x1002 device=0x73DF family=0 timestamp_bits=64 timestamp_period_ns=10",
+          "[gpu-stress] GENERATION extent=1914x1074 images=3 format=37 usage=COLOR_ATTACHMENT draw=fullscreen-triangle",
+          "[gpu-stress] GENERATION extent=1434x804 images=3 format=37 usage=COLOR_ATTACHMENT draw=fullscreen-triangle",
+          "[gpu-stress] GPU samples=240 min_ms=13.290960 median_ms=17.447780 p95_ms=18.369510 max_ms=25.006140 scope=render-submission_not_presentation not_an_FPS_measurement=true",
+          "[gpu-stress] PASS frames=240 generations=2 suboptimal_frames=0 stop=frame-limit guest_elapsed_ms=10979.771 GPU_work=fragment_arithmetic final_WSI_cleanup=process_teardown external_host_deadline_required=true"
+        ]
+      },
+      {
+        "mode": "gpu-copy",
+        "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\gpu-stress-fixture-gpu-copy-x64-1789563237894166900",
+        "passed": true,
+        "pid": 56028,
+        "analyzer_sha256": "ac0b05e2cd1aaa0ac00c5b6819fec97fb12ffef87935c4c5a70afffb243b3541",
+        "shim_sha256": "7b513235af867a3db299bd022ac30ff0ba3bcc7864e2f852c955f139435233d9",
+        "host_elapsed_including_startup_and_hold_seconds": 33.87407510005869,
+        "frames": 240,
+        "generations": 2,
+        "failures": 0,
+        "gpu_timestamp_samples": 240,
+        "gpu_render_submission_median_ms": 17.67796,
+        "gpu_render_submission_max_ms": 25.61438,
+        "gpu_scope": "TOP to BOTTOM render submission; may include acquire wait; excludes bridge copy/readback/presentation",
+        "adapter": {
+          "status": "verified_luid",
+          "description": "Discrete GPU | AMD Radeon RX 6700 | Vulkan device ID 0x5 | Vulkan swapchain ID 0x22 | presentation: GPU copy, device-local images to native Win32 Vulkan WSI | device_luid_valid=true | device_luid_hex=773a010000000000 | device_node_mask=1",
+          "name": "AMD Radeon RX 6700",
+          "kind": "Discrete GPU",
+          "adapter_luid": "0x00000000_0x00013A77",
+          "reason": "Vulkan deviceLUID bytes matched to Windows adapter LUID",
+          "device_luid_hex": "773a010000000000",
+          "device_node_mask": 1,
+          "node_attribution": "Adapter LUID only; physical-node equivalence is not inferred"
+        },
+        "sample_count": 29,
+        "selected_valid_samples": 23,
+        "selected_positive_samples": 12,
+        "gpu_peak_percent": 41.749250998824515,
+        "gpu_mean_positive_sample_percent": 33.54518648965793,
+        "sampling_mean_ms": 0.7057344894213923,
+        "sampling_max_ms": 1.9440001342445612,
+        "last_presentation_observer_delay_ms": 314.7168159484863,
+        "presentation_scope": "Accepted presentation requests; not display scanout, CPU work time or GPU execution time",
+        "configuration": "[gpu-stress] CONFIG seconds=20 max_frames=240 iterations=512 requested_outer=1920x1080 hold_ms=10000 timestamps=required guest_qpc_frequency=1000000000 shader_vertex_sha256=58a13742238c0651b8eeda455ba8962c12f41d9d627cd90480d3ed38cdf90a5c shader_fragment_sha256=d1c1f846f12dfa12748c9ed8a662228f54cc3b847b288a8bfeb3a761a3915d46",
+        "fixture_summary": [
+          "[gpu-stress] DEVICE name=AMD Radeon RX 6700 type=2 vendor=0x1002 device=0x73DF family=0 timestamp_bits=64 timestamp_period_ns=10",
+          "[gpu-stress] GENERATION extent=1914x1074 images=3 format=37 usage=COLOR_ATTACHMENT draw=fullscreen-triangle",
+          "[gpu-stress] GENERATION extent=1434x804 images=3 format=37 usage=COLOR_ATTACHMENT draw=fullscreen-triangle",
+          "[gpu-stress] GPU samples=240 min_ms=16.318950 median_ms=17.678120 p95_ms=18.261280 max_ms=25.614380 scope=render-submission_not_presentation not_an_FPS_measurement=true",
+          "[gpu-stress] PASS frames=240 generations=2 suboptimal_frames=0 stop=frame-limit guest_elapsed_ms=12528.144 GPU_work=fragment_arithmetic final_WSI_cleanup=process_teardown external_host_deadline_required=true"
+        ]
+      },
+      {
+        "mode": "readback",
+        "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\gpu-stress-fixture-readback-x64-1789563334786979700",
+        "passed": true,
+        "pid": 37496,
+        "analyzer_sha256": "ac0b05e2cd1aaa0ac00c5b6819fec97fb12ffef87935c4c5a70afffb243b3541",
+        "shim_sha256": "7b513235af867a3db299bd022ac30ff0ba3bcc7864e2f852c955f139435233d9",
+        "host_elapsed_including_startup_and_hold_seconds": 33.26749420003034,
+        "frames": 240,
+        "generations": 2,
+        "failures": 0,
+        "gpu_timestamp_samples": 240,
+        "gpu_render_submission_median_ms": 18.170395,
+        "gpu_render_submission_max_ms": 25.75374,
+        "gpu_scope": "TOP to BOTTOM render submission; may include acquire wait; excludes bridge copy/readback/presentation",
+        "adapter": {
+          "status": "verified_luid",
+          "description": "Discrete GPU | AMD Radeon RX 6700 | Vulkan device ID 0x5 | Vulkan swapchain ID 0x22 | presentation: GPU readback via CPU memory | device_luid_valid=true | device_luid_hex=773a010000000000 | device_node_mask=1",
+          "name": "AMD Radeon RX 6700",
+          "kind": "Discrete GPU",
+          "adapter_luid": "0x00000000_0x00013A77",
+          "reason": "Vulkan deviceLUID bytes matched to Windows adapter LUID",
+          "device_luid_hex": "773a010000000000",
+          "device_node_mask": 1,
+          "node_attribution": "Adapter LUID only; physical-node equivalence is not inferred"
+        },
+        "sample_count": 32,
+        "selected_valid_samples": 24,
+        "selected_positive_samples": 13,
+        "gpu_peak_percent": 42.37804439124008,
+        "gpu_mean_positive_sample_percent": 33.469631948705675,
+        "sampling_mean_ms": 0.7860437399358489,
+        "sampling_max_ms": 2.957200165838003,
+        "last_presentation_observer_delay_ms": 660.0158214569092,
+        "presentation_scope": "Accepted presentation requests; not display scanout, CPU work time or GPU execution time",
+        "configuration": "[gpu-stress] CONFIG seconds=20 max_frames=240 iterations=512 requested_outer=1920x1080 hold_ms=10000 timestamps=required guest_qpc_frequency=1000000000 shader_vertex_sha256=58a13742238c0651b8eeda455ba8962c12f41d9d627cd90480d3ed38cdf90a5c shader_fragment_sha256=d1c1f846f12dfa12748c9ed8a662228f54cc3b847b288a8bfeb3a761a3915d46",
+        "fixture_summary": [
+          "[gpu-stress] DEVICE name=AMD Radeon RX 6700 type=2 vendor=0x1002 device=0x73DF family=0 timestamp_bits=64 timestamp_period_ns=10",
+          "[gpu-stress] GENERATION extent=1914x1074 images=3 format=44 usage=COLOR_ATTACHMENT draw=fullscreen-triangle",
+          "[gpu-stress] GENERATION extent=1434x804 images=3 format=44 usage=COLOR_ATTACHMENT draw=fullscreen-triangle",
+          "[gpu-stress] GPU samples=240 min_ms=16.842200 median_ms=18.171330 p95_ms=19.021090 max_ms=25.753740 scope=render-submission_not_presentation not_an_FPS_measurement=true",
+          "[gpu-stress] PASS frames=240 generations=2 suboptimal_frames=0 stop=frame-limit guest_elapsed_ms=13120.549 GPU_work=fragment_arithmetic final_WSI_cleanup=process_teardown external_host_deadline_required=true"
+        ]
+      }
+    ]
+  },
+  "x86_runtime": "Blocked before main by WOW64 IRETQ/decoder mode; not runtime validated",
+  "caption_confirmation": {
+    "capture": "benchmarks/sogen-fixes/gpu-stress-fixture-native-x64-1789564647990772500",
+    "user_screenshot_sha256": "8bfdfc3a719420cca5416548b54022a0168692e1c0a504e4246caa2f136813f5"
+  },
+  "source_files": {
+    "src/gdb-stub/connection_handler.cpp": "48aa29752d74738c74bdbfa03640fb4bf80dc6f7b061d97dfff1372ca42154a6",
+    "src/gdb-stub/connection_handler.hpp": "233d9d46cbeeef93c1428218fa55e5c51d5e0452a5ece29ed4f1846a042d5d1b",
+    "src/gdb-stub/gdb_stub.cpp": "ab3e1e11db99bf69bf1abb66439242c3c5738f2166c01debc1603660bceb299e",
+    "src/gdb-stub/gdb_stub.hpp": "5d804cba102ef398ebb317707f8c2eb9a2859f30defad157b41ceaf4542394cd",
+    "src/windows-gdb-stub/win_x86_64_gdb_stub_handler.hpp": "208bdedabcce677080ca59dd0fbbc7b091e4627173cb0d6e8f06b2670ab0aa3a",
+    "src/windows-emulator-test/gdb_ui_idle_test.cpp": "7ea6eb13f0e31e7954054653d61329e1259a25f7d4aba2d29ba78b9453f97222",
+    "src/emulator-platform/platform/ui_backend.hpp": "90711315ea9ddab8acdea7082b5714ea9c6641a996cd2a2a1bfe5a7ba27b4bcd",
+    "src/emulator-platform/platform/native_presentation_window.hpp": "a2fc5b451a747200783a6ca8d30d353c55f2b9e0e6b55418bb08f1ba11aa7396",
+    "src/emulator-platform/platform/ui_completion_queue.hpp": "a5b2025c307642faf1dcba433df8770aa1a9516a528578d20f6d197f91032faf",
+    "src/emulator-platform/platform/ui_owned_completion.hpp": "48b1becfe0ab35a3a63283971681f1e0d3eecbfac3ec765b7ec64930ddc17c50",
+    "src/gpu-bridge-protocol/CMakeLists.txt": "4065d76b4a6879d3066507cfd431eafe1c9a1d4e739099e2334c49c0685145b2",
+    "src/gpu-bridge-protocol/gpu_bridge_protocol.hpp": "1d34daba3d09cb1011d64d0de718e74052669098c0f7fa1619f5e89b477c87e8",
+    "src/gpu-bridge-protocol/native_wsi_wire.hpp": "7cb758d323270b1d3aad879c646a0dbc9717fd5283f908dbbce2e317de5d5dda",
+    "src/gpu-bridge-protocol/vk_queue_submit.hpp": "2d6d99f8231260c18dba172e1fafd81316e606e4e83c2f28e80ad95ade60306d",
+    "src/samples/vulkan-shim/vulkan_shim.cpp": "9f30b9e7fdd33f3baad710baa417a35cfb06b770a6df5da346cd681343fe23c7",
+    "src/samples/vulkan-shim/vulkan_shim.def": "8d5aa7ff1db170e9ffd068219c15dba12d8cf8af6faae8576a6fb38d86be9162",
+    "src/samples/vulkan-shim/native_wsi_shim.inc": "6e1ba52a0e01e6ba536fda9a9ee84d950609f7c03b31f149afb70fe4a17e06de",
+    "src/windows-emulator/devices/gpu_bridge.cpp": "dddd142f6104a768e555fe20b928239573a66ea555d21a204e97a44e075f043e",
+    "src/windows-emulator/devices/vulkan_host.cpp": "8db9ee691dd8dcdd249858322e0dd92fae9551f4b93043f736e234cf00ffd1b2",
+    "src/windows-emulator/devices/vulkan_host.hpp": "530221ddd55ccd99bbc4df71ef21e6d0d740c8f77593ea9e7f7bab8c7fdb5c9d",
+    "src/windows-emulator/devices/legacy_queue_submit.hpp": "44f32b097188d814c2f38886961aa70706516e1c9418cfd762d726311a5aaad5",
+    "src/windows-emulator/devices/native_copy_commands.inc": "33a4cf01330a0f14dfc6383ded5e5f52f9f5042d6b07f8a44cbd5ae24a5efd5d",
+    "src/windows-emulator/devices/native_copy_submission.inc": "e1cce4777f30ff0d312a7895449ce13341070fcb78a42795a4f1abc91deca649",
+    "src/windows-emulator/devices/native_present_sync.hpp": "f32174a9babe8b239c1a22aecb949c05e0df74c4288d426849cd46738a6403ea",
+    "src/windows-emulator/devices/native_wsi_bridge.inc": "a4fa62e63f02ada6236ce48528d601a1b036650cb05552a1cb17034c67f1cc9b",
+    "src/windows-emulator/devices/native_wsi_completion.hpp": "1a6b0692f0e7c7816ff5398d1db35771a1e66ae7f25e509fdf17473141db6329",
+    "src/windows-emulator/devices/vulkan_native_wsi.inc": "58465c88a0ffd7756114320b656330b5820d2a1c9226674933c028693f302785",
+    "src/windows-emulator/emulator_thread.cpp": "d9fdeb0e381f2c846378a2aa00c7df7c1233aee68964d37aaeb62e7e9e17b493",
+    "src/windows-emulator/emulator_thread.hpp": "d5e82e36dfa8c8423d1f4cb41f7976e81aaddf3c2ec5ae2792016c08698b1319",
+    "src/windows-emulator/ui_backends/sdl_ui_backend.cpp": "22f96f5558ba4e2b7fb503d11317885f533f0256e7dce6c4b83790adac7995fc",
+    "src/windows-emulator/ui_backends/gpu_window_title.hpp": "88ce01e34d062cff82f0af469ac0d0fdd97384f37ddf78ba6259790141290eeb",
+    "src/windows-emulator/ui_backends/sdl_native_presentation_window.hpp": "5a9f45bf228572c4c50d8a941f64791f4876ce7cb7d26f2f3696489754b8298e",
+    "src/windows-emulator/windows_emulator.cpp": "dea4d70db4197ebd3d25a504f7569af8d1f9ae414a718624582aab882adebee1",
+    "src/windows-emulator-test/gpu_window_title_test.cpp": "39bbcd6ef0b73c8b6d01f4f90bad33b52338762e53812656c5bf1580f032c825",
+    "src/windows-emulator-test/host_wait_completion_test.cpp": "280c47cadfab4d2b12fb33be41c83d222577f06a15df600417221315c1276bfc",
+    "src/windows-emulator-test/native_present_sync_test.cpp": "0e38df052c1c0f64271eb647025c8a851d1f5c5bd538fc01ccaf9d6ef72bb2a6",
+    "src/windows-emulator-test/native_presentation_window_test.cpp": "03e3128bec28f0774d9a68d65529db6e1c8aed39881068fe0a97f2c1e1e04fec",
+    "src/windows-emulator-test/native_wsi_wire_test.cpp": "7f04a651e45adf5c9e384f59af21dfb1a59edeeee0cc0fea2cfa1694b490c265",
+    "src/windows-emulator-test/ui_owned_completion_test.cpp": "5a248d3bbac633893726fdab731b15fff6a9a24c03d5560a633c0a937d18aab1",
+    "src/windows-emulator-test/vulkan_legacy_queue_submit_test.cpp": "0b546227c76535d5526189e4f2a178162695c481b7137eb2470de05864768ea1"
+  }
+}

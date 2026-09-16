@@ -30,9 +30,11 @@
 #include <vulkan/vulkan_win32.h>
 
 #include <gpu_bridge_protocol.hpp>
+#include <native_wsi_wire.hpp>
 #include <vk_feature_chain.hpp>
 #include <vk_render_pass.hpp>
 #include <vk_synchronization.hpp>
+#include <vk_queue_submit.hpp>
 #include <vk_dynamic_state.hpp>
 
 namespace gb = sogen::gpu_bridge;
@@ -493,11 +495,22 @@ namespace
 
 }
 
+#include "native_wsi_shim.inc"
+
 extern "C"
 {
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo,
                                                                           const VkAllocationCallbacks* pAllocator, VkInstance* pInstance)
     {
+        if (native_wsi_enabled())
+        {
+            const auto validation = validate_native_instance(pCreateInfo, pAllocator, pInstance);
+            if (validation != VK_SUCCESS)
+            {
+                return validation;
+            }
+        }
+
         if (passthrough_active())
         {
             if (auto* const fn = real_global_command<PFN_vkCreateInstance>("vkCreateInstance"))
@@ -523,6 +536,12 @@ extern "C"
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks*)
     {
+        if (native_wsi_enabled())
+        {
+            native_destroy(nw::operation::destroy_instance, to_object_id(instance));
+            return;
+        }
+
         gb::destroy_instance_request request{};
         request.instance = to_object_id(instance);
         bridge_call(gb::ioctl_destroy_instance, &request, sizeof(request), nullptr, 0);
@@ -605,8 +624,9 @@ extern "C"
         static const VkExtensionProperties extensions[] = {
             {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_SURFACE_SPEC_VERSION},
             {VK_KHR_WIN32_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_SPEC_VERSION},
+            {VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME, VK_KHR_GET_SURFACE_CAPABILITIES_2_SPEC_VERSION},
         };
-        constexpr auto available = static_cast<uint32_t>(sizeof(extensions) / sizeof(extensions[0]));
+        const uint32_t available = native_wsi_enabled() ? 3u : 2u;
 
         if (!pPropertyCount)
         {
@@ -842,6 +862,12 @@ extern "C"
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice device, const VkAllocationCallbacks*)
     {
+        if (native_wsi_enabled())
+        {
+            native_destroy(nw::operation::destroy_device, to_object_id(device));
+            return;
+        }
+
         gb::destroy_device_request request{};
         request.device = to_object_id(device);
         bridge_call(gb::ioctl_destroy_device, &request, sizeof(request), nullptr, 0);
@@ -1472,57 +1498,26 @@ extern "C"
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits,
                                                                        VkFence fence)
     {
-        // Count the command buffers so the fence can be attached to the final submission only.
-        uint32_t total = 0;
-        for (uint32_t s = 0; s < submitCount; ++s)
+        try
         {
-            total += pSubmits[s].commandBufferCount;
-        }
-
-        // A zero-batch submission (no command buffers) is still a valid fence signal in Vulkan. Forward
-        // a fence-only submit so a later vkWaitForFences doesn't spin forever on an unsignaled fence.
-        if (total == 0)
-        {
-            if (!fence)
-            {
-                return VK_SUCCESS;
-            }
-
-            gb::queue_submit_request request{};
-            request.queue = to_object_id(queue);
-            request.command_buffer = gb::null_object;
-            request.fence = to_object_id(fence);
-
+            // Preserve the API call's batch boundaries and all synchronization operations in one native submit.
+            const auto packet = gb::queue_submit_wire::encode(queue, submitCount, pSubmits, fence);
             gb::result_response response{};
-            if (!bridge_call(gb::ioctl_queue_submit, &request, sizeof(request), &response, sizeof(response)) ||
-                response.vk_result != VK_SUCCESS)
+            if (!bridge_call(gb::ioctl_queue_submit_full, packet.data(), static_cast<DWORD>(packet.size()), &response, sizeof(response)))
             {
                 return VK_ERROR_INITIALIZATION_FAILED;
             }
-            return VK_SUCCESS;
+            return static_cast<VkResult>(response.vk_result);
         }
-
-        uint32_t emitted = 0;
-        for (uint32_t s = 0; s < submitCount; ++s)
+        catch (const gb::queue_submit_wire::error& error)
         {
-            for (uint32_t i = 0; i < pSubmits[s].commandBufferCount; ++i)
-            {
-                ++emitted;
-
-                gb::queue_submit_request request{};
-                request.queue = to_object_id(queue);
-                request.command_buffer = to_object_id(pSubmits[s].pCommandBuffers[i]);
-                request.fence = (emitted == total) ? to_object_id(fence) : gb::null_object;
-
-                gb::result_response response{};
-                if (!bridge_call(gb::ioctl_queue_submit, &request, sizeof(request), &response, sizeof(response)) ||
-                    response.vk_result != VK_SUCCESS)
-                {
-                    return VK_ERROR_INITIALIZATION_FAILED;
-                }
-            }
+            OutputDebugStringA(error.what());
+            return error.result;
         }
-        return VK_SUCCESS;
+        catch (const std::bad_alloc&)
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
     }
 
     // synchronization2 submit: DXVK uses this for queue submission. Marshal each VkSubmitInfo2 (wait
@@ -3762,9 +3757,15 @@ extern "C"
         vkCmdCopyImageToBuffer2(commandBuffer, pCopyImageToBufferInfo);
     }
 
-    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateWin32SurfaceKHR(VkInstance, const VkWin32SurfaceCreateInfoKHR* pCreateInfo,
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateWin32SurfaceKHR(VkInstance instance,
+                                                                                 const VkWin32SurfaceCreateInfoKHR* pCreateInfo,
                                                                                  const VkAllocationCallbacks*, VkSurfaceKHR* pSurface)
     {
+        if (native_wsi_enabled())
+        {
+            return native_create_surface(instance, pCreateInfo, pSurface);
+        }
+
         gb::create_surface_request request{};
         request.hwnd = reinterpret_cast<uint64_t>(pCreateInfo->hwnd);
 
@@ -3782,8 +3783,18 @@ extern "C"
         return VK_SUCCESS;
     }
 
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkDestroySurfaceKHR(VkInstance, VkSurfaceKHR surface, const VkAllocationCallbacks*)
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface,
+                                                                         const VkAllocationCallbacks*)
     {
+        if (native_wsi_enabled())
+        {
+            if (surface)
+            {
+                native_destroy(nw::operation::destroy_surface, to_object_id(instance), to_object_id(surface));
+            }
+            return;
+        }
+
         if (!surface)
         {
             return;
@@ -3796,6 +3807,13 @@ extern "C"
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
         VkPhysicalDevice physicalDevice, VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR* pSurfaceCapabilities)
     {
+        if (native_wsi_enabled())
+        {
+            uint32_t count = 1;
+            return native_query(nw::query::capabilities, physicalDevice, surface, 0, &count, pSurfaceCapabilities,
+                                sizeof(VkSurfaceCapabilitiesKHR));
+        }
+
         if (!pSurfaceCapabilities)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4211,9 +4229,16 @@ extern "C"
                                                         &pImageFormatProperties->imageFormatProperties);
     }
 
-    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice, uint32_t, VkSurfaceKHR,
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice physicalDevice,
+                                                                                              uint32_t queueFamily, VkSurfaceKHR surface,
                                                                                               VkBool32* pSupported)
     {
+        if (native_wsi_enabled())
+        {
+            uint32_t count = 1;
+            return native_query(nw::query::support, physicalDevice, surface, queueFamily, &count, pSupported, sizeof(VkBool32));
+        }
+
         if (pSupported)
         {
             *pSupported = VK_TRUE;
@@ -4221,10 +4246,15 @@ extern "C"
         return VK_SUCCESS;
     }
 
-    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice, VkSurfaceKHR,
-                                                                                              uint32_t* pCount,
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice physicalDevice,
+                                                                                              VkSurfaceKHR surface, uint32_t* pCount,
                                                                                               VkSurfaceFormatKHR* pSurfaceFormats)
     {
+        if (native_wsi_enabled())
+        {
+            return native_query(nw::query::formats, physicalDevice, surface, 0, pCount, pSurfaceFormats, sizeof(VkSurfaceFormatKHR));
+        }
+
         static const VkSurfaceFormatKHR formats[] = {
             {VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
             {VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
@@ -4250,10 +4280,15 @@ extern "C"
         return to_copy < available ? VK_INCOMPLETE : VK_SUCCESS;
     }
 
-    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice, VkSurfaceKHR,
-                                                                                                   uint32_t* pCount,
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice physicalDevice,
+                                                                                                   VkSurfaceKHR surface, uint32_t* pCount,
                                                                                                    VkPresentModeKHR* pPresentModes)
     {
+        if (native_wsi_enabled())
+        {
+            return native_query(nw::query::modes, physicalDevice, surface, 0, pCount, pPresentModes, sizeof(VkPresentModeKHR));
+        }
+
         static const VkPresentModeKHR modes[] = {VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR};
         constexpr auto available = static_cast<uint32_t>(sizeof(modes) / sizeof(modes[0]));
 
@@ -4276,8 +4311,19 @@ extern "C"
         return to_copy < available ? VK_INCOMPLETE : VK_SUCCESS;
     }
 
-    __declspec(dllexport) VKAPI_ATTR VkBool32 VKAPI_CALL vkGetPhysicalDeviceWin32PresentationSupportKHR(VkPhysicalDevice, uint32_t)
+    __declspec(dllexport) VKAPI_ATTR VkBool32 VKAPI_CALL vkGetPhysicalDeviceWin32PresentationSupportKHR(VkPhysicalDevice physicalDevice,
+                                                                                                        uint32_t queueFamily)
     {
+        if (native_wsi_enabled())
+        {
+            uint32_t count = 1;
+            VkBool32 supported{};
+            return native_query(nw::query::win32_support, physicalDevice, VK_NULL_HANDLE, queueFamily, &count, &supported,
+                                sizeof(supported)) == VK_SUCCESS
+                       ? supported
+                       : VK_FALSE;
+        }
+
         return VK_TRUE;
     }
 
@@ -4513,6 +4559,11 @@ extern "C"
     vkGetPhysicalDeviceSurfaceCapabilities2KHR(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceSurfaceInfo2KHR* pSurfaceInfo,
                                                VkSurfaceCapabilities2KHR* pSurfaceCapabilities)
     {
+        if (native_wsi_enabled() && (!pSurfaceInfo || !pSurfaceCapabilities || pSurfaceInfo->pNext || pSurfaceCapabilities->pNext))
+        {
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+
         if (!pSurfaceInfo || !pSurfaceCapabilities)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4524,6 +4575,11 @@ extern "C"
     vkGetPhysicalDeviceSurfaceFormats2KHR(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceSurfaceInfo2KHR* pSurfaceInfo,
                                           uint32_t* pSurfaceFormatCount, VkSurfaceFormat2KHR* pSurfaceFormats)
     {
+        if (native_wsi_enabled())
+        {
+            return native_formats2(physicalDevice, pSurfaceInfo, pSurfaceFormatCount, pSurfaceFormats);
+        }
+
         if (!pSurfaceInfo || !pSurfaceFormatCount)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4548,6 +4604,11 @@ extern "C"
     vkGetPhysicalDeviceSurfacePresentModes2EXT(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceSurfaceInfo2KHR* pSurfaceInfo,
                                                uint32_t* pPresentModeCount, VkPresentModeKHR* pPresentModes)
     {
+        if (native_wsi_enabled() && (!pSurfaceInfo || pSurfaceInfo->pNext))
+        {
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+
         if (!pSurfaceInfo || !pPresentModeCount)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -4594,6 +4655,11 @@ extern "C"
     // VK_EXT_swapchain_maintenance1: the bridge's readback present has nothing to release.
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkReleaseSwapchainImagesEXT(VkDevice, const VkReleaseSwapchainImagesInfoEXT*)
     {
+        if (native_wsi_enabled())
+        {
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+
         return VK_SUCCESS;
     }
 
@@ -4647,6 +4713,11 @@ extern "C"
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo,
                                                                               const VkAllocationCallbacks*, VkSwapchainKHR* pSwapchain)
     {
+        if (native_wsi_enabled())
+        {
+            return native_create_swapchain(device, pCreateInfo, pSwapchain);
+        }
+
         gb::create_swapchain_request request{};
         request.device = to_object_id(device);
         request.surface = to_object_id(pCreateInfo->surface);
@@ -4674,6 +4745,15 @@ extern "C"
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
                                                                            const VkAllocationCallbacks*)
     {
+        if (native_wsi_enabled())
+        {
+            if (swapchain)
+            {
+                native_destroy(nw::operation::destroy_swapchain, to_object_id(device), to_object_id(swapchain));
+            }
+            return;
+        }
+
         if (!swapchain)
         {
             return;
@@ -4684,9 +4764,14 @@ extern "C"
         bridge_call(gb::ioctl_destroy_swapchain, &request, sizeof(request), nullptr, 0);
     }
 
-    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkGetSwapchainImagesKHR(VkDevice, VkSwapchainKHR swapchain,
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
                                                                                  uint32_t* pSwapchainImageCount, VkImage* pSwapchainImages)
     {
+        if (native_wsi_enabled())
+        {
+            return native_images(device, swapchain, pSwapchainImageCount, pSwapchainImages);
+        }
+
         const uint32_t capacity = pSwapchainImages ? *pSwapchainImageCount : 0;
 
         gb::get_swapchain_images_request request{};
@@ -4722,9 +4807,14 @@ extern "C"
         return (to_write < header.count) ? VK_INCOMPLETE : VK_SUCCESS;
     }
 
-    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkAcquireNextImageKHR(VkDevice, VkSwapchainKHR swapchain, uint64_t,
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
                                                                                VkSemaphore semaphore, VkFence fence, uint32_t* pImageIndex)
     {
+        if (native_wsi_enabled())
+        {
+            return native_acquire(device, swapchain, timeout, semaphore, fence, pImageIndex);
+        }
+
         // The image is always immediately available, but the caller makes its render submit wait on the
         // semaphore (and may wait on the fence), so they must still be signalled by the bridge.
         gb::acquire_next_image_request request{};
@@ -4746,8 +4836,24 @@ extern "C"
         return VK_SUCCESS;
     }
 
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkAcquireNextImage2KHR(VkDevice device, const VkAcquireNextImageInfoKHR* info,
+                                                                                uint32_t* index)
+    {
+        if (!native_wsi_enabled() || !info || info->sType != VK_STRUCTURE_TYPE_ACQUIRE_NEXT_IMAGE_INFO_KHR || info->pNext ||
+            info->deviceMask != 1)
+        {
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        return native_acquire(device, info->swapchain, info->timeout, info->semaphore, info->fence, index);
+    }
+
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
     {
+        if (native_wsi_enabled())
+        {
+            return native_present(queue, pPresentInfo);
+        }
+
         VkResult overall = VK_SUCCESS;
         for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i)
         {
@@ -6894,6 +7000,7 @@ extern "C"
             {.name = "vkDestroySwapchainKHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroySwapchainKHR)},
             {.name = "vkGetSwapchainImagesKHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetSwapchainImagesKHR)},
             {.name = "vkAcquireNextImageKHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkAcquireNextImageKHR)},
+            {.name = "vkAcquireNextImage2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkAcquireNextImage2KHR)},
             {.name = "vkQueuePresentKHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkQueuePresentKHR)},
             {.name = "vkCreateShaderModule", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateShaderModule)},
             {.name = "vkDestroyShaderModule", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyShaderModule)},

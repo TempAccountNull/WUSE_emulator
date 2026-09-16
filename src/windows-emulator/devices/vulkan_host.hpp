@@ -1,5 +1,6 @@
 #pragma once
 
+#include <platform/native_presentation_window.hpp>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +32,10 @@ namespace sogen
 
         // False if no Vulkan driver could be loaded on the host.
         bool available() const;
+        void enable_native_wsi(bool gpu_copy = false);
+        bool try_shutdown_native() noexcept;
+        bool has_pending_native_presentations() const;
+        std::vector<std::byte> native_wsi_request(std::span<const std::byte> packet, native_presentation_window_lease lease = {});
 
         struct render_device_info
         {
@@ -38,6 +43,10 @@ namespace sogen
             uint32_t type{}; // VkPhysicalDeviceType, kept independent of guest Vulkan headers.
             uint32_t vendor_id{};
             uint32_t device_id{};
+            std::string device_luid_hex;
+            bool device_luid_valid{};
+            uint32_t device_node_mask{};
+            uint64_t guest_window{};
         };
 
         // Resolves ownership from a live swapchain; only reads properties cached at device creation.
@@ -163,6 +172,7 @@ namespace sogen
 
         // Submits a single command buffer to the queue, optionally signaling the fence (0 = none).
         int32_t queue_submit(uint64_t queue, uint64_t command_buffer, uint64_t fence);
+        int32_t queue_submit_full(std::span<const std::byte> packet);
 
         // synchronization2 submit. wait_entries/signal_entries are submit2_semaphore_entry arrays;
         // command_buffer_ids is an object_id array. fence 0 = none.

@@ -1,9 +1,14 @@
 #include "../std_include.hpp"
 #include "gpu_bridge.hpp"
 #include "vulkan_host.hpp"
+#include "native_wsi_completion.hpp"
 #include "../windows_emulator.hpp"
 
 #include <gpu_bridge_protocol.hpp>
+#include <native_wsi_wire.hpp>
+#include <platform/ui_owned_completion.hpp>
+#include <cstdlib>
+#include <chrono>
 #include <bit>
 #include <cstdio>
 
@@ -22,6 +27,40 @@ namespace sogen
             void create(windows_emulator& win_emu, const io_device_creation_data&) override
             {
                 this->memory_ = &win_emu.memory;
+                const char* option = std::getenv("SOGEN_VULKAN_PRESENT");
+                const std::string_view mode = option && *option ? option : "readback";
+                if (mode != "readback" && mode != "native" && mode != "direct" && mode != "gpu-copy")
+                {
+                    throw std::runtime_error("SOGEN_VULKAN_PRESENT must be readback, native (alias direct), or gpu-copy");
+                }
+                this->native_wsi_ = mode != "readback";
+                this->gpu_copy_ = mode == "gpu-copy";
+                if (this->native_wsi_)
+                {
+                    if (win_emu.vcpu_count() != 1)
+                    {
+                        throw std::runtime_error("Native WSI currently requires one vCPU");
+                    }
+                    this->native_dispatch_->acquire_slot();
+                    this->native_ui_ = &win_emu.ui();
+                    this->native_dispatch_->ui = this->native_ui_;
+                    this->native_dispatch_->queue = win_emu.ui().activate_native_presentation();
+                    if (!this->native_dispatch_->queue)
+                    {
+                        throw std::runtime_error("Native WSI requires the Win32 SDL UI/guest owner thread");
+                    }
+                    this->vulkan_.enable_native_wsi(this->gpu_copy_);
+                }
+                const char* presentation = "readback GPU-to-CPU SDL";
+                if (this->gpu_copy_)
+                {
+                    presentation = "gpu-copy device-local images to Win32 Vulkan WSI";
+                }
+                else if (this->native_wsi_)
+                {
+                    presentation = "native direct Win32 Vulkan WSI";
+                }
+                win_emu.log.info("[gpu-bridge] presentation=%s\n", presentation);
             }
 
             ~gpu_bridge_device() override
@@ -47,6 +86,10 @@ namespace sogen
 
             void work(windows_emulator& win_emu) override
             {
+                if (this->native_wsi_)
+                {
+                    return;
+                }
                 for (auto& frame : this->vulkan_.poll_presented_frames())
                 {
                     present_surface_if_ready(win_emu, frame.hwnd, frame.width, frame.height, frame.pixels);
@@ -55,6 +98,33 @@ namespace sogen
 
             NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& context) override
             {
+                if (this->native_wsi_ && !this->native_dispatch_->queue->owner_matches_current())
+                {
+                    return STATUS_NOT_SUPPORTED;
+                }
+                if (context.io_control_code == gpu_bridge::native_wsi::ioctl)
+                {
+                    return this->handle_native_wsi(win_emu, context);
+                }
+                if (this->native_wsi_)
+                {
+                    switch (context.io_control_code)
+                    {
+                    case gpu_bridge::ioctl_create_surface:
+                    case gpu_bridge::ioctl_destroy_surface:
+                    case gpu_bridge::ioctl_create_swapchain:
+                    case gpu_bridge::ioctl_destroy_swapchain:
+                    case gpu_bridge::ioctl_get_swapchain_images:
+                    case gpu_bridge::ioctl_acquire_next_image:
+                    case gpu_bridge::ioctl_queue_present:
+                    case gpu_bridge::ioctl_get_surface_capabilities:
+                    case gpu_bridge::ioctl_destroy_device:
+                    case gpu_bridge::ioctl_destroy_instance:
+                        return STATUS_NOT_SUPPORTED;
+                    default:
+                        break;
+                    }
+                }
                 switch (context.io_control_code)
                 {
                 case gpu_bridge::ioctl_get_version:
@@ -145,6 +215,8 @@ namespace sogen
                     return handle_set_event(win_emu, context);
                 case gpu_bridge::ioctl_reset_event:
                     return handle_reset_event(win_emu, context);
+                case gpu_bridge::ioctl_queue_submit_full:
+                    return handle_queue_submit_full(win_emu, context);
                 case gpu_bridge::ioctl_queue_submit:
                     return handle_queue_submit(win_emu, context);
                 case gpu_bridge::ioctl_queue_wait_idle:
@@ -307,7 +379,120 @@ namespace sogen
             }
 
           private:
-            std::unique_ptr<vulkan_host> vulkan_owner_{std::make_unique<vulkan_host>()};
+            static void publish_gpu_status(const char* filename, const std::string_view message) noexcept
+            {
+                try
+                {
+                    static const std::filesystem::path directory = [] {
+                        const char* configured = std::getenv("SOGEN_GPU_STATUS_DIR");
+                        return configured && *configured ? std::filesystem::path(configured) : std::filesystem::path{};
+                    }();
+                    if (directory.empty())
+                    {
+                        return;
+                    }
+                    // A dedicated tiny record keeps live telemetry independent of verbose-log backlog.
+                    // Readers accept only a complete timestamped line and retain their last valid sample.
+                    std::ofstream output(directory / filename, std::ios::binary | std::ios::trunc);
+                    const auto stamp =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                    output << stamp << ' ' << message << '\n';
+                }
+                catch (...)
+                {
+                    // Telemetry failure cannot alter guest rendering or a completed Vulkan result.
+                }
+            }
+
+            struct presentation_activity
+            {
+                std::chrono::steady_clock::time_point since{};
+                uint64_t images{};
+                uint64_t calls{};
+                uint64_t failed_images{};
+
+                void record(windows_emulator& win_emu, const uint32_t accepted, const uint32_t rejected) noexcept
+                {
+                    try
+                    {
+                        const auto now = std::chrono::steady_clock::now();
+                        if (since == std::chrono::steady_clock::time_point{})
+                        {
+                            since = now;
+                            return;
+                        }
+                        images += accepted;
+                        failed_images += rejected;
+                        ++calls;
+                        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - since).count();
+                        if (elapsed < 1000000000)
+                        {
+                            return;
+                        }
+                        // Accepted present requests are not proof of display scanout or GPU execution time.
+                        const auto stamp =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+                        const auto message =
+                            std::format("Presentation metrics: images={} | calls={} | failed_images={} | interval_ns={} | unix_ms={}",
+                                        images, calls, failed_images, elapsed, stamp);
+                        gpu_bridge_device::publish_gpu_status("presentation-live.txt", message);
+                        since = now;
+                        images = calls = failed_images = 0;
+                        if (win_emu.callbacks.on_generic_activity)
+                        {
+                            win_emu.callbacks.on_generic_activity(message);
+                        }
+                        else
+                        {
+                            win_emu.log.info("%s\n", message.c_str());
+                        }
+                    }
+                    catch (...)
+                    {
+                        // An observer failure must not change a completed Vulkan result.
+                    }
+                }
+            };
+
+            std::shared_ptr<presentation_activity> presentation_activity_{std::make_shared<presentation_activity>()};
+#include "native_wsi_bridge.inc"
+            std::shared_ptr<vulkan_host> vulkan_owner_{
+                new vulkan_host(), [dispatch = this->native_dispatch_](vulkan_host* host) {
+                    if (dispatch->retained)
+                    {
+                        return;
+                    }
+                    if (dispatch->queue)
+                    {
+                        auto cleanup = dispatch->queue->post([host, dispatch](const ui_cancellation_token&) {
+                            if (dispatch->retained || !host->try_shutdown_native() || host->has_pending_native_presentations())
+                            {
+                                dispatch->retained = true;
+                                dispatch->ui->retain_native_presentation_until_exit();
+                                std::fprintf(stderr, "[gpu-bridge] unresolved native presentation retained until process exit\n");
+                            }
+                            else
+                            {
+                                delete host;
+                            }
+                            return 0;
+                        });
+                        if (cleanup.ready())
+                        {
+                            const auto status = cleanup.try_take();
+                            if (status && status->status == ui_completion_status::queue_closed)
+                            {
+                                std::terminate();
+                            }
+                        }
+                        cleanup.detach();
+                    }
+                    else
+                    {
+                        delete host;
+                    }
+                }};
             vulkan_host& vulkan_{*this->vulkan_owner_};
             memory_manager* memory_{};
 
@@ -335,7 +520,12 @@ namespace sogen
                                  static_cast<unsigned long long>(mapping.guest_address), static_cast<unsigned long long>(mapping.size));
                 }
                 // Freeing Vulkan after failed revocation would leave guest mappings pointing to freed host storage.
-                auto* const retained_owner = this->vulkan_owner_.release();
+                this->native_dispatch_->retained = true;
+                if (this->native_ui_)
+                {
+                    this->native_ui_->retain_native_presentation_until_exit();
+                }
+                auto* const retained_owner = this->vulkan_owner_.get();
                 std::fprintf(stderr, "[gpu-bridge] Vulkan owner %p retained until process exit\n", static_cast<void*>(retained_owner));
             }
 
@@ -1473,6 +1663,29 @@ namespace sogen
                 return write_output(win_emu, context, gpu_bridge::result_response{.vk_result = result, .reserved = 0});
             }
 
+            NTSTATUS handle_queue_submit_full(windows_emulator& win_emu, const io_device_context& context)
+            {
+                if (!context.input_buffer || context.input_buffer_length < sizeof(gpu_bridge::queue_submit_full_header) ||
+                    context.input_buffer_length > gpu_bridge::max_queue_submit_full_bytes || !context.output_buffer ||
+                    context.output_buffer_length < sizeof(gpu_bridge::result_response))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                int32_t result{};
+                try
+                {
+                    std::vector<std::byte> packet(context.input_buffer_length);
+                    win_emu.emu().read_memory(context.input_buffer, packet.data(), packet.size());
+                    this->flush_aliased_memory_for_device(win_emu);
+                    result = this->vulkan_.queue_submit_full(packet);
+                }
+                catch (const std::bad_alloc&)
+                {
+                    result = -1; // VK_ERROR_OUT_OF_HOST_MEMORY; Vulkan headers stay out of the NT boundary.
+                }
+                return write_output(win_emu, context, gpu_bridge::result_response{.vk_result = result, .reserved = 0});
+            }
+
             NTSTATUS handle_queue_submit(windows_emulator& win_emu, const io_device_context& context)
             {
                 gpu_bridge::queue_submit_request request{};
@@ -2058,8 +2271,11 @@ namespace sogen
                         break;
                     }
                     const auto message = std::format("Using device: {} | {} | Vulkan device ID 0x{:X} | Vulkan swapchain ID 0x{:X} | "
-                                                     "presentation: GPU readback via CPU memory",
-                                                     kind, adapter.name, request.device, swapchain);
+                                                     "presentation: GPU readback via CPU memory | device_luid_valid={} | "
+                                                     "device_luid_hex={} | device_node_mask={} | guest_window=0x{:X}",
+                                                     kind, adapter.name, request.device, swapchain, adapter.device_luid_valid,
+                                                     adapter.device_luid_hex, adapter.device_node_mask, adapter.guest_window);
+                    publish_gpu_status("render-device-live.txt", message);
                     if (win_emu.callbacks.on_generic_activity)
                     {
                         win_emu.callbacks.on_generic_activity(message);
@@ -2163,6 +2379,7 @@ namespace sogen
                 {
                     present_surface_if_ready(win_emu, hwnd_value, width, height, pixels);
                 }
+                this->presentation_activity_->record(win_emu, result == 0 ? 1u : 0u, result == 0 ? 0u : 1u);
 
                 return write_output(win_emu, context, gpu_bridge::result_response{.vk_result = result, .reserved = 0});
             }
