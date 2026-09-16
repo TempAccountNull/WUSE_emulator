@@ -48,11 +48,13 @@ namespace sogen::gdb_stub
         uint64_t watched_size{};
         uint64_t address{};
         uint64_t size{};
+        uint64_t captured_address{};
         uint64_t callback_pc{};
         uint64_t cpu_index{};
         uint32_t thread_id{};
         bool pc_valid{};
         bool write{};
+        bool host_write{};
         watchpoint_outcome outcome{watchpoint_outcome::unknown};
         uint64_t backend_error{};
         std::array<uint8_t, 64> value{};

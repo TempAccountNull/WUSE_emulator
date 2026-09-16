@@ -60,10 +60,17 @@ namespace sogen
         failed,
     };
 
+    enum class memory_write_origin : uint8_t
+    {
+        guest,
+        host,
+    };
+
     struct memory_write_result
     {
         memory_access_outcome outcome{memory_access_outcome::unknown};
         uint64_t backend_error{};
+        memory_write_origin origin{memory_write_origin::guest};
     };
 
     using memory_write_observation_callback =

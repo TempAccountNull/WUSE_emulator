@@ -4,7 +4,9 @@
 #include <arch_emulator.hpp>
 
 #include <utils/concurrency.hpp>
+#include <utils/finally.hpp>
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <limits>
 
@@ -193,6 +195,10 @@ namespace sogen
         {
             try
             {
+                // GDB memory edits are debugger actions, not writes performed by the inferior.
+                this->debugger_memory_write_depth_.fetch_add(1, std::memory_order_acq_rel);
+                [[maybe_unused]] const auto restore =
+                    utils::finally([this] { this->debugger_memory_write_depth_.fetch_sub(1, std::memory_order_acq_rel); });
                 this->emu_->write_memory(address, data, length);
                 return true;
             }
@@ -336,6 +342,7 @@ namespace sogen
             observation.cpu_index = cpu.index();
             observation.thread_id = this->get_watchpoint_thread_id(cpu);
             observation.write = write;
+            observation.host_write = result.origin == memory_write_origin::host;
             switch (result.outcome)
             {
             case memory_access_outcome::completed:
@@ -358,7 +365,25 @@ namespace sogen
             {
                 // Preserve the access even if this backend cannot supply a PC at callback time.
             }
-            if (data)
+            observation.captured_address = access_address;
+            if (data && observation.host_write)
+            {
+                const auto access_end = access_size > std::numeric_limits<uint64_t>::max() - access_address
+                                            ? std::numeric_limits<uint64_t>::max()
+                                            : access_address + access_size;
+                const auto watched_end = watched_size > std::numeric_limits<uint64_t>::max() - watched_address
+                                             ? std::numeric_limits<uint64_t>::max()
+                                             : watched_address + watched_size;
+                observation.captured_address = std::max(access_address, watched_address);
+                const auto overlap_end = std::min(access_end, watched_end);
+                if (observation.captured_address < overlap_end)
+                {
+                    const auto source_offset = observation.captured_address - access_address;
+                    observation.captured_size = std::min<size_t>(overlap_end - observation.captured_address, observation.value.size());
+                    std::memcpy(observation.value.data(), static_cast<const uint8_t*>(data) + source_offset, observation.captured_size);
+                }
+            }
+            else if (data)
             {
                 observation.captured_size = std::min(access_size, observation.value.size());
                 std::memcpy(observation.value.data(), data, observation.captured_size);
@@ -379,6 +404,7 @@ namespace sogen
         x86_64_emulator* emu_{};
 
         utils::concurrency::container<gdb_stub::watchpoint_stop> watchpoint_stop_{};
+        std::atomic_uint32_t debugger_memory_write_depth_{};
         using hook_map = std::unordered_map<breakpoint_key, scoped_hook>;
         utils::concurrency::container<hook_map> hooks_{};
 
@@ -405,6 +431,11 @@ namespace sogen
                 watched_address, watched_size,
                 [this, watched_address, watched_size](cpu_interface& cpu, uint64_t access_address, const void* data, size_t access_size,
                                                       memory_write_result result) {
+                    if (result.origin == memory_write_origin::host &&
+                        this->debugger_memory_write_depth_.load(std::memory_order_acquire) != 0)
+                    {
+                        return;
+                    }
                     this->record_watchpoint(cpu, watched_address, watched_size, access_address, data, access_size, true, result);
                     this->on_interrupt(); //
                 });

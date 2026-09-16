@@ -81,6 +81,7 @@ namespace sogen::test
         EXPECT_EQ(access.watched_address, data + 4);
         EXPECT_EQ(access.watched_size, 2U);
         EXPECT_EQ(access.outcome, gdb_stub::watchpoint_outcome::completed);
+        EXPECT_FALSE(access.host_write);
         EXPECT_EQ(access.backend_error, 0U);
         EXPECT_TRUE(access.pc_valid);
         EXPECT_EQ(access.callback_pc, code);
@@ -94,14 +95,45 @@ namespace sogen::test
         EXPECT_LE(instruction_callbacks, 2U);
         // A later debugger register/memory read must not reconstruct or overwrite callback evidence.
         emu->reg(x86_register::rip, code + 4);
-        emu->write_memory<uint64_t>(data, 0);
+        const uint64_t debugger_value{};
+        ASSERT_TRUE(handler.write_memory(data, &debugger_value, sizeof(debugger_value)));
         const auto again = handler.get_watchpoint_observations();
         EXPECT_EQ(again.observations[0].callback_pc, code);
         EXPECT_EQ(again.observations[0].value, access.value);
         EXPECT_EQ(again.count, 1U);
         const auto xml = gdb_stub::format_watchpoint_observations(again);
         EXPECT_NE(xml.find("outcome=\"completed\""), std::string::npos);
+        EXPECT_NE(xml.find("source=\"guest\""), std::string::npos);
         EXPECT_NE(xml.find("value=\"1122334455667788\""), std::string::npos);
+    }
+
+    TEST_F(IcicleWatchpoints, HostEmulationWriteIsObservedAndDebuggerWriteIsSuppressed)
+    {
+        test_watchpoint_handler handler{*emu};
+        ASSERT_TRUE(handler.set_breakpoint(gdb_stub::breakpoint_type::hardware_write, data + 4, 2));
+        emu->reg(x86_register::rip, code + 3);
+        const uint64_t host_value = 0x8877665544332211ull;
+        emu->write_memory(data, &host_value, sizeof(host_value));
+        auto stop = handler.get_watchpoint_observations();
+        ASSERT_EQ(stop.count, 1U);
+        EXPECT_TRUE(stop.observations[0].host_write);
+        EXPECT_EQ(stop.observations[0].callback_pc, code + 3);
+        EXPECT_EQ(stop.observations[0].address, data);
+        EXPECT_EQ(stop.observations[0].size, sizeof(host_value));
+        EXPECT_EQ(stop.observations[0].captured_address, data + 4);
+        EXPECT_EQ(stop.observations[0].captured_size, 2U);
+        EXPECT_EQ(stop.observations[0].value[0], 0x55);
+        EXPECT_EQ(stop.observations[0].value[1], 0x66);
+        const auto xml = gdb_stub::format_watchpoint_observations(stop);
+        EXPECT_NE(xml.find("source=\"host\""), std::string::npos);
+        EXPECT_NE(xml.find("captured-address=\""), std::string::npos);
+        EXPECT_NE(xml.find("value-kind=\"attempted-overlap\""), std::string::npos);
+        EXPECT_NE(xml.find("value=\"5566\""), std::string::npos);
+
+        const uint64_t debugger_value{};
+        ASSERT_TRUE(handler.write_memory(data, &debugger_value, sizeof(debugger_value)));
+        stop = handler.get_watchpoint_observations();
+        EXPECT_EQ(stop.count, 1U);
     }
 
     TEST_F(IcicleWatchpoints, ProtectedStoreReportsAttemptWithoutClaimingCommit)

@@ -545,14 +545,40 @@ impl Drop for IcicleEmulator {
 }
 
 struct WriteObservationHook {
-    callback: Box<dyn Fn(u64, &[u8], u64)>,
+    callback: Box<dyn Fn(u64, &[u8], u64, bool)>,
 }
 
 impl icicle_cpu::mem::WriteHook for WriteObservationHook {
     fn write(&mut self, _mem: &mut icicle_cpu::Mmu, _addr: u64, _value: &[u8]) {}
 
-    fn write_result(&mut self, _mem: &mut icicle_cpu::Mmu, addr: u64, value: &[u8], result: icicle_cpu::mem::perm::MemResult<()>) {
-        (self.callback)(addr, value, result.err().map_or(0, |error| error.code()));
+    fn write_result(
+        &mut self,
+        _mem: &mut icicle_cpu::Mmu,
+        addr: u64,
+        value: &[u8],
+        result: icicle_cpu::mem::perm::MemResult<()>,
+    ) {
+        (self.callback)(
+            addr,
+            value,
+            result.err().map_or(0, |error| error.code()),
+            false,
+        );
+    }
+
+    fn external_write_result(
+        &mut self,
+        _mem: &mut icicle_cpu::Mmu,
+        addr: u64,
+        value: &[u8],
+        result: icicle_cpu::mem::perm::MemResult<()>,
+    ) {
+        (self.callback)(
+            addr,
+            value,
+            result.err().map_or(0, |error| error.code()),
+            true,
+        );
     }
 }
 
@@ -1009,8 +1035,16 @@ impl IcicleEmulator {
         return qualify_hook_id(id.unwrap(), HookType::Write);
     }
 
-    pub fn add_write_observation_hook(&mut self, start: u64, end: u64, callback: Box<dyn Fn(u64, &[u8], u64)>) -> u32 {
-        let Some(id) = self.get_mem().add_write_hook(start, end, Box::new(WriteObservationHook { callback })) else {
+    pub fn add_write_observation_hook(
+        &mut self,
+        start: u64,
+        end: u64,
+        callback: Box<dyn Fn(u64, &[u8], u64, bool)>,
+    ) -> u32 {
+        let Some(id) =
+            self.get_mem()
+                .add_write_hook(start, end, Box::new(WriteObservationHook { callback }))
+        else {
             return 0;
         };
         qualify_hook_id(id, HookType::Write)
@@ -1175,7 +1209,9 @@ impl IcicleEmulator {
             };
             page = next;
         }
-        match mem.write_bytes(address, data, icicle_vm::cpu::mem::perm::NONE) {
+        let result = mem.write_bytes(address, data, icicle_vm::cpu::mem::perm::NONE);
+        mem.observe_external_write(address, data, result);
+        match result {
             Ok(()) => true,
             Err(error) => {
                 eprintln!(

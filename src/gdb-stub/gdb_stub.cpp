@@ -1136,14 +1136,24 @@ namespace sogen::gdb_stub
             xml += "<access operation=\"";
             xml += observation.write ? "write" : "read";
             xml += "\" outcome=\"" + std::string(outcome) + "\" address=\"" + number(observation.address);
+            xml += "\" source=\"";
+            xml += observation.host_write ? "host" : "guest";
             xml += "\" size=\"" + number(observation.size) + "\" watched-address=\"" + number(observation.watched_address);
             xml += "\" watched-size=\"" + number(observation.watched_size) + "\" callback-pc=\"" + number(observation.callback_pc);
             xml += "\" pc-valid=\"" + std::to_string(observation.pc_valid) + "\" cpu=\"" + number(observation.cpu_index);
             xml += "\" thread=\"" + number(observation.thread_id) + "\" backend-error=\"" + number(observation.backend_error);
             const auto captured = std::min(observation.captured_size, observation.value.size());
+            xml += "\" captured-address=\"" + number(observation.captured_address);
             xml += "\" captured-size=\"" + number(captured) + "\" truncated=\"" + std::to_string(captured < observation.size);
             xml += "\" value-kind=\"";
-            xml += observation.write ? "attempted" : "callback";
+            if (observation.write && observation.host_write)
+            {
+                xml += "attempted-overlap";
+            }
+            else
+            {
+                xml += observation.write ? "attempted" : "callback";
+            }
             xml += "\" value=\"";
             constexpr std::string_view digits = "0123456789abcdef";
             for (size_t byte = 0; byte < captured; ++byte)

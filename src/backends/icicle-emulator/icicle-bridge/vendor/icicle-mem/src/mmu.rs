@@ -44,6 +44,10 @@ pub trait WriteHook {
     // Observation runs after each primitive attempt, including early permission/mapping failures.
     // A failed I/O handler may have side effects; Err does not promise unchanged device state.
     fn write_result(&mut self, _mem: &mut Mmu, _addr: u64, _value: &[u8], _result: MemResult<()>) {}
+
+    fn external_write_result(&mut self, mem: &mut Mmu, addr: u64, value: &[u8], result: MemResult<()>) {
+        self.write_result(mem, addr, value, result);
+    }
 }
 
 impl WriteHook for () {
@@ -1443,6 +1447,14 @@ impl Mmu {
         }
     }
 
+    pub fn observe_external_write(&mut self, addr: u64, value: &[u8], result: MemResult<()>) {
+        if ENABLE_MEMORY_HOOKS {
+            active_hooks!(addr, value.len(), self.write_hooks, |hook: &mut dyn WriteHook| {
+                hook.external_write_result(self, addr, value, result);
+            })
+        }
+    }
+
     /// Get a reference to the virtual address space's mapping.
     pub fn get_mapping(&self) -> &VirtualMemoryMap {
         &self.mapping
@@ -1633,7 +1645,7 @@ mod watchpoint_tests {
     }
 
     #[test]
-    fn after_read_overlap_and_passive_writes_have_distinct_scope() {
+    fn after_read_overlap_and_external_writes_have_explicit_scope() {
         struct ReadObserver(Rc<RefCell<Vec<(u64, Vec<u8>)>>>);
         impl ReadAfterHook for ReadObserver {
             fn read(&mut self, _mem: &mut Mmu, addr: u64, value: &[u8]) {
@@ -1650,5 +1662,14 @@ mod watchpoint_tests {
         assert_eq!(mmu.read::<16>(0x1000, perm::READ).unwrap(), [9; 16]);
         assert!(writes.borrow().is_empty());
         assert_eq!(*reads.borrow(), vec![(0x1000, vec![9; 16])]);
+
+        let external = [7; 16];
+        let result = mmu.write(0x1000, external, perm::NONE);
+        mmu.observe_external_write(0x1000, &external, result);
+        let observed = writes.borrow();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].address, 0x1000);
+        assert_eq!(observed[0].value, external);
+        assert_eq!(observed[0].after, Some(external.to_vec()));
     }
 }

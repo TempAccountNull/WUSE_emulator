@@ -27,7 +27,7 @@ extern "C"
     using violation_func = int32_t(void*, uint64_t address, uint8_t operation, int32_t unmapped);
     using data_accessor_func = void(void* user, const void* data, size_t length);
     using memory_access_func = icicle_mmio_write_func;
-    using write_observation_func = void(void*, uint64_t, const void*, size_t, uint64_t);
+    using write_observation_func = void(void*, uint64_t, const void*, size_t, uint64_t, int32_t);
 
     struct icicle_stop_info
     {
@@ -129,7 +129,7 @@ namespace sogen::icicle
             uint64_t size{};
             bound_memory_access_hook_callback callback{};
             bool is_read{};
-            std::function<void(uint64_t, const void*, size_t, uint64_t)> observation{};
+            std::function<void(uint64_t, const void*, size_t, uint64_t, int32_t)> observation{};
         };
 
         uint64_t configured_memory_limit_mib()
@@ -537,10 +537,12 @@ namespace sogen::icicle
                 .address = address,
                 .size = size,
                 .observation =
-                    [this, callback = std::move(callback)](uint64_t access, const void* data, size_t length, uint64_t error) {
+                    [this, callback = std::move(callback)](uint64_t access, const void* data, size_t length, uint64_t error,
+                                                           int32_t host_write) {
                         callback(*this, access, data, length,
                                  {.outcome = error == 0 ? memory_access_outcome::completed : memory_access_outcome::failed,
-                                  .backend_error = error});
+                                  .backend_error = error,
+                                  .origin = host_write != 0 ? memory_write_origin::host : memory_write_origin::guest});
                     },
             });
         }
@@ -709,8 +711,8 @@ namespace sogen::icicle
             {
                 auto obj = make_function_object(std::move(hook.observation), this->is_in_hook_);
                 auto* ptr = obj.get();
-                auto* wrapper = +[](void* user, uint64_t address, const void* data, size_t length, uint64_t error) {
-                    (*static_cast<decltype(ptr)>(user))(address, data, length, error);
+                auto* wrapper = +[](void* user, uint64_t address, const void* data, size_t length, uint64_t error, int32_t host_write) {
+                    (*static_cast<decltype(ptr)>(user))(address, data, length, error, host_write);
                 };
                 id = icicle_add_write_observation_hook(this->emu_, hook.address, hook.address + hook.size, wrapper, ptr);
                 object = std::move(obj);
