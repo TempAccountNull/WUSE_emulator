@@ -68,14 +68,26 @@ namespace sogen
                             this->log_.force_print(color::gray, "Using emulator backend: %s\n", e.backend_name.c_str());
                         },
                         [&](const run_finished_event& e) {
-                            if (e.exit_status.has_value())
+                            if (e.checkpoint_saved)
+                            {
+                                this->log_.print(color::cyan, "Guest paused at: 0x%" PRIx64 " - checkpoint saved\n", e.rip);
+                            }
+                            else if (e.exit_status.has_value())
                             {
                                 this->log_.print(e.success ? color::green : color::red, "Emulation terminated with status: %X\n",
                                                  *e.exit_status);
                             }
                         },
                         [&](const run_failed_event& e) {
-                            this->log_.error("Emulation failed at: 0x%" PRIx64 " - %s\n", e.rip, e.message.c_str());
+                            if (e.phase == "snapshot_save")
+                            {
+                                this->log_.error("Snapshot save failed (host); guest paused at: 0x%" PRIx64 " - %s\n", e.rip,
+                                                 e.message.c_str());
+                            }
+                            else
+                            {
+                                this->log_.error("Emulation failed at: 0x%" PRIx64 " - %s\n", e.rip, e.message.c_str());
+                            }
                         },
                         [&](const instruction_summary_event& e) {
                             this->log_.print(color::white, "Instruction summary:\n");

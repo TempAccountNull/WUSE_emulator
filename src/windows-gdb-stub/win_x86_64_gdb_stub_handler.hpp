@@ -60,18 +60,25 @@ namespace sogen
             return this->should_stop_();
         }
 
+        bool execution_failed() const
+        {
+            return this->execution_failed_;
+        }
+
         gdb_stub::action run() override
         {
             if (this->interrupt_pending_)
             {
                 return this->stop_action();
             }
+            this->execution_failed_ = false;
             try
             {
                 this->win_emu_->start();
             }
             catch (const std::exception& e)
             {
+                this->execution_failed_ = true;
                 if (this->win_emu_->last_stop_reason() != stop_reason::backend_error)
                 {
                     this->win_emu_->log.error("%s\n", e.what());
@@ -87,6 +94,7 @@ namespace sogen
             {
                 return this->stop_action();
             }
+            this->execution_failed_ = false;
             try
             {
                 auto& vcpu = this->win_emu_->vcpu(0);
@@ -103,6 +111,7 @@ namespace sogen
             }
             catch (const std::exception& e)
             {
+                this->execution_failed_ = true;
                 if (this->win_emu_->last_stop_reason() != stop_reason::backend_error)
                 {
                     this->win_emu_->log.error("%s\n", e.what());
@@ -354,6 +363,7 @@ namespace sogen
             return action;
         }
 
+        bool execution_failed_{};
         std::atomic_bool interrupt_pending_{false};
         windows_emulator* win_emu_{};
         utils::optional_function<bool()> should_stop_{};

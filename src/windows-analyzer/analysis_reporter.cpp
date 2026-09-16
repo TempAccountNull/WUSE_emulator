@@ -333,6 +333,12 @@ namespace sogen
             static void write_fields(json_object_builder& object, const run_finished_event& event)
             {
                 object.field("success", event.success);
+                if (event.checkpoint_saved)
+                {
+                    object.field("state", "paused");
+                    object.field("checkpoint_saved", true);
+                    object.hex_field("rip", event.rip);
+                }
                 if (event.exit_status.has_value())
                 {
                     object.field("exit", *event.exit_status);
@@ -343,6 +349,7 @@ namespace sogen
             {
                 object.hex_field("rip", event.rip);
                 object.field("error", event.message);
+                object.field("phase", event.phase);
             }
 
             static void write_fields(json_object_builder& object, const instruction_summary_event& event)

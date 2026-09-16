@@ -270,8 +270,6 @@ namespace sogen
             return;
         }
 
-        std::vector<uint8_t> data{};
-
         for (const auto& reserved_region : this->reserved_regions_)
         {
             if (reserved_region.second.kind == memory_region_kind::mmio)
@@ -281,11 +279,9 @@ namespace sogen
 
             for (const auto& region : reserved_region.second.committed_regions)
             {
-                data.resize(region.second.length);
-
-                this->read_memory(region.first, data.data(), region.second.length);
-
-                buffer.write(data.data(), region.second.length);
+                buffer.write_chunked(region.second.length, [&](const size_t offset, const std::span<std::byte> chunk) {
+                    this->read_memory(region.first + offset, chunk.data(), chunk.size());
+                });
             }
         }
     }
@@ -307,8 +303,6 @@ namespace sogen
             return;
         }
 
-        std::vector<uint8_t> data{};
-
         for (auto i = this->reserved_regions_.begin(); i != this->reserved_regions_.end();)
         {
             auto& reserved_region = i->second;
@@ -322,9 +316,7 @@ namespace sogen
 
             for (const auto& region : reserved_region.committed_regions)
             {
-                data.resize(region.second.length);
-
-                buffer.read(data.data(), region.second.length);
+                const auto data = buffer.read_data(region.second.length);
 
                 const auto effective_permission = this->get_effective_permissions(region.second.permissions);
                 this->map_memory(region.first, region.second.length, effective_permission);

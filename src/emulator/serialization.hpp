@@ -11,6 +11,9 @@
 #include <functional>
 #include <typeindex>
 #include <atomic>
+#include <limits>
+#include <algorithm>
+#include <utility>
 
 namespace sogen
 {
@@ -81,24 +84,61 @@ namespace sogen
         class buffer_serializer
         {
           public:
+            using output_handler = std::function<void(std::span<const std::byte>)>;
+
             buffer_serializer() = default;
+
+            explicit buffer_serializer(output_handler output)
+                : output_(std::move(output))
+            {
+                if (!this->output_)
+                {
+                    throw std::invalid_argument("Missing serialization output handler");
+                }
+            }
+
+            static buffer_serializer counting()
+            {
+                buffer_serializer result{};
+                result.count_only_ = true;
+                return result;
+            }
+
+            size_t size() const
+            {
+                return this->size_;
+            }
 
             void write(const void* buffer, const size_t length)
             {
-                const auto old_size_remainder = static_cast<uint8_t>(length);
-                constexpr auto check_size = sizeof(old_size_remainder);
-
-                if (this->break_offset_ && this->buffer_.size() <= *this->break_offset_ &&
-                    this->buffer_.size() + length + check_size > *this->break_offset_)
+                this->write_marker(length);
+                if (this->count_only_)
                 {
-                    throw std::runtime_error("Break offset reached!");
+                    this->size_ += length;
+                    return;
+                }
+                this->write_raw({static_cast<const std::byte*>(buffer), length});
+            }
+
+            template <typename Reader>
+            void write_chunked(const size_t length, Reader&& read)
+            {
+                this->write_marker(length);
+                if (this->count_only_)
+                {
+                    this->size_ += length;
+                    return;
                 }
 
-                const auto* security_buffer = reinterpret_cast<const std::byte*>(&old_size_remainder);
-                this->buffer_.insert(this->buffer_.end(), security_buffer, security_buffer + check_size);
-
-                const auto* byte_buffer = static_cast<const std::byte*>(buffer);
-                this->buffer_.insert(this->buffer_.end(), byte_buffer, byte_buffer + length);
+                this->scratch_.resize(std::min<size_t>(length, 0x10000));
+                for (size_t offset = 0; offset < length;)
+                {
+                    const auto count = std::min(this->scratch_.size(), length - offset);
+                    const std::span chunk{this->scratch_.data(), count};
+                    read(offset, chunk);
+                    this->write_raw(chunk);
+                    offset += count;
+                }
             }
 
             void write(const buffer_serializer& object)
@@ -245,12 +285,15 @@ namespace sogen
 
             const std::vector<std::byte>& get_buffer() const
             {
+                this->require_buffer();
                 return this->buffer_;
             }
 
             std::vector<std::byte> move_buffer()
             {
-                return std::move(this->buffer_);
+                this->require_buffer();
+                this->size_ = 0;
+                return std::exchange(this->buffer_, {});
             }
 
             void set_break_offset(const size_t break_offset)
@@ -293,7 +336,49 @@ namespace sogen
 
           private:
             std::vector<std::byte> buffer_{};
+            std::vector<std::byte> scratch_{};
+            output_handler output_{};
+            size_t size_{};
+            bool count_only_{};
             std::optional<size_t> break_offset_{};
+
+            void require_buffer() const
+            {
+                if (this->output_ || this->count_only_)
+                {
+                    throw std::logic_error("This serializer does not retain a buffer");
+                }
+            }
+
+            void write_marker(const size_t length)
+            {
+                if (this->size_ == std::numeric_limits<size_t>::max() || length > std::numeric_limits<size_t>::max() - this->size_ - 1)
+                {
+                    throw std::length_error("Serialized data size overflow");
+                }
+                if (this->break_offset_ && this->size_ <= *this->break_offset_ && this->size_ + length + 1 > *this->break_offset_)
+                {
+                    throw std::runtime_error("Break offset reached!");
+                }
+                const auto marker = static_cast<std::byte>(static_cast<uint8_t>(length));
+                this->write_raw({&marker, 1});
+            }
+
+            void write_raw(const std::span<const std::byte> data)
+            {
+                if (!data.empty() && !this->count_only_)
+                {
+                    if (this->output_)
+                    {
+                        this->output_(data);
+                    }
+                    else
+                    {
+                        this->buffer_.insert(this->buffer_.end(), data.begin(), data.end());
+                    }
+                }
+                this->size_ += data.size();
+            }
         };
 
         class buffer_deserializer

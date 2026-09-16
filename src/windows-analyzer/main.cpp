@@ -395,16 +395,22 @@ namespace sogen
             });
 #endif
 
+            const bool debugger_capture_requested = options.use_gdb && !options.snapshot_output.empty();
             bool snapshot_attempted = false;
+            bool debugger_execution_failed = false;
+            bool snapshot_saving = false;
             auto save_requested_snapshot = [&] {
                 if (!options.snapshot_output.empty() && !snapshot_attempted)
                 {
                     snapshot_attempted = true;
+                    snapshot_saving = true;
                     snapshot::write_emulator_snapshot(win_emu, options.snapshot_output);
+                    snapshot_saving = false;
                 }
             };
 
             auto emit_failure = [&](std::string message) {
+                const std::string phase = snapshot_saving ? "snapshot_save" : "emulation";
                 try
                 {
                     save_requested_snapshot();
@@ -417,6 +423,7 @@ namespace sogen
                 c.emit_summary<run_failed_event>([&](auto& event) {
                     event.rip = win_emu.emu().read_instruction_pointer();
                     event.message = std::move(message);
+                    event.phase = phase;
                 });
                 flush_reporters(c);
                 return false;
@@ -433,6 +440,7 @@ namespace sogen
 
                     win_x86_64_gdb_stub_handler handler{win_emu, should_stop, parse_gdb_target_architecture(options.gdb_architecture)};
                     gdb_stub::run_gdb_stub(address, handler);
+                    debugger_execution_failed = handler.execution_failed();
                     if (!options.snapshot_output.empty())
                     {
                         options.use_gdb = false;
@@ -474,7 +482,9 @@ namespace sogen
 
                     if (write_snapshot)
                     {
+                        snapshot_saving = true;
                         snapshot::write_emulator_snapshot(win_emu);
+                        snapshot_saving = false;
                     }
                 }
             }
@@ -496,6 +506,18 @@ namespace sogen
             exit_status = win_emu.process.exit_status;
             if (!exit_status.has_value())
             {
+                if (snapshot_attempted && !debugger_execution_failed && (debugger_capture_requested || signals_received > 0) &&
+                    snapshot::is_resumable_checkpoint_stop(win_emu.last_stop_reason()))
+                {
+                    do_post_emulation_work(c);
+                    c.emit_summary<run_finished_event>([&](auto& event) {
+                        event.success = true;
+                        event.checkpoint_saved = true;
+                        event.rip = win_emu.emu().read_instruction_pointer();
+                    });
+                    flush_reporters(c);
+                    return true;
+                }
                 return emit_failure(win_emu.last_stop_reason() == stop_reason::backend_error ? win_emu.last_stop_detail()
                                                                                              : "Emulation terminated without status");
             }

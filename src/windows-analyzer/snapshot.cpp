@@ -2,6 +2,14 @@
 
 #include <utils/io.hpp>
 #include <utils/compression.hpp>
+#include <utils/finally.hpp>
+#include <fstream>
+#include <chrono>
+#include <atomic>
+
+#ifdef OS_WINDOWS
+#include <windows.h>
+#endif
 
 namespace sogen
 {
@@ -59,6 +67,38 @@ namespace sogen
                 return utils::compression::zstd::decompress(data);
             }
 
+            std::filesystem::path create_snapshot_staging_directory(const std::filesystem::path& snapshot_file)
+            {
+                if (snapshot_file.has_parent_path())
+                {
+                    std::filesystem::create_directories(snapshot_file.parent_path());
+                }
+                static std::atomic_uint64_t sequence{};
+                const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+                for (size_t attempt = 0; attempt < 100; ++attempt)
+                {
+                    auto path = snapshot_file;
+                    path += ".writing-" + std::to_string(stamp) + "-" + std::to_string(sequence++);
+                    if (std::filesystem::create_directory(path))
+                    {
+                        return path;
+                    }
+                }
+                throw std::runtime_error("Cannot create snapshot staging directory");
+            }
+
+            void publish_snapshot(const std::filesystem::path& source, const std::filesystem::path& target)
+            {
+#ifdef OS_WINDOWS
+                if (!MoveFileExW(source.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                {
+                    throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "Cannot publish snapshot");
+                }
+#else
+                std::filesystem::rename(source, target);
+#endif
+            }
+
             std::string get_main_executable_name(const windows_emulator& win_emu)
             {
                 const auto* exe = win_emu.mod_manager.executable;
@@ -100,11 +140,29 @@ namespace sogen
                 win_emu.log.log("Writing snapshot to %s...\n", snapshot_file.string().c_str());
             }
 
-            const auto snapshot = create_emulator_snapshot(win_emu);
-            if (!utils::io::write_file(snapshot_file, snapshot))
-            {
-                throw std::runtime_error("Failed to write snapshot!");
-            }
+            auto count = utils::buffer_serializer::counting();
+            win_emu.serialize(count);
+
+            const auto staging = create_snapshot_staging_directory(snapshot_file);
+            const auto staged_file = staging / "snapshot";
+            const auto cleanup = utils::finally([&] {
+                std::error_code error{};
+                std::filesystem::remove(staged_file, error);
+                std::filesystem::remove(staging, error);
+            });
+
+            std::ofstream stream(staged_file, std::ios::binary | std::ios::trunc);
+            stream.exceptions(std::ios::badbit | std::ios::failbit);
+            const snapshot_header header{};
+            stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
+
+            utils::compression::zstd::stream_compressor compressor{stream, count.size()};
+            utils::buffer_serializer serializer{[&](const std::span<const std::byte> data) { compressor.write(data); }};
+            win_emu.serialize(serializer);
+            compressor.finish();
+            stream.flush();
+            stream.close();
+            publish_snapshot(staged_file, snapshot_file);
 
             return snapshot_file;
         }

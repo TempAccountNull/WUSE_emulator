@@ -55,12 +55,15 @@ namespace sogen
     {
         bool success{};
         std::optional<uint32_t> exit_status{};
+        bool checkpoint_saved{};
+        uint64_t rip{};
     };
 
     struct run_failed_event : summary_event
     {
         uint64_t rip{};
         std::string message{};
+        std::string phase{"emulation"};
     };
 
     struct instruction_summary_entry
