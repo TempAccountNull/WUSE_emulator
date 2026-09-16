@@ -158,3 +158,7 @@ printed and suspicious journals remain in the capture directory. Both collectors
 reached source offset 12,242,496,809 with zero pending bytes. After preserving
 SHA256 hashes and first/last samples, completed raw console/event logs totaling
 18,059,480,914 bytes were removed. No active-run output was removed.
+
+The subsequent executed classifier and caller path is now captured in
+worker-rip-decision.md. It establishes the zero-result branch through the
+termination wrapper to the verified syscall entry after the memory-walk fix.
