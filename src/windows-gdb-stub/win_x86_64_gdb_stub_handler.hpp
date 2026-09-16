@@ -56,6 +56,12 @@ namespace sogen
             this->win_emu_->stop();
         }
 
+        void on_idle() override
+        {
+            // UI event sinks acquire their own kernel lock; pumping must not retain it.
+            this->win_emu_->ui().pump_events();
+        }
+
         bool should_stop() override
         {
             return this->should_stop_();

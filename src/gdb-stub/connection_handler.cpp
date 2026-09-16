@@ -23,8 +23,10 @@ namespace sogen::gdb_stub
         }
     }
 
-    connection_handler::connection_handler(network::tcp_client_socket& client, utils::optional_function<bool()> should_stop)
+    connection_handler::connection_handler(network::tcp_client_socket& client, utils::optional_function<bool()> should_stop,
+                                           utils::optional_function<void()> on_idle)
         : should_stop_(std::move(should_stop)),
+          on_idle_(std::move(on_idle)),
           client_(client)
     {
         this->client_.set_blocking(false);
@@ -51,6 +53,11 @@ namespace sogen::gdb_stub
     {
         while (this->client_.is_valid() && !this->processor_.has_packet() && !this->should_stop_())
         {
+            this->on_idle_();
+            if (this->should_stop_() || !this->client_.is_valid())
+            {
+                return std::nullopt;
+            }
             if (!read_from_socket(this->processor_, this->client_))
             {
                 (void)this->client_.sleep(100ms, true);

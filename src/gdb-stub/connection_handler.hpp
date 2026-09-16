@@ -13,7 +13,8 @@ namespace sogen::gdb_stub
     class connection_handler
     {
       public:
-        connection_handler(network::tcp_client_socket& client, utils::optional_function<bool()> should_stop = {});
+        connection_handler(network::tcp_client_socket& client, utils::optional_function<bool()> should_stop = {},
+                           utils::optional_function<void()> on_idle = {});
         ~connection_handler();
 
         connection_handler(connection_handler&&) = delete;
@@ -34,6 +35,7 @@ namespace sogen::gdb_stub
 
       private:
         utils::optional_function<bool()> should_stop_{};
+        utils::optional_function<void()> on_idle_{};
         network::tcp_client_socket& client_;
         stream_processor processor_{};
 

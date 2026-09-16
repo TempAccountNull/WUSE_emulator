@@ -117,6 +117,12 @@ namespace sogen::gdb_stub
 
         virtual void on_interrupt() = 0;
 
+        // Runs on the run_gdb_stub caller while accepting or waiting for a packet, never on
+        // the interrupt-monitor thread. Implementations must not resume guest execution.
+        virtual void on_idle()
+        {
+        }
+
         virtual std::string get_target_description(std::string_view file) = 0;
 
         virtual bool switch_to_thread(uint32_t thread_id) = 0;

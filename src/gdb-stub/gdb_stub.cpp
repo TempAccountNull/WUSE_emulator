@@ -39,7 +39,8 @@ namespace sogen::gdb_stub
             async_handler& async;
         };
 
-        network::tcp_client_socket accept_client(const network::address& bind_address, const utils::optional_function<bool()>& should_stop)
+        network::tcp_client_socket accept_client(const network::address& bind_address, const utils::optional_function<bool()>& should_stop,
+                                                 const utils::optional_function<void()>& on_idle)
         {
             network::tcp_server_socket server{bind_address.get_family()};
             if (!server.bind(bind_address))
@@ -50,15 +51,20 @@ namespace sogen::gdb_stub
             server.set_blocking(false);
             server.listen();
 
-            while (true)
+            while (!should_stop())
             {
-                if (should_stop() || server.sleep(100ms))
+                on_idle();
+                if (should_stop())
                 {
                     break;
                 }
+                if (server.sleep(100ms))
+                {
+                    return server.accept();
+                }
             }
 
-            return server.accept();
+            return {};
         }
 
         constexpr std::string escape(const std::string_view data, size_t max_size, size_t* total_copied = nullptr)
@@ -1163,7 +1169,10 @@ namespace sogen::gdb_stub
             return handler.should_stop(); //
         };
 
-        auto client = accept_client(bind_address, should_stop);
+        // should_stop is also called by the interrupt monitor; UI work belongs only here.
+        const auto on_idle = [&] { handler.on_idle(); };
+
+        auto client = accept_client(bind_address, should_stop, on_idle);
         if (!client)
         {
             set_reason(should_stop() ? session_end_reason::stop_requested : session_end_reason::no_connection);
@@ -1185,7 +1194,7 @@ namespace sogen::gdb_stub
         }};
 
         debugging_state state{};
-        connection_handler connection{client, should_stop};
+        connection_handler connection{client, should_stop, on_idle};
 
         debugging_context c{
             .connection = connection,
