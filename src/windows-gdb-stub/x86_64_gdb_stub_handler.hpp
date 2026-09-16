@@ -94,6 +94,11 @@ namespace sogen
 
         size_t read_register(const size_t reg, void* data, const size_t max_length) override
         {
+            return this->read_cpu_register(*this->emu_, reg, data, max_length);
+        }
+
+        size_t read_cpu_register(x86_64_cpu& cpu, const size_t reg, void* data, const size_t max_length) const
+        {
             try
             {
                 const auto& registers = this->get_register_mapping();
@@ -104,7 +109,7 @@ namespace sogen
 
                 const auto real_reg = registers[reg];
 
-                auto size = this->emu_->read_register(real_reg.reg, data, max_length);
+                auto size = cpu.read_register(real_reg.reg, data, max_length);
 
                 if (real_reg.offset)
                 {
@@ -129,6 +134,11 @@ namespace sogen
 
         size_t write_register(const size_t reg, const void* data, const size_t size) override
         {
+            return this->write_cpu_register(*this->emu_, reg, data, size);
+        }
+
+        size_t write_cpu_register(x86_64_cpu& cpu, const size_t reg, const void* data, const size_t size)
+        {
             try
             {
                 const auto& registers = this->get_register_mapping();
@@ -146,19 +156,19 @@ namespace sogen
                     std::vector<std::byte> full_data{};
                     full_data.resize(this->get_max_register_size());
 
-                    written_size = this->emu_->read_register(real_reg.reg, full_data.data(), full_data.size());
+                    written_size = cpu.read_register(real_reg.reg, full_data.data(), full_data.size());
                     if (written_size < *real_reg.offset)
                     {
                         return 0;
                     }
 
                     memcpy(full_data.data() + *real_reg.offset, data, written_size - *real_reg.offset);
-                    this->emu_->write_register(real_reg.reg, full_data.data(), written_size);
+                    cpu.write_register(real_reg.reg, full_data.data(), written_size);
                     written_size -= *real_reg.offset;
                 }
                 else
                 {
-                    written_size = this->emu_->write_register(real_reg.reg, data, size);
+                    written_size = cpu.write_register(real_reg.reg, data, size);
                 }
 
                 return real_reg.expected_size.value_or(written_size);

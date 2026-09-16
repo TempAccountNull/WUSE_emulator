@@ -1,0 +1,30 @@
+Debugger thread selection
+
+Selecting a Windows thread with Hg invoked the scheduler. A read-only debugger
+inspection could expire waits, consume synchronization objects, dispatch APCs,
+initialize a thread, or change the WOW64 GDT before any continue command.
+
+Keep the inspected thread in the debugger handler. Read inactive registers by
+temporarily loading the backend register context, then restoring it. Register
+writes update only that selected thread. Thread diagnostics and scheduling state
+are unchanged by inspection. Continue uses the execution selection; step uses
+an explicit continuation selection, otherwise the inspected thread. Invalid
+continuation IDs return E01 without running the guest.
+
+Protocol: https://sourceware.org/gdb/current/onlinedocs/gdb.html/Packets.html
+
+Validation
+- Release and tidy builds completed. Thirty focused tests passed in interpreter
+  and JIT modes for both builds: 120 passes. Twenty cases cover thread selection.
+- Final deployed build replayed the actual Destiny checkpoint. Initial registers
+  and sampled memory matched the checkpoint. Every initialized thread was read
+  twice before and after guest execution; registers, stacks, wait diagnostics,
+  GDT and execution-thread selection were unchanged by inspection.
+- Invalid continuation returned E01 without execution in that actual-game test.
+- The active graphics investigation uses the preceding candidate, which passed
+  the same live inspection checks twice. Final source changes after staging that
+  candidate were tidy-only const/control-flow/test qualifications.
+
+Evidence and build identities: gdb-thread-selection-validation.json.
+x86/WOW64 coverage here is synthetic. Forced stepping of blocked threads retains
+the existing policy. Rendering and successful game boot remain unconfirmed.

@@ -647,13 +647,14 @@ namespace sogen::gdb_stub
             c.connection.send_reply(reply);
         }
 
-        void apply_continuation_thread(const debugging_context& c)
+        bool apply_continuation_thread(const debugging_context& c)
         {
-            if (c.state.continuation_thread)
+            if (!c.state.continuation_thread)
             {
-                c.handler.switch_to_thread(*c.state.continuation_thread);
-                c.state.continuation_thread = std::nullopt;
+                return true;
             }
+            const auto thread = std::exchange(c.state.continuation_thread, std::nullopt);
+            return c.handler.select_continuation_thread(*thread);
         }
 
         bool process_action(const debugging_context& c, const action a)
@@ -681,7 +682,11 @@ namespace sogen::gdb_stub
 
         void resume_execution(const debugging_context& c, const bool single_step)
         {
-            apply_continuation_thread(c);
+            if (!apply_continuation_thread(c))
+            {
+                c.connection.send_reply("E01");
+                return;
+            }
 
             action a{};
             bool continue_execution = false;
@@ -951,7 +956,7 @@ namespace sogen::gdb_stub
             }
             else if (operation == 'g')
             {
-                const auto res = id == 0 || c.handler.switch_to_thread(id);
+                const auto res = c.handler.select_general_thread(id);
                 c.connection.send_reply(res ? "OK" : "E01");
             }
             else

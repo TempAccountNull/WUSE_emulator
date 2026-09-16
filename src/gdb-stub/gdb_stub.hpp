@@ -86,6 +86,16 @@ namespace sogen::gdb_stub
 
         virtual bool switch_to_thread(uint32_t thread_id) = 0;
 
+        virtual bool select_general_thread(uint32_t thread_id)
+        {
+            return thread_id == 0 || thread_id == UINT32_MAX || this->switch_to_thread(thread_id);
+        }
+
+        virtual bool select_continuation_thread(uint32_t thread_id)
+        {
+            return thread_id == 0 || thread_id == UINT32_MAX || this->switch_to_thread(thread_id);
+        }
+
         virtual uint32_t get_current_thread_id() = 0;
         virtual std::vector<uint32_t> get_thread_ids() = 0;
 

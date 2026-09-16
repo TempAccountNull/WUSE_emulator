@@ -1,0 +1,62 @@
+{
+  "change": "Keep debugger thread inspection out of scheduling",
+  "build": "D:\\Sunrise\\D2\\sogen\\builds\\20260915-223538-gdb-thread-inspection-final",
+  "hashes": {
+    "analyzer.exe": "ed18a568f02816d47d14b306ca15dfaa90d9d1cc0a30d0ec16ae0cc8de6bf67c",
+    "analyzer.pdb": "5d5eff021372fa0eeda054a0761f9a0b2721e8bb3087e21ae76b8bde5504b741",
+    "icicle-emulator.dll": "3e1442d1395dde76f766bac59a641bb4736deb6a12afe0bd848d6acfbe07172f"
+  },
+  "regressions": [
+    {
+      "configuration": "release",
+      "mode": "interpreter",
+      "tests": 30,
+      "failures": 0,
+      "seconds": 11.794953300151974,
+      "evidence": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789529678645392400"
+    },
+    {
+      "configuration": "release",
+      "mode": "jit",
+      "tests": 30,
+      "failures": 0,
+      "seconds": 8.366986700100824,
+      "evidence": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789529678645392400"
+    },
+    {
+      "configuration": "tidy",
+      "mode": "interpreter",
+      "tests": 30,
+      "failures": 0,
+      "seconds": 8.061547999968752,
+      "evidence": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789529450258900500"
+    },
+    {
+      "configuration": "tidy",
+      "mode": "jit",
+      "tests": 30,
+      "failures": 0,
+      "seconds": 7.374749599955976,
+      "evidence": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789529450258900500"
+    }
+  ],
+  "actual_game": {
+    "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789529833271350700-thread-selection-validation",
+    "input": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789523905046747600-analysis-dispatch-continue\\guest.snap",
+    "checks": [
+      "Restored register packet and sampled memory match original game checkpoint",
+      "All initialized threads inspected twice before and after actual guest execution without changing registers, stacks, wait diagnostics or GDT",
+      "Invalid continuation is rejected without executing the guest"
+    ],
+    "inspections": [
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789529833271350700-thread-selection-validation\\thread-inspection-1789529838344516100\\inspection.json",
+      "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789529833271350700-thread-selection-validation\\thread-inspection-1789529839747918500\\inspection.json"
+    ],
+    "passed": true
+  },
+  "limitations": [
+    "Actual game validation is x64; x86 register views and WOW64 GDT preservation have synthetic regression coverage.",
+    "Forced stepping of a blocked thread retains existing policy.",
+    "This validates debugger inspection, not rendering or successful game boot."
+  ]
+}

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <windows_emulator.hpp>
 #include <utils/function.hpp>
+#include <utils/finally.hpp>
 #include <utils/string.hpp>
 
 namespace sogen
@@ -74,6 +75,7 @@ namespace sogen
             this->execution_failed_ = false;
             try
             {
+                this->prepare_execution(false);
                 this->win_emu_->start();
             }
             catch (const std::exception& e)
@@ -97,14 +99,10 @@ namespace sogen
             this->execution_failed_ = false;
             try
             {
+                this->prepare_execution(true);
                 auto& vcpu = this->win_emu_->vcpu(0);
 
-                // Bypass the emulator scheduler: the GDB protocol already
-                // selected the target thread via switch_to_thread(). Going
-                // through windows_emulator::start() would let the scheduler
-                // redirect to a different "ready" thread (e.g. when the
-                // stepped thread is in NtDelayExecution), causing IDA to
-                // receive a T05 for an unexpected tid → SIGTRAP error.
+                // A debugger step must execute the requested thread, even when another thread is scheduler-ready.
                 vcpu.switch_thread = false;
                 vcpu.thread().setup_if_necessary(vcpu.cpu, this->win_emu_->process);
                 this->win_emu_->start_cpu(vcpu, 1);
@@ -146,7 +144,43 @@ namespace sogen
 
         bool switch_to_thread(const uint32_t thread_id) override
         {
-            return this->win_emu_->activate_thread(this->win_emu_->vcpu(0), thread_id);
+            if (thread_id == 0 || thread_id == UINT32_MAX)
+            {
+                this->selected_thread_ = std::nullopt;
+                return true;
+            }
+            if (!this->find_live_thread(thread_id))
+            {
+                return false;
+            }
+            this->selected_thread_ = thread_id;
+            return true;
+        }
+
+        bool select_general_thread(const uint32_t thread_id) override
+        {
+            return this->switch_to_thread(thread_id);
+        }
+
+        bool select_continuation_thread(const uint32_t thread_id) override
+        {
+            if (thread_id != 0 && thread_id != UINT32_MAX && !this->find_live_thread(thread_id))
+            {
+                return false;
+            }
+            this->continuation_thread_ = thread_id;
+            return true;
+        }
+
+        size_t read_register(const size_t reg, void* data, const size_t max_length) override
+        {
+            return this->access_selected_registers(false,
+                                                   [&](x86_64_cpu& cpu) { return this->read_cpu_register(cpu, reg, data, max_length); });
+        }
+
+        size_t write_register(const size_t reg, const void* data, const size_t size) override
+        {
+            return this->access_selected_registers(true, [&](x86_64_cpu& cpu) { return this->write_cpu_register(cpu, reg, data, size); });
         }
 
         std::optional<uint32_t> get_exit_code() override
@@ -353,8 +387,81 @@ namespace sogen
         }
 
       private:
+        emulator_thread* find_live_thread(const uint32_t id) const
+        {
+            for (auto& thread : this->win_emu_->process.threads | std::views::values)
+            {
+                if (thread.id == id && !thread.is_terminated())
+                {
+                    return &thread;
+                }
+            }
+            return nullptr;
+        }
+
+        template <typename F>
+        size_t access_selected_registers(const bool write, F&& access)
+        {
+            try
+            {
+                auto* thread =
+                    this->selected_thread_ ? this->find_live_thread(*this->selected_thread_) : this->win_emu_->vcpu(0).active_thread;
+                if (!thread)
+                {
+                    return 0;
+                }
+                for (uint32_t i = 0; i < this->win_emu_->vcpu_count(); ++i)
+                {
+                    auto& vcpu = this->win_emu_->vcpu(i);
+                    if (vcpu.active_thread == thread)
+                    {
+                        return access(vcpu.cpu);
+                    }
+                }
+                if (thread->last_registers.empty())
+                {
+                    return 0;
+                }
+                auto& cpu = this->win_emu_->vcpu(0).cpu;
+                const auto saved = cpu.save_registers();
+                const auto restore = utils::finally([&] { cpu.restore_registers(saved); });
+                // thread.restore() also changes the guest WOW64 GDT; inspection only loads backend registers.
+                cpu.restore_registers(thread->last_registers);
+                const auto result = access(cpu);
+                if (write && result != 0)
+                {
+                    thread->last_registers = cpu.save_registers();
+                }
+                return result;
+            }
+            catch (...)
+            {
+                return 0;
+            }
+        }
+
+        void prepare_execution(const bool step)
+        {
+            auto target = this->continuation_thread_;
+            if (!target && step)
+            {
+                target = this->selected_thread_;
+            }
+            this->continuation_thread_ = std::nullopt;
+            this->selected_thread_ = std::nullopt;
+            if (target && *target != 0 && *target != UINT32_MAX && !this->win_emu_->activate_thread(this->win_emu_->vcpu(0), *target))
+            {
+                throw std::runtime_error("Cannot activate debugger continuation thread");
+            }
+        }
+
+        std::optional<uint32_t> selected_thread_{};
+        std::optional<uint32_t> continuation_thread_{};
+
         gdb_stub::action stop_action()
         {
+            this->selected_thread_ = std::nullopt;
+            this->continuation_thread_ = std::nullopt;
             // Output packets auto-resume in the GDB stub; retain a concurrent interrupt until the following stop reply.
             if (action != gdb_stub::action::output)
             {
