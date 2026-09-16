@@ -22,6 +22,7 @@ namespace sogen::test
         analysis_context analysis{.settings = &logging_settings, .win_emu = &win_emu, .reporters = {this}};
         std::vector<function_execution_event> calls{};
         std::vector<execution_progress_event> progress{};
+        std::vector<import_read_event> imports{};
         std::vector<entry_point_execution_event> entries{};
         std::vector<foreign_code_transition_event> transitions{};
         std::vector<thread_terminated_event> terminated{};
@@ -46,6 +47,10 @@ namespace sogen::test
             if (const auto* exit = std::get_if<thread_terminated_event>(&event))
             {
                 terminated.push_back(*exit);
+            }
+            if (const auto* access = std::get_if<import_read_event>(&event))
+            {
+                imports.push_back(*access);
             }
             if (const auto* update = std::get_if<execution_progress_event>(&event))
             {
@@ -263,6 +268,60 @@ namespace sogen::test
             EXPECT_FALSE(win_emu.process.exit_status.has_value());
         }
         EXPECT_EQ(terminated.size(), 2U);
+    }
+
+    TEST_F(AnalysisObservation, UnnamedInstructionPrunesOnlyTheCurrentDebugPrintStack)
+    {
+        const auto id = win_emu.current_thread().id;
+        analysis.debug_print_calls[id].push_back({.call_id = 7, .stack = stack, .return_address = caller});
+        analysis.debug_print_calls[id + 4].push_back({.call_id = 8, .stack = stack, .return_address = caller});
+        observe(caller - 1, caller);
+        EXPECT_FALSE(analysis.debug_print_calls.contains(id));
+        ASSERT_TRUE(analysis.debug_print_calls.contains(id + 4));
+        EXPECT_EQ(analysis.debug_print_calls.at(id + 4).front().call_id, 8U);
+        EXPECT_TRUE(calls.empty());
+    }
+
+    TEST_F(AnalysisObservation, DeferredImportReadKeepsItsInstructionBoundary)
+    {
+        const auto id = win_emu.current_thread().id;
+        analysis.accessed_imports.push_back({.address = callee,
+                                             .access_context = {.thread_id = id},
+                                             .access_inst_count = 100,
+                                             .import_name = "DeferredImport",
+                                             .import_module = "test.dll"});
+        win_emu.current_thread().executed_instructions = 199;
+        win_emu.callbacks.on_instruction(caller);
+        EXPECT_TRUE(imports.empty());
+        ASSERT_EQ(analysis.accessed_imports.size(), 1U);
+        win_emu.current_thread().executed_instructions = 200;
+        win_emu.callbacks.on_instruction(caller);
+        ASSERT_EQ(imports.size(), 1U);
+        EXPECT_EQ(imports.front().resolved_address, callee);
+        EXPECT_EQ(imports.front().import_name, "DeferredImport");
+        EXPECT_TRUE(analysis.accessed_imports.empty());
+        win_emu.callbacks.on_instruction(caller);
+        EXPECT_EQ(imports.size(), 1U);
+    }
+
+    TEST_F(AnalysisObservation, ProgressKeepsModeAndInstructionGates)
+    {
+        analysis.progress_last -= std::chrono::seconds(6);
+        logging_settings.verbose_logging = false;
+        win_emu.callbacks.on_instruction(caller);
+        EXPECT_TRUE(progress.empty());
+        logging_settings.verbose_logging = true;
+        logging_settings.reproducible = true;
+        win_emu.callbacks.on_instruction(caller);
+        EXPECT_TRUE(progress.empty());
+        logging_settings.reproducible = false;
+        win_emu.emu().write_memory<uint8_t>(caller, 0x90);
+        win_emu.emu().reg(x86_register::rip, caller);
+        win_emu.emu().start(1);
+        ASSERT_EQ(win_emu.get_executed_instructions(), 1U);
+        EXPECT_TRUE(progress.empty());
+        win_emu.callbacks.on_instruction(caller);
+        EXPECT_TRUE(progress.empty());
     }
 
     TEST_F(AnalysisObservation, ProgressExcludesInstructionsFromRestoredSnapshot)

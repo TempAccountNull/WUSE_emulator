@@ -6,6 +6,7 @@
 #include "disassembler.hpp"
 #include "windows_emulator.hpp"
 #include <utils/lazy_object.hpp>
+#include <platform/compiler.hpp>
 
 #if defined(OS_EMSCRIPTEN) && !defined(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS)
 #include <event_handler.hpp>
@@ -489,13 +490,8 @@ namespace sogen
             });
         }
 
-        void report_execution_progress(analysis_context& c, const uint64_t address)
+        NO_INLINE void report_execution_progress(analysis_context& c, const uint64_t address, const uint64_t count)
         {
-            const auto count = c.win_emu->get_executed_instructions();
-            if (!c.settings->verbose_logging || c.settings->reproducible || (count & 0x3FFFF) != 0)
-            {
-                return;
-            }
             const auto now = std::chrono::steady_clock::now();
             const auto interval = std::chrono::duration<double>(now - c.progress_last).count();
             if (interval < 5.0)
@@ -514,12 +510,61 @@ namespace sogen
             c.progress_instructions = count;
         }
 
+        NO_INLINE void report_instruction_execution(analysis_context& c, const uint64_t address, const mapped_module& binary,
+                                                    const std::string* name, const bool is_entry, const bool is_interesting_call,
+                                                    const uint64_t previous_ip)
+        {
+            if (name)
+            {
+                auto details = collect_function_details(c, *name);
+                const auto call_count = next_traced_call_count(c);
+                c.emit_observation<function_execution_event>([&](auto& event) {
+                    event.call_count = call_count;
+                    event.function_name = *name;
+                    event.interesting = is_interesting_call;
+                    event.details = std::move(details);
+                });
+                (void)break_before_traced_call(c, call_count);
+            }
+            else if (is_entry)
+            {
+                c.emit_observation<entry_point_execution_event>([&](auto& event) { event.interesting = is_interesting_call; });
+            }
+            else if (!is_return(c.d, c.win_emu->emu(), previous_ip))
+            {
+                auto nearest_entry = binary.address_names.upper_bound(address);
+                if (nearest_entry == binary.address_names.begin())
+                {
+                    return;
+                }
+                --nearest_entry;
+                c.emit_observation<foreign_code_transition_event>([&](auto& event) {
+                    event.function_name = nearest_entry->second;
+                    event.function_offset = address - nearest_entry->first;
+                    event.interesting = is_interesting_call;
+                });
+            }
+        }
+
         void handle_instruction(analysis_context& c, const uint64_t address)
         {
             auto& win_emu = *c.win_emu;
-            prune_debug_print_calls(c, address);
-            report_execution_progress(c, address);
-            update_import_access(c, address);
+            if (!c.debug_print_calls.empty())
+            {
+                prune_debug_print_calls(c, address);
+            }
+            if (c.settings->verbose_logging && !c.settings->reproducible)
+            {
+                const auto count = win_emu.get_executed_instructions();
+                if ((count & 0x3FFFF) == 0)
+                {
+                    report_execution_progress(c, address, count);
+                }
+            }
+            if (!c.accessed_imports.empty())
+            {
+                update_import_access(c, address);
+            }
 
 #if defined(OS_EMSCRIPTEN) && !defined(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS)
             if ((win_emu.get_executed_instructions() % 0x20000) == 0)
@@ -578,36 +623,8 @@ namespace sogen
                 return;
             }
 
-            if (is_named)
-            {
-                auto details = collect_function_details(c, export_entry->second);
-                const auto call_count = next_traced_call_count(c);
-                c.emit_observation<function_execution_event>([&](auto& event) {
-                    event.call_count = call_count;
-                    event.function_name = export_entry->second;
-                    event.interesting = is_interesting_call;
-                    event.details = std::move(details);
-                });
-                (void)break_before_traced_call(c, call_count);
-            }
-            else if (is_entry)
-            {
-                c.emit_observation<entry_point_execution_event>([&](auto& event) { event.interesting = is_interesting_call; });
-            }
-            else if (is_foreign && !is_return(c.d, win_emu.emu(), previous_ip))
-            {
-                auto nearest_entry = binary->address_names.upper_bound(address);
-                if (nearest_entry == binary->address_names.begin())
-                {
-                    return;
-                }
-                --nearest_entry;
-                c.emit_observation<foreign_code_transition_event>([&](auto& event) {
-                    event.function_name = nearest_entry->second;
-                    event.function_offset = address - nearest_entry->first;
-                    event.interesting = is_interesting_call;
-                });
-            }
+            report_instruction_execution(c, address, *binary, is_named ? &export_entry->second : nullptr, is_entry, is_interesting_call,
+                                         previous_ip);
         }
 
         void handle_rdtsc(analysis_context& c)

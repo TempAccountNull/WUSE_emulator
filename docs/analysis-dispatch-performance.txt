@@ -1,0 +1,40 @@
+Instruction observation overhead
+
+The packed game's SHA-384 loop spends substantial time in per-instruction
+callbacks. Empty debug-print cleanup and ineligible progress reporting built
+stack frames before returning. Ordinary instructions also paid for the stack
+frame used to construct rare function, entry-point and transition events.
+
+Check empty work and the existing progress eligibility conditions before
+calling the helpers. Construct rare events in a separate non-inlined function.
+Preserve callback order, the five-second reporting threshold, imported-pointer
+tracking, debug-print ownership, function filtering, call counts and breakpoints.
+The logger, instruction precision and SHA-384 computation are unchanged.
+
+In the matched MSVC build, handle_instruction shrank from 1416 to 940 bytes,
+reserved 0xD0 rather than 0x130 stack bytes and pushed three rather than seven
+registers. Its common path no longer needs a security cookie. Security-cookie
+checks remain enabled for the helpers that construct events.
+
+Four 60-second actual-game checkpoint replays in baseline/candidate/candidate/
+baseline order used identical Icicle backend, processor specification, graphics,
+input state and full verbose observers. The main guest continued on another core.
+No build or profiler overlapped the measurements. Restore and snapshot writing
+were outside the timed interval. Counters subtract the saved initial progress.
+
+Baseline mean: 27.5896 million guest instructions/s; 40059.4 SHA input bytes/s.
+Candidate mean: 32.9780 million guest instructions/s; 47884.2 SHA input bytes/s.
+Measured throughput gain: 19.53%.
+All four restores and sampled SHA states matched. This is a packer-phase
+measurement; it does not establish normal-execution speed or game boot.
+
+Validation: 38 observation/debug-print/kernel/hook tests passed in interpreter
+and JIT modes for RelWithDebInfo and tidy (152 passes). Release and required
+tidy builds passed. Exact commands, identities, captures and tests are retained
+in analysis-dispatch-validation.json.
+
+The captured hash work belongs to guest thread 8. The only other guest thread
+waits on an event. SHA-384 chains each block through the preceding state; the
+image ranges feed one ordered stream. Icicle currently rejects multiple vCPUs.
+Increasing a thread count cannot parallelize this guest chain. This change
+removes measured execution overhead and does not claim multicore hashing.
