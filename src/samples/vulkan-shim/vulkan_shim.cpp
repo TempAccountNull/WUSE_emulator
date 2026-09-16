@@ -30,6 +30,9 @@
 
 #include <gpu_bridge_protocol.hpp>
 #include <vk_feature_chain.hpp>
+#include <vk_render_pass.hpp>
+#include <vk_synchronization.hpp>
+#include <vk_dynamic_state.hpp>
 
 namespace gb = sogen::gpu_bridge;
 
@@ -249,12 +252,35 @@ namespace
         bridge_call(code, &request, sizeof(request), nullptr, 0);
     }
 
+    // The original single-thread assumption below is historical: guest preemption requires the map lock.
     // Command-buffer recording is batched: instead of one IOCTL per vkCmd*, each command is appended to a
     // per-command-buffer byte stream and the whole stream (begin -> cmds -> end) is flushed to the bridge
     // in a single IOCTL at vkEndCommandBuffer. This amortises the boundary crossing, which dominates
     // emulated frame time. The shim only runs inside the single-threaded emulator, so the map needs no
     // lock. Each record is a gb::command_record_header followed by that command's request payload.
-    std::unordered_map<gb::object_id, std::vector<uint8_t>> g_command_streams;
+    struct command_stream
+    {
+        std::vector<uint8_t> bytes;
+        VkResult error = VK_SUCCESS;
+
+        void clear()
+        {
+            bytes.clear();
+            error = VK_SUCCESS;
+        }
+    };
+
+    std::unordered_map<gb::object_id, command_stream> g_command_streams;
+    std::mutex g_command_streams_mutex;
+
+    command_stream* find_command_stream(gb::object_id command_buffer)
+    {
+        std::lock_guard<std::mutex> lock(g_command_streams_mutex);
+        const auto it = g_command_streams.find(command_buffer);
+        // Rehash preserves references to elements. Vulkan externally synchronizes each command buffer,
+        // so other threads may alter the map but cannot erase or mutate this buffer during recording.
+        return it == g_command_streams.end() ? nullptr : &it->second;
+    }
 
     // Pending coalesced vkUpdateDescriptorSets blobs (the hottest bridge call - DXVK updates per draw).
     // Unlike the per-command-buffer streams (each synchronised to one thread by Vulkan), this global is
@@ -284,12 +310,175 @@ namespace
 
     void record_command(gb::object_id command_buffer, gb::command command, const void* payload, size_t size)
     {
+        std::lock_guard<std::mutex> lock(g_command_streams_mutex);
         auto& stream = g_command_streams[command_buffer];
-        gb::command_record_header header{.command = static_cast<uint32_t>(command), .size = static_cast<uint32_t>(size)};
-        const auto* header_bytes = reinterpret_cast<const uint8_t*>(&header);
-        stream.insert(stream.end(), header_bytes, header_bytes + sizeof(header));
-        const auto* payload_bytes = reinterpret_cast<const uint8_t*>(payload);
-        stream.insert(stream.end(), payload_bytes, payload_bytes + size);
+        if (stream.error != VK_SUCCESS)
+        {
+            return;
+        }
+        constexpr size_t limit = 256 * 1024 * 1024;
+        if (size > limit - sizeof(gb::command_record_header) || stream.bytes.size() > limit - sizeof(gb::command_record_header) - size)
+        {
+            stream.error = VK_ERROR_OUT_OF_HOST_MEMORY;
+            return;
+        }
+        try
+        {
+            // Reserve the complete record before appending so allocation failure cannot leave a partial header.
+            const size_t required = stream.bytes.size() + sizeof(gb::command_record_header) + size;
+            if (required > stream.bytes.capacity())
+            {
+                stream.bytes.reserve(std::max(required, std::min(limit, stream.bytes.capacity() * 2)));
+            }
+            gb::command_record_header header{.command = static_cast<uint32_t>(command), .size = static_cast<uint32_t>(size)};
+            const auto* header_bytes = reinterpret_cast<const uint8_t*>(&header);
+            stream.bytes.insert(stream.bytes.end(), header_bytes, header_bytes + sizeof(header));
+            const auto* payload_bytes = reinterpret_cast<const uint8_t*>(payload);
+            if (size)
+            {
+                stream.bytes.insert(stream.bytes.end(), payload_bytes, payload_bytes + size);
+            }
+        }
+        catch (const std::bad_alloc&)
+        {
+            stream.error = VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+
+    void record_extended_dynamic(gb::dynamic_request request, const void* values, size_t stride)
+    {
+        try
+        {
+            const auto payload = gb::encode_dynamic(request, values, stride);
+            record_command(request.command_buffer, gb::command::cmd_extended_dynamic, payload.data(), payload.size());
+        }
+        catch (const std::bad_alloc&)
+        {
+            request.error = VK_ERROR_OUT_OF_HOST_MEMORY;
+            record_command(request.command_buffer, gb::command::cmd_extended_dynamic, &request, sizeof(request));
+        }
+    }
+
+    template <typename... T>
+    std::vector<std::byte> render_pass_packet(gb::object_id object, const T&... values)
+    {
+        auto bytes = gb::render_pass_wire::encode(values...);
+        const gb::render_pass_packet header{.object = object, .version = 1, .payload_size = static_cast<uint32_t>(bytes.size())};
+        bytes.insert(bytes.begin(), reinterpret_cast<const std::byte*>(&header),
+                     reinterpret_cast<const std::byte*>(&header) + sizeof(header));
+        return bytes;
+    }
+
+    template <typename T, typename H>
+    VkResult create_render_pass_object(uint32_t code, VkDevice device, const T* info, const VkAllocationCallbacks* allocator, H* object)
+    {
+        if (!object)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        *object = VK_NULL_HANDLE;
+        if (!info)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        // Guest allocation callbacks cannot be called on the host. Reject them explicitly instead
+        // of forwarding guest function pointers or silently replacing the requested allocator.
+        if (allocator)
+        {
+            OutputDebugStringA("[vulkan-shim] render-pass allocation callbacks are unsupported\n");
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        try
+        {
+            const auto packet = render_pass_packet(to_object_id(device), *info);
+            gb::object_response response{};
+            if (!bridge_call(code, packet.data(), static_cast<DWORD>(packet.size()), &response, sizeof(response)))
+            {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            if (response.vk_result == VK_SUCCESS)
+            {
+                *object = to_handle<H>(response.object);
+            }
+            return static_cast<VkResult>(response.vk_result);
+        }
+        catch (const gb::render_pass_wire::error& error)
+        {
+            OutputDebugStringA(error.what());
+            return error.result;
+        }
+        catch (const std::bad_alloc&)
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+
+    template <typename... T>
+    void record_render_pass(VkCommandBuffer buffer, gb::command command, const T*... values)
+    {
+        // The stream already exists after vkBeginCommandBuffer. Store a failed void command's
+        // result there so vkEndCommandBuffer cannot claim a successful, incomplete recording.
+        auto* const stream = find_command_stream(to_object_id(buffer));
+        if (!stream)
+        {
+            OutputDebugStringA("[vulkan-shim] render-pass command outside recording\n");
+            return;
+        }
+        if (stream->error != VK_SUCCESS)
+        {
+            return;
+        }
+        if ((!values || ...))
+        {
+            stream->error = VK_ERROR_INITIALIZATION_FAILED;
+            return;
+        }
+        try
+        {
+            const auto packet = render_pass_packet(to_object_id(buffer), *values...);
+            record_command(to_object_id(buffer), command, packet.data(), packet.size());
+        }
+        catch (const gb::render_pass_wire::error& error)
+        {
+            OutputDebugStringA(error.what());
+            stream->error = error.result;
+        }
+        catch (const std::bad_alloc&)
+        {
+            stream->error = VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+
+    void record_synchronization(VkCommandBuffer buffer, const gb::synchronization_wire::command& command)
+    {
+        auto* const stream = find_command_stream(to_object_id(buffer));
+        if (!stream)
+        {
+            OutputDebugStringA("[vulkan-shim] synchronization command outside recording\n");
+            return;
+        }
+        if (stream->error != VK_SUCCESS)
+        {
+            return;
+        }
+        try
+        {
+            auto bytes = gb::synchronization_wire::encode(command);
+            const gb::render_pass_packet header{
+                .object = to_object_id(buffer), .version = 1, .payload_size = static_cast<uint32_t>(bytes.size())};
+            bytes.insert(bytes.begin(), reinterpret_cast<const std::byte*>(&header),
+                         reinterpret_cast<const std::byte*>(&header) + sizeof(header));
+            record_command(to_object_id(buffer), gb::command::cmd_synchronization, bytes.data(), bytes.size());
+        }
+        catch (const gb::render_pass_wire::error& error)
+        {
+            OutputDebugStringA(error.what());
+            stream->error = error.result;
+        }
+        catch (const std::bad_alloc&)
+        {
+            stream->error = VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
     }
 
     // OutputDebugStringA is unbuffered; printf mirrors it to stdout, which the emulator captures.
@@ -788,7 +977,10 @@ extern "C"
             std::memcpy(message.data(), &request, sizeof(request));
         }
 
-        g_command_streams[request.command_buffer].clear();
+        {
+            std::lock_guard<std::mutex> lock(g_command_streams_mutex);
+            g_command_streams[request.command_buffer].clear();
+        }
         record_command(request.command_buffer, gb::command::begin_command_buffer, message.data(), message.size());
         return VK_SUCCESS;
     }
@@ -818,13 +1010,23 @@ extern "C"
         request.command_buffer = command_buffer;
         record_command(command_buffer, gb::command::end_command_buffer, &request, sizeof(request));
 
-        const auto it = g_command_streams.find(command_buffer);
-        if (it == g_command_streams.end())
+        std::vector<uint8_t> stream;
         {
-            return VK_ERROR_INITIALIZATION_FAILED;
+            std::lock_guard<std::mutex> lock(g_command_streams_mutex);
+            const auto it = g_command_streams.find(command_buffer);
+            if (it == g_command_streams.end())
+            {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            if (it->second.error != VK_SUCCESS)
+            {
+                const VkResult result = it->second.error;
+                g_command_streams.erase(it);
+                return result;
+            }
+            stream = std::move(it->second.bytes);
+            g_command_streams.erase(it);
         }
-        const std::vector<uint8_t> stream = std::move(it->second);
-        g_command_streams.erase(it);
 
         gb::result_response response{};
         if (!bridge_call(gb::ioctl_record_commands, stream.data(), static_cast<DWORD>(stream.size()), &response, sizeof(response)))
@@ -854,7 +1056,10 @@ extern "C"
                                                                               VkCommandBufferResetFlags flags)
     {
         // Drop any half-recorded local stream; recording only reaches the bridge at vkEndCommandBuffer.
-        g_command_streams.erase(to_object_id(commandBuffer));
+        {
+            std::lock_guard<std::mutex> lock(g_command_streams_mutex);
+            g_command_streams.erase(to_object_id(commandBuffer));
+        }
 
         gb::reset_command_buffer_request request{};
         request.command_buffer = to_object_id(commandBuffer);
@@ -952,13 +1157,11 @@ extern "C"
         bridge_call(gb::ioctl_destroy_event, &request, sizeof(request), nullptr, 0);
     }
 
-    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkGetEventStatus(VkDevice, VkEvent event)
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkGetEventStatus(VkDevice device, VkEvent event)
     {
-        gb::get_event_status_request request{};
-        request.event = to_object_id(event);
-
+        const gb::event_op_request request{.device = to_object_id(device), .event = to_object_id(event)};
         gb::result_response response{};
-        if (!bridge_call(gb::ioctl_get_event_status, &request, sizeof(request), &response, sizeof(response)))
+        if (!bridge_call(gb::ioctl_get_event_status_owned, &request, sizeof(request), &response, sizeof(response)))
         {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
@@ -993,34 +1196,105 @@ extern "C"
         return static_cast<VkResult>(response.vk_result);
     }
 
+    // Historical behavior, superseded by the native event recorders below:
     // GPU-side event commands are not forwarded to the host command buffer: the bridge's submission model
     // is effectively synchronous, so DXVK's vkGetEventStatus always reports the event as set (see the host).
     // These recorders are no-ops; they exist so DXVK's device function table is non-null and does not call
     // through a null pointer when it records them.
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetEvent(VkCommandBuffer, VkEvent, VkPipelineStageFlags)
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetEvent(VkCommandBuffer buffer, VkEvent event, VkPipelineStageFlags stages)
     {
+        gb::synchronization_wire::command command{};
+        command.op = gb::synchronization_wire::operation::set_event;
+        command.event = event;
+        command.stage = stages;
+        record_synchronization(buffer, command);
     }
 
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdResetEvent(VkCommandBuffer, VkEvent, VkPipelineStageFlags)
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdResetEvent(VkCommandBuffer buffer, VkEvent event, VkPipelineStageFlags stages)
     {
+        gb::synchronization_wire::command command{};
+        command.op = gb::synchronization_wire::operation::reset_event;
+        command.event = event;
+        command.stage = stages;
+        record_synchronization(buffer, command);
     }
 
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdWaitEvents(VkCommandBuffer, uint32_t, const VkEvent*, VkPipelineStageFlags,
-                                                                     VkPipelineStageFlags, uint32_t, const VkMemoryBarrier*, uint32_t,
-                                                                     const VkBufferMemoryBarrier*, uint32_t, const VkImageMemoryBarrier*)
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdWaitEvents(VkCommandBuffer buffer, uint32_t eventCount, const VkEvent* events,
+                                                                     VkPipelineStageFlags sourceStages,
+                                                                     VkPipelineStageFlags destinationStages, uint32_t memoryCount,
+                                                                     const VkMemoryBarrier* memory, uint32_t bufferCount,
+                                                                     const VkBufferMemoryBarrier* buffers, uint32_t imageCount,
+                                                                     const VkImageMemoryBarrier* images)
     {
+        gb::synchronization_wire::command command{};
+        command.op = gb::synchronization_wire::operation::wait_events;
+        command.event_count = eventCount;
+        command.events = events;
+        command.legacy = {.source_stages = sourceStages,
+                          .destination_stages = destinationStages,
+                          .flags = 0,
+                          .memory_count = memoryCount,
+                          .memory = memory,
+                          .buffer_count = bufferCount,
+                          .buffers = buffers,
+                          .image_count = imageCount,
+                          .images = images};
+        record_synchronization(buffer, command);
     }
 
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetEvent2(VkCommandBuffer, VkEvent, const VkDependencyInfo*)
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetEvent2(VkCommandBuffer buffer, VkEvent event,
+                                                                    const VkDependencyInfo* dependency)
     {
+        gb::synchronization_wire::command command{};
+        command.op = gb::synchronization_wire::operation::set_event2;
+        command.event = event;
+        if (dependency)
+        {
+            command.dependency = *dependency;
+        }
+        else
+        {
+            command.dependency.sType = VK_STRUCTURE_TYPE_MAX_ENUM;
+        }
+        record_synchronization(buffer, command);
     }
 
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdResetEvent2(VkCommandBuffer, VkEvent, VkPipelineStageFlags2)
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdResetEvent2(VkCommandBuffer buffer, VkEvent event, VkPipelineStageFlags2 stages)
     {
+        gb::synchronization_wire::command command{};
+        command.op = gb::synchronization_wire::operation::reset_event2;
+        command.event = event;
+        command.stage2 = stages;
+        record_synchronization(buffer, command);
     }
 
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdWaitEvents2(VkCommandBuffer, uint32_t, const VkEvent*, const VkDependencyInfo*)
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdWaitEvents2(VkCommandBuffer buffer, uint32_t eventCount, const VkEvent* events,
+                                                                      const VkDependencyInfo* dependencies)
     {
+        gb::synchronization_wire::command command{};
+        command.op = gb::synchronization_wire::operation::wait_events2;
+        command.event_count = eventCount;
+        command.events = events;
+        command.dependencies = dependencies;
+        record_synchronization(buffer, command);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetEvent2KHR(VkCommandBuffer buffer, VkEvent event,
+                                                                       const VkDependencyInfo* dependency)
+    {
+        vkCmdSetEvent2(buffer, event, dependency);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdResetEvent2KHR(VkCommandBuffer buffer, VkEvent event,
+                                                                         VkPipelineStageFlags2 stages)
+    {
+        vkCmdResetEvent2(buffer, event, stages);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdWaitEvents2KHR(VkCommandBuffer buffer, uint32_t eventCount, const VkEvent* events,
+                                                                         const VkDependencyInfo* dependencies)
+    {
+        vkCmdWaitEvents2(buffer, eventCount, events, dependencies);
     }
 
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo* pCreateInfo,
@@ -2107,6 +2381,480 @@ extern "C"
         record_command(request.command_buffer, gb::command::cmd_set_stencil_op, &request, sizeof(request));
     }
 
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetAttachmentFeedbackLoopEnableEXT(VkCommandBuffer commandBuffer,
+                                                                                             VkImageAspectFlags value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::attachment_feedback_loop,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetCoverageModulationModeNV(VkCommandBuffer commandBuffer,
+                                                                                      VkCoverageModulationModeNV value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::coverage_modulation_mode,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetCoverageModulationTableEnableNV(VkCommandBuffer commandBuffer, VkBool32 value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::coverage_table_enable,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetCoverageReductionModeNV(VkCommandBuffer commandBuffer,
+                                                                                     VkCoverageReductionModeNV value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::coverage_reduction_mode,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetCoverageToColorEnableNV(VkCommandBuffer commandBuffer, VkBool32 value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::coverage_to_color_enable,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetCoverageToColorLocationNV(VkCommandBuffer commandBuffer, uint32_t value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::coverage_to_color_location,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthClipNegativeOneToOneEXT(VkCommandBuffer commandBuffer, VkBool32 value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::depth_clip_negative_one,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetDiscardRectangleEnableEXT(VkCommandBuffer commandBuffer, VkBool32 value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::discard_rectangle_enable,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetDiscardRectangleModeEXT(VkCommandBuffer commandBuffer,
+                                                                                     VkDiscardRectangleModeEXT value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::discard_rectangle_mode,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetLineStippleEnableEXT(VkCommandBuffer commandBuffer, VkBool32 value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::line_stipple_enable,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetLogicOpEXT(VkCommandBuffer commandBuffer, VkLogicOp value)
+    {
+        const gb::dynamic_request request{
+            .command_buffer = to_object_id(commandBuffer), .kind = gb::dynamic_command::logic_op, .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetPatchControlPointsEXT(VkCommandBuffer commandBuffer, uint32_t value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::patch_control_points,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetPrimitiveRestartIndexEXT(VkCommandBuffer commandBuffer, uint32_t value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::primitive_restart_index,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetProvokingVertexModeEXT(VkCommandBuffer commandBuffer,
+                                                                                    VkProvokingVertexModeEXT value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::provoking_vertex_mode,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetRayTracingPipelineStackSizeKHR(VkCommandBuffer commandBuffer, uint32_t value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::ray_tracing_stack_size,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetRepresentativeFragmentTestEnableNV(VkCommandBuffer commandBuffer,
+                                                                                                VkBool32 value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::representative_fragment_test,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetShadingRateImageEnableNV(VkCommandBuffer commandBuffer, VkBool32 value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::shading_rate_image_enable,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetViewportWScalingEnableNV(VkCommandBuffer commandBuffer, VkBool32 value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::viewport_w_scaling_enable,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetDeviceMask(VkCommandBuffer commandBuffer, uint32_t value)
+    {
+        const gb::dynamic_request request{
+            .command_buffer = to_object_id(commandBuffer), .kind = gb::dynamic_command::device_mask, .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetColorBlendAdvancedEXT(VkCommandBuffer commandBuffer, uint32_t first,
+                                                                                   uint32_t count, const VkColorBlendAdvancedEXT* values)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::color_blend_advanced,
+                                          .first = first,
+                                          .count = count};
+        record_extended_dynamic(request, values, sizeof(VkColorBlendAdvancedEXT));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetColorWriteEnableEXT(VkCommandBuffer commandBuffer, uint32_t count,
+                                                                                 const VkBool32* values)
+    {
+        const gb::dynamic_request request{
+            .command_buffer = to_object_id(commandBuffer), .kind = gb::dynamic_command::color_write_enable, .count = count};
+        record_extended_dynamic(request, values, sizeof(VkBool32));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetCoverageModulationTableNV(VkCommandBuffer commandBuffer, uint32_t count,
+                                                                                       const float* values)
+    {
+        const gb::dynamic_request request{
+            .command_buffer = to_object_id(commandBuffer), .kind = gb::dynamic_command::coverage_modulation_table, .count = count};
+        record_extended_dynamic(request, values, sizeof(float));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetDiscardRectangleEXT(VkCommandBuffer commandBuffer, uint32_t first,
+                                                                                 uint32_t count, const VkRect2D* values)
+    {
+        const gb::dynamic_request request{
+            .command_buffer = to_object_id(commandBuffer), .kind = gb::dynamic_command::discard_rectangles, .first = first, .count = count};
+        record_extended_dynamic(request, values, sizeof(VkRect2D));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetExclusiveScissorEnableNV(VkCommandBuffer commandBuffer, uint32_t first,
+                                                                                      uint32_t count, const VkBool32* values)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::exclusive_scissor_enable,
+                                          .first = first,
+                                          .count = count};
+        record_extended_dynamic(request, values, sizeof(VkBool32));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetExclusiveScissorNV(VkCommandBuffer commandBuffer, uint32_t first,
+                                                                                uint32_t count, const VkRect2D* values)
+    {
+        const gb::dynamic_request request{
+            .command_buffer = to_object_id(commandBuffer), .kind = gb::dynamic_command::exclusive_scissors, .first = first, .count = count};
+        record_extended_dynamic(request, values, sizeof(VkRect2D));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetViewportSwizzleNV(VkCommandBuffer commandBuffer, uint32_t first,
+                                                                               uint32_t count, const VkViewportSwizzleNV* values)
+    {
+        const gb::dynamic_request request{
+            .command_buffer = to_object_id(commandBuffer), .kind = gb::dynamic_command::viewport_swizzles, .first = first, .count = count};
+        record_extended_dynamic(request, values, sizeof(VkViewportSwizzleNV));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetViewportWScalingNV(VkCommandBuffer commandBuffer, uint32_t first,
+                                                                                uint32_t count, const VkViewportWScalingNV* values)
+    {
+        const gb::dynamic_request request{
+            .command_buffer = to_object_id(commandBuffer), .kind = gb::dynamic_command::viewport_w_scaling, .first = first, .count = count};
+        record_extended_dynamic(request, values, sizeof(VkViewportWScalingNV));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetLineStipple(VkCommandBuffer commandBuffer, uint32_t factor, uint16_t pattern)
+    {
+        const gb::dynamic_request request{
+            .command_buffer = to_object_id(commandBuffer), .kind = gb::dynamic_command::line_stipple, .first = pattern, .value = factor};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetLineStippleKHR(VkCommandBuffer commandBuffer, uint32_t factor,
+                                                                            uint16_t pattern)
+    {
+        vkCmdSetLineStipple(commandBuffer, factor, pattern);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetLineStippleEXT(VkCommandBuffer commandBuffer, uint32_t factor,
+                                                                            uint16_t pattern)
+    {
+        vkCmdSetLineStipple(commandBuffer, factor, pattern);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetDeviceMaskKHR(VkCommandBuffer commandBuffer, uint32_t deviceMask)
+    {
+        vkCmdSetDeviceMask(commandBuffer, deviceMask);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetFragmentShadingRateKHR(VkCommandBuffer commandBuffer,
+                                                                                    const VkExtent2D* pFragmentSize,
+                                                                                    const VkFragmentShadingRateCombinerOpKHR combinerOps[2])
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::fragment_shading_rate,
+                                          .count = 2,
+                                          .width = pFragmentSize ? pFragmentSize->width : 0,
+                                          .height = pFragmentSize ? pFragmentSize->height : 0,
+                                          .error = pFragmentSize ? VK_SUCCESS : VK_ERROR_INITIALIZATION_FAILED};
+        record_extended_dynamic(request, combinerOps, sizeof(VkFragmentShadingRateCombinerOpKHR));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetFragmentShadingRateEnumNV(
+        VkCommandBuffer commandBuffer, VkFragmentShadingRateNV shadingRate, const VkFragmentShadingRateCombinerOpKHR combinerOps[2])
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::fragment_shading_rate_enum,
+                                          .count = 2,
+                                          .value = static_cast<uint32_t>(shadingRate)};
+        record_extended_dynamic(request, combinerOps, sizeof(VkFragmentShadingRateCombinerOpKHR));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthClampRangeEXT(VkCommandBuffer commandBuffer, VkDepthClampModeEXT mode,
+                                                                                const VkDepthClampRangeEXT* range)
+    {
+        // Vulkan ignores pDepthClampRange unless the user-defined range mode is selected.
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::depth_clamp_range,
+                                          .count = mode == VK_DEPTH_CLAMP_MODE_USER_DEFINED_RANGE_EXT ? 1u : 0u,
+                                          .value = static_cast<uint32_t>(mode)};
+        record_extended_dynamic(request, range, sizeof(VkDepthClampRangeEXT));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetAlphaToCoverageEnableEXT(VkCommandBuffer commandBuffer, VkBool32 value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::alpha_to_coverage,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetAlphaToOneEnableEXT(VkCommandBuffer commandBuffer, VkBool32 value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::alpha_to_one,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthClampEnableEXT(VkCommandBuffer commandBuffer, VkBool32 value)
+    {
+        const gb::dynamic_request request{
+            .command_buffer = to_object_id(commandBuffer), .kind = gb::dynamic_command::depth_clamp, .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetLogicOpEnableEXT(VkCommandBuffer commandBuffer, VkBool32 value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::logic_op_enable,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetPolygonModeEXT(VkCommandBuffer commandBuffer, VkPolygonMode value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::polygon_mode,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetRasterizationSamplesEXT(VkCommandBuffer commandBuffer,
+                                                                                     VkSampleCountFlagBits value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::rasterization_samples,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetRasterizationStreamEXT(VkCommandBuffer commandBuffer, uint32_t value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::rasterization_stream,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetConservativeRasterizationModeEXT(VkCommandBuffer commandBuffer,
+                                                                                              VkConservativeRasterizationModeEXT value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::conservative_rasterization,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetSampleLocationsEnableEXT(VkCommandBuffer commandBuffer, VkBool32 value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::sample_locations_enable,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetLineRasterizationModeEXT(VkCommandBuffer commandBuffer,
+                                                                                      VkLineRasterizationModeEXT value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::line_rasterization,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetTessellationDomainOriginEXT(VkCommandBuffer commandBuffer,
+                                                                                         VkTessellationDomainOrigin value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::tessellation_domain,
+                                          .value = static_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetExtraPrimitiveOverestimationSizeEXT(VkCommandBuffer commandBuffer, float value)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::extra_overestimation,
+                                          .value = std::bit_cast<uint32_t>(value)};
+        record_extended_dynamic(request, nullptr, 0);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetColorBlendEnableEXT(VkCommandBuffer commandBuffer, uint32_t firstAttachment,
+                                                                                 uint32_t attachmentCount, const VkBool32* values)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::color_blend_enable,
+                                          .first = firstAttachment,
+                                          .count = attachmentCount};
+        record_extended_dynamic(request, values, sizeof(VkBool32));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetColorBlendEquationEXT(VkCommandBuffer commandBuffer, uint32_t firstAttachment,
+                                                                                   uint32_t attachmentCount,
+                                                                                   const VkColorBlendEquationEXT* values)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::color_blend_equation,
+                                          .first = firstAttachment,
+                                          .count = attachmentCount};
+        record_extended_dynamic(request, values, sizeof(VkColorBlendEquationEXT));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetColorWriteMaskEXT(VkCommandBuffer commandBuffer, uint32_t firstAttachment,
+                                                                               uint32_t attachmentCount,
+                                                                               const VkColorComponentFlags* values)
+    {
+        const gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                          .kind = gb::dynamic_command::color_write_mask,
+                                          .first = firstAttachment,
+                                          .count = attachmentCount};
+        record_extended_dynamic(request, values, sizeof(VkColorComponentFlags));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetSampleMaskEXT(VkCommandBuffer commandBuffer, VkSampleCountFlagBits samples,
+                                                                           const VkSampleMask* pSampleMask)
+    {
+        gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer),
+                                    .kind = gb::dynamic_command::sample_mask,
+                                    .count = (static_cast<uint32_t>(samples) + 31) / 32,
+                                    .value = static_cast<uint32_t>(samples)};
+        if (!gb::valid_sample_count(request.value))
+        {
+            request.error = VK_ERROR_INITIALIZATION_FAILED;
+        }
+        // maintenance10 allows NULL to mean all bits set. An explicit mask has identical command state
+        // and keeps the wire independent of the host's maintenance10 support.
+        const VkSampleMask all_samples[] = {UINT32_MAX, UINT32_MAX};
+        record_extended_dynamic(request, pSampleMask ? pSampleMask : all_samples, sizeof(VkSampleMask));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceMultisamplePropertiesEXT(
+        VkPhysicalDevice physicalDevice, VkSampleCountFlagBits samples, VkMultisamplePropertiesEXT* pMultisampleProperties)
+    {
+        if (!pMultisampleProperties || pMultisampleProperties->sType != VK_STRUCTURE_TYPE_MULTISAMPLE_PROPERTIES_EXT ||
+            pMultisampleProperties->pNext)
+        {
+            shim_log("vulkan-shim: vkGetPhysicalDeviceMultisamplePropertiesEXT invalid output structure or unsupported pNext\n");
+            return;
+        }
+        const gb::get_multisample_properties_request request{
+            .physical_device = to_object_id(physicalDevice), .samples = static_cast<uint32_t>(samples), .reserved = 0};
+        gb::get_multisample_properties_response response{};
+        if (!bridge_call(gb::ioctl_get_multisample_properties, &request, sizeof(request), &response, sizeof(response)) ||
+            response.vk_result != VK_SUCCESS)
+        {
+            shim_log("vulkan-shim: vkGetPhysicalDeviceMultisamplePropertiesEXT bridge/driver failure\n");
+            return;
+        }
+        pMultisampleProperties->maxSampleLocationGridSize = {.width = response.width, .height = response.height};
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetSampleLocationsEXT(VkCommandBuffer commandBuffer,
+                                                                                const VkSampleLocationsInfoEXT* pSampleLocationsInfo)
+    {
+        gb::dynamic_request request{.command_buffer = to_object_id(commandBuffer), .kind = gb::dynamic_command::sample_locations};
+        if (!pSampleLocationsInfo || pSampleLocationsInfo->sType != VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT)
+        {
+            request.error = VK_ERROR_INITIALIZATION_FAILED;
+            record_extended_dynamic(request, nullptr, 0);
+            return;
+        }
+        // The pinned registry defines no structures extending VkSampleLocationsInfoEXT. Preserve an
+        // explicit error for an unknown chain instead of silently changing future extension semantics.
+        if (pSampleLocationsInfo->pNext)
+        {
+            request.error = VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+        request.value = static_cast<uint32_t>(pSampleLocationsInfo->sampleLocationsPerPixel);
+        request.width = pSampleLocationsInfo->sampleLocationGridSize.width;
+        request.height = pSampleLocationsInfo->sampleLocationGridSize.height;
+        request.count = pSampleLocationsInfo->sampleLocationsCount;
+        record_extended_dynamic(request, pSampleLocationsInfo->pSampleLocations, sizeof(VkSampleLocationEXT));
+    }
+
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdSetCullMode(VkCommandBuffer commandBuffer, VkCullModeFlags cullMode)
     {
         record_set_dynamic_u32(commandBuffer, gb::dynamic_state_u32::cull_mode, static_cast<uint32_t>(cullMode));
@@ -2522,58 +3270,53 @@ extern "C"
         }
     }
 
+    // Historical limitation, superseded by the complete arrays passed below:
     // Only image memory barriers are remoted (one IOCTL each, using the global stage masks); memory and
     // buffer barriers are not modeled yet.
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier(VkCommandBuffer commandBuffer, VkPipelineStageFlags srcStageMask,
-                                                                          VkPipelineStageFlags dstStageMask, VkDependencyFlags, uint32_t,
-                                                                          const VkMemoryBarrier*, uint32_t, const VkBufferMemoryBarrier*,
-                                                                          uint32_t imageMemoryBarrierCount,
-                                                                          const VkImageMemoryBarrier* pImageMemoryBarriers)
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier(VkCommandBuffer buffer, VkPipelineStageFlags sourceStages,
+                                                                          VkPipelineStageFlags destinationStages, VkDependencyFlags flags,
+                                                                          uint32_t memoryCount, const VkMemoryBarrier* memory,
+                                                                          uint32_t bufferCount, const VkBufferMemoryBarrier* buffers,
+                                                                          uint32_t imageCount, const VkImageMemoryBarrier* images)
     {
-        for (uint32_t i = 0; i < imageMemoryBarrierCount; ++i)
-        {
-            const VkImageMemoryBarrier& b = pImageMemoryBarriers[i];
-            gb::cmd_pipeline_barrier_request request{};
-            request.command_buffer = to_object_id(commandBuffer);
-            request.image = to_object_id(b.image);
-            request.subresource = to_wire_range(b.subresourceRange);
-            request.src_stage_mask = srcStageMask;
-            request.dst_stage_mask = dstStageMask;
-            request.src_access_mask = b.srcAccessMask;
-            request.dst_access_mask = b.dstAccessMask;
-            request.old_layout = static_cast<uint32_t>(b.oldLayout);
-            request.new_layout = static_cast<uint32_t>(b.newLayout);
-            record_command(request.command_buffer, gb::command::cmd_pipeline_barrier, &request, sizeof(request));
-        }
+        gb::synchronization_wire::command command{};
+        command.op = gb::synchronization_wire::operation::barrier;
+        command.legacy = {.source_stages = sourceStages,
+                          .destination_stages = destinationStages,
+                          .flags = flags,
+                          .memory_count = memoryCount,
+                          .memory = memory,
+                          .buffer_count = bufferCount,
+                          .buffers = buffers,
+                          .image_count = imageCount,
+                          .images = images};
+        record_synchronization(buffer, command);
     }
 
+    // Historical conversion, superseded by native synchronization2 forwarding below:
     // synchronization2 barrier: DXVK uses this exclusively. Lower its image barriers to the v1
     // cmd_pipeline_barrier records. The VkPipelineStageFlags2/VkAccessFlags2 (64-bit) don't map cleanly to
     // the v1 32-bit flags and a 0 stage mask is invalid in v1, so use ALL_COMMANDS stages (the bridge
     // executes submissions synchronously, so over-synchronizing is harmless). Layout transitions -- the
     // part DXVK actually relies on -- are preserved. Global/buffer memory barriers are no-ops here.
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier2(VkCommandBuffer commandBuffer,
-                                                                           const VkDependencyInfo* pDependencyInfo)
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier2(VkCommandBuffer buffer, const VkDependencyInfo* dependency)
     {
-        if (!pDependencyInfo)
+        gb::synchronization_wire::command command{};
+        command.op = gb::synchronization_wire::operation::barrier2;
+        if (dependency)
         {
-            return;
+            command.dependency = *dependency;
         }
-        for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; ++i)
+        else
         {
-            const VkImageMemoryBarrier2& b = pDependencyInfo->pImageMemoryBarriers[i];
-            gb::cmd_pipeline_barrier_request request{};
-            request.command_buffer = to_object_id(commandBuffer);
-            request.image = to_object_id(b.image);
-            request.subresource = to_wire_range(b.subresourceRange);
-            request.src_stage_mask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-            request.dst_stage_mask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-            request.src_access_mask = static_cast<uint32_t>(b.srcAccessMask);
-            request.dst_access_mask = static_cast<uint32_t>(b.dstAccessMask);
-            request.old_layout = static_cast<uint32_t>(b.oldLayout);
-            request.new_layout = static_cast<uint32_t>(b.newLayout);
-            record_command(request.command_buffer, gb::command::cmd_pipeline_barrier, &request, sizeof(request));
+            command.dependency.sType = VK_STRUCTURE_TYPE_MAX_ENUM;
         }
+        record_synchronization(buffer, command);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier2KHR(VkCommandBuffer buffer, const VkDependencyInfo* dependency)
+    {
+        vkCmdPipelineBarrier2(buffer, dependency);
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdClearColorImage(VkCommandBuffer commandBuffer, VkImage image,
@@ -4088,6 +4831,81 @@ extern "C"
         destroy_device_child(gb::ioctl_destroy_image_view, device, imageView);
     }
 
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass2(VkDevice device, const VkRenderPassCreateInfo2* pCreateInfo,
+                                                                             const VkAllocationCallbacks* pAllocator,
+                                                                             VkRenderPass* pRenderPass)
+    {
+        return create_render_pass_object(gb::ioctl_create_render_pass2, device, pCreateInfo, pAllocator, pRenderPass);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass2KHR(VkDevice device, const VkRenderPassCreateInfo2* pCreateInfo,
+                                                                                const VkAllocationCallbacks* pAllocator,
+                                                                                VkRenderPass* pRenderPass)
+    {
+        return vkCreateRenderPass2(device, pCreateInfo, pAllocator, pRenderPass);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+                                                                           const VkRenderPassBeginInfo* pRenderPassBegin,
+                                                                           const VkSubpassBeginInfo* pSubpassBeginInfo)
+    {
+        record_render_pass(commandBuffer, gb::command::cmd_begin_render_pass2, pRenderPassBegin, pSubpassBeginInfo);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass2KHR(VkCommandBuffer commandBuffer,
+                                                                              const VkRenderPassBeginInfo* pRenderPassBegin,
+                                                                              const VkSubpassBeginInfo* pSubpassBeginInfo)
+    {
+        vkCmdBeginRenderPass2(commandBuffer, pRenderPassBegin, pSubpassBeginInfo);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass2(VkCommandBuffer commandBuffer,
+                                                                       const VkSubpassBeginInfo* pSubpassBeginInfo,
+                                                                       const VkSubpassEndInfo* pSubpassEndInfo)
+    {
+        record_render_pass(commandBuffer, gb::command::cmd_next_subpass2, pSubpassBeginInfo, pSubpassEndInfo);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass2KHR(VkCommandBuffer commandBuffer,
+                                                                          const VkSubpassBeginInfo* pSubpassBeginInfo,
+                                                                          const VkSubpassEndInfo* pSubpassEndInfo)
+    {
+        vkCmdNextSubpass2(commandBuffer, pSubpassBeginInfo, pSubpassEndInfo);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass2(VkCommandBuffer commandBuffer,
+                                                                         const VkSubpassEndInfo* pSubpassEndInfo)
+    {
+        record_render_pass(commandBuffer, gb::command::cmd_end_render_pass2, pSubpassEndInfo);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass2KHR(VkCommandBuffer commandBuffer,
+                                                                            const VkSubpassEndInfo* pSubpassEndInfo)
+    {
+        vkCmdEndRenderPass2(commandBuffer, pSubpassEndInfo);
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkGetRenderAreaGranularity(VkDevice device, VkRenderPass renderPass,
+                                                                                VkExtent2D* pGranularity)
+    {
+        if (!pGranularity)
+        {
+            return;
+        }
+        *pGranularity = {};
+        const gb::device_child_request request{.device = to_object_id(device), .object = to_object_id(renderPass)};
+        gb::render_area_granularity_response response{};
+        if (bridge_call(gb::ioctl_get_render_area_granularity, &request, sizeof(request), &response, sizeof(response)) &&
+            response.vk_result == VK_SUCCESS)
+        {
+            *pGranularity = {.width = response.width, .height = response.height};
+        }
+        else
+        {
+            OutputDebugStringA("[vulkan-shim] vkGetRenderAreaGranularity failed\n");
+        }
+    }
+
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo* pCreateInfo,
                                                                             const VkAllocationCallbacks*, VkRenderPass* pRenderPass)
     {
@@ -4130,27 +4948,12 @@ extern "C"
     }
 
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo* pCreateInfo,
-                                                                             const VkAllocationCallbacks*, VkFramebuffer* pFramebuffer)
+                                                                             const VkAllocationCallbacks* pAllocator,
+                                                                             VkFramebuffer* pFramebuffer)
     {
-        gb::create_framebuffer_request request{};
-        request.device = to_object_id(device);
-        request.render_pass = to_object_id(pCreateInfo->renderPass);
-        request.image_view = to_object_id(pCreateInfo->pAttachments[0]); // color attachment
-        request.depth_view = (pCreateInfo->attachmentCount >= 2) ? to_object_id(pCreateInfo->pAttachments[1]) : gb::null_object;
-        request.width = pCreateInfo->width;
-        request.height = pCreateInfo->height;
-
-        gb::object_response response{};
-        if (!bridge_call(gb::ioctl_create_framebuffer, &request, sizeof(request), &response, sizeof(response)))
-        {
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
-        if (response.vk_result != VK_SUCCESS)
-        {
-            return static_cast<VkResult>(response.vk_result);
-        }
-        *pFramebuffer = to_handle<VkFramebuffer>(response.object);
-        return VK_SUCCESS;
+        // color attachment
+        // All attachments and layers are marshalled together; imageless attachments arrive at render-pass begin.
+        return create_render_pass_object(gb::ioctl_create_framebuffer_full, device, pCreateInfo, pAllocator, pFramebuffer);
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkDestroyFramebuffer(VkDevice device, VkFramebuffer framebuffer,
@@ -5367,27 +6170,11 @@ extern "C"
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer commandBuffer,
-                                                                          const VkRenderPassBeginInfo* pRenderPassBegin, VkSubpassContents)
+                                                                          const VkRenderPassBeginInfo* pRenderPassBegin,
+                                                                          VkSubpassContents contents)
     {
-        gb::cmd_begin_render_pass_request request{};
-        request.command_buffer = to_object_id(commandBuffer);
-        request.render_pass = to_object_id(pRenderPassBegin->renderPass);
-        request.framebuffer = to_object_id(pRenderPassBegin->framebuffer);
-        request.width = pRenderPassBegin->renderArea.extent.width;
-        request.height = pRenderPassBegin->renderArea.extent.height;
-        request.clear_depth = 1.0f;
-        if (pRenderPassBegin->clearValueCount > 0 && pRenderPassBegin->pClearValues)
-        {
-            request.clear_r = pRenderPassBegin->pClearValues[0].color.float32[0];
-            request.clear_g = pRenderPassBegin->pClearValues[0].color.float32[1];
-            request.clear_b = pRenderPassBegin->pClearValues[0].color.float32[2];
-            request.clear_a = pRenderPassBegin->pClearValues[0].color.float32[3];
-            if (pRenderPassBegin->clearValueCount >= 2)
-            {
-                request.clear_depth = pRenderPassBegin->pClearValues[1].depthStencil.depth;
-            }
-        }
-        record_command(request.command_buffer, gb::command::cmd_begin_render_pass, &request, sizeof(request));
+        const VkSubpassBeginInfo begin{VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO, nullptr, contents};
+        record_render_pass(commandBuffer, gb::command::cmd_begin_render_pass_full, pRenderPassBegin, &begin);
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint,
@@ -5895,11 +6682,11 @@ extern "C"
             {.name = "vkCmdResetEvent", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdResetEvent)},
             {.name = "vkCmdWaitEvents", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdWaitEvents)},
             {.name = "vkCmdSetEvent2", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetEvent2)},
-            {.name = "vkCmdSetEvent2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetEvent2)},
+            {.name = "vkCmdSetEvent2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetEvent2KHR)},
             {.name = "vkCmdResetEvent2", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdResetEvent2)},
-            {.name = "vkCmdResetEvent2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdResetEvent2)},
+            {.name = "vkCmdResetEvent2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdResetEvent2KHR)},
             {.name = "vkCmdWaitEvents2", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdWaitEvents2)},
-            {.name = "vkCmdWaitEvents2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdWaitEvents2)},
+            {.name = "vkCmdWaitEvents2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdWaitEvents2KHR)},
             {.name = "vkCreateFence", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateFence)},
             {.name = "vkCreateSemaphore", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateSemaphore)},
             {.name = "vkDestroySemaphore", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroySemaphore)},
@@ -5985,7 +6772,7 @@ extern "C"
             {.name = "vkBindImageMemory", .func = reinterpret_cast<PFN_vkVoidFunction>(vkBindImageMemory)},
             {.name = "vkCmdPipelineBarrier", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdPipelineBarrier)},
             {.name = "vkCmdPipelineBarrier2", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdPipelineBarrier2)},
-            {.name = "vkCmdPipelineBarrier2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdPipelineBarrier2)},
+            {.name = "vkCmdPipelineBarrier2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdPipelineBarrier2KHR)},
             {.name = "vkCmdClearColorImage", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdClearColorImage)},
             {.name = "vkCmdClearAttachments", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdClearAttachments)},
             {.name = "vkCmdClearDepthStencilImage", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdClearDepthStencilImage)},
@@ -6021,6 +6808,15 @@ extern "C"
             {.name = "vkCreateImageView", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateImageView)},
             {.name = "vkDestroyImageView", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyImageView)},
             {.name = "vkCreateRenderPass", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateRenderPass)},
+            {.name = "vkCreateRenderPass2", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateRenderPass2)},
+            {.name = "vkCreateRenderPass2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateRenderPass2KHR)},
+            {.name = "vkCmdBeginRenderPass2", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBeginRenderPass2)},
+            {.name = "vkCmdBeginRenderPass2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBeginRenderPass2KHR)},
+            {.name = "vkCmdNextSubpass2", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdNextSubpass2)},
+            {.name = "vkCmdNextSubpass2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdNextSubpass2KHR)},
+            {.name = "vkCmdEndRenderPass2", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdEndRenderPass2)},
+            {.name = "vkCmdEndRenderPass2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdEndRenderPass2KHR)},
+            {.name = "vkGetRenderAreaGranularity", .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetRenderAreaGranularity)},
             {.name = "vkDestroyRenderPass", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyRenderPass)},
             {.name = "vkCreateFramebuffer", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateFramebuffer)},
             {.name = "vkDestroyFramebuffer", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyFramebuffer)},
@@ -6111,6 +6907,67 @@ extern "C"
             {.name = "vkCmdSetStencilReference", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetStencilReference)},
             {.name = "vkCmdSetStencilOp", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetStencilOp)},
             {.name = "vkCmdSetStencilOpEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetStencilOp)},
+            {.name = "vkCmdSetAttachmentFeedbackLoopEnableEXT",
+             .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetAttachmentFeedbackLoopEnableEXT)},
+            {.name = "vkCmdSetCoverageModulationModeNV", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetCoverageModulationModeNV)},
+            {.name = "vkCmdSetCoverageModulationTableEnableNV",
+             .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetCoverageModulationTableEnableNV)},
+            {.name = "vkCmdSetCoverageReductionModeNV", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetCoverageReductionModeNV)},
+            {.name = "vkCmdSetCoverageToColorEnableNV", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetCoverageToColorEnableNV)},
+            {.name = "vkCmdSetCoverageToColorLocationNV", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetCoverageToColorLocationNV)},
+            {.name = "vkCmdSetDepthClipNegativeOneToOneEXT",
+             .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetDepthClipNegativeOneToOneEXT)},
+            {.name = "vkCmdSetDiscardRectangleEnableEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetDiscardRectangleEnableEXT)},
+            {.name = "vkCmdSetDiscardRectangleModeEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetDiscardRectangleModeEXT)},
+            {.name = "vkCmdSetLineStippleEnableEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetLineStippleEnableEXT)},
+            {.name = "vkCmdSetLogicOpEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetLogicOpEXT)},
+            {.name = "vkCmdSetPatchControlPointsEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetPatchControlPointsEXT)},
+            {.name = "vkCmdSetPrimitiveRestartIndexEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetPrimitiveRestartIndexEXT)},
+            {.name = "vkCmdSetProvokingVertexModeEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetProvokingVertexModeEXT)},
+            {.name = "vkCmdSetRayTracingPipelineStackSizeKHR",
+             .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetRayTracingPipelineStackSizeKHR)},
+            {.name = "vkCmdSetRepresentativeFragmentTestEnableNV",
+             .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetRepresentativeFragmentTestEnableNV)},
+            {.name = "vkCmdSetShadingRateImageEnableNV", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetShadingRateImageEnableNV)},
+            {.name = "vkCmdSetViewportWScalingEnableNV", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetViewportWScalingEnableNV)},
+            {.name = "vkCmdSetDeviceMask", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetDeviceMask)},
+            {.name = "vkCmdSetColorBlendAdvancedEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetColorBlendAdvancedEXT)},
+            {.name = "vkCmdSetColorWriteEnableEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetColorWriteEnableEXT)},
+            {.name = "vkCmdSetCoverageModulationTableNV", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetCoverageModulationTableNV)},
+            {.name = "vkCmdSetDiscardRectangleEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetDiscardRectangleEXT)},
+            {.name = "vkCmdSetExclusiveScissorEnableNV", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetExclusiveScissorEnableNV)},
+            {.name = "vkCmdSetExclusiveScissorNV", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetExclusiveScissorNV)},
+            {.name = "vkCmdSetViewportSwizzleNV", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetViewportSwizzleNV)},
+            {.name = "vkCmdSetViewportWScalingNV", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetViewportWScalingNV)},
+            {.name = "vkCmdSetLineStipple", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetLineStipple)},
+            {.name = "vkCmdSetFragmentShadingRateKHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetFragmentShadingRateKHR)},
+            {.name = "vkCmdSetFragmentShadingRateEnumNV", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetFragmentShadingRateEnumNV)},
+            {.name = "vkCmdSetDepthClampRangeEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetDepthClampRangeEXT)},
+            {.name = "vkCmdSetDeviceMaskKHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetDeviceMaskKHR)},
+            {.name = "vkCmdSetLineStippleKHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetLineStippleKHR)},
+            {.name = "vkCmdSetLineStippleEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetLineStippleEXT)},
+            {.name = "vkCmdSetAlphaToCoverageEnableEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetAlphaToCoverageEnableEXT)},
+            {.name = "vkCmdSetAlphaToOneEnableEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetAlphaToOneEnableEXT)},
+            {.name = "vkCmdSetDepthClampEnableEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetDepthClampEnableEXT)},
+            {.name = "vkCmdSetLogicOpEnableEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetLogicOpEnableEXT)},
+            {.name = "vkCmdSetPolygonModeEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetPolygonModeEXT)},
+            {.name = "vkCmdSetRasterizationSamplesEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetRasterizationSamplesEXT)},
+            {.name = "vkCmdSetRasterizationStreamEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetRasterizationStreamEXT)},
+            {.name = "vkCmdSetConservativeRasterizationModeEXT",
+             .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetConservativeRasterizationModeEXT)},
+            {.name = "vkCmdSetSampleLocationsEnableEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetSampleLocationsEnableEXT)},
+            {.name = "vkCmdSetLineRasterizationModeEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetLineRasterizationModeEXT)},
+            {.name = "vkCmdSetTessellationDomainOriginEXT",
+             .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetTessellationDomainOriginEXT)},
+            {.name = "vkCmdSetExtraPrimitiveOverestimationSizeEXT",
+             .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetExtraPrimitiveOverestimationSizeEXT)},
+            {.name = "vkCmdSetColorBlendEnableEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetColorBlendEnableEXT)},
+            {.name = "vkCmdSetColorBlendEquationEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetColorBlendEquationEXT)},
+            {.name = "vkCmdSetColorWriteMaskEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetColorWriteMaskEXT)},
+            {.name = "vkCmdSetSampleMaskEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetSampleMaskEXT)},
+            {.name = "vkGetPhysicalDeviceMultisamplePropertiesEXT",
+             .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetPhysicalDeviceMultisamplePropertiesEXT)},
+            {.name = "vkCmdSetSampleLocationsEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetSampleLocationsEXT)},
             {.name = "vkCmdSetCullMode", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetCullMode)},
             {.name = "vkCmdSetCullModeEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetCullMode)},
             {.name = "vkCmdSetFrontFace", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetFrontFace)},

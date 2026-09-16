@@ -113,6 +113,15 @@ EXPORTS
     vkCreatePipelineLayout
     vkCreatePipelineCache
     vkCreateRenderPass
+    vkCreateRenderPass2
+    vkCreateRenderPass2KHR
+    vkCmdBeginRenderPass2
+    vkCmdBeginRenderPass2KHR
+    vkCmdNextSubpass2
+    vkCmdNextSubpass2KHR
+    vkCmdEndRenderPass2
+    vkCmdEndRenderPass2KHR
+    vkGetRenderAreaGranularity
     vkCreateSampler
     vkCreateShaderModule
     vkCreateSwapchainKHR
@@ -216,3 +225,72 @@ EXPORTS
     vkUpdateDescriptorSets
     vkWaitForFences
     vk_icdGetInstanceProcAddr
+
+    vkCmdSetAlphaToCoverageEnableEXT
+    vkCmdSetAlphaToOneEnableEXT
+    vkCmdSetDepthClampEnableEXT
+    vkCmdSetLogicOpEnableEXT
+    vkCmdSetPolygonModeEXT
+    vkCmdSetRasterizationSamplesEXT
+    vkCmdSetRasterizationStreamEXT
+    vkCmdSetConservativeRasterizationModeEXT
+    vkCmdSetSampleLocationsEnableEXT
+    vkCmdSetLineRasterizationModeEXT
+    vkCmdSetTessellationDomainOriginEXT
+    vkCmdSetExtraPrimitiveOverestimationSizeEXT
+    vkCmdSetColorBlendEnableEXT
+    vkCmdSetColorBlendEquationEXT
+    vkCmdSetColorWriteMaskEXT
+    vkCmdSetSampleMaskEXT
+    vkCmdSetSampleLocationsEXT
+    vkGetPhysicalDeviceMultisamplePropertiesEXT
+    vkCmdSetAttachmentFeedbackLoopEnableEXT
+    vkCmdSetCoverageModulationModeNV
+    vkCmdSetCoverageModulationTableEnableNV
+    vkCmdSetCoverageReductionModeNV
+    vkCmdSetCoverageToColorEnableNV
+    vkCmdSetCoverageToColorLocationNV
+    vkCmdSetDepthClipNegativeOneToOneEXT
+    vkCmdSetDiscardRectangleEnableEXT
+    vkCmdSetDiscardRectangleModeEXT
+    vkCmdSetLineStippleEnableEXT
+    vkCmdSetLogicOpEXT
+    vkCmdSetPatchControlPointsEXT
+    vkCmdSetPrimitiveRestartIndexEXT
+    vkCmdSetProvokingVertexModeEXT
+    vkCmdSetRayTracingPipelineStackSizeKHR
+    vkCmdSetRepresentativeFragmentTestEnableNV
+    vkCmdSetShadingRateImageEnableNV
+    vkCmdSetViewportWScalingEnableNV
+    vkCmdSetDeviceMask
+    vkCmdSetColorBlendAdvancedEXT
+    vkCmdSetColorWriteEnableEXT
+    vkCmdSetCoverageModulationTableNV
+    vkCmdSetDiscardRectangleEXT
+    vkCmdSetExclusiveScissorEnableNV
+    vkCmdSetExclusiveScissorNV
+    vkCmdSetViewportSwizzleNV
+    vkCmdSetViewportWScalingNV
+    vkCmdSetLineStipple
+    vkCmdSetFragmentShadingRateKHR
+    vkCmdSetFragmentShadingRateEnumNV
+    vkCmdSetDepthClampRangeEXT
+    vkCmdSetDeviceMaskKHR
+    vkCmdSetLineStippleKHR
+    vkCmdSetLineStippleEXT
+    vkCmdSetEvent2
+    vkCmdSetEvent2KHR
+    vkCmdResetEvent2
+    vkCmdResetEvent2KHR
+    vkCmdWaitEvents2
+    vkCmdWaitEvents2KHR
+    vkCmdPipelineBarrier2
+    vkCmdPipelineBarrier2KHR
+    vkCmdSetEvent
+    vkCmdResetEvent
+    vkCmdWaitEvents
+    vkCreateEvent
+    vkDestroyEvent
+    vkGetEventStatus
+    vkSetEvent
+    vkResetEvent

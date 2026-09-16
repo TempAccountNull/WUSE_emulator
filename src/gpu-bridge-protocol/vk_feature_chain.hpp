@@ -11,6 +11,7 @@
 // body size and the host echoes it, keeping a 32-bit guest and 64-bit host in agreement.
 
 #include <cstddef>
+#include <vk_feature_layouts.hpp>
 #include <vulkan/vulkan_core.h>
 
 namespace sogen::gpu_bridge
@@ -19,52 +20,17 @@ namespace sogen::gpu_bridge
     inline constexpr size_t feature_chain_header_size = 2 * sizeof(void*);
 
     // sizeof the named feature struct on THIS architecture, or 0 if the bridge does not know it.
-    // Extend this switch when a new required feature struct shows up (the only place to edit).
+    // The switch is generated in vk_feature_layouts.hpp; regenerate it when the pinned registry changes.
     inline size_t feature_struct_size(const VkStructureType type)
     {
-        switch (type)
-        {
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
-            return sizeof(VkPhysicalDeviceFeatures2);
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
-            return sizeof(VkPhysicalDeviceVulkan11Features);
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
-            return sizeof(VkPhysicalDeviceVulkan12Features);
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES:
-            return sizeof(VkPhysicalDeviceVulkan13Features);
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT:
-            return sizeof(VkPhysicalDeviceDepthClipEnableFeaturesEXT);
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT:
-            return sizeof(VkPhysicalDeviceTransformFeedbackFeaturesEXT);
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT:
-            return sizeof(VkPhysicalDeviceExtendedDynamicState3FeaturesEXT);
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT:
-            return sizeof(VkPhysicalDeviceRobustness2FeaturesEXT);
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT:
-            return sizeof(VkPhysicalDeviceShaderModuleIdentifierFeaturesEXT);
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR:
-            return sizeof(VkPhysicalDeviceMaintenance5FeaturesKHR);
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR:
-            return sizeof(VkPhysicalDeviceMaintenance6FeaturesKHR);
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR:
-            return sizeof(VkPhysicalDeviceMaintenance7FeaturesKHR);
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR:
-            return sizeof(VkPhysicalDeviceMaintenance8FeaturesKHR);
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_9_FEATURES_KHR:
-            return sizeof(VkPhysicalDeviceMaintenance9FeaturesKHR);
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES:
-            return sizeof(VkPhysicalDeviceVertexAttributeDivisorFeatures);
-        default:
-            return 0;
-        }
+        return registry_feature_layout(type).structure_size;
     }
 
     // Bytes of VkBool32 body (no header, no trailing padding) for a known feature struct, else 0.
-    // Computed on x86 in the guest (pad-free); the host reuses the guest-supplied value.
+    // The old x86 computation was pad-free; the registry count now excludes tail padding on both ABIs.
     inline size_t feature_body_size(const VkStructureType type)
     {
-        const size_t total = feature_struct_size(type);
-        return total > feature_chain_header_size ? total - feature_chain_header_size : 0;
+        return registry_feature_layout(type).body_size;
     }
 
     // sizeof the named VkPhysicalDevice*Properties struct on THIS architecture, or 0 if unknown. These

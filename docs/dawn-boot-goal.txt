@@ -66,3 +66,22 @@ The user authorized building D:/Dawn/refs/dxvk with outputs under built and
 requested build.cmd. Other reference trees remain read-only. Stage DLL/PDB
 pairs outside the reference tree, verify GUID/age and architecture, and log
 selected paths/hashes. Old checkpoints must retain their original renderer.
+
+// VULKAN COVERAGE
+Implement the full Windows Vulkan API from Sogen's pinned Vulkan-Headers
+v1.4.361 registry, including core and extension commands, defined aliases,
+x86/x64 structures, nested arrays and pNext chains, callback behavior, handle
+ownership, synchronization, output contracts and error paths. A registered
+entry point or empty wrapper is not implementation proof. Track coverage and
+validate each family with focused tests and real guest-to-host execution.
+Driver-specific features must reflect real host capabilities; no fabricated
+success for unsupported operations. Non-Windows/provisional surfaces remain
+explicitly listed outside the current Windows build target.
+
+D:/Dawn/vulkan supplies Khronos reference source. Git reference checkouts may
+be switched/pulled to verified revisions when needed; do not build or execute
+reference code. Headers, Docs, Hpp and ValidationLayers use v1.4.361;
+ExtensionLayer uses pinned origin/vulkan-tmp-1.4.361; the host Loader reference
+uses v1.4.313 matching the installed loader version. The actual DXVK consumer
+remains pinned to its own Vulkan-Headers v1.4.350. Preserve official EXT/KHR
+suffixes; use core aliases only when the registry defines them.

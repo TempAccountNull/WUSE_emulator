@@ -16,7 +16,7 @@ namespace sogen::gpu_bridge
     // Identifies a valid bridge and lets the guest detect a host that speaks a different
     // protocol revision before issuing any further commands.
     inline constexpr uint32_t protocol_magic = 0x55504753; // 'SGPU'
-    inline constexpr uint32_t protocol_version = 29;
+    inline constexpr uint32_t protocol_version = 30;
 
     // Windows IOCTL encoding: CTL_CODE(DeviceType, Function, Method, Access).
     //   value = (DeviceType << 16) | (Access << 14) | (Function << 2) | Method
@@ -200,7 +200,37 @@ namespace sogen::gpu_bridge
         merge_pipeline_caches = 0x8A1,
         get_device_memory_commitment = 0x8A2,
         get_calibrated_timestamps = 0x8A3,
+        create_render_pass2 = 0x8A4,
+        create_framebuffer_full = 0x8A5,
+        cmd_begin_render_pass2 = 0x8A6,
+        cmd_next_subpass2 = 0x8A7,
+        cmd_end_render_pass2 = 0x8A8,
+        get_render_area_granularity = 0x8A9,
+        cmd_begin_render_pass_full = 0x8AB,
+        cmd_extended_dynamic = 0x8B0,
+        get_multisample_properties = 0x8B1,
+        cmd_synchronization = 0x8C0,
+        get_event_status_owned = 0x8C1,
     };
+
+    inline constexpr uint32_t ioctl_get_event_status_owned = make_ioctl(static_cast<uint32_t>(command::get_event_status_owned));
+
+    inline constexpr uint32_t ioctl_get_multisample_properties = make_ioctl(static_cast<uint32_t>(command::get_multisample_properties));
+    struct get_multisample_properties_request
+    {
+        uint64_t physical_device;
+        uint32_t samples;
+        uint32_t reserved;
+    };
+    struct get_multisample_properties_response
+    {
+        int32_t vk_result;
+        uint32_t width;
+        uint32_t height;
+        uint32_t reserved;
+    };
+    static_assert(sizeof(get_multisample_properties_request) == 16);
+    static_assert(sizeof(get_multisample_properties_response) == 16);
 
     // Discriminator for cmd_set_dynamic_u32: the family of extended-dynamic-state setters that all take a
     // single uint32 value (VkBool32 / enum). One wire command replaces ~a dozen near-identical vkCmdSet*.
@@ -285,6 +315,9 @@ namespace sogen::gpu_bridge
     inline constexpr uint32_t ioctl_get_query_pool_results = make_ioctl(static_cast<uint32_t>(command::get_query_pool_results));
     inline constexpr uint32_t ioctl_reset_query_pool = make_ioctl(static_cast<uint32_t>(command::reset_query_pool));
     inline constexpr uint32_t ioctl_create_render_pass = make_ioctl(static_cast<uint32_t>(command::create_render_pass));
+    inline constexpr uint32_t ioctl_create_render_pass2 = make_ioctl(static_cast<uint32_t>(command::create_render_pass2));
+    inline constexpr uint32_t ioctl_create_framebuffer_full = make_ioctl(static_cast<uint32_t>(command::create_framebuffer_full));
+    inline constexpr uint32_t ioctl_get_render_area_granularity = make_ioctl(static_cast<uint32_t>(command::get_render_area_granularity));
     inline constexpr uint32_t ioctl_destroy_render_pass = make_ioctl(static_cast<uint32_t>(command::destroy_render_pass));
     inline constexpr uint32_t ioctl_create_framebuffer = make_ioctl(static_cast<uint32_t>(command::create_framebuffer));
     inline constexpr uint32_t ioctl_destroy_framebuffer = make_ioctl(static_cast<uint32_t>(command::destroy_framebuffer));
@@ -1671,6 +1704,27 @@ namespace sogen::gpu_bridge
     };
 
     // out = object_response
+    // Variable render-pass packets contain this fixed header followed by a versioned field stream.
+    // Native pointers, padding and dispatchable handles never appear in that stream.
+    struct render_pass_packet
+    {
+        object_id object;
+        uint32_t version;
+        uint32_t payload_size;
+    };
+
+    static_assert(sizeof(render_pass_packet) == 16, "wire layout drift");
+
+    struct render_area_granularity_response
+    {
+        int32_t vk_result;
+        uint32_t width;
+        uint32_t height;
+        uint32_t reserved;
+    };
+
+    static_assert(sizeof(render_area_granularity_response) == 16, "wire layout drift");
+
     struct create_render_pass_request
     {
         object_id device;

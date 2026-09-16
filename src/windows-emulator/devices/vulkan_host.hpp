@@ -75,6 +75,7 @@ namespace sogen
 
         int32_t get_physical_device_cooperative_matrix_properties(uint64_t physical_device, void* out, size_t out_size, uint32_t max_count,
                                                                   bool has_entries, uint32_t& out_count);
+        int32_t get_multisample_properties(uint64_t physical_device, uint32_t samples, uint32_t& width, uint32_t& height);
         int32_t get_physical_device_fragment_shading_rates(uint64_t physical_device, void* out, size_t out_size, uint32_t max_count,
                                                            bool has_entries, uint32_t& out_count);
         int32_t get_physical_device_calibrateable_time_domains(uint64_t physical_device, std::span<uint32_t> out_domains,
@@ -129,6 +130,7 @@ namespace sogen
         int32_t create_event(uint64_t device, uint32_t flags, uint64_t& out_event);
         void destroy_event(uint64_t device, uint64_t event);
         int32_t get_event_status(uint64_t event);
+        int32_t get_event_status(uint64_t device, uint64_t event);
         int32_t set_event(uint64_t device, uint64_t event);
         int32_t reset_event(uint64_t device, uint64_t event);
 
@@ -450,6 +452,12 @@ namespace sogen
 
         // One color attachment + an optional depth attachment (depth_format == 0 => color only), single
         // subpass (initial/final layouts as given; PRESENT_SRC_KHR is mapped to TRANSFER_SRC_OPTIMAL).
+        int32_t create_render_pass2(uint64_t device, std::span<const std::byte> packet, uint64_t& out_render_pass);
+        int32_t create_framebuffer_full(uint64_t device, std::span<const std::byte> packet, uint64_t& out_framebuffer);
+        int32_t cmd_synchronization(uint64_t command_buffer, std::span<const std::byte> packet);
+        int32_t render_pass_command(uint32_t command, uint64_t command_buffer, std::span<const std::byte> packet);
+        int32_t get_render_area_granularity(uint64_t device, uint64_t render_pass, uint32_t& width, uint32_t& height);
+
         int32_t create_render_pass(uint64_t device, uint32_t format, uint32_t load_op, uint32_t store_op, uint32_t initial_layout,
                                    uint32_t final_layout, uint32_t depth_format, uint64_t& out_render_pass);
         void destroy_render_pass(uint64_t device, uint64_t render_pass);
@@ -653,6 +661,7 @@ namespace sogen
         int32_t cmd_set_stencil_op(uint64_t command_buffer, uint32_t face_mask, uint32_t fail_op, uint32_t pass_op, uint32_t depth_fail_op,
                                    uint32_t compare_op);
         int32_t cmd_set_dynamic_u32(uint64_t command_buffer, uint32_t state, uint32_t value);
+        int32_t cmd_extended_dynamic(std::span<const uint8_t> payload);
 
       private:
         int32_t cmd_transform_feedback(uint64_t command_buffer, uint32_t first_counter_buffer, std::span<const uint64_t> counter_buffer_ids,

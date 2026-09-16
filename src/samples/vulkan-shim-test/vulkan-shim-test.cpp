@@ -13,6 +13,10 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan_core.h>
 
+bool test_synchronization(PFN_vkGetInstanceProcAddr, VkInstance, VkDevice, VkQueue, uint32_t, bool);
+
+bool test_render_pass2(PFN_vkGetInstanceProcAddr, VkInstance, VkPhysicalDevice, VkDevice, VkQueue, uint32_t);
+
 namespace
 {
     // Records an empty primary command buffer, submits it with a fence, and waits on the fence
@@ -1069,6 +1073,8 @@ namespace
     }
 }
 
+bool test_dynamic_commands(PFN_vkGetInstanceProcAddr get, VkInstance instance, VkPhysicalDevice physical, uint32_t family);
+
 int main(int argc, char** argv)
 {
     const char* dll = (argc > 1) ? argv[1] : "vulkan-shim.dll";
@@ -1147,7 +1153,10 @@ int main(int argc, char** argv)
     bool pipeline_cache_test_ok = true;
     bool fill_readback_ok = false;
     bool persistent_coherent_ok = false;
+    bool synchronization_test_ok = false;
+    bool render_pass_test_ok = false;
     bool image_readback_ok = false;
+    bool dynamic_commands_ok = false;
     uint32_t count = 0;
     result = enumerate(instance, &count, nullptr);
     std::printf("[shim-test] vkEnumeratePhysicalDevices -> %d, count=%u\n", result, count);
@@ -1432,7 +1441,11 @@ int main(int argc, char** argv)
                 {
                     shader_identifier_test_ok = test_shader_module_identifier(get_instance_proc, instance, device);
                 }
+                synchronization_test_ok =
+                    test_synchronization(get_instance_proc, instance, device, queue, graphics_family, timestamp2_test_supported);
+                render_pass_test_ok = test_render_pass2(get_instance_proc, instance, devices[0], device, queue, graphics_family);
                 pipeline_cache_test_ok = test_pipeline_cache(get_instance_proc, instance, device);
+                dynamic_commands_ok = test_dynamic_commands(get_instance_proc, instance, devices[0], graphics_family);
 
                 destroy_device(device, nullptr);
             }
@@ -1444,9 +1457,10 @@ int main(int argc, char** argv)
         destroy_instance(instance, nullptr);
     }
 
-    const bool all_ok = timestamp2_test_ok && calibrated_timestamps_test_ok && transform_feedback_test_ok &&
-                        transform_feedback_capabilities_ok && shader_identifier_test_ok && pipeline_cache_test_ok && fill_readback_ok &&
-                        persistent_coherent_ok && image_readback_ok;
+    const bool all_ok = synchronization_test_ok && render_pass_test_ok && dynamic_commands_ok && timestamp2_test_ok &&
+                        calibrated_timestamps_test_ok && transform_feedback_test_ok && transform_feedback_capabilities_ok &&
+                        shader_identifier_test_ok && pipeline_cache_test_ok && fill_readback_ok && persistent_coherent_ok &&
+                        image_readback_ok;
     std::printf("[shim-test] %s\n", all_ok ? "ok" : "FAILED");
     return all_ok ? 0 : 6;
 }

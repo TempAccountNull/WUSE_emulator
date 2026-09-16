@@ -18,6 +18,9 @@
 
 #include <gpu_bridge_protocol.hpp>
 #include <vk_feature_chain.hpp>
+#include <vk_render_pass.hpp>
+#include <vk_synchronization.hpp>
+#include <vk_dynamic_state.hpp>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -215,6 +218,7 @@ namespace sogen
             PFN_vkGetPhysicalDeviceProperties2 get_physical_device_properties2{};
             PFN_vkEnumerateDeviceExtensionProperties enumerate_device_extension_properties{};
             PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR get_cooperative_matrix_properties{};
+            PFN_vkGetPhysicalDeviceMultisamplePropertiesEXT get_multisample_properties{};
             PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR get_fragment_shading_rates{};
             PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR get_calibrateable_time_domains{};
             PFN_vkCreateDevice create_device{};
@@ -281,6 +285,13 @@ namespace sogen
             PFN_vkGetImageSubresourceLayout get_image_subresource_layout{};
             PFN_vkBindImageMemory bind_image_memory{};
             PFN_vkCmdPipelineBarrier cmd_pipeline_barrier{};
+            PFN_vkCmdPipelineBarrier2 cmd_pipeline_barrier2{};
+            PFN_vkCmdSetEvent cmd_set_event{};
+            PFN_vkCmdResetEvent cmd_reset_event{};
+            PFN_vkCmdWaitEvents cmd_wait_events{};
+            PFN_vkCmdSetEvent2 cmd_set_event2{};
+            PFN_vkCmdResetEvent2 cmd_reset_event2{};
+            PFN_vkCmdWaitEvents2 cmd_wait_events2{};
             PFN_vkCmdClearColorImage cmd_clear_color_image{};
             PFN_vkCmdClearAttachments cmd_clear_attachments{};
             PFN_vkCmdClearDepthStencilImage cmd_clear_depth_stencil_image{};
@@ -318,6 +329,11 @@ namespace sogen
             PFN_vkCmdWriteTimestamp2 cmd_write_timestamp2{};
             PFN_vkCmdCopyQueryPoolResults cmd_copy_query_pool_results{};
             PFN_vkCreateRenderPass create_render_pass{};
+            PFN_vkCreateRenderPass2 create_render_pass2{};
+            PFN_vkCmdBeginRenderPass2 cmd_begin_render_pass2{};
+            PFN_vkCmdNextSubpass2 cmd_next_subpass2{};
+            PFN_vkCmdEndRenderPass2 cmd_end_render_pass2{};
+            PFN_vkGetRenderAreaGranularity get_render_area_granularity{};
             PFN_vkDestroyRenderPass destroy_render_pass{};
             PFN_vkCreateFramebuffer create_framebuffer{};
             PFN_vkDestroyFramebuffer destroy_framebuffer{};
@@ -371,6 +387,7 @@ namespace sogen
             PFN_vkCmdSetStencilWriteMask cmd_set_stencil_write_mask{};
             PFN_vkCmdSetStencilReference cmd_set_stencil_reference{};
             PFN_vkCmdSetStencilOp cmd_set_stencil_op{};
+            gpu_bridge::dynamic_dispatch extended_dynamic{};
             PFN_vkCmdSetCullMode cmd_set_cull_mode{};
             PFN_vkCmdSetFrontFace cmd_set_front_face{};
             PFN_vkCmdSetPrimitiveTopology cmd_set_primitive_topology{};
@@ -1118,6 +1135,8 @@ namespace sogen
             this->impl_->load_instance_proc<PFN_vkEnumerateDeviceExtensionProperties>(instance, "vkEnumerateDeviceExtensionProperties");
         data.get_cooperative_matrix_properties = this->impl_->load_instance_proc<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
             instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+        data.get_multisample_properties = this->impl_->load_instance_proc<PFN_vkGetPhysicalDeviceMultisamplePropertiesEXT>(
+            instance, "vkGetPhysicalDeviceMultisamplePropertiesEXT");
         data.get_fragment_shading_rates = this->impl_->load_instance_proc<PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR>(
             instance, "vkGetPhysicalDeviceFragmentShadingRatesKHR");
         data.get_calibrateable_time_domains = this->impl_->load_instance_proc<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(
@@ -1508,6 +1527,35 @@ namespace sogen
         return result;
     }
 
+    int32_t vulkan_host::get_multisample_properties(uint64_t physical_device, uint32_t samples, uint32_t& width, uint32_t& height)
+    {
+        width = 0;
+        height = 0;
+        if (!gpu_bridge::valid_sample_count(samples))
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        const auto pd = this->impl_->physical_devices.find(physical_device);
+        if (pd == this->impl_->physical_devices.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        const auto instance = this->impl_->instances.find(pd->second.instance_id);
+        if (instance == this->impl_->instances.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (!instance->second.get_multisample_properties)
+        {
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+        VkMultisamplePropertiesEXT properties{VK_STRUCTURE_TYPE_MULTISAMPLE_PROPERTIES_EXT};
+        instance->second.get_multisample_properties(pd->second.handle, static_cast<VkSampleCountFlagBits>(samples), &properties);
+        width = properties.maxSampleLocationGridSize.width;
+        height = properties.maxSampleLocationGridSize.height;
+        return VK_SUCCESS;
+    }
+
     int32_t vulkan_host::get_physical_device_fragment_shading_rates(uint64_t physical_device, void* out, size_t out_size,
                                                                     uint32_t max_count, bool has_entries, uint32_t& out_count)
     {
@@ -1710,7 +1758,7 @@ namespace sogen
             uint32_t body_size = 0;
             if (body)
             {
-                const size_t host_capacity = gpu_bridge::feature_struct_size(type) - gpu_bridge::feature_chain_header_size;
+                const size_t host_capacity = gpu_bridge::feature_body_size(type);
                 body_size = static_cast<uint32_t>(std::min<size_t>(records[i].body_size, host_capacity));
             }
 
@@ -1924,7 +1972,7 @@ namespace sogen
                 const size_t size = gpu_bridge::feature_struct_size(type);
                 if (size != 0)
                 {
-                    const size_t capacity = size - gpu_bridge::feature_chain_header_size;
+                    const size_t capacity = gpu_bridge::feature_body_size(type);
                     const size_t copy = std::min<size_t>(record.body_size, capacity);
                     if (type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
                     {
@@ -2038,6 +2086,29 @@ namespace sogen
             data.get_image_subresource_layout = reinterpret_cast<PFN_vkGetImageSubresourceLayout>(resolve("vkGetImageSubresourceLayout"));
             data.bind_image_memory = reinterpret_cast<PFN_vkBindImageMemory>(resolve("vkBindImageMemory"));
             data.cmd_pipeline_barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(resolve("vkCmdPipelineBarrier"));
+            data.cmd_pipeline_barrier2 = reinterpret_cast<PFN_vkCmdPipelineBarrier2>(resolve("vkCmdPipelineBarrier2"));
+            if (!data.cmd_pipeline_barrier2)
+            {
+                data.cmd_pipeline_barrier2 = reinterpret_cast<PFN_vkCmdPipelineBarrier2>(resolve("vkCmdPipelineBarrier2KHR"));
+            }
+            data.cmd_set_event = reinterpret_cast<PFN_vkCmdSetEvent>(resolve("vkCmdSetEvent"));
+            data.cmd_reset_event = reinterpret_cast<PFN_vkCmdResetEvent>(resolve("vkCmdResetEvent"));
+            data.cmd_wait_events = reinterpret_cast<PFN_vkCmdWaitEvents>(resolve("vkCmdWaitEvents"));
+            data.cmd_set_event2 = reinterpret_cast<PFN_vkCmdSetEvent2>(resolve("vkCmdSetEvent2"));
+            if (!data.cmd_set_event2)
+            {
+                data.cmd_set_event2 = reinterpret_cast<PFN_vkCmdSetEvent2>(resolve("vkCmdSetEvent2KHR"));
+            }
+            data.cmd_reset_event2 = reinterpret_cast<PFN_vkCmdResetEvent2>(resolve("vkCmdResetEvent2"));
+            if (!data.cmd_reset_event2)
+            {
+                data.cmd_reset_event2 = reinterpret_cast<PFN_vkCmdResetEvent2>(resolve("vkCmdResetEvent2KHR"));
+            }
+            data.cmd_wait_events2 = reinterpret_cast<PFN_vkCmdWaitEvents2>(resolve("vkCmdWaitEvents2"));
+            if (!data.cmd_wait_events2)
+            {
+                data.cmd_wait_events2 = reinterpret_cast<PFN_vkCmdWaitEvents2>(resolve("vkCmdWaitEvents2KHR"));
+            }
             data.cmd_clear_color_image = reinterpret_cast<PFN_vkCmdClearColorImage>(resolve("vkCmdClearColorImage"));
             data.cmd_clear_attachments = reinterpret_cast<PFN_vkCmdClearAttachments>(resolve("vkCmdClearAttachments"));
             data.cmd_clear_depth_stencil_image = reinterpret_cast<PFN_vkCmdClearDepthStencilImage>(resolve("vkCmdClearDepthStencilImage"));
@@ -2084,6 +2155,27 @@ namespace sogen
             }
             data.cmd_copy_query_pool_results = reinterpret_cast<PFN_vkCmdCopyQueryPoolResults>(resolve("vkCmdCopyQueryPoolResults"));
             data.create_render_pass = reinterpret_cast<PFN_vkCreateRenderPass>(resolve("vkCreateRenderPass"));
+            data.create_render_pass2 = reinterpret_cast<PFN_vkCreateRenderPass2>(resolve("vkCreateRenderPass2"));
+            if (!data.create_render_pass2)
+            {
+                data.create_render_pass2 = reinterpret_cast<PFN_vkCreateRenderPass2>(resolve("vkCreateRenderPass2KHR"));
+            }
+            data.cmd_begin_render_pass2 = reinterpret_cast<PFN_vkCmdBeginRenderPass2>(resolve("vkCmdBeginRenderPass2"));
+            if (!data.cmd_begin_render_pass2)
+            {
+                data.cmd_begin_render_pass2 = reinterpret_cast<PFN_vkCmdBeginRenderPass2>(resolve("vkCmdBeginRenderPass2KHR"));
+            }
+            data.cmd_next_subpass2 = reinterpret_cast<PFN_vkCmdNextSubpass2>(resolve("vkCmdNextSubpass2"));
+            if (!data.cmd_next_subpass2)
+            {
+                data.cmd_next_subpass2 = reinterpret_cast<PFN_vkCmdNextSubpass2>(resolve("vkCmdNextSubpass2KHR"));
+            }
+            data.cmd_end_render_pass2 = reinterpret_cast<PFN_vkCmdEndRenderPass2>(resolve("vkCmdEndRenderPass2"));
+            if (!data.cmd_end_render_pass2)
+            {
+                data.cmd_end_render_pass2 = reinterpret_cast<PFN_vkCmdEndRenderPass2>(resolve("vkCmdEndRenderPass2KHR"));
+            }
+            data.get_render_area_granularity = reinterpret_cast<PFN_vkGetRenderAreaGranularity>(resolve("vkGetRenderAreaGranularity"));
             data.destroy_render_pass = reinterpret_cast<PFN_vkDestroyRenderPass>(resolve("vkDestroyRenderPass"));
             data.create_framebuffer = reinterpret_cast<PFN_vkCreateFramebuffer>(resolve("vkCreateFramebuffer"));
             data.destroy_framebuffer = reinterpret_cast<PFN_vkDestroyFramebuffer>(resolve("vkDestroyFramebuffer"));
@@ -2154,6 +2246,7 @@ namespace sogen
             data.cmd_set_stencil_write_mask = reinterpret_cast<PFN_vkCmdSetStencilWriteMask>(resolve("vkCmdSetStencilWriteMask"));
             data.cmd_set_stencil_reference = reinterpret_cast<PFN_vkCmdSetStencilReference>(resolve("vkCmdSetStencilReference"));
             data.cmd_set_stencil_op = reinterpret_cast<PFN_vkCmdSetStencilOp>(resolve("vkCmdSetStencilOp"));
+            data.extended_dynamic.load(resolve);
             data.cmd_set_cull_mode = reinterpret_cast<PFN_vkCmdSetCullMode>(resolve("vkCmdSetCullMode"));
             data.cmd_set_front_face = reinterpret_cast<PFN_vkCmdSetFrontFace>(resolve("vkCmdSetFrontFace"));
             data.cmd_set_primitive_topology = reinterpret_cast<PFN_vkCmdSetPrimitiveTopology>(resolve("vkCmdSetPrimitiveTopology"));
@@ -2718,11 +2811,24 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
 
+        // Historical limitation, superseded by the native event recording and query below:
         // GPU-side event ops (vkCmdSetEvent2/ResetEvent2/WaitEvents2) are not recorded through the bridge,
         // so the real VkEvent is never signalled by the GPU. DXVK only uses these events to poll for the
         // completion of work the bridge has already executed by the time the guest gets here, so report the
         // event as set. (If precise GPU event ordering is ever needed, record the cmd ops instead.)
-        return VK_EVENT_SET;
+        return this->get_event_status(it->second.device_id, event);
+    }
+
+    int32_t vulkan_host::get_event_status(uint64_t device, uint64_t event)
+    {
+        const auto it = this->impl_->events.find(event);
+        const auto dev = this->impl_->devices.find(device);
+        if (it == this->impl_->events.end() || dev == this->impl_->devices.end() || it->second.device_id != device ||
+            !dev->second.get_event_status)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        return dev->second.get_event_status(dev->second.handle, it->second.handle);
     }
 
     int32_t vulkan_host::set_event(uint64_t device, uint64_t event)
@@ -3465,6 +3571,181 @@ namespace sogen
                 return VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             }
             return static_cast<VkImageLayout>(layout);
+        }
+    }
+
+    int32_t vulkan_host::cmd_synchronization(uint64_t command_buffer, std::span<const std::byte> packet)
+    {
+        namespace sync = gpu_bridge::synchronization_wire;
+        namespace codec = gpu_bridge::render_pass_wire;
+        const auto cb = this->impl_->command_buffers.find(command_buffer);
+        if (cb == this->impl_->command_buffers.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev == this->impl_->devices.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        try
+        {
+            codec::reader reader(packet);
+            sync::command command{};
+            sync::decode(reader, command);
+            const auto event_handle = [&](VkEvent& event) {
+                const auto object = this->impl_->events.find(codec::handle_id(event));
+                if (object == this->impl_->events.end() || object->second.device_id != cb->second.device_id)
+                {
+                    throw codec::error("event does not belong to command-buffer device", VK_ERROR_INITIALIZATION_FAILED);
+                }
+                event = object->second.handle;
+            };
+            const auto buffers = [&](auto* barriers, uint32_t count) {
+                for (uint32_t i = 0; i < count; ++i)
+                {
+                    auto& barrier = const_cast<std::remove_const_t<std::remove_reference_t<decltype(barriers[i])>>&>(barriers[i]);
+                    const auto object = this->impl_->buffers.find(codec::handle_id(barrier.buffer));
+                    if (object == this->impl_->buffers.end() || object->second.device_id != cb->second.device_id)
+                    {
+                        throw codec::error("buffer does not belong to command-buffer device", VK_ERROR_INITIALIZATION_FAILED);
+                    }
+                    barrier.buffer = object->second.handle;
+                }
+            };
+            const auto images = [&](auto* barriers, uint32_t count) {
+                for (uint32_t i = 0; i < count; ++i)
+                {
+                    auto& barrier = const_cast<std::remove_const_t<std::remove_reference_t<decltype(barriers[i])>>&>(barriers[i]);
+                    const auto object = this->impl_->images.find(codec::handle_id(barrier.image));
+                    if (object == this->impl_->images.end() || object->second.device_id != cb->second.device_id)
+                    {
+                        throw codec::error("image does not belong to command-buffer device", VK_ERROR_INITIALIZATION_FAILED);
+                    }
+                    barrier.image = object->second.handle;
+                    barrier.oldLayout = translate_layout(barrier.oldLayout);
+                    barrier.newLayout = translate_layout(barrier.newLayout);
+                }
+            };
+            const auto dependency2 = [&](const VkDependencyInfo& dependency) {
+                buffers(dependency.pBufferMemoryBarriers, dependency.bufferMemoryBarrierCount);
+                images(dependency.pImageMemoryBarriers, dependency.imageMemoryBarrierCount);
+            };
+            // Resolve every referenced object before invoking the driver. Queue-family indices,
+            // access masks and range sizes remain exactly as supplied by the guest.
+            switch (command.op)
+            {
+            case sync::operation::barrier:
+            case sync::operation::wait_events:
+                buffers(command.legacy.buffers, command.legacy.buffer_count);
+                images(command.legacy.images, command.legacy.image_count);
+                break;
+            case sync::operation::barrier2:
+            case sync::operation::set_event2:
+                dependency2(command.dependency);
+                break;
+            case sync::operation::wait_events2:
+                for (uint32_t i = 0; i < command.event_count; ++i)
+                {
+                    dependency2(command.dependencies[i]);
+                }
+                break;
+            default:
+                break;
+            }
+            switch (command.op)
+            {
+            case sync::operation::set_event:
+            case sync::operation::reset_event:
+            case sync::operation::set_event2:
+            case sync::operation::reset_event2:
+                event_handle(command.event);
+                break;
+            case sync::operation::wait_events:
+            case sync::operation::wait_events2:
+                for (uint32_t i = 0; i < command.event_count; ++i)
+                {
+                    event_handle(const_cast<VkEvent*>(command.events)[i]);
+                }
+                break;
+            default:
+                break;
+            }
+            const auto& legacy = command.legacy;
+            switch (command.op)
+            {
+            case sync::operation::barrier:
+                if (!dev->second.cmd_pipeline_barrier)
+                {
+                    return VK_ERROR_INITIALIZATION_FAILED;
+                }
+                dev->second.cmd_pipeline_barrier(cb->second.handle, legacy.source_stages, legacy.destination_stages, legacy.flags,
+                                                 legacy.memory_count, legacy.memory, legacy.buffer_count, legacy.buffers,
+                                                 legacy.image_count, legacy.images);
+                break;
+            case sync::operation::barrier2:
+                if (!dev->second.cmd_pipeline_barrier2)
+                {
+                    return VK_ERROR_INITIALIZATION_FAILED;
+                }
+                dev->second.cmd_pipeline_barrier2(cb->second.handle, &command.dependency);
+                break;
+            case sync::operation::set_event:
+                if (!dev->second.cmd_set_event)
+                {
+                    return VK_ERROR_INITIALIZATION_FAILED;
+                }
+                dev->second.cmd_set_event(cb->second.handle, command.event, command.stage);
+                break;
+            case sync::operation::reset_event:
+                if (!dev->second.cmd_reset_event)
+                {
+                    return VK_ERROR_INITIALIZATION_FAILED;
+                }
+                dev->second.cmd_reset_event(cb->second.handle, command.event, command.stage);
+                break;
+            case sync::operation::wait_events:
+                if (!dev->second.cmd_wait_events)
+                {
+                    return VK_ERROR_INITIALIZATION_FAILED;
+                }
+                dev->second.cmd_wait_events(cb->second.handle, command.event_count, command.events, legacy.source_stages,
+                                            legacy.destination_stages, legacy.memory_count, legacy.memory, legacy.buffer_count,
+                                            legacy.buffers, legacy.image_count, legacy.images);
+                break;
+            case sync::operation::set_event2:
+                if (!dev->second.cmd_set_event2)
+                {
+                    return VK_ERROR_INITIALIZATION_FAILED;
+                }
+                dev->second.cmd_set_event2(cb->second.handle, command.event, &command.dependency);
+                break;
+            case sync::operation::reset_event2:
+                if (!dev->second.cmd_reset_event2)
+                {
+                    return VK_ERROR_INITIALIZATION_FAILED;
+                }
+                dev->second.cmd_reset_event2(cb->second.handle, command.event, command.stage2);
+                break;
+            case sync::operation::wait_events2:
+                if (!dev->second.cmd_wait_events2)
+                {
+                    return VK_ERROR_INITIALIZATION_FAILED;
+                }
+                dev->second.cmd_wait_events2(cb->second.handle, command.event_count, command.events, command.dependencies);
+                break;
+            default:
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            return VK_SUCCESS;
+        }
+        catch (const codec::error& error)
+        {
+            return error.result;
+        }
+        catch (const std::bad_alloc&)
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
         }
     }
 
@@ -4936,6 +5217,317 @@ namespace sogen
         dev->second.cmd_copy_query_pool_results(cb->second.handle, qp->second.handle, first_query, query_count, buffer->second.handle,
                                                 destination_offset, stride, static_cast<VkQueryResultFlags>(flags));
         return VK_SUCCESS;
+    }
+
+    namespace
+    {
+        void translate_render_pass_reference(const VkAttachmentReference2* reference)
+        {
+            if (!reference)
+            {
+                return;
+            }
+            auto& value = *const_cast<VkAttachmentReference2*>(reference);
+            value.layout = translate_layout(value.layout);
+            for (const auto* node = static_cast<const VkBaseInStructure*>(value.pNext); node; node = node->pNext)
+            {
+                if (node->sType == VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_STENCIL_LAYOUT)
+                {
+                    auto& stencil = *reinterpret_cast<VkAttachmentReferenceStencilLayout*>(const_cast<VkBaseInStructure*>(node));
+                    stencil.stencilLayout = translate_layout(stencil.stencilLayout);
+                }
+            }
+        }
+
+        void translate_render_pass_layouts(VkRenderPassCreateInfo2& info)
+        {
+            // Bridge swapchain images are offscreen images, so PRESENT uses the same layout translation
+            // as the existing barriers and render-pass path. Other layouts remain unchanged.
+            for (uint32_t i = 0; i < info.attachmentCount; ++i)
+            {
+                auto& attachment = const_cast<VkAttachmentDescription2&>(info.pAttachments[i]);
+                attachment.initialLayout = translate_layout(attachment.initialLayout);
+                attachment.finalLayout = translate_layout(attachment.finalLayout);
+                for (const auto* node = static_cast<const VkBaseInStructure*>(attachment.pNext); node; node = node->pNext)
+                {
+                    if (node->sType == VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_STENCIL_LAYOUT)
+                    {
+                        auto& stencil = *reinterpret_cast<VkAttachmentDescriptionStencilLayout*>(const_cast<VkBaseInStructure*>(node));
+                        stencil.stencilInitialLayout = translate_layout(stencil.stencilInitialLayout);
+                        stencil.stencilFinalLayout = translate_layout(stencil.stencilFinalLayout);
+                    }
+                }
+            }
+            for (uint32_t i = 0; i < info.subpassCount; ++i)
+            {
+                const auto& subpass = info.pSubpasses[i];
+                for (uint32_t j = 0; j < subpass.inputAttachmentCount; ++j)
+                {
+                    translate_render_pass_reference(&subpass.pInputAttachments[j]);
+                }
+                for (uint32_t j = 0; j < subpass.colorAttachmentCount; ++j)
+                {
+                    translate_render_pass_reference(&subpass.pColorAttachments[j]);
+                    if (subpass.pResolveAttachments)
+                    {
+                        translate_render_pass_reference(&subpass.pResolveAttachments[j]);
+                    }
+                }
+                translate_render_pass_reference(subpass.pDepthStencilAttachment);
+                for (const auto* node = static_cast<const VkBaseInStructure*>(subpass.pNext); node; node = node->pNext)
+                {
+                    if (node->sType == VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE)
+                    {
+                        translate_render_pass_reference(
+                            reinterpret_cast<const VkSubpassDescriptionDepthStencilResolve*>(node)->pDepthStencilResolveAttachment);
+                    }
+                    else if (node->sType == VK_STRUCTURE_TYPE_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR)
+                    {
+                        translate_render_pass_reference(
+                            reinterpret_cast<const VkFragmentShadingRateAttachmentInfoKHR*>(node)->pFragmentShadingRateAttachment);
+                    }
+                }
+            }
+            for (const auto* node = static_cast<const VkBaseInStructure*>(info.pNext); node; node = node->pNext)
+            {
+                if (node->sType == VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT)
+                {
+                    auto& map = *reinterpret_cast<VkRenderPassFragmentDensityMapCreateInfoEXT*>(const_cast<VkBaseInStructure*>(node));
+                    map.fragmentDensityMapAttachment.layout = translate_layout(map.fragmentDensityMapAttachment.layout);
+                }
+            }
+        }
+    }
+
+    int32_t vulkan_host::create_render_pass2(uint64_t device, std::span<const std::byte> packet, uint64_t& out_render_pass)
+    {
+        namespace wire = gpu_bridge::render_pass_wire;
+        out_render_pass = 0;
+        const auto dev = this->impl_->devices.find(device);
+        if (dev == this->impl_->devices.end() || !dev->second.create_render_pass2 || !dev->second.destroy_render_pass)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        try
+        {
+            wire::reader reader(packet);
+            VkRenderPassCreateInfo2 info{};
+            wire::decode(reader, info);
+            translate_render_pass_layouts(info);
+            VkRenderPass render_pass{};
+            const VkResult result = dev->second.create_render_pass2(dev->second.handle, &info, nullptr, &render_pass);
+            if (result != VK_SUCCESS)
+            {
+                return result;
+            }
+            bool has_depth = false;
+            for (uint32_t i = 0; i < info.subpassCount; ++i)
+            {
+                has_depth |= info.pSubpasses[i].pDepthStencilAttachment &&
+                             info.pSubpasses[i].pDepthStencilAttachment->attachment != VK_ATTACHMENT_UNUSED;
+            }
+            const uint64_t id = this->impl_->next_id++;
+            try
+            {
+                this->impl_->render_passes.emplace(
+                    id, impl::render_pass_data{.handle = render_pass, .device_id = device, .has_depth = has_depth});
+            }
+            catch (...)
+            {
+                dev->second.destroy_render_pass(dev->second.handle, render_pass, nullptr);
+                throw;
+            }
+            out_render_pass = id;
+            return VK_SUCCESS;
+        }
+        catch (const wire::error& error)
+        {
+            return error.result;
+        }
+        catch (const std::bad_alloc&)
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+
+    int32_t vulkan_host::create_framebuffer_full(uint64_t device, std::span<const std::byte> packet, uint64_t& out_framebuffer)
+    {
+        namespace wire = gpu_bridge::render_pass_wire;
+        out_framebuffer = 0;
+        const auto dev = this->impl_->devices.find(device);
+        if (dev == this->impl_->devices.end() || !dev->second.create_framebuffer || !dev->second.destroy_framebuffer)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        try
+        {
+            wire::reader reader(packet);
+            VkFramebufferCreateInfo info{};
+            wire::decode(reader, info);
+            const auto rp = this->impl_->render_passes.find(wire::handle_id(info.renderPass));
+            if (rp == this->impl_->render_passes.end() || rp->second.device_id != device)
+            {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            info.renderPass = rp->second.handle;
+            if (info.pAttachments)
+            {
+                for (uint32_t i = 0; i < info.attachmentCount; ++i)
+                {
+                    const auto view = this->impl_->image_views.find(wire::handle_id(info.pAttachments[i]));
+                    if (view == this->impl_->image_views.end() || view->second.device_id != device)
+                    {
+                        return VK_ERROR_INITIALIZATION_FAILED;
+                    }
+                    const_cast<VkImageView*>(info.pAttachments)[i] = view->second.handle;
+                }
+            }
+            VkFramebuffer framebuffer{};
+            const VkResult result = dev->second.create_framebuffer(dev->second.handle, &info, nullptr, &framebuffer);
+            if (result != VK_SUCCESS)
+            {
+                return result;
+            }
+            const uint64_t id = this->impl_->next_id++;
+            try
+            {
+                this->impl_->framebuffers.emplace(id, impl::framebuffer_data{.handle = framebuffer, .device_id = device});
+            }
+            catch (...)
+            {
+                dev->second.destroy_framebuffer(dev->second.handle, framebuffer, nullptr);
+                throw;
+            }
+            out_framebuffer = id;
+            return VK_SUCCESS;
+        }
+        catch (const wire::error& error)
+        {
+            return error.result;
+        }
+        catch (const std::bad_alloc&)
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+
+    int32_t vulkan_host::get_render_area_granularity(uint64_t device, uint64_t render_pass, uint32_t& width, uint32_t& height)
+    {
+        width = height = 0;
+        const auto dev = this->impl_->devices.find(device);
+        const auto rp = this->impl_->render_passes.find(render_pass);
+        if (dev == this->impl_->devices.end() || rp == this->impl_->render_passes.end() || rp->second.device_id != device ||
+            !dev->second.get_render_area_granularity)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        VkExtent2D granularity{};
+        dev->second.get_render_area_granularity(dev->second.handle, rp->second.handle, &granularity);
+        width = granularity.width;
+        height = granularity.height;
+        return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::render_pass_command(uint32_t command, uint64_t command_buffer, std::span<const std::byte> packet)
+    {
+        namespace wire = gpu_bridge::render_pass_wire;
+        const auto cb = this->impl_->command_buffers.find(command_buffer);
+        if (cb == this->impl_->command_buffers.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev == this->impl_->devices.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        try
+        {
+            wire::reader reader(packet);
+            switch (static_cast<gpu_bridge::command>(command))
+            {
+            case gpu_bridge::command::cmd_begin_render_pass2:
+            case gpu_bridge::command::cmd_begin_render_pass_full: {
+                VkRenderPassBeginInfo info{};
+                VkSubpassBeginInfo begin{};
+                wire::decode(reader, info, begin);
+                const auto rp = this->impl_->render_passes.find(wire::handle_id(info.renderPass));
+                const auto fb = this->impl_->framebuffers.find(wire::handle_id(info.framebuffer));
+                if (rp == this->impl_->render_passes.end() || fb == this->impl_->framebuffers.end() ||
+                    rp->second.device_id != cb->second.device_id || fb->second.device_id != cb->second.device_id)
+                {
+                    return VK_ERROR_INITIALIZATION_FAILED;
+                }
+                info.renderPass = rp->second.handle;
+                info.framebuffer = fb->second.handle;
+                for (const auto* node = static_cast<const VkBaseInStructure*>(info.pNext); node; node = node->pNext)
+                {
+                    if (node->sType != VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO)
+                    {
+                        continue;
+                    }
+                    const auto& attachments = *reinterpret_cast<const VkRenderPassAttachmentBeginInfo*>(node);
+                    for (uint32_t i = 0; i < attachments.attachmentCount; ++i)
+                    {
+                        const auto view = this->impl_->image_views.find(wire::handle_id(attachments.pAttachments[i]));
+                        if (view == this->impl_->image_views.end() || view->second.device_id != cb->second.device_id)
+                        {
+                            return VK_ERROR_INITIALIZATION_FAILED;
+                        }
+                        const_cast<VkImageView*>(attachments.pAttachments)[i] = view->second.handle;
+                    }
+                }
+                if (command == static_cast<uint32_t>(gpu_bridge::command::cmd_begin_render_pass2))
+                {
+                    if (!dev->second.cmd_begin_render_pass2)
+                    {
+                        return VK_ERROR_INITIALIZATION_FAILED;
+                    }
+                    dev->second.cmd_begin_render_pass2(cb->second.handle, &info, &begin);
+                }
+                else
+                {
+                    if (!dev->second.cmd_begin_render_pass)
+                    {
+                        return VK_ERROR_INITIALIZATION_FAILED;
+                    }
+                    dev->second.cmd_begin_render_pass(cb->second.handle, &info, begin.contents);
+                }
+                return VK_SUCCESS;
+            }
+            case gpu_bridge::command::cmd_next_subpass2: {
+                if (!dev->second.cmd_next_subpass2)
+                {
+                    return VK_ERROR_INITIALIZATION_FAILED;
+                }
+                VkSubpassBeginInfo begin{};
+                VkSubpassEndInfo end{};
+                wire::decode(reader, begin, end);
+                dev->second.cmd_next_subpass2(cb->second.handle, &begin, &end);
+                return VK_SUCCESS;
+            }
+            case gpu_bridge::command::cmd_end_render_pass2: {
+                if (!dev->second.cmd_end_render_pass2)
+                {
+                    return VK_ERROR_INITIALIZATION_FAILED;
+                }
+                VkSubpassEndInfo end{};
+                wire::decode(reader, end);
+                dev->second.cmd_end_render_pass2(cb->second.handle, &end);
+                return VK_SUCCESS;
+            }
+            default:
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+        }
+        catch (const wire::error& error)
+        {
+            return error.result;
+        }
+        catch (const std::bad_alloc&)
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
     }
 
     int32_t vulkan_host::create_render_pass(uint64_t device, uint32_t format, uint32_t load_op, uint32_t store_op, uint32_t initial_layout,
@@ -6846,6 +7438,33 @@ namespace sogen
                                        static_cast<VkStencilOp>(pass_op), static_cast<VkStencilOp>(depth_fail_op),
                                        static_cast<VkCompareOp>(compare_op));
         return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::cmd_extended_dynamic(std::span<const uint8_t> payload)
+    {
+        gpu_bridge::dynamic_request request{};
+        if (!gpu_bridge::decode_dynamic_header(payload, request))
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        const auto cb = this->impl_->command_buffers.find(request.command_buffer);
+        if (cb == this->impl_->command_buffers.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev == this->impl_->devices.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        try
+        {
+            return dev->second.extended_dynamic.dispatch(cb->second.handle, request, payload.subspan(sizeof(request)));
+        }
+        catch (const std::bad_alloc&)
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
     }
 
     int32_t vulkan_host::cmd_set_dynamic_u32(uint64_t command_buffer, uint32_t state, uint32_t value)
