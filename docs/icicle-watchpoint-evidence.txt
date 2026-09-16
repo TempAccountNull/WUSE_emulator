@@ -1,0 +1,28 @@
+Icicle memory watchpoints
+
+Match half-open access ranges, including wider stores that begin before the
+watched bytes. Keep watched pages out of the bypassing TLB fast path. Preserve
+the existing pre-write callback and add a result callback after each primitive
+MMU write attempt, with its original backend error and attempted bytes.
+
+GDB retains callback PC, CPU, Windows thread, access/watch ranges, result and
+up to 64 bytes for 128 observations. Overflow and truncation are explicit.
+Read qXfer:sogen-watchpoints:read after a stop and before resuming; it rejects
+requests during execution. Reads and pending debug output do not clear the
+packet. A subsequent actual start/step does. The callback PC is separate from
+the debugger's later stopped register state.
+
+Completed means that MMU primitive completed. Failed is not a claim that an
+entire instruction was atomic or that an I/O handler had no side effects.
+Portable read hooks and other backend adapters report unknown write outcome
+unless the backend supplies it. Host/debugger/restore writes, DMA and other
+virtual aliases are not captured by these guest MMU watchpoints. No historical
+pre-write value is reconstructed. An exclusive endpoint of 2^64 is rejected.
+
+Rebuild the analyzer and loaded backends together: the additive virtual method
+changes the hook-interface vtable. Guest snapshot layout is unchanged.
+
+Validation: Release and final tidy builds; 33 focused C++ tests in both Icicle
+interpreter and JIT modes; four vendored icicle-mem watchpoint tests; Python
+transport persistence/chunk/error tests. These prove the observer contracts,
+not the identity of the writer behind a particular game heap corruption.

@@ -1,6 +1,7 @@
 #include "gdb_stub.hpp"
 
 #include <cassert>
+#include <algorithm>
 #include <cinttypes>
 
 #include <utils/string.hpp>
@@ -349,6 +350,23 @@ namespace sogen::gdb_stub
             send_xfer_data(c.connection, std::string(data), xml);
         }
 
+        void handle_watchpoint_diagnostics(const debugging_context& c, const std::string_view payload)
+        {
+            const auto [command, args] = split_string(payload, ':');
+            const auto [annex, data] = split_string(args, ':');
+            if (command != "read" || !annex.empty() || !c.handler.supports_watchpoint_diagnostics())
+            {
+                c.connection.send_reply({});
+                return;
+            }
+            if (c.async.is_running())
+            {
+                c.connection.send_reply("E16");
+                return;
+            }
+            send_xfer_data(c.connection, std::string(data), format_watchpoint_observations(c.handler.get_watchpoint_observations()));
+        }
+
         void process_xfer(const debugging_context& c, const std::string_view payload)
         {
             auto [name, args] = split_string(payload, ':');
@@ -368,6 +386,10 @@ namespace sogen::gdb_stub
             else if (name == "threads")
             {
                 handle_threads(c, args);
+            }
+            else if (name == "sogen-watchpoints")
+            {
+                handle_watchpoint_diagnostics(c, args);
             }
             else if (name == "sogen-threads")
             {
@@ -393,6 +415,10 @@ namespace sogen::gdb_stub
                              ";qXfer:threads:read+"
                              ";binary-upload+");
 
+                if (c.handler.supports_watchpoint_diagnostics())
+                {
+                    reply.append(";qXfer:sogen-watchpoints:read+");
+                }
                 if (c.handler.supports_thread_diagnostics())
                 {
                     reply.append(";qXfer:sogen-threads:read+");
@@ -1083,6 +1109,46 @@ namespace sogen::gdb_stub
         {
             return data && data->size() == 1 && data->front() == '\x03';
         }
+    }
+
+    std::string format_watchpoint_observations(const watchpoint_stop& stop)
+    {
+        std::string xml = R"(<sogen-watchpoints version="1" dropped=")" + std::to_string(stop.dropped) + "\">\n";
+        for (size_t index = 0; index < std::min(stop.count, stop.observations.size()); ++index)
+        {
+            const auto& observation = stop.observations[index];
+            const auto number = [](uint64_t value) { return utils::string::to_hex_number(value); };
+            std::string_view outcome = "unknown";
+            if (observation.outcome == watchpoint_outcome::completed)
+            {
+                outcome = "completed";
+            }
+            else if (observation.outcome == watchpoint_outcome::failed)
+            {
+                outcome = "failed";
+            }
+            xml += "<access operation=\"";
+            xml += observation.write ? "write" : "read";
+            xml += "\" outcome=\"" + std::string(outcome) + "\" address=\"" + number(observation.address);
+            xml += "\" size=\"" + number(observation.size) + "\" watched-address=\"" + number(observation.watched_address);
+            xml += "\" watched-size=\"" + number(observation.watched_size) + "\" callback-pc=\"" + number(observation.callback_pc);
+            xml += "\" pc-valid=\"" + std::to_string(observation.pc_valid) + "\" cpu=\"" + number(observation.cpu_index);
+            xml += "\" thread=\"" + number(observation.thread_id) + "\" backend-error=\"" + number(observation.backend_error);
+            const auto captured = std::min(observation.captured_size, observation.value.size());
+            xml += "\" captured-size=\"" + number(captured) + "\" truncated=\"" + std::to_string(captured < observation.size);
+            xml += "\" value-kind=\"";
+            xml += observation.write ? "attempted" : "callback";
+            xml += "\" value=\"";
+            constexpr std::string_view digits = "0123456789abcdef";
+            for (size_t byte = 0; byte < captured; ++byte)
+            {
+                xml += digits[observation.value[byte] >> 4];
+                xml += digits[observation.value[byte] & 0xF];
+            }
+            xml += "\"/>\n";
+        }
+        xml += "</sogen-watchpoints>";
+        return xml;
     }
 
     bool run_gdb_stub(const network::address& bind_address, debugging_handler& handler, session_end_reason* end_reason)

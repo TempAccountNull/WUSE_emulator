@@ -27,6 +27,7 @@ extern "C"
     using violation_func = int32_t(void*, uint64_t address, uint8_t operation, int32_t unmapped);
     using data_accessor_func = void(void* user, const void* data, size_t length);
     using memory_access_func = icicle_mmio_write_func;
+    using write_observation_func = void(void*, uint64_t, const void*, size_t, uint64_t);
 
     struct icicle_stop_info
     {
@@ -62,6 +63,7 @@ extern "C"
     uint32_t icicle_add_violation_hook(icicle_emulator*, violation_func* callback, void* data);
     uint32_t icicle_add_read_hook(icicle_emulator*, uint64_t start, uint64_t end, memory_access_func* cb, void* data);
     uint32_t icicle_add_write_hook(icicle_emulator*, uint64_t start, uint64_t end, memory_access_func* cb, void* data);
+    uint32_t icicle_add_write_observation_hook(icicle_emulator*, uint64_t, uint64_t, write_observation_func*, void*);
     void icicle_remove_hook(icicle_emulator*, uint32_t id);
     size_t icicle_read_register(icicle_emulator*, int reg, void* data, size_t length);
     size_t icicle_write_register(icicle_emulator*, int reg, const void* data, size_t length);
@@ -127,6 +129,7 @@ namespace sogen::icicle
             uint64_t size{};
             bound_memory_access_hook_callback callback{};
             bool is_read{};
+            std::function<void(uint64_t, const void*, size_t, uint64_t)> observation{};
         };
 
         uint64_t configured_memory_limit_mib()
@@ -527,6 +530,21 @@ namespace sogen::icicle
             });
         }
 
+        emulator_hook* hook_memory_write_observed(const uint64_t address, const uint64_t size,
+                                                  memory_write_observation_callback callback) override
+        {
+            return this->try_install_memory_access_hook(memory_access_hook{
+                .address = address,
+                .size = size,
+                .observation =
+                    [this, callback = std::move(callback)](uint64_t access, const void* data, size_t length, uint64_t error) {
+                        callback(*this, access, data, length,
+                                 {.outcome = error == 0 ? memory_access_outcome::completed : memory_access_outcome::failed,
+                                  .backend_error = error});
+                    },
+            });
+        }
+
         void delete_hook(emulator_hook* hook) override
         {
             if (this->is_in_hook_)
@@ -685,16 +703,36 @@ namespace sogen::icicle
 
         emulator_hook* hook_memory_access(memory_access_hook hook, emulator_hook* hook_id)
         {
-            auto obj = make_function_object(std::move(hook.callback), this->is_in_hook_);
-            auto* ptr = obj.get();
-            auto* wrapper = +[](void* user, const uint64_t address, const void* data, size_t length) {
-                const auto& func = *static_cast<decltype(ptr)>(user);
-                func(address, data, length);
-            };
+            std::unique_ptr<utils::object> object;
+            uint32_t id{};
+            if (hook.observation)
+            {
+                auto obj = make_function_object(std::move(hook.observation), this->is_in_hook_);
+                auto* ptr = obj.get();
+                auto* wrapper = +[](void* user, uint64_t address, const void* data, size_t length, uint64_t error) {
+                    (*static_cast<decltype(ptr)>(user))(address, data, length, error);
+                };
+                id = icicle_add_write_observation_hook(this->emu_, hook.address, hook.address + hook.size, wrapper, ptr);
+                object = std::move(obj);
+            }
+            else
+            {
+                auto obj = make_function_object(std::move(hook.callback), this->is_in_hook_);
+                auto* ptr = obj.get();
+                auto* wrapper = +[](void* user, const uint64_t address, const void* data, size_t length) {
+                    const auto& func = *static_cast<decltype(ptr)>(user);
+                    func(address, data, length);
+                };
 
-            auto* installer = hook.is_read ? &icicle_add_read_hook : &icicle_add_write_hook;
-            const auto id = installer(this->emu_, hook.address, hook.address + hook.size, wrapper, ptr);
-            this->hooks_[id] = std::move(obj);
+                auto* installer = hook.is_read ? &icicle_add_read_hook : &icicle_add_write_hook;
+                id = installer(this->emu_, hook.address, hook.address + hook.size, wrapper, ptr);
+                object = std::move(obj);
+            }
+            if (id == 0)
+            {
+                throw std::runtime_error("Icicle memory hook registration failed");
+            }
+            this->hooks_[id] = std::move(object);
 
             if (hook_id)
             {
@@ -760,6 +798,10 @@ namespace sogen::icicle
 
         emulator_hook* try_install_memory_access_hook(memory_access_hook hook)
         {
+            if (hook.size == 0 || hook.size > std::numeric_limits<uint64_t>::max() - hook.address)
+            {
+                throw std::invalid_argument("Invalid Icicle memory hook range");
+            }
             if (!this->is_in_hook_)
             {
                 return this->hook_memory_access(std::move(hook), nullptr);

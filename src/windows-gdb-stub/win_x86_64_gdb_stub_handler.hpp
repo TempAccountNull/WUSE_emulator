@@ -76,6 +76,7 @@ namespace sogen
             try
             {
                 this->prepare_execution(false);
+                this->clear_watchpoint_observations();
                 this->win_emu_->start();
             }
             catch (const std::exception& e)
@@ -105,6 +106,7 @@ namespace sogen
                 // A debugger step must execute the requested thread, even when another thread is scheduler-ready.
                 vcpu.switch_thread = false;
                 vcpu.thread().setup_if_necessary(vcpu.cpu, this->win_emu_->process);
+                this->clear_watchpoint_observations();
                 this->win_emu_->start_cpu(vcpu, 1);
             }
             catch (const std::exception& e)
@@ -438,6 +440,12 @@ namespace sogen
             {
                 return 0;
             }
+        }
+
+        uint32_t get_watchpoint_thread_id(cpu_interface& cpu) override
+        {
+            const auto& vcpu = this->win_emu_->vcpu(static_cast<uint32_t>(cpu.index()));
+            return vcpu.active_thread ? vcpu.active_thread->id : 0;
         }
 
         void prepare_execution(const bool step)

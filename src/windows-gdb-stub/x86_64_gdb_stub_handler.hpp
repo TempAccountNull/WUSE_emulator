@@ -4,6 +4,9 @@
 #include <arch_emulator.hpp>
 
 #include <utils/concurrency.hpp>
+#include <algorithm>
+#include <cstring>
+#include <limits>
 
 #include "x86_register_mapping.hpp"
 #include "x86_target_descriptions.hpp"
@@ -58,6 +61,7 @@ namespace sogen
         {
             try
             {
+                this->clear_watchpoint_observations();
                 this->emu_->start();
             }
             catch (const std::exception& e)
@@ -72,6 +76,7 @@ namespace sogen
         {
             try
             {
+                this->clear_watchpoint_observations();
                 this->emu_->start(1);
             }
             catch (const std::exception& e)
@@ -201,6 +206,10 @@ namespace sogen
         {
             try
             {
+                if (size == 0 || size > std::numeric_limits<uint64_t>::max() - addr)
+                {
+                    return false;
+                }
                 return this->hooks_.access<bool>([&](hook_map& hooks) {
                     hooks[{addr, size, type}] = this->create_hook(type, addr, size);
                     return true;
@@ -292,11 +301,84 @@ namespace sogen
             return {this->get_current_thread_id()};
         }
 
+        bool supports_watchpoint_diagnostics() const override
+        {
+            return true;
+        }
+
+        gdb_stub::watchpoint_stop get_watchpoint_observations() const override
+        {
+            return this->watchpoint_stop_.copy();
+        }
+
         virtual bool is_32_bit() const = 0;
+
+      protected:
+        virtual uint32_t get_watchpoint_thread_id(cpu_interface& cpu)
+        {
+            (void)cpu;
+            return this->get_current_thread_id();
+        }
+
+        void clear_watchpoint_observations()
+        {
+            this->watchpoint_stop_.access([](auto& stop) { stop = {}; });
+        }
+
+        void record_watchpoint(cpu_interface& cpu, uint64_t watched_address, size_t watched_size, uint64_t access_address, const void* data,
+                               size_t access_size, bool write, memory_write_result result)
+        {
+            gdb_stub::watchpoint_observation observation{};
+            observation.watched_address = watched_address;
+            observation.watched_size = watched_size;
+            observation.address = access_address;
+            observation.size = access_size;
+            observation.cpu_index = cpu.index();
+            observation.thread_id = this->get_watchpoint_thread_id(cpu);
+            observation.write = write;
+            switch (result.outcome)
+            {
+            case memory_access_outcome::completed:
+                observation.outcome = gdb_stub::watchpoint_outcome::completed;
+                break;
+            case memory_access_outcome::failed:
+                observation.outcome = gdb_stub::watchpoint_outcome::failed;
+                break;
+            default:
+                break;
+            }
+            observation.backend_error = result.backend_error;
+            try
+            {
+                auto& x86_cpu = dynamic_cast<x86_64_cpu&>(cpu);
+                observation.callback_pc = x86_cpu.read_instruction_pointer();
+                observation.pc_valid = true;
+            }
+            catch (...)
+            {
+                // Preserve the access even if this backend cannot supply a PC at callback time.
+            }
+            if (data)
+            {
+                observation.captured_size = std::min(access_size, observation.value.size());
+                std::memcpy(observation.value.data(), data, observation.captured_size);
+            }
+            this->watchpoint_stop_.access([&](auto& stop) {
+                if (stop.count < stop.observations.size())
+                {
+                    stop.observations[stop.count++] = observation;
+                }
+                else
+                {
+                    ++stop.dropped;
+                }
+            });
+        }
 
       private:
         x86_64_emulator* emu_{};
 
+        utils::concurrency::container<gdb_stub::watchpoint_stop> watchpoint_stop_{};
         using hook_map = std::unordered_map<breakpoint_key, scoped_hook>;
         utils::concurrency::container<hook_map> hooks_{};
 
@@ -307,18 +389,25 @@ namespace sogen
             });
         }
 
-        emulator_hook* create_read_hook(const uint64_t addr, const size_t size)
+        emulator_hook* create_read_hook(const uint64_t watched_address, const size_t watched_size)
         {
-            return this->emu_->hook_memory_read(addr, size, [this](cpu_interface&, const uint64_t, const void*, const size_t) {
-                this->on_interrupt(); //
-            });
+            return this->emu_->hook_memory_read(
+                watched_address, watched_size,
+                [this, watched_address, watched_size](cpu_interface& cpu, uint64_t access_address, const void* data, size_t access_size) {
+                    this->record_watchpoint(cpu, watched_address, watched_size, access_address, data, access_size, false, {});
+                    this->on_interrupt(); //
+                });
         }
 
-        emulator_hook* create_write_hook(const uint64_t addr, const size_t size)
+        emulator_hook* create_write_hook(const uint64_t watched_address, const size_t watched_size)
         {
-            return this->emu_->hook_memory_write(addr, size, [this](cpu_interface&, const uint64_t, const void*, const size_t) {
-                this->on_interrupt(); //
-            });
+            return this->emu_->hook_memory_write_observed(
+                watched_address, watched_size,
+                [this, watched_address, watched_size](cpu_interface& cpu, uint64_t access_address, const void* data, size_t access_size,
+                                                      memory_write_result result) {
+                    this->record_watchpoint(cpu, watched_address, watched_size, access_address, data, access_size, true, result);
+                    this->on_interrupt(); //
+                });
         }
 
         scoped_hook create_hook(const gdb_stub::breakpoint_type type, const uint64_t addr, const size_t size)

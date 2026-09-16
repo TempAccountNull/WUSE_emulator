@@ -6,6 +6,7 @@
 #include <cassert>
 #include <functional>
 #include <stdexcept>
+#include <utility>
 
 namespace sogen
 {
@@ -52,6 +53,22 @@ namespace sogen
     using instruction_hook_callback = std::function<instruction_hook_continuation(cpu_interface& cpu, uint64_t data)>;
     using interrupt_hook_callback = std::function<void(cpu_interface& cpu, int interrupt)>;
 
+    enum class memory_access_outcome : uint8_t
+    {
+        unknown,
+        completed,
+        failed,
+    };
+
+    struct memory_write_result
+    {
+        memory_access_outcome outcome{memory_access_outcome::unknown};
+        uint64_t backend_error{};
+    };
+
+    using memory_write_observation_callback =
+        std::function<void(cpu_interface& cpu, uint64_t address, const void* data, size_t size, memory_write_result result)>;
+
     using memory_access_hook_callback = std::function<void(cpu_interface& cpu, uint64_t address, const void* data, size_t size)>;
     using memory_execution_hook_callback = std::function<void(cpu_interface& cpu, uint64_t address)>;
 
@@ -87,6 +104,14 @@ namespace sogen
         virtual emulator_hook* hook_memory_range_execution(uint64_t address, uint64_t size, memory_execution_hook_callback callback) = 0;
         virtual emulator_hook* hook_memory_read(uint64_t address, uint64_t size, memory_access_hook_callback callback) = 0;
         virtual emulator_hook* hook_memory_write(uint64_t address, uint64_t size, memory_access_hook_callback callback) = 0;
+
+        // Backends without result-bearing hooks retain their existing timing and report unknown.
+        virtual emulator_hook* hook_memory_write_observed(uint64_t address, uint64_t size, memory_write_observation_callback callback)
+        {
+            return this->hook_memory_write(address, size,
+                                           [callback = std::move(callback)](cpu_interface& cpu, uint64_t access, const void* data,
+                                                                            size_t length) { callback(cpu, access, data, length, {}); });
+        }
 
         virtual emulator_hook* hook_instruction(int instruction_type, instruction_hook_callback callback) = 0;
 

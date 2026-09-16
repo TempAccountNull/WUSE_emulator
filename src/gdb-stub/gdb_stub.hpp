@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <array>
 #include <network/address.hpp>
 #include <stdexcept>
 
@@ -33,6 +34,40 @@ namespace sogen::gdb_stub
         hardware_read_write = 4,
         END,
     };
+
+    enum class watchpoint_outcome : uint8_t
+    {
+        unknown,
+        completed,
+        failed,
+    };
+
+    struct watchpoint_observation
+    {
+        uint64_t watched_address{};
+        uint64_t watched_size{};
+        uint64_t address{};
+        uint64_t size{};
+        uint64_t callback_pc{};
+        uint64_t cpu_index{};
+        uint32_t thread_id{};
+        bool pc_valid{};
+        bool write{};
+        watchpoint_outcome outcome{watchpoint_outcome::unknown};
+        uint64_t backend_error{};
+        std::array<uint8_t, 64> value{};
+        size_t captured_size{};
+    };
+
+    struct watchpoint_stop
+    {
+        // Fixed storage keeps callback capture allocation-free across the Rust/C++ boundary.
+        std::array<watchpoint_observation, 128> observations{};
+        size_t count{};
+        uint64_t dropped{};
+    };
+
+    std::string format_watchpoint_observations(const watchpoint_stop& stop);
 
     struct library_info
     {
@@ -126,6 +161,16 @@ namespace sogen::gdb_stub
         }
 
         virtual std::vector<thread_info> get_thread_list() const
+        {
+            return {};
+        }
+
+        virtual bool supports_watchpoint_diagnostics() const
+        {
+            return false;
+        }
+
+        virtual watchpoint_stop get_watchpoint_observations() const
         {
             return {};
         }

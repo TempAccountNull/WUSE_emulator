@@ -83,6 +83,7 @@ type MmioWriteFunction = extern "C" fn(*mut c_void, u64, *const c_void, usize);
 type ViolationFunction = extern "C" fn(*mut c_void, u64, u8, i32) -> i32;
 type InterruptFunction = extern "C" fn(*mut c_void, i32);
 type MemoryAccessFunction = MmioWriteFunction;
+type WriteObservationFunction = extern "C" fn(*mut c_void, u64, *const c_void, usize, u64);
 
 #[unsafe(no_mangle)]
 pub fn icicle_map_mmio(
@@ -332,6 +333,16 @@ pub fn icicle_add_write_hook(
                 callback(user, address, data.as_ptr() as *const c_void, data.len());
             }),
         );
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn icicle_add_write_observation_hook(ptr: *mut c_void, start: u64, end: u64, callback: WriteObservationFunction, user: *mut c_void) -> u32 {
+    unsafe {
+        let emulator = &mut *(ptr as *mut IcicleEmulator);
+        emulator.add_write_observation_hook(start, end, Box::new(move |address, data, error| {
+            callback(user, address, data.as_ptr() as *const c_void, data.len(), error);
+        }))
     }
 }
 

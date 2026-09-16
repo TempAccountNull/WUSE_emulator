@@ -40,6 +40,10 @@ pub trait ReadAfterHook {
 
 pub trait WriteHook {
     fn write(&mut self, mem: &mut Mmu, addr: u64, value: &[u8]);
+
+    // Observation runs after each primitive attempt, including early permission/mapping failures.
+    // A failed I/O handler may have side effects; Err does not promise unchanged device state.
+    fn write_result(&mut self, _mem: &mut Mmu, _addr: u64, _value: &[u8], _result: MemResult<()>) {}
 }
 
 impl WriteHook for () {
@@ -66,7 +70,8 @@ impl<T: ?Sized> HookEntry<T> {
     fn range(&self, page_size: u64) -> std::ops::RangeInclusive<u64> {
         let alignment_mask = !(page_size - 1);
         let start = self.start & alignment_mask;
-        let end = (self.end + page_size) & alignment_mask;
+        // Align the last covered byte instead of adding a page to the exclusive endpoint.
+        let end = (self.end.saturating_sub(1) & alignment_mask) | (page_size - 1);
         start..=end
     }
 }
@@ -117,14 +122,20 @@ impl<T: ?Sized> HookStore<T> {
     }
 }
 
+// Compare distances so the access endpoint cannot wrap into low guest addresses.
+fn access_overlaps(start: u64, end: u64, addr: u64, size: usize) -> bool {
+    start < end && size != 0 && addr < end && (addr >= start || (size as u64) > start - addr)
+}
+
 macro_rules! active_hooks {
-    ($addr:expr, $list:expr, $action:expr) => {{
+    ($addr:expr, $size:expr, $list:expr, $action:expr) => {{
         if !$list.hooks.is_empty() {
             let addr = $addr;
+            let size = $size;
             let mut hooks = std::mem::take(&mut $list.hooks);
             for hook in &mut hooks {
                 if let Some(handler) = hook.handler.as_deref_mut() {
-                    if hook.start <= addr && addr < hook.end {
+                    if access_overlaps(hook.start, hook.end, addr, size) {
                         ($action)(handler);
                     }
                 }
@@ -235,6 +246,9 @@ impl Mmu {
         end: u64,
         hook: Box<dyn WriteHook>,
     ) -> Option<u32> {
+        if start >= end {
+            return None;
+        }
         self.tlb.clear();
         Some(self.write_hooks.add(start, end, hook))
     }
@@ -249,6 +263,9 @@ impl Mmu {
     }
 
     pub fn add_read_hook(&mut self, start: u64, end: u64, hook: Box<dyn ReadHook>) -> Option<u32> {
+        if start >= end {
+            return None;
+        }
         self.tlb.clear();
         Some(self.read_hooks.add(start, end, hook))
     }
@@ -268,6 +285,9 @@ impl Mmu {
         end: u64,
         hook: Box<dyn ReadAfterHook>,
     ) -> Option<u32> {
+        if start >= end {
+            return None;
+        }
         self.tlb.clear();
         Some(self.read_after_hooks.add(start, end, hook))
     }
@@ -1365,7 +1385,7 @@ impl Mmu {
 
         if let Ok(value) = result {
             if perm != perm::NONE && ENABLE_MEMORY_HOOKS {
-                active_hooks!(addr, self.read_after_hooks, |hook: &mut dyn ReadAfterHook| {
+                active_hooks!(addr, N, self.read_after_hooks, |hook: &mut dyn ReadAfterHook| {
                     hook.read(self, addr, &value)
                 })
             }
@@ -1387,28 +1407,40 @@ impl Mmu {
 
         tracing::trace!("write_tlb_miss: {:#0x}", self.page_aligned(addr));
         self.tlb_miss_count += 1;
-        let result = match self.mapping.get(addr).ok_or(MemError::Unmapped)? {
-            MemoryMapping::Physical(entry) => self.write_physical(entry.index, addr, value, perm),
-            &MemoryMapping::Unallocated(entry) => {
-                perm::check(entry.perm | perm::MAP, perm)?;
-                let index = self.init_physical(addr, true).ok_or(MemError::OutOfMemory)?;
-                self.write_physical(index, addr, value, perm)
-            }
-            MemoryMapping::Io(id) => self.io[*id].write(addr, &value),
-        };
+        let mut legacy_notify = false;
+        let result = (|| {
+            let result = match self.mapping.get(addr).ok_or(MemError::Unmapped)? {
+                MemoryMapping::Physical(entry) => self.write_physical(entry.index, addr, value, perm),
+                &MemoryMapping::Unallocated(entry) => {
+                    perm::check(entry.perm | perm::MAP, perm)?;
+                    let index = self.init_physical(addr, true).ok_or(MemError::OutOfMemory)?;
+                    self.write_physical(index, addr, value, perm)
+                }
+                MemoryMapping::Io(id) => self.io[*id].write(addr, &value),
+            };
+            legacy_notify = true;
+            result
+        })();
 
         // Handle case where we are writing across a mapping boundary (see `read_tlb_miss`).
-        if N != 1 && result == Err(MemError::Unmapped) {
+        if legacy_notify && N != 1 && result == Err(MemError::Unmapped) {
             return self.write_unaligned(addr, value, perm);
         }
 
+        self.observe_write(addr, &value, perm, result, legacy_notify);
+        result
+    }
+
+    fn observe_write(&mut self, addr: u64, value: &[u8], perm: u8, result: MemResult<()>, legacy_notify: bool) {
         if perm != perm::NONE && ENABLE_MEMORY_HOOKS {
-            active_hooks!(addr, self.write_hooks, |hook: &mut dyn WriteHook| {
-                hook.write(self, addr, &value)
+            active_hooks!(addr, value.len(), self.write_hooks, |hook: &mut dyn WriteHook| {
+                // Keep the legacy post-attempt callback contract; richer observations are additive.
+                if legacy_notify {
+                    hook.write(self, addr, value);
+                }
+                hook.write_result(self, addr, value, result);
             })
         }
-
-        result
     }
 
     /// Get a reference to the virtual address space's mapping.
@@ -1501,3 +1533,122 @@ impl_read_write!(read_u8, write_u8, u8);
 impl_read_write!(read_u16, write_u16, u16);
 impl_read_write!(read_u32, write_u32, u32);
 impl_read_write!(read_u64, write_u64, u64);
+
+#[cfg(test)]
+mod watchpoint_tests {
+    use super::*;
+    use crate::Mapping;
+    use std::{cell::RefCell, rc::Rc};
+
+    #[derive(Debug, PartialEq)]
+    struct Attempt {
+        address: u64,
+        value: Vec<u8>,
+        result: MemResult<()>,
+        after: Option<Vec<u8>>,
+    }
+
+    struct Observer(Rc<RefCell<Vec<Attempt>>>);
+
+    impl WriteHook for Observer {
+        fn write(&mut self, _mem: &mut Mmu, _addr: u64, _value: &[u8]) {}
+
+        fn write_result(&mut self, mem: &mut Mmu, addr: u64, value: &[u8], result: MemResult<()>) {
+            let mut after = vec![0; value.len()];
+            let readable = mem.read_bytes(addr, &mut after, perm::NONE).is_ok();
+            self.0.borrow_mut().push(Attempt {
+                address: addr,
+                value: value.to_vec(),
+                result,
+                after: readable.then_some(after),
+            });
+        }
+    }
+
+    #[test]
+    fn overlap_is_half_open_without_endpoint_overflow() {
+        assert!(access_overlaps(0x1008, 0x100c, 0x1000, 16));
+        assert!(access_overlaps(0x1008, 0x100c, 0x100b, 1));
+        assert!(!access_overlaps(0x1008, 0x100c, 0x1000, 8));
+        assert!(!access_overlaps(0x1008, 0x100c, 0x100c, 1));
+        assert!(!access_overlaps(0x1008, 0x100c, 0x1008, 0));
+        assert!(!access_overlaps(8, 4, 0, 16));
+        assert!(access_overlaps(u64::MAX - 3, u64::MAX, u64::MAX - 7, 16));
+        assert!(!access_overlaps(0, 8, u64::MAX - 7, 16));
+        let hook: HookEntry<dyn WriteHook> = HookEntry {
+            start: u64::MAX - 3, end: u64::MAX, handler: Some(Box::new(())),
+        };
+        assert_eq!(*hook.range(0x1000).end(), u64::MAX);
+        let mut mmu = Mmu::default();
+        assert!(mmu.add_write_hook(5, 5, Box::new(())).is_none());
+        assert!(mmu.add_write_hook(u64::MAX - 3, 4, Box::new(())).is_none());
+        assert!(mmu.add_read_hook(8, 4, Box::new(())).is_none());
+    }
+
+    #[test]
+    fn enclosing_write_is_observed_after_commit_even_after_tlb_warmup() {
+        let mut mmu = Mmu::default();
+        assert!(mmu.map_memory_len(0x1000, 0x2000, Mapping { perm: perm::READ | perm::WRITE, value: 0 }));
+        mmu.write(0x1000, [0; 16], perm::WRITE).unwrap();
+        let attempts = Rc::new(RefCell::new(vec![]));
+        mmu.add_write_hook(0x1008, 0x100c, Box::new(Observer(attempts.clone()))).unwrap();
+        // An unrelated access on the same watched page must not restore a bypassing write TLB entry.
+        mmu.write(0x1100, [1; 16], perm::WRITE).unwrap();
+        mmu.write(0x1000, [2; 16], perm::WRITE).unwrap();
+        mmu.write(0x1000, [3; 16], perm::WRITE).unwrap();
+        mmu.write(0x1000, [4; 8], perm::WRITE).unwrap();
+        mmu.write(0x100c, [5; 4], perm::WRITE).unwrap();
+        let observed = attempts.borrow();
+        assert_eq!(observed.len(), 2);
+        for (index, attempt) in observed.iter().enumerate() {
+            assert_eq!(attempt.address, 0x1000);
+            assert_eq!(attempt.result, Ok(()));
+            assert_eq!(attempt.value, vec![(index + 2) as u8; 16]);
+            assert_eq!(attempt.after.as_ref(), Some(&attempt.value));
+        }
+    }
+
+    #[test]
+    fn rejected_and_partial_writes_keep_individual_results() {
+        let mut mmu = Mmu::default();
+        assert!(mmu.map_memory_len(0x1000, 0x1000, Mapping { perm: perm::READ, value: 0xAA }));
+        let attempts = Rc::new(RefCell::new(vec![]));
+        mmu.add_write_hook(0x1000, 0x3000, Box::new(Observer(attempts.clone()))).unwrap();
+        assert_eq!(mmu.write(0x1000, [0xBB; 4], perm::WRITE), Err(MemError::WriteViolation));
+        assert_eq!(mmu.write(0x2000, [0xCC; 4], perm::WRITE), Err(MemError::Unmapped));
+        mmu.update_perm(0x1000, 0x1000, perm::READ | perm::WRITE).unwrap();
+        assert_eq!(mmu.write(0x1fff, [0xDD, 0xEE], perm::WRITE), Err(MemError::Unmapped));
+        let observed = attempts.borrow();
+        assert_eq!(observed.len(), 4);
+        assert_eq!(observed[0].result, Err(MemError::WriteViolation));
+        assert_eq!(observed[0].after, Some(vec![0xAA; 4]));
+        assert_eq!(observed[1].result, Err(MemError::Unmapped));
+        assert_eq!(observed[1].after, None);
+        assert_eq!(observed[2].address, 0x1fff);
+        assert_eq!(observed[2].result, Ok(()));
+        assert_eq!(observed[2].after, Some(vec![0xDD]));
+        assert_eq!(observed[3].address, 0x2000);
+        assert_eq!(observed[3].value, vec![0xEE]);
+        assert_eq!(observed[3].result, Err(MemError::Unmapped));
+    }
+
+    #[test]
+    fn after_read_overlap_and_passive_writes_have_distinct_scope() {
+        struct ReadObserver(Rc<RefCell<Vec<(u64, Vec<u8>)>>>);
+        impl ReadAfterHook for ReadObserver {
+            fn read(&mut self, _mem: &mut Mmu, addr: u64, value: &[u8]) {
+                self.0.borrow_mut().push((addr, value.to_vec()));
+            }
+        }
+        let mut mmu = Mmu::default();
+        assert!(mmu.map_memory_len(0x1000, 0x1000, Mapping { perm: perm::READ | perm::WRITE, value: 0 }));
+        let writes = Rc::new(RefCell::new(vec![]));
+        let reads = Rc::new(RefCell::new(vec![]));
+        mmu.add_write_hook(0x1008, 0x100c, Box::new(Observer(writes.clone()))).unwrap();
+        mmu.add_read_after_hook(0x1008, 0x100c, Box::new(ReadObserver(reads.clone()))).unwrap();
+        mmu.write(0x1000, [9; 16], perm::NONE).unwrap();
+        assert_eq!(mmu.read::<16>(0x1000, perm::READ).unwrap(), [9; 16]);
+        assert!(writes.borrow().is_empty());
+        assert_eq!(*reads.borrow(), vec![(0x1000, vec![9; 16])]);
+    }
+}
