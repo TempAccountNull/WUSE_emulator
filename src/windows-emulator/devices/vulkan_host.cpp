@@ -466,18 +466,13 @@ namespace sogen
         // guest window via the UI backend. No real presentation engine is involved.
 #include "native_copy_submission.inc"
 
-        struct swapchain_data
+        struct swapchain_data : native_present_sync::swapchain_generation
         {
-            VkSwapchainKHR native{};
-            uint64_t surface_id{};
             native_presentation_window_lease lease;
-            bool retired{};
-            bool destroy_requested{};
             VkDeviceSize native_copy_allocation_bytes{};
             uint32_t array_layers{1};
             std::vector<VkImage> native_images;
             std::vector<std::shared_ptr<native_copy_submission>> copies;
-            uint64_t device_id{};
             uint64_t hwnd{};
             uint32_t width{};
             uint32_t height{};

@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <algorithm>
+#include <type_traits>
 #include <utility>
 
 namespace sogen::native_present_sync
@@ -166,6 +167,74 @@ namespace sogen::native_present_sync
     inline constexpr size_t max_retained_submissions = 256;
     inline constexpr size_t max_retained_acquisitions = 256;
     inline constexpr VkDeviceSize max_copy_allocation_bytes = 512ULL * 1024 * 1024;
+
+    template <typename Handle>
+    uint64_t native_handle_bits(const Handle handle)
+    {
+        if constexpr (std::is_pointer_v<Handle>)
+        {
+            return reinterpret_cast<uintptr_t>(handle);
+        }
+        else
+        {
+            return static_cast<uint64_t>(handle);
+        }
+    }
+
+    // The guest may destroy a swapchain while native presentation still references it. A
+    // successful vkCreateSwapchainKHR retires that native generation; a failed create does not.
+    struct swapchain_generation
+    {
+        VkSwapchainKHR native{};
+        uint64_t surface_id{};
+        uint64_t device_id{};
+        bool retired{};
+        bool destroy_requested{};
+        bool native_retired{};
+
+        bool explicit_predecessor(const uint64_t device, const uint64_t surface) const
+        {
+            return native && device_id == device && surface_id == surface && !retired && !destroy_requested && !native_retired;
+        }
+
+        bool deferred_predecessor(const uint64_t device, const uint64_t surface) const
+        {
+            return native && device_id == device && surface_id == surface && destroy_requested && !native_retired;
+        }
+
+        void replaced()
+        {
+            retired = true;
+            native_retired = true;
+        }
+    };
+
+    struct generation_selection
+    {
+        swapchain_generation* value{};
+        bool ambiguous{};
+    };
+
+    inline generation_selection select_deferred_generation(const std::span<swapchain_generation* const> generations, const uint64_t device,
+                                                           const uint64_t surface)
+    {
+        generation_selection result;
+        for (auto* generation : generations)
+        {
+            if (!generation || !generation->deferred_predecessor(device, surface))
+            {
+                continue;
+            }
+            if (result.value)
+            {
+                result.value = nullptr;
+                result.ambiguous = true;
+                return result;
+            }
+            result.value = generation;
+        }
+        return result;
+    }
 
     class acquisition
     {

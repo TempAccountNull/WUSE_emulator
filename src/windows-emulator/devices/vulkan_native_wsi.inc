@@ -248,16 +248,52 @@ try
         {
             return finish(VK_ERROR_EXTENSION_NOT_PRESENT);
         }
-        VkSwapchainKHR old{};
+        impl::swapchain_data* predecessor{};
+        uint64_t predecessor_id{};
         if (request.related)
         {
             const auto previous = host.swapchains.find(request.related);
-            if (previous == host.swapchains.end() || previous->second.device_id != request.owner ||
-                previous->second.surface_id != request.object || previous->second.retired)
+            if (previous == host.swapchains.end() || !previous->second.explicit_predecessor(request.owner, request.object))
             {
                 return finish(VK_ERROR_UNKNOWN);
             }
-            old = previous->second.native;
+            predecessor = &previous->second;
+            predecessor_id = request.related;
+        }
+        else
+        {
+            std::vector<native_present_sync::swapchain_generation*> generations;
+            generations.reserve(host.swapchains.size());
+            for (auto& item : host.swapchains)
+            {
+                generations.push_back(&item.second);
+            }
+            const auto selected = native_present_sync::select_deferred_generation(generations, request.owner, request.object);
+            if (selected.ambiguous)
+            {
+                std::fprintf(stderr, "[gpu-bridge] native swapchain predecessor is ambiguous: device=%llu surface=%llu\n",
+                             static_cast<unsigned long long>(request.owner), static_cast<unsigned long long>(request.object));
+                return finish(VK_ERROR_INITIALIZATION_FAILED);
+            }
+            if (selected.value)
+            {
+                predecessor = static_cast<impl::swapchain_data*>(selected.value);
+                for (const auto& [id, state] : host.swapchains)
+                {
+                    if (&state == predecessor)
+                    {
+                        predecessor_id = id;
+                        break;
+                    }
+                }
+                std::fprintf(stderr,
+                             "[gpu-bridge] reusing deferred native swapchain: device=%llu surface=%llu guest-swapchain=%llu "
+                             "native=0x%llx records=%zu\n",
+                             static_cast<unsigned long long>(request.owner), static_cast<unsigned long long>(request.object),
+                             static_cast<unsigned long long>(predecessor_id),
+                             static_cast<unsigned long long>(native_present_sync::native_handle_bits(predecessor->native)),
+                             predecessor->copies.size());
+            }
         }
         std::vector<uint32_t> families(request.words[wire::family_count]);
         std::vector<VkFormat> formats(request.words[wire::format_count]);
@@ -290,7 +326,7 @@ try
         info.compositeAlpha = static_cast<VkCompositeAlphaFlagBitsKHR>(request.words[wire::alpha]);
         info.presentMode = static_cast<VkPresentModeKHR>(request.words[wire::present_mode]);
         info.clipped = request.words[wire::clipped];
-        info.oldSwapchain = old;
+        info.oldSwapchain = predecessor ? predecessor->native : VK_NULL_HANDLE;
         impl::swapchain_data value{};
         value.device_id = request.owner;
         value.surface_id = request.object;
@@ -332,14 +368,21 @@ try
             }
             info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         }
-        if (request.related)
-        {
-            host.swapchains.at(request.related).retired = true;
-        }
         auto result = dev.native_create_swapchain(dev.handle, &info, nullptr, &value.native);
         if (result != VK_SUCCESS)
         {
+            std::fprintf(stderr,
+                         "[gpu-bridge] native swapchain create failed: result=%d device=%llu surface=%llu format=%d color-space=%d "
+                         "present-mode=%d flags=0x%x usage=0x%x extent=%ux%u images=%u old=0x%llx formats=%zu\n",
+                         result, static_cast<unsigned long long>(request.owner), static_cast<unsigned long long>(request.object),
+                         static_cast<int>(info.imageFormat), static_cast<int>(info.imageColorSpace), static_cast<int>(info.presentMode),
+                         info.flags, info.imageUsage, info.imageExtent.width, info.imageExtent.height, info.minImageCount,
+                         static_cast<unsigned long long>(native_present_sync::native_handle_bits(info.oldSwapchain)), formats.size());
             return finish(result);
+        }
+        if (predecessor)
+        {
+            predecessor->replaced();
         }
         std::vector<uint64_t> registered;
         std::vector<VkDeviceMemory> allocated;

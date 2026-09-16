@@ -396,4 +396,45 @@ namespace sogen::test
         EXPECT_FALSE(copy.value.references(waits[0]));
         EXPECT_TRUE(direct.value.references(waits[0]));
     }
+
+    TEST(NativePresentSync, SwapchainPredecessorSeparatesGuestAndNativeRetirement)
+    {
+        sync::swapchain_generation generation{.native = handle<VkSwapchainKHR>(3), .surface_id = 7, .device_id = 5};
+        EXPECT_TRUE(generation.explicit_predecessor(5, 7));
+        EXPECT_FALSE(generation.deferred_predecessor(5, 7));
+
+        generation.retired = generation.destroy_requested = true;
+        EXPECT_FALSE(generation.explicit_predecessor(5, 7));
+        EXPECT_TRUE(generation.deferred_predecessor(5, 7));
+
+        generation.replaced();
+        EXPECT_TRUE(generation.retired);
+        EXPECT_TRUE(generation.destroy_requested);
+        EXPECT_TRUE(generation.native_retired);
+        EXPECT_FALSE(generation.deferred_predecessor(5, 7));
+    }
+
+    TEST(NativePresentSync, DeferredPredecessorMustBeUniqueForDeviceAndSurface)
+    {
+        sync::swapchain_generation first{
+            .native = handle<VkSwapchainKHR>(3), .surface_id = 7, .device_id = 5, .retired = true, .destroy_requested = true};
+        sync::swapchain_generation other_surface{
+            .native = handle<VkSwapchainKHR>(4), .surface_id = 8, .device_id = 5, .retired = true, .destroy_requested = true};
+        std::array<sync::swapchain_generation*, 2> candidates{&first, &other_surface};
+        auto selected = sync::select_deferred_generation(candidates, 5, 7);
+        EXPECT_EQ(selected.value, &first);
+        EXPECT_FALSE(selected.ambiguous);
+
+        sync::swapchain_generation duplicate{
+            .native = handle<VkSwapchainKHR>(5), .surface_id = 7, .device_id = 5, .retired = true, .destroy_requested = true};
+        candidates.back() = &duplicate;
+        selected = sync::select_deferred_generation(candidates, 5, 7);
+        EXPECT_EQ(selected.value, nullptr);
+        EXPECT_TRUE(selected.ambiguous);
+
+        duplicate.native_retired = true;
+        selected = sync::select_deferred_generation(candidates, 5, 7);
+        EXPECT_EQ(selected.value, &first);
+        EXPECT_FALSE(selected.ambiguous);
+    }
 }
