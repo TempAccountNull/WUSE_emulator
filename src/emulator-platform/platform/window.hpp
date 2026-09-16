@@ -696,6 +696,41 @@ namespace sogen
         uint32_t scanLineOrdering;
     };
 
+    struct EMU_DISPLAYCONFIG_PATH_INFO_INTERNAL
+    {
+        UINT64 flags;
+        UINT64 reserved0;
+        LUID adapterId;
+        UINT32 sourceId;
+        UINT32 targetId;
+        EMU_DISPLAYCONFIG_VIDEO_SIGNAL_INFO targetSignalInfo;
+        UINT32 outputTechnology;
+        UINT8 reserved1[17]; // NOLINT
+        UINT8 virtualModeAvailable;
+        UINT8 reserved2[2]; // NOLINT
+        UINT32 rotation;
+        UINT32 scaling;
+        UINT32 databaseCurrentScaling;
+        DISPLAYCONFIG_RATIONAL refreshRateOverride;
+        UINT32 sourceWidth;
+        UINT32 sourceHeight;
+        UINT8 reserved3[56]; // NOLINT
+        UINT32 filterStatus;
+        UINT8 reserved4[8]; // NOLINT
+    };
+
+    // Windows 10 19041 user32 allocates and walks these private win32u records with a fixed 0xC8 stride on
+    // both x64 and x86. The field offsets below are the ones consumed by that wrapper before it emits public
+    // DISPLAYCONFIG_PATH_INFO and DISPLAYCONFIG_MODE_INFO arrays.
+    static_assert(sizeof(EMU_DISPLAYCONFIG_PATH_INFO_INTERNAL) == 0xC8);
+    static_assert(offsetof(EMU_DISPLAYCONFIG_PATH_INFO_INTERNAL, adapterId) == 0x10);
+    static_assert(offsetof(EMU_DISPLAYCONFIG_PATH_INFO_INTERNAL, targetSignalInfo) == 0x20);
+    static_assert(offsetof(EMU_DISPLAYCONFIG_PATH_INFO_INTERNAL, outputTechnology) == 0x50);
+    static_assert(offsetof(EMU_DISPLAYCONFIG_PATH_INFO_INTERNAL, virtualModeAvailable) == 0x65);
+    static_assert(offsetof(EMU_DISPLAYCONFIG_PATH_INFO_INTERNAL, rotation) == 0x68);
+    static_assert(offsetof(EMU_DISPLAYCONFIG_PATH_INFO_INTERNAL, sourceWidth) == 0x7C);
+    static_assert(offsetof(EMU_DISPLAYCONFIG_PATH_INFO_INTERNAL, filterStatus) == 0xBC);
+
     struct EMU_DISPLAYCONFIG_TARGET_MODE
     {
         EMU_DISPLAYCONFIG_VIDEO_SIGNAL_INFO targetVideoSignalInfo;

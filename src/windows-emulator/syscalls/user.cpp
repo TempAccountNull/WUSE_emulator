@@ -5527,7 +5527,7 @@ namespace sogen
             return result;
         }
 
-        NTSTATUS handle_NtUserGetDisplayConfigBufferSizes(const syscall_context& c, const UINT32 /*flags*/,
+        NTSTATUS handle_NtUserGetDisplayConfigBufferSizes(const syscall_context& c, const UINT32 flags,
                                                           const emulator_object<UINT32> num_path_array_elements,
                                                           const emulator_object<UINT32> num_mode_info_array_elements)
         {
@@ -5540,7 +5540,7 @@ namespace sogen
             // must surface as an error to the caller, not abort the whole emulator with an unhandled
             // host-side memory exception.
             const UINT32 path_count = 1;
-            const UINT32 mode_count = 2;
+            const UINT32 mode_count = (flags & 0x10) != 0 ? 3 : 2; // QDC_VIRTUAL_MODE_AWARE
             if (!c.win_emu.memory.try_write_memory(num_path_array_elements.value(), &path_count, sizeof(path_count)) ||
                 !c.win_emu.memory.try_write_memory(num_mode_info_array_elements.value(), &mode_count, sizeof(mode_count)))
             {
@@ -5550,58 +5550,52 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
-        NTSTATUS handle_NtUserQueryDisplayConfig(const syscall_context& c, const UINT32 /*flags*/,
+        NTSTATUS handle_NtUserQueryDisplayConfig(const syscall_context& c, const UINT32 flags,
                                                  const emulator_object<UINT32> num_path_array_elements, const emulator_pointer path_array,
-                                                 const emulator_object<UINT32> current_topology_id, const emulator_pointer /*reserved*/)
+                                                 const emulator_object<UINT32> current_topology_id, const emulator_pointer reserved)
         {
-            if (!num_path_array_elements)
+            constexpr UINT32 qdc_retrieve_flags_mask = 0x7;
+            constexpr UINT32 qdc_all_paths = 0x1;
+            constexpr UINT32 qdc_only_active_paths = 0x2;
+            constexpr UINT32 qdc_database_current = 0x4;
+            const auto retrieve_flags = flags & qdc_retrieve_flags_mask;
+            if (!num_path_array_elements || !path_array || reserved ||
+                (retrieve_flags != qdc_all_paths && retrieve_flags != qdc_only_active_paths && retrieve_flags != qdc_database_current) ||
+                (retrieve_flags == qdc_database_current) != static_cast<bool>(current_topology_id))
             {
                 return STATUS_INVALID_PARAMETER;
             }
 
-            const auto num_paths = num_path_array_elements.read();
-
-            num_path_array_elements.write(1);
-
-            if (current_topology_id)
+            UINT32 num_paths{};
+            if (!c.win_emu.memory.try_read_memory(num_path_array_elements.value(), &num_paths, sizeof(num_paths)) || num_paths < 1)
             {
-                current_topology_id.write(0x1); // DISPLAYCONFIG_TOPOLOGY_INTERNAL
+                return STATUS_INVALID_PARAMETER;
             }
 
-            if (path_array && num_paths >= 1)
+            EMU_DISPLAYCONFIG_PATH_INFO_INTERNAL internal_path{};
+            internal_path.flags = 0x2000000000020003ULL;
+            internal_path.adapterId = {.LowPart = 0x1000, .HighPart = 0};
+            internal_path.sourceId = 0;
+            internal_path.targetId = 0;
+            internal_path.targetSignalInfo.pixelRate = 148500000;
+            internal_path.targetSignalInfo.hSyncFreq = {.Numerator = 67500, .Denominator = 1};
+            internal_path.targetSignalInfo.vSyncFreq = {.Numerator = 60, .Denominator = 1};
+            internal_path.targetSignalInfo.activeSize = {.cx = 1920, .cy = 1080};
+            internal_path.targetSignalInfo.totalSize = {.cx = 2200, .cy = 1125};
+            internal_path.targetSignalInfo.scanLineOrdering = 1; // PROGRESSIVE
+            internal_path.targetSignalInfo.u.videoStandard = 0;
+            internal_path.outputTechnology = 5; // HDMI
+            internal_path.virtualModeAvailable = 1;
+            internal_path.sourceWidth = 1920;
+            internal_path.sourceHeight = 1080;
+
+            const UINT32 returned_paths = 1;
+            const UINT32 topology = 0x1; // DISPLAYCONFIG_TOPOLOGY_INTERNAL
+            if (!c.win_emu.memory.try_write_memory(path_array, &internal_path, sizeof(internal_path)) ||
+                !c.win_emu.memory.try_write_memory(num_path_array_elements.value(), &returned_paths, sizeof(returned_paths)) ||
+                (current_topology_id && !c.win_emu.memory.try_write_memory(current_topology_id.value(), &topology, sizeof(topology))))
             {
-                struct EMU_CCD_PATH_INFO
-                {
-                    UINT64 flags;
-                    UINT64 padding1;
-                    LUID adapterId;
-                    UINT32 sourceId;
-                    UINT32 targetId;
-                    EMU_DISPLAYCONFIG_VIDEO_SIGNAL_INFO targetSignalInfo;
-                    UINT32 outputTechnology;
-                    UINT8 padding2[40]; // NOLINT
-                    UINT32 sourceWidth;
-                    UINT32 sourceHeight;
-                    UINT8 padding3[84]; // NOLINT
-                } internal_path{};
-
-                internal_path.flags = 0x2000000000020003ULL;
-                internal_path.adapterId = {.LowPart = 0x1000, .HighPart = 0};
-                internal_path.sourceId = 0;
-                internal_path.targetId = 0;
-                internal_path.targetSignalInfo.pixelRate = 148500000;
-                internal_path.targetSignalInfo.hSyncFreq = {.Numerator = 67500, .Denominator = 1};
-                internal_path.targetSignalInfo.vSyncFreq = {.Numerator = 60, .Denominator = 1};
-                internal_path.targetSignalInfo.activeSize = {.cx = 1920, .cy = 1080};
-                internal_path.targetSignalInfo.totalSize = {.cx = 2200, .cy = 1125};
-                internal_path.targetSignalInfo.scanLineOrdering = 1; // PROGRESSIVE
-                internal_path.targetSignalInfo.u.videoStandard = 0;
-                internal_path.outputTechnology = 5; // HDMI
-                internal_path.padding2[17] = 1;
-                internal_path.sourceWidth = 1920;
-                internal_path.sourceHeight = 1080;
-
-                c.emu.write_memory(path_array, &internal_path, sizeof(internal_path));
+                return STATUS_INVALID_PARAMETER;
             }
 
             return STATUS_SUCCESS;
