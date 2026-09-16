@@ -66,10 +66,18 @@ They do not acquire new renderer defaults. File mappings are not serialized,
 so replay must preserve the matching external configuration. The launcher
 rejects changing a checkpoint's renderer.
 
-Live host Vulkan objects are not serialized by the GPU bridge. DXVK checkpoint
-replay is currently refused by the launcher. A saved file alone does not
-establish valid graphics restoration.
+The GPU bridge now rejects saving or restoring any retained SogenGpu device:
+host Vulkan objects cannot be reconstructed from guest handles. Checkpoints
+taken before the bridge opens remain usable. The launcher requires the
+verified guard build and the same DLL/PDB hashes and guest mappings on replay.
+A restore refusal discards the partially restored emulator. Final close removes
+a device from the handle store; this guard does not prove that previously used
+and closed GPU state is safe to restore.
 
 Local build and identity evidence is retained in PatchScanner's
 `artifacts/source-crosschecks/dxvk-build.log`, `dxvk-runtime-identity.json`,
 and `dxvk-runtime-validation.json`.
+
+The guard passed 31 focused tests and both RelWithDebInfo and tidy builds.
+Tests cover both guest architectures, legacy empty GPU state rejection, and
+preserving an existing destination without leaving temporary files.

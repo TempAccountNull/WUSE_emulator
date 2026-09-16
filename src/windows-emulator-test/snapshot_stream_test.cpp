@@ -216,6 +216,32 @@ namespace sogen::test
         EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory), std::filesystem::directory_iterator{}), 1);
     }
 
+    TEST_F(SnapshotFile, OpenGpuDeviceRejectsSaveBeforeReplacingDestination)
+    {
+        auto emu = sample();
+        emu.setup_process_if_necessary();
+        emu.process.devices.store(io_device_container{u"SogenGpu", emu, {}});
+        const auto file = directory / "existing.snap";
+        const std::array<std::byte, 1> sentinel{std::byte{0xa5}};
+        ASSERT_TRUE(utils::io::write_file(file, sentinel));
+        EXPECT_THROW(snapshot::write_emulator_snapshot(emu, file, false), std::runtime_error);
+        EXPECT_EQ(utils::io::read_file(file), std::vector<std::byte>(sentinel.begin(), sentinel.end()));
+        EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory), std::filesystem::directory_iterator{}), 1);
+    }
+
+    TEST(SnapshotStream, OpenGpuDeviceRejectsLegacyEmptyStateInBothGuestArchitectures)
+    {
+        for (const bool is_32_bit : {false, true})
+        {
+            SCOPED_TRACE(is_32_bit);
+            auto device = create_device(u"SogenGpu", {.is_32_bit = is_32_bit});
+            utils::buffer_deserializer old_state{std::span<const std::byte>{}};
+            EXPECT_THROW(device->deserialize_object(old_state), std::runtime_error);
+            auto count = utils::buffer_serializer::counting();
+            EXPECT_THROW(device->serialize_object(count), std::runtime_error);
+        }
+    }
+
     TEST(SnapshotStream, FailureStopsAreNotSuccessfulCheckpointPauses)
     {
         for (const auto reason : {stop_reason::unknown_syscall, stop_reason::unimplemented_syscall, stop_reason::syscall_exception,

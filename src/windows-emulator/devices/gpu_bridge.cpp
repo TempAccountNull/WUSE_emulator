@@ -14,8 +14,7 @@ namespace sogen
         // payload carried in the input/output buffers. Real Vulkan objects live on the host (behind
         // vulkan_host) and the guest only ever sees opaque object ids.
         //
-        // Live Vulkan state cannot be serialized, so this device intentionally does not participate
-        // in snapshots yet; restoring with an open GPU handle is an experimental limitation.
+        // Host Vulkan objects cannot be reconstructed from the serialized guest handles.
         struct gpu_bridge_device : io_device
         {
             void work(windows_emulator& win_emu) override
@@ -257,10 +256,12 @@ namespace sogen
 
             void serialize_object(utils::buffer_serializer&) const override
             {
+                throw std::runtime_error("Cannot save a snapshot with an open SogenGpu device: host Vulkan state is not serialized");
             }
 
             void deserialize_object(utils::buffer_deserializer&) override
             {
+                throw std::runtime_error("Cannot restore a snapshot with an open SogenGpu device: host Vulkan state was not serialized");
             }
 
           private:
