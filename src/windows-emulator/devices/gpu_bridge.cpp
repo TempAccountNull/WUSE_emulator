@@ -4,6 +4,7 @@
 #include "../windows_emulator.hpp"
 
 #include <gpu_bridge_protocol.hpp>
+#include <bit>
 #include <cstdio>
 
 namespace sogen
@@ -160,6 +161,8 @@ namespace sogen
                     return handle_get_physical_device_memory_budget(win_emu, context);
                 case gpu_bridge::ioctl_get_device_memory_commitment:
                     return handle_get_device_memory_commitment(win_emu, context);
+                case gpu_bridge::ioctl_set_device_memory_priority:
+                    return handle_set_device_memory_priority(win_emu, context);
                 case gpu_bridge::ioctl_allocate_memory:
                     return handle_allocate_memory(win_emu, context);
                 case gpu_bridge::ioctl_free_memory:
@@ -234,6 +237,7 @@ namespace sogen
                     return handle_get_query_pool_results(win_emu, context);
                 case gpu_bridge::ioctl_reset_query_pool:
                     return handle_reset_query_pool(win_emu, context);
+                case gpu_bridge::ioctl_allocate_memory_full:
                 case gpu_bridge::ioctl_get_rendering_area_granularity:
                 case gpu_bridge::ioctl_create_render_pass_full:
                 case gpu_bridge::ioctl_create_render_pass2:
@@ -1589,6 +1593,18 @@ namespace sogen
                     gpu_bridge::get_device_memory_commitment_response{.vk_result = result, .reserved = 0, .committed_bytes = committed});
             }
 
+            NTSTATUS handle_set_device_memory_priority(windows_emulator& win_emu, const io_device_context& context)
+            {
+                gpu_bridge::set_device_memory_priority_request request{};
+                if (!read_input(win_emu, context, request) || request.reserved != 0)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                const int32_t result =
+                    this->vulkan_.set_device_memory_priority(request.device, request.memory, std::bit_cast<float>(request.priority_bits));
+                return write_output(win_emu, context, gpu_bridge::result_response{.vk_result = result, .reserved = 0});
+            }
+
             NTSTATUS handle_allocate_memory(windows_emulator& win_emu, const io_device_context& context)
             {
                 gpu_bridge::allocate_memory_request request{};
@@ -2341,6 +2357,12 @@ namespace sogen
                 if (!packet.empty())
                 {
                     win_emu.emu().read_memory(context.input_buffer + sizeof(request), packet.data(), packet.size());
+                }
+                if (code == gpu_bridge::ioctl_allocate_memory_full)
+                {
+                    gpu_bridge::allocate_memory_response response{};
+                    response.vk_result = this->vulkan_.allocate_memory_full(request.object, packet, response.memory);
+                    return write_output(win_emu, context, response);
                 }
                 if (code == gpu_bridge::ioctl_get_rendering_area_granularity)
                 {

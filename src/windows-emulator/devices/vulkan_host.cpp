@@ -268,6 +268,10 @@ namespace sogen
             PFN_vkQueueSubmit queue_submit{};
             PFN_vkQueueSubmit2 queue_submit2{};
             PFN_vkAllocateMemory allocate_memory{};
+            PFN_vkSetDeviceMemoryPriorityEXT set_device_memory_priority{};
+            bool memory_priority_extension{};
+            bool memory_priority_feature{};
+            bool pageable_memory_extension{};
             PFN_vkFreeMemory free_memory{};
             PFN_vkGetDeviceMemoryCommitment get_device_memory_commitment{};
             PFN_vkGetCalibratedTimestampsKHR get_calibrated_timestamps{};
@@ -2041,6 +2045,19 @@ namespace sogen
         data.instance_id = pd->second.instance_id;
         data.physical_device = pd->second.handle;
         data.queue_family_index = primary_family;
+        const auto enabled_extension = [&](const char* name) {
+            return std::ranges::any_of(extensions, [&](const char* enabled) { return std::strcmp(enabled, name) == 0; });
+        };
+        data.memory_priority_extension = enabled_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+        data.pageable_memory_extension = enabled_extension(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+        for (const auto* feature = static_cast<const VkBaseInStructure*>(features2.pNext); feature; feature = feature->pNext)
+        {
+            if (feature->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT)
+            {
+                data.memory_priority_feature =
+                    reinterpret_cast<const VkPhysicalDeviceMemoryPriorityFeaturesEXT*>(feature)->memoryPriority == VK_TRUE;
+            }
+        }
 
         if (const auto gdpa = instance->second.get_device_proc_addr)
         {
@@ -2076,6 +2093,11 @@ namespace sogen
             data.queue_submit = reinterpret_cast<PFN_vkQueueSubmit>(resolve("vkQueueSubmit"));
             data.queue_submit2 = reinterpret_cast<PFN_vkQueueSubmit2>(resolve("vkQueueSubmit2"));
             data.allocate_memory = reinterpret_cast<PFN_vkAllocateMemory>(resolve("vkAllocateMemory"));
+            if (data.pageable_memory_extension)
+            {
+                data.set_device_memory_priority =
+                    reinterpret_cast<PFN_vkSetDeviceMemoryPriorityEXT>(resolve("vkSetDeviceMemoryPriorityEXT"));
+            }
             data.free_memory = reinterpret_cast<PFN_vkFreeMemory>(resolve("vkFreeMemory"));
             data.get_device_memory_commitment = reinterpret_cast<PFN_vkGetDeviceMemoryCommitment>(resolve("vkGetDeviceMemoryCommitment"));
             data.get_calibrated_timestamps = reinterpret_cast<PFN_vkGetCalibratedTimestampsKHR>(resolve("vkGetCalibratedTimestampsKHR"));
@@ -3075,6 +3097,13 @@ namespace sogen
     int32_t vulkan_host::allocate_memory(uint64_t device, uint64_t size, uint32_t memory_type_index, uint32_t flags, uint32_t device_mask,
                                          uint64_t& out_memory)
     {
+        const VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, flags, device_mask};
+        return this->allocate_memory_impl(device, size, memory_type_index, flags || device_mask ? &flags_info : nullptr, false, out_memory);
+    }
+
+    int32_t vulkan_host::allocate_memory_impl(uint64_t device, uint64_t size, uint32_t memory_type_index, const void* allocation_next,
+                                              bool preserve_requested_type, uint64_t& out_memory)
+    {
         out_memory = 0;
 
         const auto dev = this->impl_->devices.find(device);
@@ -3087,7 +3116,7 @@ namespace sogen
         const bool have_props = this->impl_->query_memory_properties(dev->second, mem_props);
         // The spec requires memoryTypeIndex < memoryTypeCount; drivers index their internal type/heap arrays
         // with it unchecked, so an out-of-range guest value is an OOB read inside the host driver.
-        if (have_props && memory_type_index >= mem_props.memoryTypeCount)
+        if (!have_props || memory_type_index >= mem_props.memoryTypeCount)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
@@ -3102,16 +3131,10 @@ namespace sogen
         VkMemoryAllocateInfo info{};
         info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         info.allocationSize = aligned_size;
-        info.memoryTypeIndex = this->impl_->substitute_cached_memory_type(dev->second, memory_type_index);
+        info.memoryTypeIndex =
+            preserve_requested_type ? memory_type_index : this->impl_->substitute_cached_memory_type(dev->second, memory_type_index);
 
-        VkMemoryAllocateFlagsInfo flags_info{};
-        if (flags != 0 || device_mask != 0)
-        {
-            flags_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
-            flags_info.flags = flags;
-            flags_info.deviceMask = device_mask;
-            info.pNext = &flags_info;
-        }
+        info.pNext = allocation_next;
 
         VkDeviceMemory memory{};
         const VkResult result = dev->second.allocate_memory(dev->second.handle, &info, nullptr, &memory);
@@ -3148,8 +3171,107 @@ namespace sogen
         }
 
         const uint64_t id = this->impl_->next_id++;
-        this->impl_->memories.emplace(id, impl::memory_data{.handle = memory, .device_id = device, .allocation_size = aligned_size});
+        try
+        {
+            this->impl_->memories.emplace(id, impl::memory_data{.handle = memory, .device_id = device, .allocation_size = aligned_size});
+        }
+        catch (const std::bad_alloc&)
+        {
+            dev->second.free_memory(dev->second.handle, memory, nullptr);
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
         out_memory = id;
+        return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::allocate_memory_full(uint64_t device, std::span<const std::byte> packet, uint64_t& out_memory)
+    {
+        namespace wire = gpu_bridge::render_pass_wire;
+        out_memory = 0;
+        const auto dev = this->impl_->devices.find(device);
+        if (dev == this->impl_->devices.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        try
+        {
+            wire::reader reader(packet);
+            VkMemoryAllocateInfo info{};
+            wire::decode(reader, info);
+            for (const auto* next = static_cast<const VkBaseInStructure*>(info.pNext); next; next = next->pNext)
+            {
+                if (next->sType == VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT)
+                {
+                    // The Features chapter requires enabling allocation-time priority functionality.
+                    // FEATURE_NOT_PRESENT is bridge validation here, not a mandated native VkResult.
+                    if (!dev->second.memory_priority_extension || !dev->second.memory_priority_feature)
+                    {
+                        return VK_ERROR_FEATURE_NOT_PRESENT;
+                    }
+                }
+                else if (next->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO)
+                {
+                    // The decoded nodes are owned mutable storage; only native resource handles reach the driver.
+                    auto* dedicated =
+                        const_cast<VkMemoryDedicatedAllocateInfo*>(reinterpret_cast<const VkMemoryDedicatedAllocateInfo*>(next));
+                    if (dedicated->image && dedicated->buffer)
+                    {
+                        return VK_ERROR_VALIDATION_FAILED_EXT;
+                    }
+                    if (dedicated->image)
+                    {
+                        const auto image = this->impl_->images.find(wire::handle_id(dedicated->image));
+                        if (image == this->impl_->images.end() || image->second.device_id != device)
+                        {
+                            return VK_ERROR_INITIALIZATION_FAILED;
+                        }
+                        dedicated->image = image->second.handle;
+                    }
+                    if (dedicated->buffer)
+                    {
+                        const auto buffer = this->impl_->buffers.find(wire::handle_id(dedicated->buffer));
+                        if (buffer == this->impl_->buffers.end() || buffer->second.device_id != device)
+                        {
+                            return VK_ERROR_INITIALIZATION_FAILED;
+                        }
+                        dedicated->buffer = buffer->second.handle;
+                    }
+                }
+            }
+            // Priority describes the requested heap, and a dedicated resource constrains compatible types.
+            // Do not apply the legacy cached-memory heuristic to this complete allocation description.
+            return this->allocate_memory_impl(device, info.allocationSize, info.memoryTypeIndex, info.pNext, true, out_memory);
+        }
+        catch (const wire::error& error)
+        {
+            return error.result;
+        }
+        catch (const std::bad_alloc&)
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+
+    int32_t vulkan_host::set_device_memory_priority(uint64_t device, uint64_t memory, float priority)
+    {
+        const auto dev = this->impl_->devices.find(device);
+        const auto mem = this->impl_->memories.find(memory);
+        if (dev == this->impl_->devices.end() || mem == this->impl_->memories.end() || mem->second.device_id != device)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        // This form also rejects NaN and infinities without altering the caller's finite priority.
+        if (!(priority >= 0.0f && priority <= 1.0f))
+        {
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
+        if (!dev->second.pageable_memory_extension || !dev->second.set_device_memory_priority)
+        {
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        // The extension exposes this command even when its pageable feature is disabled. That feature
+        // controls automatic migration; it is not a prerequisite for setting an allocation's priority.
+        dev->second.set_device_memory_priority(dev->second.handle, mem->second.handle, priority);
         return VK_SUCCESS;
     }
 

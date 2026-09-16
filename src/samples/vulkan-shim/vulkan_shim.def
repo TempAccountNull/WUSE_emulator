@@ -10,6 +10,7 @@ EXPORTS
     vkAllocateCommandBuffers
     vkAllocateDescriptorSets
     vkAllocateMemory
+    vkSetDeviceMemoryPriorityEXT
     vkBeginCommandBuffer
     vkBindBufferMemory
     vkBindImageMemory

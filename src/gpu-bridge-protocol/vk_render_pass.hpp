@@ -464,6 +464,65 @@ namespace sogen::gpu_bridge::render_pass_wire
     }
 
     template <>
+    struct structure_type<VkMemoryAllocateInfo>
+    {
+        static constexpr auto type = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    };
+
+    template <typename A>
+    void fields(A& a, VkMemoryAllocateInfo& v)
+    {
+        value(a, v.allocationSize);
+        value(a, v.memoryTypeIndex);
+        if (!v.allocationSize)
+        {
+            throw error("zero allocation size without a supported import chain", VK_ERROR_VALIDATION_FAILED_EXT);
+        }
+    }
+
+    template <>
+    struct structure_type<VkMemoryAllocateFlagsInfo>
+    {
+        static constexpr auto type = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    };
+
+    template <typename A>
+    void fields(A& a, VkMemoryAllocateFlagsInfo& v)
+    {
+        value(a, v.flags);
+        value(a, v.deviceMask);
+    }
+
+    template <>
+    struct structure_type<VkMemoryDedicatedAllocateInfo>
+    {
+        static constexpr auto type = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+    };
+
+    template <typename A>
+    void fields(A& a, VkMemoryDedicatedAllocateInfo& v)
+    {
+        handle(a, v.image);
+        handle(a, v.buffer);
+    }
+
+    template <>
+    struct structure_type<VkMemoryPriorityAllocateInfoEXT>
+    {
+        static constexpr auto type = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT;
+    };
+
+    template <typename A>
+    void fields(A& a, VkMemoryPriorityAllocateInfoEXT& v)
+    {
+        value(a, v.priority);
+        if (!(v.priority >= 0.0f && v.priority <= 1.0f))
+        {
+            throw error("memory allocation priority is outside [0, 1]", VK_ERROR_VALIDATION_FAILED_EXT);
+        }
+    }
+
+    template <>
     struct structure_type<VkRenderingAreaInfo>
     {
         static constexpr auto type = VK_STRUCTURE_TYPE_RENDERING_AREA_INFO;
@@ -998,6 +1057,10 @@ namespace sogen::gpu_bridge::render_pass_wire
     {
         switch (type)
         {
+        case VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO:
+        case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO:
+        case VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT:
+            return parent == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         case VK_STRUCTURE_TYPE_COPY_COMMAND_TRANSFORM_INFO_QCOM:
             return parent == VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
         case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_ACQUIRE_UNMODIFIED_EXT:
@@ -1086,6 +1149,75 @@ namespace sogen::gpu_bridge::render_pass_wire
             seen[i] = type;
             switch (type)
             {
+            case VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO:
+                if constexpr (A::reading)
+                {
+                    auto* node = archive.template allocate<VkMemoryAllocateFlagsInfo>(1);
+                    node->sType = type;
+                    fields(archive, *node);
+                    auto* base = reinterpret_cast<VkBaseOutStructure*>(node);
+                    if (previous)
+                    {
+                        previous->pNext = base;
+                    }
+                    else
+                    {
+                        next = node;
+                    }
+                    previous = base;
+                }
+                else
+                {
+                    auto node = *reinterpret_cast<const VkMemoryAllocateFlagsInfo*>(nodes[i]);
+                    fields(archive, node);
+                }
+                break;
+            case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO:
+                if constexpr (A::reading)
+                {
+                    auto* node = archive.template allocate<VkMemoryDedicatedAllocateInfo>(1);
+                    node->sType = type;
+                    fields(archive, *node);
+                    auto* base = reinterpret_cast<VkBaseOutStructure*>(node);
+                    if (previous)
+                    {
+                        previous->pNext = base;
+                    }
+                    else
+                    {
+                        next = node;
+                    }
+                    previous = base;
+                }
+                else
+                {
+                    auto node = *reinterpret_cast<const VkMemoryDedicatedAllocateInfo*>(nodes[i]);
+                    fields(archive, node);
+                }
+                break;
+            case VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT:
+                if constexpr (A::reading)
+                {
+                    auto* node = archive.template allocate<VkMemoryPriorityAllocateInfoEXT>(1);
+                    node->sType = type;
+                    fields(archive, *node);
+                    auto* base = reinterpret_cast<VkBaseOutStructure*>(node);
+                    if (previous)
+                    {
+                        previous->pNext = base;
+                    }
+                    else
+                    {
+                        next = node;
+                    }
+                    previous = base;
+                }
+                else
+                {
+                    auto node = *reinterpret_cast<const VkMemoryPriorityAllocateInfoEXT*>(nodes[i]);
+                    fields(archive, node);
+                }
+                break;
             case VK_STRUCTURE_TYPE_COPY_COMMAND_TRANSFORM_INFO_QCOM:
                 if constexpr (A::reading)
                 {

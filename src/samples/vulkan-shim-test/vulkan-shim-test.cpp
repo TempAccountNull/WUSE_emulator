@@ -17,6 +17,7 @@ bool test_synchronization(PFN_vkGetInstanceProcAddr, VkInstance, VkDevice, VkQue
 
 bool test_render_pass2(PFN_vkGetInstanceProcAddr, VkInstance, VkPhysicalDevice, VkDevice, VkQueue, uint32_t);
 bool test_layered_resolve_readback(PFN_vkGetInstanceProcAddr);
+bool test_memory_priority(PFN_vkGetInstanceProcAddr, VkInstance, VkPhysicalDevice, uint32_t, uint32_t);
 
 namespace
 {
@@ -1166,6 +1167,7 @@ int main(int argc, char** argv)
     bool synchronization_test_ok = false;
     bool render_pass_test_ok = false;
     bool layered_resolve_test_ok = false;
+    bool memory_priority_test_ok = false;
     bool image_readback_ok = false;
     bool dynamic_commands_ok = false;
     uint32_t count = 0;
@@ -1468,6 +1470,8 @@ int main(int argc, char** argv)
                     render_pass_test_ok = true;
                 }
                 layered_resolve_test_ok = test_layered_resolve_readback(get_instance_proc);
+                memory_priority_test_ok =
+                    test_memory_priority(get_instance_proc, instance, devices[0], graphics_family, app_info.apiVersion);
                 pipeline_cache_test_ok = test_pipeline_cache(get_instance_proc, instance, device);
                 dynamic_commands_ok = test_dynamic_commands(get_instance_proc, instance, devices[0], graphics_family);
 
@@ -1481,8 +1485,8 @@ int main(int argc, char** argv)
         destroy_instance(instance, nullptr);
     }
 
-    const bool all_ok = synchronization_test_ok && render_pass_test_ok && layered_resolve_test_ok && dynamic_commands_ok &&
-                        timestamp2_test_ok && calibrated_timestamps_test_ok && transform_feedback_test_ok &&
+    const bool all_ok = memory_priority_test_ok && synchronization_test_ok && render_pass_test_ok && layered_resolve_test_ok &&
+                        dynamic_commands_ok && timestamp2_test_ok && calibrated_timestamps_test_ok && transform_feedback_test_ok &&
                         transform_feedback_capabilities_ok && shader_identifier_test_ok && pipeline_cache_test_ok && fill_readback_ok &&
                         persistent_coherent_ok && image_readback_ok;
     std::printf("[shim-test] %s\n", all_ok ? "ok" : "FAILED");

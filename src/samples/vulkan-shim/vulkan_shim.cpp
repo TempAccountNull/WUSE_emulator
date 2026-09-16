@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -224,6 +225,7 @@ namespace
     // staging a guest-side copy: download the host range on map, hand the app that buffer, and upload
     // it back on unmap so writes persist. allocationSize is tracked here to resolve VK_WHOLE_SIZE.
     std::unordered_map<gb::object_id, uint64_t> g_memory_sizes;
+    std::mutex g_memory_sizes_mutex;
 
     struct mapped_range
     {
@@ -1641,36 +1643,81 @@ extern "C"
     }
 
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* pAllocateInfo,
-                                                                          const VkAllocationCallbacks*, VkDeviceMemory* pMemory)
+                                                                          const VkAllocationCallbacks* pAllocator, VkDeviceMemory* pMemory)
     {
-        gb::allocate_memory_request request{};
-        request.device = to_object_id(device);
-        request.size = pAllocateInfo->allocationSize;
-        request.memory_type_index = pAllocateInfo->memoryTypeIndex;
-        for (const auto* next = static_cast<const VkBaseInStructure*>(pAllocateInfo->pNext); next; next = next->pNext)
-        {
-            if (next->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO)
-            {
-                const auto* flags = reinterpret_cast<const VkMemoryAllocateFlagsInfo*>(next);
-                request.flags = flags->flags;
-                request.device_mask = flags->deviceMask;
-                break;
-            }
-        }
-
-        gb::allocate_memory_response response{};
-        if (!bridge_call(gb::ioctl_allocate_memory, &request, sizeof(request), &response, sizeof(response)))
+        if (!pMemory)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
-        if (response.vk_result != VK_SUCCESS)
+        *pMemory = VK_NULL_HANDLE;
+        if (!pAllocateInfo)
         {
-            return static_cast<VkResult>(response.vk_result);
+            return VK_ERROR_INITIALIZATION_FAILED;
         }
+        if (pAllocator)
+        {
+            OutputDebugStringA("[vulkan-shim] vkAllocateMemory: guest allocation callbacks are unsupported\n");
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        gb::allocate_memory_response response{};
+        try
+        {
+            const auto packet = render_pass_packet(to_object_id(device), *pAllocateInfo);
+            if (!bridge_call(gb::ioctl_allocate_memory_full, packet.data(), static_cast<DWORD>(packet.size()), &response, sizeof(response)))
+            {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            if (response.vk_result != VK_SUCCESS)
+            {
+                return static_cast<VkResult>(response.vk_result);
+            }
+            try
+            {
+                const std::lock_guard lock(g_memory_sizes_mutex);
+                g_memory_sizes.emplace(response.memory, pAllocateInfo->allocationSize);
+            }
+            catch (const std::bad_alloc&)
+            {
+                // The host allocation succeeded, but the guest cannot track whole-size mappings without this entry.
+                const gb::free_memory_request release{.device = to_object_id(device), .memory = response.memory};
+                if (!bridge_call(gb::ioctl_free_memory, &release, sizeof(release), nullptr, 0))
+                {
+                    OutputDebugStringA("[vulkan-shim] vkAllocateMemory: host cleanup failed after tracking allocation failure\n");
+                }
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+            *pMemory = to_handle<VkDeviceMemory>(response.memory);
+            return VK_SUCCESS;
+        }
+        catch (const gb::render_pass_wire::error& error)
+        {
+            OutputDebugStringA(error.what());
+            return error.result;
+        }
+        catch (const std::bad_alloc&)
+        {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
 
-        g_memory_sizes[response.memory] = pAllocateInfo->allocationSize;
-        *pMemory = to_handle<VkDeviceMemory>(response.memory);
-        return VK_SUCCESS;
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkSetDeviceMemoryPriorityEXT(VkDevice device, VkDeviceMemory memory, float priority)
+    {
+        const gb::set_device_memory_priority_request request{.device = to_object_id(device),
+                                                             .memory = to_object_id(memory),
+                                                             .priority_bits = std::bit_cast<uint32_t>(priority),
+                                                             .reserved = 0};
+        gb::result_response response{.vk_result = VK_ERROR_INITIALIZATION_FAILED, .reserved = 0};
+        const bool transported = bridge_call(gb::ioctl_set_device_memory_priority, &request, sizeof(request), &response, sizeof(response));
+        if (!transported || response.vk_result != VK_SUCCESS)
+        {
+            std::array<char, 256> message{};
+            std::snprintf(
+                message.data(), message.size(),
+                "[vulkan-shim] vkSetDeviceMemoryPriorityEXT failed: device=%llu memory=%llu priority=%.9g transported=%u result=%d\n",
+                static_cast<unsigned long long>(request.device), static_cast<unsigned long long>(request.memory),
+                static_cast<double>(priority), transported ? 1u : 0u, response.vk_result);
+            OutputDebugStringA(message.data());
+        }
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks*)
@@ -1686,7 +1733,10 @@ extern "C"
         request.memory = mem_id;
         bridge_call(gb::ioctl_free_memory, &request, sizeof(request), nullptr, 0);
 
-        g_memory_sizes.erase(mem_id);
+        {
+            const std::lock_guard lock(g_memory_sizes_mutex);
+            g_memory_sizes.erase(mem_id);
+        }
         g_mapped_ranges.erase(mem_id);
     }
 
@@ -1698,6 +1748,7 @@ extern "C"
         uint64_t actual = size;
         if (size == VK_WHOLE_SIZE)
         {
+            const std::lock_guard lock(g_memory_sizes_mutex);
             const auto it = g_memory_sizes.find(mem_id);
             const uint64_t total = (it != g_memory_sizes.end()) ? it->second : 0;
             actual = (total > offset) ? (total - offset) : 0;
@@ -6751,6 +6802,7 @@ extern "C"
             {.name = "vkWaitForFences", .func = reinterpret_cast<PFN_vkVoidFunction>(vkWaitForFences)},
             {.name = "vkGetPhysicalDeviceMemoryProperties",
              .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetPhysicalDeviceMemoryProperties)},
+            {.name = "vkSetDeviceMemoryPriorityEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkSetDeviceMemoryPriorityEXT)},
             {.name = "vkAllocateMemory", .func = reinterpret_cast<PFN_vkVoidFunction>(vkAllocateMemory)},
             {.name = "vkFreeMemory", .func = reinterpret_cast<PFN_vkVoidFunction>(vkFreeMemory)},
             {.name = "vkMapMemory", .func = reinterpret_cast<PFN_vkVoidFunction>(vkMapMemory)},

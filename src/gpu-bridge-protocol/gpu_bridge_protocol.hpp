@@ -215,6 +215,8 @@ namespace sogen::gpu_bridge
         get_event_status_owned = 0x8C1,
         cmd_copy_image_to_buffer_full = 0x8D0,
         cmd_copy_image_to_buffer2_full = 0x8D1,
+        set_device_memory_priority = 0x8D2,
+        allocate_memory_full = 0x8D3,
     };
 
     inline constexpr uint32_t ioctl_get_event_status_owned = make_ioctl(static_cast<uint32_t>(command::get_event_status_owned));
@@ -286,6 +288,8 @@ namespace sogen::gpu_bridge
     inline constexpr uint32_t ioctl_queue_submit = make_ioctl(static_cast<uint32_t>(command::queue_submit));
     inline constexpr uint32_t ioctl_get_physical_device_memory_properties =
         make_ioctl(static_cast<uint32_t>(command::get_physical_device_memory_properties));
+    inline constexpr uint32_t ioctl_set_device_memory_priority = make_ioctl(static_cast<uint32_t>(command::set_device_memory_priority));
+    inline constexpr uint32_t ioctl_allocate_memory_full = make_ioctl(static_cast<uint32_t>(command::allocate_memory_full));
     inline constexpr uint32_t ioctl_allocate_memory = make_ioctl(static_cast<uint32_t>(command::allocate_memory));
     inline constexpr uint32_t ioctl_free_memory = make_ioctl(static_cast<uint32_t>(command::free_memory));
     inline constexpr uint32_t ioctl_create_buffer = make_ioctl(static_cast<uint32_t>(command::create_buffer));
@@ -928,6 +932,17 @@ namespace sogen::gpu_bridge
         std::array<uint64_t, max_memory_heaps> heap_budget;
         std::array<uint64_t, max_memory_heaps> heap_usage;
     };
+
+    struct set_device_memory_priority_request
+    {
+        object_id device;
+        object_id memory;
+        uint32_t priority_bits;
+        uint32_t reserved;
+    };
+
+    static_assert(sizeof(set_device_memory_priority_request) == 24, "wire layout drift");
+    static_assert(offsetof(set_device_memory_priority_request, priority_bits) == 16, "wire layout drift");
 
     struct allocate_memory_request
     {

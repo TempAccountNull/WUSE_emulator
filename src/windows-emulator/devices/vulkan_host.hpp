@@ -169,6 +169,8 @@ namespace sogen
         // fresh object id, or 0 on failure.
         int32_t allocate_memory(uint64_t device, uint64_t size, uint32_t memory_type_index, uint32_t flags, uint32_t device_mask,
                                 uint64_t& out_memory);
+        int32_t allocate_memory_full(uint64_t device, std::span<const std::byte> packet, uint64_t& out_memory);
+        int32_t set_device_memory_priority(uint64_t device, uint64_t memory, float priority);
         void free_memory(uint64_t device, uint64_t memory);
         int32_t get_device_memory_commitment(uint64_t device, uint64_t memory, uint64_t& out_committed_bytes);
 
@@ -670,6 +672,9 @@ namespace sogen
         int32_t cmd_extended_dynamic(std::span<const uint8_t> payload);
 
       private:
+        int32_t allocate_memory_impl(uint64_t device, uint64_t size, uint32_t memory_type_index, const void* allocation_next,
+                                     bool preserve_requested_type, uint64_t& out_memory);
+
         int32_t cmd_transform_feedback(uint64_t command_buffer, uint32_t first_counter_buffer, std::span<const uint64_t> counter_buffer_ids,
                                        std::span<const uint64_t> counter_buffer_offsets, bool has_counter_buffers,
                                        bool has_counter_buffer_offsets, bool begin);
