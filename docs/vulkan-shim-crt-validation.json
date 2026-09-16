@@ -1,0 +1,416 @@
+{
+  "passed": true,
+  "architectures": [
+    {
+      "arch": "x64",
+      "identity": {
+        "path": "D:\\Sunrise\\D2\\sogen\\graphics\\dxvk-7df3596e-static-crt-20260915\\x64\\vulkan-1.dll",
+        "sha256": "65c4e20a71782471edfa2fa8a2883e4f41fb67072e3f87b259b5fecf9a16e4d2",
+        "bytes": 285696,
+        "machine": 34404,
+        "timestamp": 1789531589,
+        "image_size": 307200,
+        "codeview": [
+          {
+            "guid": "5e6dd37d-9d79-4240-9c7d-023952f08ee6",
+            "age": 2,
+            "embedded_path": "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo\\vulkan-shim.pdb"
+          }
+        ],
+        "pdb": {
+          "path": "D:\\Sunrise\\D2\\sogen\\graphics\\dxvk-7df3596e-static-crt-20260915\\x64\\vulkan-1.pdb",
+          "sha256": "a01e785cc7edadfe35f7b1aa0dab63ddc69a303e1d6098435390cb4f68c9e179",
+          "guid": "5e6dd37d-9d79-4240-9c7d-023952f08ee6",
+          "age": 2
+        }
+      },
+      "imports": [
+        "KERNEL32.dll"
+      ],
+      "export_count": 243,
+      "exports_unchanged": true,
+      "configurations": [
+        {
+          "target": "vulkan-shim",
+          "condition": "'$(Configuration)|$(Platform)'=='Debug|x64'",
+          "runtime": "MultiThreadedDebug",
+          "suppressed": [
+            "libcmt.lib",
+            "msvcrt.lib",
+            "msvcrtd.lib"
+          ]
+        },
+        {
+          "target": "vulkan-shim",
+          "condition": "'$(Configuration)|$(Platform)'=='Release|x64'",
+          "runtime": "MultiThreaded",
+          "suppressed": [
+            "msvcrt.lib",
+            "libcmtd.lib",
+            "msvcrtd.lib"
+          ]
+        },
+        {
+          "target": "vulkan-shim",
+          "condition": "'$(Configuration)|$(Platform)'=='MinSizeRel|x64'",
+          "runtime": "MultiThreaded",
+          "suppressed": [
+            "msvcrt.lib",
+            "libcmtd.lib",
+            "msvcrtd.lib"
+          ]
+        },
+        {
+          "target": "vulkan-shim",
+          "condition": "'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'",
+          "runtime": "MultiThreaded",
+          "suppressed": [
+            "msvcrt.lib",
+            "libcmtd.lib",
+            "msvcrtd.lib"
+          ]
+        },
+        {
+          "target": "analyzer",
+          "condition": "'$(Configuration)|$(Platform)'=='Debug|x64'",
+          "runtime": "MultiThreadedDebugDLL",
+          "suppressed": [
+            "libcmt.lib",
+            "msvcrt.lib",
+            "libcmtd.lib"
+          ]
+        },
+        {
+          "target": "analyzer",
+          "condition": "'$(Configuration)|$(Platform)'=='Release|x64'",
+          "runtime": "MultiThreadedDLL",
+          "suppressed": [
+            "libcmt.lib",
+            "libcmtd.lib",
+            "msvcrtd.lib"
+          ]
+        },
+        {
+          "target": "analyzer",
+          "condition": "'$(Configuration)|$(Platform)'=='MinSizeRel|x64'",
+          "runtime": "MultiThreadedDLL",
+          "suppressed": [
+            "libcmt.lib",
+            "libcmtd.lib",
+            "msvcrtd.lib"
+          ]
+        },
+        {
+          "target": "analyzer",
+          "condition": "'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'",
+          "runtime": "MultiThreadedDLL",
+          "suppressed": [
+            "libcmt.lib",
+            "libcmtd.lib",
+            "msvcrtd.lib"
+          ]
+        }
+      ]
+    },
+    {
+      "arch": "x86",
+      "identity": {
+        "path": "D:\\Sunrise\\D2\\sogen\\graphics\\dxvk-7df3596e-static-crt-20260915\\x86\\vulkan-1.dll",
+        "sha256": "982010037b7cab901ee6b34fcc5c13eafca79cf5f443fe80d6b1965164683622",
+        "bytes": 239104,
+        "machine": 332,
+        "timestamp": 1789531596,
+        "image_size": 262144,
+        "codeview": [
+          {
+            "guid": "4a19a627-67dd-4fbc-9372-ce716344882f",
+            "age": 2,
+            "embedded_path": "D:\\Emulation\\sogen\\build\\vs2022-x86-shim\\artifacts-relwithdebinfo\\vulkan-shim.pdb"
+          }
+        ],
+        "pdb": {
+          "path": "D:\\Sunrise\\D2\\sogen\\graphics\\dxvk-7df3596e-static-crt-20260915\\x86\\vulkan-1.pdb",
+          "sha256": "b1482de374b756752985f2d35e1b75b37bc13ef88d9a3d6a7f21e6c1301dd03f",
+          "guid": "4a19a627-67dd-4fbc-9372-ce716344882f",
+          "age": 2
+        }
+      },
+      "imports": [
+        "KERNEL32.dll"
+      ],
+      "export_count": 243,
+      "exports_unchanged": true,
+      "configurations": [
+        {
+          "target": "vulkan-shim",
+          "condition": "'$(Configuration)|$(Platform)'=='Debug|Win32'",
+          "runtime": "MultiThreadedDebug",
+          "suppressed": [
+            "libcmt.lib",
+            "msvcrt.lib",
+            "msvcrtd.lib"
+          ]
+        },
+        {
+          "target": "vulkan-shim",
+          "condition": "'$(Configuration)|$(Platform)'=='Release|Win32'",
+          "runtime": "MultiThreaded",
+          "suppressed": [
+            "msvcrt.lib",
+            "libcmtd.lib",
+            "msvcrtd.lib"
+          ]
+        },
+        {
+          "target": "vulkan-shim",
+          "condition": "'$(Configuration)|$(Platform)'=='MinSizeRel|Win32'",
+          "runtime": "MultiThreaded",
+          "suppressed": [
+            "msvcrt.lib",
+            "libcmtd.lib",
+            "msvcrtd.lib"
+          ]
+        },
+        {
+          "target": "vulkan-shim",
+          "condition": "'$(Configuration)|$(Platform)'=='RelWithDebInfo|Win32'",
+          "runtime": "MultiThreaded",
+          "suppressed": [
+            "msvcrt.lib",
+            "libcmtd.lib",
+            "msvcrtd.lib"
+          ]
+        },
+        {
+          "target": "analyzer",
+          "condition": "'$(Configuration)|$(Platform)'=='Debug|Win32'",
+          "runtime": "MultiThreadedDebugDLL",
+          "suppressed": [
+            "libcmt.lib",
+            "msvcrt.lib",
+            "libcmtd.lib"
+          ]
+        },
+        {
+          "target": "analyzer",
+          "condition": "'$(Configuration)|$(Platform)'=='Release|Win32'",
+          "runtime": "MultiThreadedDLL",
+          "suppressed": [
+            "libcmt.lib",
+            "libcmtd.lib",
+            "msvcrtd.lib"
+          ]
+        },
+        {
+          "target": "analyzer",
+          "condition": "'$(Configuration)|$(Platform)'=='MinSizeRel|Win32'",
+          "runtime": "MultiThreadedDLL",
+          "suppressed": [
+            "libcmt.lib",
+            "libcmtd.lib",
+            "msvcrtd.lib"
+          ]
+        },
+        {
+          "target": "analyzer",
+          "condition": "'$(Configuration)|$(Platform)'=='RelWithDebInfo|Win32'",
+          "runtime": "MultiThreadedDLL",
+          "suppressed": [
+            "libcmt.lib",
+            "libcmtd.lib",
+            "msvcrtd.lib"
+          ]
+        }
+      ]
+    }
+  ],
+  "guest_tests": {
+    "icicle": [
+      {
+        "architecture": "x64",
+        "command": [
+          "D:\\Sunrise\\D2\\sogen\\builds\\20260915-223538-gdb-thread-inspection-final\\analyzer.exe",
+          "--backend",
+          "icicle",
+          "-e",
+          "D:\\Sunrise\\D2\\sogen\\root",
+          "-v",
+          "-p",
+          "c:\\sogen-test",
+          "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo",
+          "-p",
+          "c:\\sogen-test\\vulkan-shim.dll",
+          "D:\\Sunrise\\D2\\sogen\\graphics\\dxvk-7df3596e-static-crt-20260915\\x64\\vulkan-1.dll",
+          "--stdout",
+          "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\shim-static-crt-guest-1789532033084636300\\x64-stdout.log",
+          "--report",
+          "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\shim-static-crt-guest-1789532033084636300\\x64-events.jsonl",
+          "-p",
+          "c:\\sogen-test\\msvcp140.dll",
+          "D:\\Sunrise\\D2\\msvcp140.dll",
+          "c:\\sogen-test\\vulkan-shim-test.exe",
+          "c:\\sogen-test\\vulkan-shim.dll"
+        ],
+        "started": 1789532033.084861,
+        "shim_sha256": "65c4e20a71782471edfa2fa8a2883e4f41fb67072e3f87b259b5fecf9a16e4d2",
+        "scope": "Icicle guest test; x64 maps the exact game MSVCP 14.10 runtime; x86 uses the root x86 runtime",
+        "pid": 54716,
+        "exit_code": 1,
+        "elapsed": 8.15925931930542,
+        "test_output": "[shim-test] loading c:\\sogen-test\\vulkan-shim.dll\n[shim-test] vkCreateInstance -> 0, instance=0000000000000001\n[shim-test] vkEnumeratePhysicalDevices -> 0, count=2\n[shim-test] device[0]: 'AMD Radeon RX 6700' type=2 api=1.4.315\n[shim-test] device[1]: 'Intel(R) UHD Graphics 770' type=1 api=1.4.323\n[shim-test] VK_EXT_transform_feedback advertised=yes feature=1 capability mask=PASS\n[shim-test] VK_EXT_shader_module_identifier advertised=yes feature=1 algorithm UUID=414D444D...\n[shim-test] queue families=5, graphics family=0, timestamp family=0\n[shim-test] vkCreateDevice -> 0, device=0000000000000004\n[shim-test] vkGetDeviceQueue -> queue=0000000000000005\n[shim-test] timestamp2 stage2-only recording -> PASS\n[shim-test] calibrated timestamps KHR=0/33 EXT=0/34 -> PASS\n[shim-test] transform feedback command recording -> PASS\n[shim-test] vkQueueSubmit -> 0, vkWaitForFences -> 0\n[shim-test] empty submit -> 0, fence wait -> 0 -> PASS\n[shim-test] fill: vkWaitForFences -> 0\n",
+        "passed": false
+      },
+      {
+        "architecture": "x86",
+        "command": [
+          "D:\\Sunrise\\D2\\sogen\\builds\\20260915-223538-gdb-thread-inspection-final\\analyzer.exe",
+          "--backend",
+          "icicle",
+          "-e",
+          "D:\\Sunrise\\D2\\sogen\\root",
+          "-v",
+          "-p",
+          "c:\\sogen-test",
+          "D:\\Emulation\\sogen\\build\\vs2022-x86-shim\\artifacts-relwithdebinfo",
+          "-p",
+          "c:\\sogen-test\\vulkan-shim.dll",
+          "D:\\Sunrise\\D2\\sogen\\graphics\\dxvk-7df3596e-static-crt-20260915\\x86\\vulkan-1.dll",
+          "--stdout",
+          "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\shim-static-crt-guest-1789532033084636300\\x86-stdout.log",
+          "--report",
+          "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\shim-static-crt-guest-1789532033084636300\\x86-events.jsonl",
+          "c:\\sogen-test\\vulkan-shim-test.exe",
+          "c:\\sogen-test\\vulkan-shim.dll"
+        ],
+        "started": 1789532041.244579,
+        "shim_sha256": "982010037b7cab901ee6b34fcc5c13eafca79cf5f443fe80d6b1965164683622",
+        "scope": "Icicle guest test; x64 maps the exact game MSVCP 14.10 runtime; x86 uses the root x86 runtime",
+        "pid": 29220,
+        "exit_code": 1,
+        "elapsed": 2.7488412857055664,
+        "test_output": "",
+        "passed": false
+      }
+    ],
+    "unicorn": [
+      {
+        "architecture": "x64",
+        "command": [
+          "D:\\Sunrise\\D2\\sogen\\builds\\20260915-223538-gdb-thread-inspection-final\\analyzer.exe",
+          "--backend",
+          "unicorn",
+          "-e",
+          "D:\\Sunrise\\D2\\sogen\\root",
+          "-v",
+          "-p",
+          "c:\\sogen-test",
+          "D:\\Emulation\\sogen\\build\\vs2022\\artifacts-relwithdebinfo",
+          "-p",
+          "c:\\sogen-test\\vulkan-shim.dll",
+          "D:\\Sunrise\\D2\\sogen\\graphics\\dxvk-7df3596e-static-crt-20260915\\x64\\vulkan-1.dll",
+          "--stdout",
+          "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\shim-static-crt-unicorn-1789532119347567900\\x64-stdout.log",
+          "--report",
+          "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\shim-static-crt-unicorn-1789532119347567900\\x64-events.jsonl",
+          "-p",
+          "c:\\sogen-test\\msvcp140.dll",
+          "D:\\Sunrise\\D2\\msvcp140.dll",
+          "c:\\sogen-test\\vulkan-shim-test.exe",
+          "c:\\sogen-test\\vulkan-shim.dll"
+        ],
+        "started": 1789532119.3477714,
+        "shim_sha256": "65c4e20a71782471edfa2fa8a2883e4f41fb67072e3f87b259b5fecf9a16e4d2",
+        "scope": "unicorn guest test; x64 maps the exact game MSVCP 14.10 runtime; x86 uses the root x86 runtime",
+        "pid": 1752,
+        "exit_code": 0,
+        "elapsed": 1.2126154899597168,
+        "test_output": "[shim-test] loading c:\\sogen-test\\vulkan-shim.dll\n[shim-test] vkCreateInstance -> 0, instance=0000000000000001\n[shim-test] vkEnumeratePhysicalDevices -> 0, count=2\n[shim-test] device[0]: 'AMD Radeon RX 6700' type=2 api=1.4.315\n[shim-test] device[1]: 'Intel(R) UHD Graphics 770' type=1 api=1.4.323\n[shim-test] VK_EXT_transform_feedback advertised=yes feature=1 capability mask=PASS\n[shim-test] VK_EXT_shader_module_identifier advertised=yes feature=1 algorithm UUID=414D444D...\n[shim-test] queue families=5, graphics family=0, timestamp family=0\n[shim-test] vkCreateDevice -> 0, device=0000000000000004\n[shim-test] vkGetDeviceQueue -> queue=0000000000000005\n[shim-test] timestamp2 stage2-only recording -> PASS\n[shim-test] calibrated timestamps KHR=0/27 EXT=0/19 -> PASS\n[shim-test] transform feedback command recording -> PASS\n[shim-test] vkQueueSubmit -> 0, vkWaitForFences -> 0\n[shim-test] empty submit -> 0, fence wait -> 0 -> PASS\n[shim-test] fill: vkWaitForFences -> 0\n[shim-test] fill+readback (0xDEADBEEF x64) -> PASS\n[shim-test] clear+readback (16x16 -> 0xFF0000FF) wait=0 -> PASS\n[shim-test] shader identifiers size=16 match=yes, identifier pipeline=1000297000 -> PASS\n[shim-test] pipeline cache round trip -> PASS\n[shim-test] ok\n",
+        "passed": true
+      },
+      {
+        "architecture": "x86",
+        "command": [
+          "D:\\Sunrise\\D2\\sogen\\builds\\20260915-223538-gdb-thread-inspection-final\\analyzer.exe",
+          "--backend",
+          "unicorn",
+          "-e",
+          "D:\\Sunrise\\D2\\sogen\\root",
+          "-v",
+          "-p",
+          "c:\\sogen-test",
+          "D:\\Emulation\\sogen\\build\\vs2022-x86-shim\\artifacts-relwithdebinfo",
+          "-p",
+          "c:\\sogen-test\\vulkan-shim.dll",
+          "D:\\Sunrise\\D2\\sogen\\graphics\\dxvk-7df3596e-static-crt-20260915\\x86\\vulkan-1.dll",
+          "--stdout",
+          "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\shim-static-crt-unicorn-1789532119347567900\\x86-stdout.log",
+          "--report",
+          "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\shim-static-crt-unicorn-1789532119347567900\\x86-events.jsonl",
+          "c:\\sogen-test\\vulkan-shim-test.exe",
+          "c:\\sogen-test\\vulkan-shim.dll"
+        ],
+        "started": 1789532120.560829,
+        "shim_sha256": "982010037b7cab901ee6b34fcc5c13eafca79cf5f443fe80d6b1965164683622",
+        "scope": "unicorn guest test; x64 maps the exact game MSVCP 14.10 runtime; x86 uses the root x86 runtime",
+        "pid": 20608,
+        "exit_code": 1,
+        "elapsed": 20.368149518966675,
+        "test_output": "",
+        "passed": false
+      }
+    ]
+  },
+  "actual_game_fault": {
+    "time": 1789531178.8806884,
+    "stack_start": "0x86a3249000",
+    "stack_end": "0x86a3250000",
+    "records": [
+      {
+        "address": "0x86a324a7f0",
+        "code": "0xc0000005",
+        "flags": "0x0",
+        "fault": "0x95c4328644",
+        "nested": "0x0",
+        "parameters": [
+          "0x0",
+          "0x0"
+        ],
+        "preceding_context": {
+          "address": "0x86a324a300",
+          "flags": "0x10001f",
+          "rip": "0x95c4328644",
+          "rsp": "0x86a324a910"
+        },
+        "context_registers": {
+          "rax": "0x0",
+          "rcx": "0x38878520c0",
+          "rdx": "0x0",
+          "rbx": "0x222004",
+          "rsp": "0x86a324a910",
+          "rbp": "0x86a324aa90",
+          "rsi": "0x38878520c0",
+          "rdi": "0x0",
+          "r8": "0x0",
+          "r9": "0x86a324aa90",
+          "r10": "0x8000",
+          "r11": "0x86a324a9b0",
+          "r12": "0x8",
+          "r13": "0x0",
+          "r14": "0x38878520c0",
+          "r15": "0x0",
+          "rip": "0x95c4328644"
+        },
+        "instruction_bytes": "488b18488bcbe8c50c0300498d4e08ffd3e99400000048833a007c687506837a08007e60ba01000000488d4c2420e8b99efeff488b442420493b077c100f8583"
+      }
+    ],
+    "memory": {
+      "0x1426869d4": "010000000000803f0000000010d1bc41010000001000800400000000500000000d00000000000000ffffffff01000000424e473a4d4553534147455f50554d5000000000000000000000000000000000000000005000000000000000000000000000000000000000000000000000000000000000042022000000000000000000",
+      "0x38878520c0": "020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffffffff0000000009000001000000007598000000000000e88284873800000000000000000000002e3f41566261645f616c6c6f63407374"
+    },
+    "scope": "Raw stack candidates; matching context layout identified separately"
+  },
+  "actual_game_retest": {
+    "capture": "destiny-sogen-1789531878084952900-static-crt-fresh",
+    "state": "Fresh Icicle launch in progress; no boot claim"
+  }
+}

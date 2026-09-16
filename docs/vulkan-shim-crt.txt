@@ -1,0 +1,49 @@
+Vulkan guest shim runtime isolation
+
+The actual Destiny graphics worker faulted with STATUS_ACCESS_VIOLATION at
+msvcp140.dll+0x18644 (mtx_do_lock). RAX was zero at mov rbx,[rax]; the preceding
+instruction loaded RAX from mutex+8. The loaded game DLL was 14.10.25008.0,
+SHA256 7a222f091fdd8a8e6026c24e652396519103e982571370c8740f10778bc9ac43.
+IDA instance 13337 matched the loaded bytes and identified mtx_do_lock.
+
+The mutex was vulkan-1.dll+0x220c0. Its matching PDB identifies
+g_pending_descriptor_updates_mutex at section 3 (.data RVA 0x22000), offset 192.
+MSVC 14.44 headers initialize the former vptr field to zero and use an SRW lock.
+The old 14.10 runtime still dereferences that field for virtual dispatch.
+This is a runtime/header mismatch, not an uninitialized guest mutex.
+
+Build vulkan-shim with its own static MSVC runtime. Its Vulkan C ABI does not
+transfer STL object ownership; allocations and corresponding frees stay inside
+the shim. Keep the host emulator's shared-runtime policy. Evaluate runtime
+suppression options per consuming target and configuration; an empty runtime
+property emits no suppression options.
+
+Validation:
+- x64 and x86 RelWithDebInfo builds passed. The tidy preset build passed.
+- Both shim import tables contain only KERNEL32.dll, including delay imports.
+- All 243 export names match their respective previous DLLs.
+- Debug/Release/MinSizeRel/RelWithDebInfo project settings preserve host /MD[d]
+  and shim /MT[d], with the corresponding CRT library left enabled.
+- x64 Unicorn guest test with the game 14.10 runtime mapped: complete pass,
+  including instance/device creation, submissions, fences, buffer/image
+  readback, shader identifiers and pipeline-cache round trip (1.21 seconds).
+- x64 Icicle guest test with the same runtime: passed startup, device creation,
+  submissions and fences. Later stopped at SogenGpu ioctl 0x222200 because
+  Icicle does not implement direct host-memory mapping. This is not a full
+  Icicle Vulkan regression pass.
+- x86 tests on both engines failed in WOW64 startup before test output.
+  The x86 build/import/export checks pass; x86 runtime acceptance is unproven.
+- Fresh real-game Icicle run started with -e and -v using the new DLL/PDB pair.
+  It is still in startup; no claim of graphics progress or successful boot yet.
+
+The game's DLL and the restored system-root DLL were not replaced by this fix.
+System-root msvcp140.dll remains 14.51.36231.0,
+SHA256 639342ea9a67c0009122238ce070a8257e2e04d367d627509fec29f8442afb42.
+
+Primary references:
+https://learn.microsoft.com/en-us/cpp/porting/binary-compat-2015-2017
+https://cmake.org/cmake/help/latest/manual/cmake-generator-expressions.7.html
+MSVC 14.44.35207 include/mutex, include/__msvc_threads_core.hpp,
+crt/src/stl/mutex.cpp; exact game MSVCP disassembly.
+
+Complete local evidence and validation limits: vulkan-shim-crt-validation.json.
