@@ -458,7 +458,9 @@ namespace sogen
 
     void memory_manager::revoke_host_memory(const host_memory_token& backing)
     {
-        const auto retained = backing;
+        // The argument may refer to the token inside a reservation that this loop erases.
+        // Retain an owning copy so subsequent aliases still compare against a live allocation identity.
+        const auto retained = backing; // NOLINT(performance-unnecessary-copy-initialization)
         if (!retained)
         {
             return;

@@ -320,7 +320,8 @@ namespace sogen
                                  static_cast<unsigned long long>(mapping.guest_address), static_cast<unsigned long long>(mapping.size));
                 }
                 // Freeing Vulkan after failed revocation would leave guest mappings pointing to freed host storage.
-                (void)this->vulkan_owner_.release();
+                auto* const retained_owner = this->vulkan_owner_.release();
+                std::fprintf(stderr, "[gpu-bridge] Vulkan owner %p retained until process exit\n", static_cast<void*>(retained_owner));
             }
 
             // Before the host GPU reads guest-produced data, make the guest's writes to every directly-aliased
