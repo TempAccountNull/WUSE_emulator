@@ -59,3 +59,10 @@ Additional SDK and CRT header references (cross-check against the matched DLL):
 - C:/Program Files/Microsoft Visual Studio/18/Insiders/VC/Tools/MSVC
 Use headers to establish declarations and ABI details; a header alone does not
 prove implementation behavior in the current guest DLL.
+// GRAPHICS DEFAULT
+Fresh Dawn runs use DXVK over Sogen's guest Vulkan shim. Select DXGI with an
+explicit guest file override; preserve the Microsoft DLLs for comparison.
+The user authorized building D:/Dawn/refs/dxvk with outputs under built and
+requested build.cmd. Other reference trees remain read-only. Stage DLL/PDB
+pairs outside the reference tree, verify GUID/age and architecture, and log
+selected paths/hashes. Old checkpoints must retain their original renderer.
