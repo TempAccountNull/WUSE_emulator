@@ -2036,6 +2036,39 @@ namespace sogen
                 const int32_t result =
                     this->vulkan_.create_swapchain(request.device, request.surface, request.format, request.width, request.height,
                                                    request.min_image_count, request.image_usage, swapchain, image_count);
+                vulkan_host::render_device_info adapter;
+                if (result == 0 && this->vulkan_.get_swapchain_render_device(request.device, swapchain, adapter))
+                {
+                    const char* kind = "Other";
+                    switch (adapter.type)
+                    {
+                    case 1:
+                        kind = "Integrated GPU";
+                        break;
+                    case 2:
+                        kind = "Discrete GPU";
+                        break;
+                    case 3:
+                        kind = "Virtual GPU";
+                        break;
+                    case 4:
+                        kind = "CPU";
+                        break;
+                    default:
+                        break;
+                    }
+                    const auto message = std::format("Using device: {} | {} | Vulkan device ID 0x{:X} | Vulkan swapchain ID 0x{:X} | "
+                                                     "presentation: GPU readback via CPU memory",
+                                                     kind, adapter.name, request.device, swapchain);
+                    if (win_emu.callbacks.on_generic_activity)
+                    {
+                        win_emu.callbacks.on_generic_activity(message);
+                    }
+                    else
+                    {
+                        win_emu.log.info("%s\n", message.c_str());
+                    }
+                }
                 return write_output(
                     win_emu, context,
                     gpu_bridge::create_swapchain_response{.vk_result = result, .image_count = image_count, .swapchain = swapchain});

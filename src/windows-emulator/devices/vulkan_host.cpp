@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <optional>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -230,6 +231,7 @@ namespace sogen
         {
             VkPhysicalDevice handle{};
             uint64_t instance_id{};
+            std::optional<VkPhysicalDeviceProperties> properties;
         };
 
         struct device_data
@@ -237,7 +239,8 @@ namespace sogen
             VkDevice handle{};
             uint64_t instance_id{};
             VkPhysicalDevice physical_device{}; // the device this was created from (for memory queries)
-            uint32_t queue_family_index{};      // the single family this device was created with
+            render_device_info identity;
+            uint32_t queue_family_index{}; // the single family this device was created with
             PFN_vkDestroyDevice destroy_device{};
             PFN_vkGetDeviceQueue get_device_queue{};
             PFN_vkQueueWaitIdle queue_wait_idle{};
@@ -1272,6 +1275,19 @@ namespace sogen
         return VK_SUCCESS;
     }
 
+    bool vulkan_host::get_swapchain_render_device(const uint64_t device, const uint64_t swapchain, render_device_info& out) const
+    {
+        out = {};
+        const auto sc = this->impl_->swapchains.find(swapchain);
+        const auto dev = this->impl_->devices.find(device);
+        if (sc == this->impl_->swapchains.end() || dev == this->impl_->devices.end() || sc->second.device_id != device)
+        {
+            return false;
+        }
+        out = dev->second.identity;
+        return true;
+    }
+
     int32_t vulkan_host::get_physical_device_properties(uint64_t physical_device, void* out, size_t out_size, bool guest_is_32bit)
     {
         const auto pd = this->impl_->physical_devices.find(physical_device);
@@ -1286,8 +1302,13 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
 
-        VkPhysicalDeviceProperties properties{};
-        instance->second.get_physical_device_properties(pd->second.handle, &properties);
+        if (!pd->second.properties)
+        {
+            VkPhysicalDeviceProperties properties{};
+            instance->second.get_physical_device_properties(pd->second.handle, &properties);
+            pd->second.properties = properties;
+        }
+        const auto& properties = *pd->second.properties;
 
         if (guest_is_32bit)
         {
@@ -2033,6 +2054,17 @@ namespace sogen
             create_info.pNext = &features2;
         }
 
+        if (!pd->second.properties)
+        {
+            if (!instance->second.get_physical_device_properties)
+            {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            VkPhysicalDeviceProperties properties{};
+            instance->second.get_physical_device_properties(pd->second.handle, &properties);
+            pd->second.properties = properties;
+        }
+
         VkDevice device{};
         const VkResult result = instance->second.create_device(pd->second.handle, &create_info, nullptr, &device);
         if (result != VK_SUCCESS)
@@ -2044,6 +2076,11 @@ namespace sogen
         data.handle = device;
         data.instance_id = pd->second.instance_id;
         data.physical_device = pd->second.handle;
+        const auto& properties = *pd->second.properties;
+        data.identity = {.name = properties.deviceName,
+                         .type = static_cast<uint32_t>(properties.deviceType),
+                         .vendor_id = properties.vendorID,
+                         .device_id = properties.deviceID};
         data.queue_family_index = primary_family;
         const auto enabled_extension = [&](const char* name) {
             return std::ranges::any_of(extensions, [&](const char* enabled) { return std::strcmp(enabled, name) == 0; });

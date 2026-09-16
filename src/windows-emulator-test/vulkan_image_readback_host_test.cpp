@@ -176,4 +176,40 @@ namespace sogen::test
         }
         EXPECT_EQ(host.end_command_buffer(command_buffer), VK_SUCCESS);
     }
+
+    TEST_F(VulkanImageReadbackHostTest, DeviceIdentityFollowsSwapchainOwnershipAndLifetime)
+    {
+        uint64_t surface{};
+        uint64_t swapchain{};
+        uint32_t images_count{};
+        ASSERT_EQ(host.create_surface(0x1234, surface), VK_SUCCESS);
+        ASSERT_EQ(host.create_swapchain(devices[0], surface, VK_FORMAT_B8G8R8A8_UNORM, 8, 8, 2, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                                        swapchain, images_count),
+                  VK_SUCCESS);
+        vulkan_host::render_device_info info;
+        ASSERT_TRUE(host.get_swapchain_render_device(devices[0], swapchain, info));
+        std::array<uint64_t, 32> physical{};
+        uint32_t count{};
+        ASSERT_EQ(host.enumerate_physical_devices(instance, physical, count), VK_SUCCESS);
+        ASSERT_GT(count, 0u);
+        VkPhysicalDeviceProperties properties{};
+        ASSERT_EQ(host.get_physical_device_properties(physical[0], &properties, sizeof(properties), false), VK_SUCCESS);
+        EXPECT_EQ(info.name, properties.deviceName);
+        EXPECT_EQ(info.type, static_cast<uint32_t>(properties.deviceType));
+        EXPECT_EQ(info.vendor_id, properties.vendorID);
+        EXPECT_EQ(info.device_id, properties.deviceID);
+        const auto cached = info;
+        EXPECT_FALSE(host.get_swapchain_render_device(devices[1], swapchain, info));
+        EXPECT_TRUE(info.name.empty());
+        ASSERT_TRUE(host.get_swapchain_render_device(devices[0], swapchain, info));
+        EXPECT_EQ(info.name, cached.name);
+        EXPECT_EQ(info.type, cached.type);
+        EXPECT_EQ(info.vendor_id, cached.vendor_id);
+        EXPECT_EQ(info.device_id, cached.device_id);
+        host.destroy_swapchain(devices[0], swapchain);
+        EXPECT_FALSE(host.get_swapchain_render_device(devices[0], swapchain, info));
+        EXPECT_TRUE(info.name.empty());
+        host.destroy_surface(surface);
+    }
+
 }

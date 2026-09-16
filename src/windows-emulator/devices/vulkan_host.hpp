@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace sogen
@@ -30,6 +31,17 @@ namespace sogen
 
         // False if no Vulkan driver could be loaded on the host.
         bool available() const;
+
+        struct render_device_info
+        {
+            std::string name;
+            uint32_t type{}; // VkPhysicalDeviceType, kept independent of guest Vulkan headers.
+            uint32_t vendor_id{};
+            uint32_t device_id{};
+        };
+
+        // Resolves ownership from a live swapchain; only reads properties cached at device creation.
+        bool get_swapchain_render_device(uint64_t device, uint64_t swapchain, render_device_info& out) const;
 
         // Creates a bare instance (no layers/extensions). out_instance is set to a fresh object id
         // on success, or 0 on failure.
