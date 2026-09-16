@@ -29,6 +29,20 @@ struct interface_list_request {
 
 static_assert(sizeof(interface_list_request) == 40);
 
+struct device_node_request {
+  uint32_t size;
+  uint32_t operation;
+  uint32_t object_type;
+  uint32_t reserved;
+  uint64_t device_id;
+  uint32_t device_id_bytes;
+  uint32_t flags;
+  uint32_t result_size;
+  uint32_t padding;
+};
+
+static_assert(sizeof(device_node_request) == 40);
+
 struct property_key {
   GUID format;
   uint32_t id;
@@ -623,8 +637,14 @@ struct handle_result {
   uint64_t key{};
 };
 
+struct status_result {
+  uint32_t size{8};
+  NTSTATUS status{};
+};
+
 static_assert(sizeof(registry_request) == 48);
 static_assert(sizeof(handle_result) == 16);
+static_assert(sizeof(status_result) == 8);
 
 bool is_class_guid(const std::u16string_view value) {
   if (value.size() != 38 || value.front() != u'{' || value.back() != u'}') {
@@ -642,6 +662,29 @@ bool is_class_guid(const std::u16string_view value) {
     }
   }
   return true;
+}
+
+bool is_legal_device_id(const std::u16string_view value) {
+  if (value.empty() || value.size() > 200) {
+    return false;
+  }
+  size_t components = 1;
+  size_t component_length = 0;
+  for (const auto character : value) {
+    if (character < 0x21 || character > 0x7F || character == u',') {
+      return false;
+    }
+    if (character == u'\\') {
+      if (!component_length) {
+        return false;
+      }
+      ++components;
+      component_length = 0;
+    } else {
+      ++component_length;
+    }
+  }
+  return components == 3 && component_length != 0;
 }
 
 struct cm_api : stateless_device {
@@ -930,6 +973,137 @@ struct cm_api : stateless_device {
     return STATUS_SUCCESS;
   }
 
+  NTSTATUS read_device_node_request(windows_emulator &win_emu,
+                                    const io_device_context &c,
+                                    device_node_request &request) const {
+    const auto required = this->is_32_bit ? 28u : 40u;
+    if (!c.input_buffer || c.input_buffer_length < required) {
+      return STATUS_INVALID_PARAMETER;
+    }
+    if (c.input_buffer % (this->is_32_bit ? 4 : 8)) {
+      return STATUS_DATATYPE_MISALIGNMENT;
+    }
+    if (this->is_32_bit) {
+      std::array<uint32_t, 7> input{};
+      if (!win_emu.memory.try_read_memory(c.input_buffer, input.data(),
+                                          sizeof(input))) {
+        return STATUS_ACCESS_VIOLATION;
+      }
+      if (input[0] != required) {
+        return STATUS_INVALID_PARAMETER;
+      }
+      request = {.size = 40,
+                 .operation = input[1],
+                 .object_type = input[2],
+                 .reserved = 0,
+                 .device_id = input[3],
+                 .device_id_bytes = input[4],
+                 .flags = input[5],
+                 .result_size = input[6],
+                 .padding = 0};
+    } else if (!win_emu.memory.try_read_memory(c.input_buffer, &request,
+                                               sizeof(request))) {
+      return STATUS_ACCESS_VIOLATION;
+    }
+    if (request.size != 40 || (request.operation != 1 && request.operation != 2) ||
+        request.object_type != 1 || request.reserved || request.flags ||
+        request.result_size != sizeof(status_result) || request.padding) {
+      return STATUS_INVALID_PARAMETER;
+    }
+    return STATUS_SUCCESS;
+  }
+
+  static NTSTATUS read_device_id(windows_emulator &win_emu,
+                                 const device_node_request &request,
+                                 std::u16string &device_id) {
+    if (!request.device_id || request.device_id_bytes < 2 ||
+        request.device_id_bytes > 402 ||
+        request.device_id_bytes % sizeof(char16_t)) {
+      return STATUS_INVALID_PARAMETER;
+    }
+    if (request.device_id % alignof(char16_t)) {
+      return STATUS_DATATYPE_MISALIGNMENT;
+    }
+    device_id.resize(request.device_id_bytes / sizeof(char16_t));
+    if (!win_emu.memory.try_read_memory(request.device_id, device_id.data(),
+                                        request.device_id_bytes)) {
+      return STATUS_ACCESS_VIOLATION;
+    }
+    const auto terminator = device_id.find(u'\0');
+    if (terminator == std::u16string::npos ||
+        terminator + 1 != device_id.size()) {
+      return STATUS_INVALID_PARAMETER;
+    }
+    device_id.resize(terminator);
+    return is_legal_device_id(device_id) ? STATUS_SUCCESS
+                                         : STATUS_OBJECT_NAME_INVALID;
+  }
+
+  static NTSTATUS validate_device_node(windows_emulator &win_emu,
+                                       const device_node_request &request,
+                                       const std::u16string_view device_id) {
+    const auto path =
+        uR"(\Registry\Machine\System\CurrentControlSet\Enum\)" +
+        std::u16string(device_id);
+    win_emu.callbacks.on_generic_access("Registry key", path);
+    const auto key = win_emu.registry.get_key({path});
+    if (!key) {
+      return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
+    const auto phantom = win_emu.registry.get_value(*key, "Phantom");
+    if (phantom && phantom->as_dword().value_or(0)) {
+      return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
+    if (request.operation == 1) {
+      // The volatile Control key is Sogen's registry-backed projection of a
+      // live PnP devnode. A saved Enum entry without it remains phantom.
+      win_emu.callbacks.on_generic_access("Registry key", path + uR"(\Control)");
+      if (!win_emu.registry.get_key({path + uR"(\Control)"})) {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+      }
+    }
+    return STATUS_SUCCESS;
+  }
+
+  NTSTATUS locate_device_node(windows_emulator &win_emu,
+                              const io_device_context &c) const {
+    device_node_request request{};
+    auto status = this->read_device_node_request(win_emu, c, request);
+    if (status != STATUS_SUCCESS) {
+      return status;
+    }
+    if (!c.output_buffer || c.output_buffer_length < sizeof(status_result)) {
+      return STATUS_INVALID_PARAMETER;
+    }
+    if (c.output_buffer % alignof(uint32_t)) {
+      return STATUS_DATATYPE_MISALIGNMENT;
+    }
+
+    std::u16string device_id;
+    status = read_device_id(win_emu, request, device_id);
+    if (status == STATUS_SUCCESS) {
+      status = validate_device_node(win_emu, request, device_id);
+    }
+
+    status_result result{};
+    result.status = status;
+    if (!win_emu.memory.try_write_memory(c.output_buffer, &result,
+                                         sizeof(result))) {
+      return STATUS_ACCESS_VIOLATION;
+    }
+    if (c.io_status_block) {
+      c.io_status_block.access(
+          [](auto &block) { block.Information = sizeof(status_result); });
+    }
+    win_emu.log.info("CMApi locate devnode %s (%s): status 0x%08X\n",
+                     u16_to_u8(device_id).c_str(),
+                     request.operation == 1 ? "normal" : "phantom",
+                     static_cast<uint32_t>(status));
+    return STATUS_SUCCESS;
+  }
+
   NTSTATUS read_request(windows_emulator &win_emu, const io_device_context &c,
                         registry_request &request) const {
     const auto required = this->is_32_bit ? 36u : 48u;
@@ -1183,6 +1357,9 @@ struct cm_api : stateless_device {
     }
     if (c.io_control_code == 0x470813) {
       return get_object_property(win_emu, c);
+    }
+    if (c.io_control_code == 0x470843) {
+      return locate_device_node(win_emu, c);
     }
     if (c.io_control_code != 0x470863) {
       win_emu.log.warn("Unsupported CMApi ioctl: 0x%X\n", c.io_control_code);

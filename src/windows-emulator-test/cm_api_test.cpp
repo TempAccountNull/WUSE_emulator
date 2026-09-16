@@ -154,6 +154,146 @@ TEST_F(CmApiTest, FailedOutputWriteClosesNewHandle) {
   EXPECT_EQ(emu.process.registry_keys.size(), 0u);
 }
 
+class CmLocateDeviceNodeTest : public CmApiTest {
+protected:
+  std::array<uint32_t, 10> input{40, 1, 1, 0, 0, 0, 0, 0, 8, 0};
+  const std::u16string device_id = u"ROOT\\SOGENTEST\\0000";
+  const std::u16string device_path =
+      uR"(\Registry\Machine\System\CurrentControlSet\Enum\ROOT\SOGENTEST\0000)";
+
+  void SetUp() override {
+    CmApiTest::SetUp();
+    set_name(device_id);
+  }
+
+  void set_name(const std::u16string_view name) {
+    std::u16string terminated(name);
+    terminated += u'\0';
+    emu.memory.write_memory(memory + 0x300, terminated.data(),
+                            terminated.size() * sizeof(char16_t));
+    const auto address = memory + 0x300;
+    memcpy(input.data() + 4, &address, sizeof(address));
+    input[6] = static_cast<uint32_t>(terminated.size() * sizeof(char16_t));
+  }
+
+  io_device_context locate_context() {
+    auto c = context();
+    c.io_control_code = 0x470843;
+    c.input_buffer_length = 40;
+    c.output_buffer_length = 8;
+    return c;
+  }
+
+  NTSTATUS locate() {
+    emu.memory.write_memory(memory + 0x100, input.data(), sizeof(input));
+    return device->execute_ioctl(emu, locate_context());
+  }
+};
+
+TEST_F(CmLocateDeviceNodeTest, LocatesLiveDeviceAndReturnsStatusRecord) {
+  ASSERT_TRUE(emu.registry.create_key(device_path + uR"(\Control)"));
+  emu.memory.set_memory(memory + 0x200, 0xA5, 8);
+  ASSERT_EQ(locate(), STATUS_SUCCESS);
+  EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x200), 8u);
+  EXPECT_EQ(returned_status(), STATUS_SUCCESS);
+  EXPECT_EQ(
+      emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(memory)
+          .Information,
+      8u);
+}
+
+TEST_F(CmLocateDeviceNodeTest, DistinguishesNormalAndPhantomDevices) {
+  ASSERT_TRUE(emu.registry.create_key(device_path));
+  ASSERT_EQ(locate(), STATUS_SUCCESS);
+  EXPECT_EQ(returned_status(), STATUS_OBJECT_NAME_NOT_FOUND);
+
+  input[1] = 2;
+  ASSERT_EQ(locate(), STATUS_SUCCESS);
+  EXPECT_EQ(returned_status(), STATUS_SUCCESS);
+}
+
+TEST_F(CmLocateDeviceNodeTest, RejectsPrivatePhantomAndMissingDevices) {
+  const auto key = emu.registry.create_key(device_path);
+  ASSERT_TRUE(key);
+  const uint32_t phantom = 1;
+  emu.registry.set_value(*key, "Phantom", REG_DWORD,
+                         std::as_bytes(std::span(&phantom, 1)));
+  input[1] = 2;
+  ASSERT_EQ(locate(), STATUS_SUCCESS);
+  EXPECT_EQ(returned_status(), STATUS_OBJECT_NAME_NOT_FOUND);
+
+  set_name(u"ROOT\\MISSING\\0000");
+  ASSERT_EQ(locate(), STATUS_SUCCESS);
+  EXPECT_EQ(returned_status(), STATUS_OBJECT_NAME_NOT_FOUND);
+}
+
+TEST_F(CmLocateDeviceNodeTest, ValidatesDeviceIdUsingMatchedDllRules) {
+  set_name(u"ROOT\\SOGEN TEST\\0000");
+  ASSERT_EQ(locate(), STATUS_SUCCESS);
+  EXPECT_EQ(returned_status(), STATUS_OBJECT_NAME_INVALID);
+  set_name(u"ROOT\\SOGENTEST");
+  ASSERT_EQ(locate(), STATUS_SUCCESS);
+  EXPECT_EQ(returned_status(), STATUS_OBJECT_NAME_INVALID);
+  set_name(u"ROOT\\SOGEN,TEST\\0000");
+  ASSERT_EQ(locate(), STATUS_SUCCESS);
+  EXPECT_EQ(returned_status(), STATUS_OBJECT_NAME_INVALID);
+}
+
+TEST_F(CmLocateDeviceNodeTest, DecodesWow64PointerLayout) {
+  constexpr uint64_t low_memory = 0x100000;
+  ASSERT_TRUE(emu.memory.allocate_memory(low_memory, 0x1000,
+                                         memory_permission::read_write));
+  const std::u16string terminated = device_id + u'\0';
+  emu.memory.write_memory(low_memory + 0x300, terminated.data(),
+                          terminated.size() * sizeof(char16_t));
+  ASSERT_TRUE(emu.registry.create_key(device_path));
+  const std::array<uint32_t, 7> wow64{
+      28, 2, 1, static_cast<uint32_t>(low_memory + 0x300),
+      static_cast<uint32_t>(terminated.size() * sizeof(char16_t)), 0, 8};
+  emu.memory.write_memory(low_memory + 0x100, wow64.data(), sizeof(wow64));
+  device = create_cm_api({.is_32_bit = true});
+  io_device_context c{emu.memory};
+  c.io_status_block = {emu.memory, low_memory};
+  c.io_control_code = 0x470843;
+  c.input_buffer = low_memory + 0x100;
+  c.input_buffer_length = sizeof(wow64);
+  c.output_buffer = low_memory + 0x200;
+  c.output_buffer_length = 8;
+  ASSERT_EQ(device->execute_ioctl(emu, c), STATUS_SUCCESS);
+  EXPECT_EQ(emu.memory.read_memory<uint32_t>(low_memory + 0x200), 8u);
+  EXPECT_EQ(emu.memory.read_memory<NTSTATUS>(low_memory + 0x204),
+            STATUS_SUCCESS);
+}
+
+TEST_F(CmLocateDeviceNodeTest, RejectsMalformedPacketsAndBuffers) {
+  input[0] = 39;
+  EXPECT_EQ(locate(), STATUS_INVALID_PARAMETER);
+  input[0] = 40;
+  input[1] = 3;
+  EXPECT_EQ(locate(), STATUS_INVALID_PARAMETER);
+  input[1] = 1;
+  input[2] = 2;
+  EXPECT_EQ(locate(), STATUS_INVALID_PARAMETER);
+  input[2] = 1;
+  input[7] = 1;
+  EXPECT_EQ(locate(), STATUS_INVALID_PARAMETER);
+  input[7] = 0;
+  input[8] = 16;
+  EXPECT_EQ(locate(), STATUS_INVALID_PARAMETER);
+
+  input[8] = 8;
+  emu.memory.write_memory(memory + 0x100, input.data(), sizeof(input));
+  auto c = locate_context();
+  c.output_buffer_length = 7;
+  EXPECT_EQ(device->execute_ioctl(emu, c), STATUS_INVALID_PARAMETER);
+  c = locate_context();
+  c.output_buffer++;
+  EXPECT_EQ(device->execute_ioctl(emu, c), STATUS_DATATYPE_MISALIGNMENT);
+  c = locate_context();
+  c.input_buffer = 0x7FFFFFFF0000;
+  EXPECT_EQ(device->execute_ioctl(emu, c), STATUS_ACCESS_VIOLATION);
+}
+
 class CmInterfaceListTest : public CmApiTest {
 protected:
   std::array<uint32_t, 10> input{
