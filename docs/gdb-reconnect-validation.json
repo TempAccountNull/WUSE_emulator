@@ -1,0 +1,43 @@
+{
+  "analyzer_sha256": "0ebabbbe3f845b07bfe883be2ba859206d66a8c9231918cd43b7ddcbc3d33553",
+  "backend_sha256": "3e1442d1395dde76f766bac59a641bb4736deb6a12afe0bd848d6acfbe07172f",
+  "candidate": "D:\\Sunrise\\D2\\sogen\\builds\\20260915-214752-gdb-reconnect",
+  "release_test_build": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\vs2022-x64-driver-1789527128164467000.log",
+  "tidy_build": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\tidy-1789526923146372600.log",
+  "release_tests": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789527220212169300",
+  "tidy_tests": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\sogen-fixes\\regression-1789527059538574800",
+  "test_cases_per_mode": 8,
+  "total_passes": 32,
+  "reconnect": {
+    "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789527130371473500-gdb-reconnect-validation",
+    "input": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789523905046747600-analysis-dispatch-continue\\guest.snap",
+    "checks": [
+      "Input checkpoint registers and sampled memory match",
+      "Paused EOF preserves full register packet, sampled memory and all thread diagnostics; old breakpoints cleared",
+      "Repeated EOF preserves log prefix with one run header and no failure record"
+    ],
+    "prefix_bytes": 95102,
+    "prefix_sha256": "31202732bca495a9ed03c353b1cff1980804b1fb164729e992ce1cd4b31b16e1",
+    "passed": true
+  },
+  "detach": {
+    "capture": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789527194209170500-gdb-detach-snapshot",
+    "replay": "D:\\source\\repos\\test_research\\PatchScanner\\benchmarks\\destiny-sogen-1789527219272244300-gdb-detach-restore",
+    "passed": true,
+    "checks": [
+      "D returned OK",
+      "Snapshot capture exited 0 without resuming guest",
+      "Reloaded snapshot matches full register packet and sampled guest memory"
+    ],
+    "snapshot_sha256": "86ca73b88c4509560a4097ba5fce51ee6db3680351d82c9eab43cdf4b66d60e0"
+  },
+  "limitations": [
+    "No game boot/rendering success established.",
+    "Linux caller preserves its existing single-session policy; Linux runtime was not tested.",
+    "Actual-game continuity compares complete exposed register packet, sampled memory and thread diagnostics; it is not a whole-memory byte comparison."
+  ],
+  "initial_failures": [
+    "Host commit pressure caused release driver/link OOM and one isolated guest allocation failure.",
+    "First socket fixture used the wrong address constructor overload; corrected and rerun."
+  ]
+}

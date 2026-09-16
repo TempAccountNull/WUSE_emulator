@@ -15,6 +15,15 @@ namespace sogen::gdb_stub
         shutdown,
     };
 
+    enum class session_end_reason : uint8_t
+    {
+        transport_closed,
+        detached,
+        stop_requested,
+        no_connection,
+        handler_shutdown,
+    };
+
     enum class breakpoint_type : uint8_t
     {
         software = 0,
@@ -149,5 +158,5 @@ namespace sogen::gdb_stub
         }
     };
 
-    bool run_gdb_stub(const network::address& bind_address, debugging_handler& handler);
+    bool run_gdb_stub(const network::address& bind_address, debugging_handler& handler, session_end_reason* end_reason = nullptr);
 } // namespace sogen::gdb_stub

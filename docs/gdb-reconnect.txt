@@ -1,0 +1,30 @@
+Debugger reconnect
+
+The Windows analyzer recreated its emulator and reporters after each GDB
+connection ended. With a snapshot input, reconnect replayed the checkpoint
+and truncated the JSONL/stdout reports.
+
+Keep one emulator and reporter set. A lost connection leaves the guest paused
+at its current state and accepts another debugger. Each connection owns its
+breakpoints; they are removed when that connection ends.
+
+Explicit D detach flushes OK, removes debugger hooks, and resumes the same
+guest. A snapshot-output request takes precedence and saves the stopped state.
+Exit, execution failure, and host stop do not enter a new emulation run.
+Detach draining has a two-second bound. Commands queued after detach are not
+processed. Closing a socket releases it even if peer lookup fails.
+
+Validation
+- Release and tidy builds completed. Eight focused tests passed in interpreter
+  and JIT modes for both builds: 32 passes.
+- Actual Destiny checkpoint: executed guest instructions, disconnected twice,
+  and compared the full register packet, sampled memory and thread diagnostics.
+  They matched. The 95,102-byte observation prefix remained byte-identical;
+  there was one run header and no failure record.
+- D with snapshot output returned OK and exited successfully. Reloading the
+  saved checkpoint matched the registers and sampled memory before detach.
+- Separate source review checked handler and transport lifetimes.
+
+Evidence and build identities: gdb-reconnect-validation.json.
+The graphics startup wait remains under investigation. These checks do not
+establish rendering or game boot success.

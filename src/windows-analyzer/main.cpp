@@ -51,7 +51,7 @@ namespace sogen
 
         struct analysis_options : analysis_settings
         {
-            mutable bool use_gdb{false};
+            bool use_gdb{false};
             std::string gdb_host{"127.0.0.1"};
             uint16_t gdb_port{28960};
             std::string gdb_architecture{"64bits"};
@@ -438,12 +438,40 @@ namespace sogen
 
                     const auto should_stop = [&] { return signals_received > 0; };
 
-                    win_x86_64_gdb_stub_handler handler{win_emu, should_stop, parse_gdb_target_architecture(options.gdb_architecture)};
-                    gdb_stub::run_gdb_stub(address, handler);
-                    debugger_execution_failed = handler.execution_failed();
-                    if (!options.snapshot_output.empty())
+                    while (true)
                     {
-                        options.use_gdb = false;
+                        bool connected{};
+                        gdb_stub::session_end_reason end_reason{};
+                        {
+                            win_x86_64_gdb_stub_handler handler{win_emu, should_stop,
+                                                                parse_gdb_target_architecture(options.gdb_architecture)};
+                            connected = gdb_stub::run_gdb_stub(address, handler, &end_reason);
+                            debugger_execution_failed = handler.execution_failed();
+                        }
+
+                        flush_reporters(c);
+                        if (!connected || should_stop() || debugger_capture_requested || debugger_execution_failed ||
+                            win_emu.process.exit_status.has_value())
+                        {
+                            break;
+                        }
+
+                        if (end_reason == gdb_stub::session_end_reason::detached)
+                        {
+                            win_emu.log.force_print(color::pink, "GDB detached; continuing guest execution without debugger control.\n");
+                            win_emu.start();
+                            break;
+                        }
+                        if (end_reason != gdb_stub::session_end_reason::transport_closed)
+                        {
+                            break;
+                        }
+
+                        win_emu.log.force_print(color::pink,
+                                                "GDB connection ended; guest paused at 0x%llx with state retained. "
+                                                "Waiting for GDB connection on %s...\n",
+                                                static_cast<unsigned long long>(win_emu.emu().read_instruction_pointer()),
+                                                address.to_string().c_str());
                     }
                 }
                 else if (!options.minidump_path.empty())
@@ -470,11 +498,6 @@ namespace sogen
 
                 save_requested_snapshot();
 
-                if (signals_received > 0)
-                {
-                    options.use_gdb = false;
-                }
-
                 if (signals_received > 0 && options.snapshot_output.empty())
                 {
                     win_emu.log.log("Do you want to create a snapshot? (y/n)\n");
@@ -491,7 +514,6 @@ namespace sogen
             catch (const gdb_stub::binding_error& e)
             {
                 win_emu.log.error("Cannot bind to address %s\n", e.what());
-                options.use_gdb = false;
                 return emit_failure("Cannot bind to address "s + e.what());
             }
             catch (const std::exception& e)
@@ -1041,14 +1063,7 @@ namespace sogen
                 const auto application = app.remaining();
                 const std::vector<std::string_view> args{application.begin(), application.end()};
 
-                bool result{};
-
-                do
-                {
-                    result = run(options, args);
-                } while (options.use_gdb);
-
-                return result ? 0 : 1;
+                return run(options, args) ? 0 : 1;
             }
             catch (std::exception& e)
             {

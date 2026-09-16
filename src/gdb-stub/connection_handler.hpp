@@ -28,6 +28,7 @@ namespace sogen::gdb_stub
         void send_raw_data(std::string_view data);
 
         void close() const;
+        void close_after_flush();
 
         bool should_stop() const;
 
@@ -39,6 +40,7 @@ namespace sogen::gdb_stub
         std::mutex mutex_{};
         std::atomic_bool stop_{};
         std::string output_stream_{};
+        bool close_after_flush_{};
         std::thread output_thread_{};
         std::condition_variable condition_variable_{};
 

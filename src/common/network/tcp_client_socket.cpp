@@ -101,7 +101,7 @@ namespace sogen::network
         if (*this && this->get_target())
         {
             ::shutdown(this->get_socket(), SHUT_RDWR);
-            socket::close();
         }
+        socket::close();
     }
 }

@@ -153,13 +153,26 @@ namespace sogen::gdb_stub
         this->client_.close();
     }
 
+    void connection_handler::close_after_flush()
+    {
+        std::unique_lock lock{this->mutex_};
+        this->close_after_flush_ = true;
+        this->condition_variable_.notify_all();
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (!this->should_stop() && !this->should_stop_() && std::chrono::steady_clock::now() < deadline)
+        {
+            this->condition_variable_.wait_for(lock, 100ms);
+        }
+        this->client_.close();
+    }
+
     void connection_handler::await_transmission(const std::function<void()>& handler)
     {
         std::unique_lock lock{this->mutex_};
 
         const auto can_run = [this] {
             return this->should_stop() //
-                   || !this->output_stream_.empty();
+                   || !this->output_stream_.empty() || this->close_after_flush_;
         };
 
         const auto run = this->condition_variable_.wait_for(lock, 100ms, can_run);
@@ -187,7 +200,15 @@ namespace sogen::gdb_stub
         while (!this->should_stop())
         {
             const auto data = this->get_next_data_to_transmit();
-            (void)this->client_.send(data);
+            const auto sent = this->client_.send(data);
+            {
+                std::lock_guard lock{this->mutex_};
+                if (!sent || (this->close_after_flush_ && this->output_stream_.empty()))
+                {
+                    this->client_.close();
+                }
+            }
+            this->condition_variable_.notify_all();
         }
     }
 } // namespace sogen::gdb_stub

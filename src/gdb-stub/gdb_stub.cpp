@@ -27,6 +27,7 @@ namespace sogen::gdb_stub
         struct debugging_state
         {
             std::optional<uint32_t> continuation_thread{};
+            session_end_reason end_reason{session_end_reason::transport_closed};
         };
 
         struct debugging_context
@@ -661,6 +662,7 @@ namespace sogen::gdb_stub
 
             if (a == action::shutdown)
             {
+                c.state.end_reason = session_end_reason::handler_shutdown;
                 c.connection.close();
             }
             else if (a == action::output)
@@ -995,8 +997,9 @@ namespace sogen::gdb_stub
                 break;
 
             case 'D':
+                c.state.end_reason = session_end_reason::detached;
                 c.connection.send_reply("OK");
-                c.connection.close();
+                c.connection.close_after_flush();
                 break;
 
             case 'z':
@@ -1077,8 +1080,14 @@ namespace sogen::gdb_stub
         }
     }
 
-    bool run_gdb_stub(const network::address& bind_address, debugging_handler& handler)
+    bool run_gdb_stub(const network::address& bind_address, debugging_handler& handler, session_end_reason* end_reason)
     {
+        const auto set_reason = [&](const session_end_reason reason) {
+            if (end_reason)
+            {
+                *end_reason = reason;
+            }
+        };
         const auto should_stop = [&] {
             return handler.should_stop(); //
         };
@@ -1086,6 +1095,7 @@ namespace sogen::gdb_stub
         auto client = accept_client(bind_address, should_stop);
         if (!client)
         {
+            set_reason(should_stop() ? session_end_reason::stop_requested : session_end_reason::no_connection);
             return false;
         }
 
@@ -1122,8 +1132,13 @@ namespace sogen::gdb_stub
             }
 
             process_packet(c, *packet);
+            if (state.end_reason != session_end_reason::transport_closed || connection.should_stop())
+            {
+                break;
+            }
         }
 
+        set_reason(should_stop() ? session_end_reason::stop_requested : state.end_reason);
         return true;
     }
 } // namespace sogen::gdb_stub
