@@ -1,7 +1,11 @@
 #include "emulation_test_utils.hpp"
 #include "../windows-analyzer/analysis.hpp"
 #include "../windows-analyzer/analysis_reporter.hpp"
+#include "../windows-analyzer/jsonl_reporter.hpp"
+#include <emulator_utils.hpp>
 #include <syscall_utils.hpp>
+#include <utils/io.hpp>
+#include <utils/finally.hpp>
 
 namespace sogen::syscalls
 {
@@ -26,12 +30,17 @@ namespace sogen::test
         std::vector<entry_point_execution_event> entries{};
         std::vector<foreign_code_transition_event> transitions{};
         std::vector<thread_terminated_event> terminated{};
+        std::vector<memory_violation_event> violations{};
         uint64_t caller{};
         uint64_t callee{};
         uint64_t stack{};
 
         void report(const analysis_event& event) override
         {
+            if (const auto* violation = std::get_if<memory_violation_event>(&event))
+            {
+                violations.push_back(*violation);
+            }
             if (const auto* call = std::get_if<function_execution_event>(&event))
             {
                 calls.push_back(*call);
@@ -58,6 +67,21 @@ namespace sogen::test
             }
         }
 
+        void set_fault_stack_descriptor(const uint32_t base, const uint32_t limit, const uint8_t flags, const uint8_t access = 0xF3)
+        {
+            const auto table = segment_utils::read_descriptor_table(win_emu.emu(), x86_register::gdtr);
+            ASSERT_TRUE(table);
+            const segment_utils::raw_segment_descriptor descriptor{.limit_low = static_cast<uint16_t>(limit),
+                                                                   .base_low = static_cast<uint16_t>(base),
+                                                                   .base_mid = static_cast<uint8_t>(base >> 16),
+                                                                   .access = access,
+                                                                   .limit_high_flags = static_cast<uint8_t>(flags | ((limit >> 16) & 15)),
+                                                                   .base_high = static_cast<uint8_t>(base >> 24)};
+            win_emu.emu().write_memory(table->base + 0x58, &descriptor, sizeof(descriptor));
+            win_emu.emu().reg(x86_register::cs, 0x23);
+            win_emu.emu().reg(x86_register::ss, 0x5B);
+        }
+
         void observe(const uint64_t previous, const uint64_t current)
         {
             auto& thread = win_emu.current_thread();
@@ -82,6 +106,372 @@ namespace sogen::test
             register_analysis_callbacks(analysis);
         }
     };
+
+    TEST_F(AnalysisObservation, ExecuteFaultCapturesActualAndLastTrackedIpWithHighStackWithoutMutation)
+    {
+        const auto allocation = win_emu.memory.allocate_memory(0x1000, memory_permission::read_write, false, 0x100000000ULL);
+        ASSERT_NE(allocation, 0U);
+        const auto high_stack = allocation + 0x200;
+        ASSERT_GT(high_stack, 0xFFFFFFFFULL);
+        const std::array<uint8_t, 2> call{0xFF, 0xD0};
+        win_emu.emu().write_memory(caller, call.data(), call.size());
+        win_emu.emu().write_memory<uint64_t>(high_stack, caller + 2);
+        auto& thread = win_emu.current_thread();
+        thread.previous_ip = callee;
+        thread.current_ip = caller;
+        thread.executed_instructions = 3;
+        win_emu.emu().reg(x86_register::rsp, high_stack);
+        win_emu.emu().reg(x86_register::rip, 0ULL);
+        win_emu.emu().reg(x86_register::rax, 0ULL);
+        win_emu.emu().reg(x86_register::r15, 0x1234567887654321ULL);
+        win_emu.emu().reg(x86_register::eflags, 0x246U);
+        const auto before = win_emu.emu().save_registers();
+        const auto layout = win_emu.memory.get_layout_version();
+        win_emu.callbacks.on_memory_violate(0, 1, memory_operation::exec, memory_violation_type::unmapped);
+        EXPECT_EQ(win_emu.emu().save_registers(), before);
+        EXPECT_EQ(win_emu.memory.get_layout_version(), layout);
+        EXPECT_EQ(win_emu.emu().read_memory<uint64_t>(high_stack), caller + 2);
+        ASSERT_EQ(violations.size(), 1U);
+        const auto& event = violations.front();
+        EXPECT_EQ(event.execution.rip, 0U);
+        EXPECT_EQ(event.execution.previous_ip, callee);
+        EXPECT_EQ(event.actual_instruction.location.address, 0U);
+        EXPECT_TRUE(event.actual_instruction.bytes_hex.empty());
+        EXPECT_FALSE(event.actual_instruction.error.empty());
+        EXPECT_TRUE(event.near_null_execute);
+        ASSERT_TRUE(event.last_tracked_instruction);
+        EXPECT_EQ(event.last_tracked_instruction->location.address, caller);
+        EXPECT_EQ(event.last_tracked_instruction->bytes_hex, "ffd0");
+        EXPECT_EQ(event.last_tracked_instruction->assembly, "call rax");
+        EXPECT_EQ(event.last_tracked_instruction->location.module_base, win_emu.mod_manager.executable->image_base);
+        EXPECT_EQ(event.last_tracked_instruction->location.module_rva, caller - win_emu.mod_manager.executable->image_base);
+        EXPECT_EQ(event.code_bits, 64U);
+        EXPECT_EQ(event.stack_slot.pointer_bits, 64U);
+        EXPECT_EQ(event.stack_slot.address, high_stack);
+        EXPECT_EQ(event.stack_slot.value, caller + 2);
+        ASSERT_TRUE(event.stack_slot.value_location);
+        ASSERT_TRUE(event.stack_slot.value_location->region);
+        EXPECT_TRUE(event.stack_slot.value_location->region->committed);
+        ASSERT_EQ(event.registers.size(), 20U);
+        const auto value = [&](const std::string_view name) {
+            for (const auto& reg : event.registers)
+            {
+                if (reg.name == name)
+                {
+                    return reg.value;
+                }
+            }
+            return std::optional<uint64_t>{};
+        };
+        EXPECT_EQ(value("rsp"), high_stack);
+        EXPECT_EQ(value("r15"), 0x1234567887654321ULL);
+        EXPECT_EQ(value("eflags"), 0x246U);
+        EXPECT_EQ(value("cs"), 0x33U);
+        win_emu.emu().reg(x86_register::rip, callee);
+        win_emu.emu().write_memory<uint64_t>(high_stack, 0);
+        win_emu.emu().write_memory<uint8_t>(caller, 0x90);
+        EXPECT_EQ(event.execution.rip, 0U);
+        EXPECT_EQ(event.stack_slot.value, caller + 2);
+        EXPECT_EQ(event.last_tracked_instruction->bytes_hex, "ffd0");
+    }
+
+    TEST_F(AnalysisObservation, NullReadAndWriteFaultsDoNotInferACallOrReturnAddress)
+    {
+        const std::array<uint8_t, 3> load{0x48, 0x8B, 0x00};
+        win_emu.emu().write_memory(caller, load.data(), load.size());
+        win_emu.emu().reg(x86_register::rip, caller);
+        win_emu.emu().write_memory<uint64_t>(stack, 0x1122334455667788ULL);
+        const auto before = win_emu.emu().save_registers();
+        for (const auto operation : {memory_operation::read, memory_operation::write})
+        {
+            win_emu.callbacks.on_memory_violate(0, 8, operation, memory_violation_type::unmapped);
+            const auto& event = violations.back();
+            EXPECT_FALSE(event.near_null_execute);
+            EXPECT_EQ(event.actual_instruction.location.address, caller);
+            EXPECT_EQ(event.actual_instruction.bytes_hex, "488b00");
+            EXPECT_FALSE(event.actual_instruction.assembly.empty());
+            EXPECT_EQ(event.stack_slot.value, 0x1122334455667788ULL);
+        }
+        EXPECT_EQ(win_emu.emu().save_registers(), before);
+    }
+
+    TEST_F(AnalysisObservation, CompatibilityFaultReadsOnlyTheLowEspFourByteSlot)
+    {
+        constexpr uint64_t low_stack = 0x40000000;
+        ASSERT_TRUE(win_emu.memory.allocate_memory(low_stack, 0x1000, memory_permission::read_write));
+        win_emu.emu().write_memory<uint64_t>(low_stack, 0xDEADBEEF12345678ULL);
+        win_emu.emu().write_memory<uint16_t>(caller, 0x9040);
+        win_emu.emu().reg(x86_register::cs, 0x23);
+        ASSERT_TRUE(is_32bit_code_segment(win_emu.emu()));
+        win_emu.emu().reg(x86_register::rsp, 0x9999999940000000ULL);
+        win_emu.emu().reg(x86_register::rip, caller);
+        const auto before = win_emu.emu().save_registers();
+        win_emu.callbacks.on_memory_violate(0, 4, memory_operation::read, memory_violation_type::unmapped);
+        EXPECT_EQ(win_emu.emu().save_registers(), before);
+        ASSERT_EQ(violations.size(), 1U);
+        EXPECT_EQ(violations[0].code_bits, 32U);
+        EXPECT_EQ(violations[0].actual_instruction.bytes_hex, "40");
+        EXPECT_EQ(violations[0].actual_instruction.assembly, "inc eax");
+        EXPECT_EQ(violations[0].stack_slot.pointer_bits, 32U);
+        EXPECT_EQ(violations[0].stack_slot.address, low_stack);
+        EXPECT_EQ(violations[0].stack_slot.value, 0x12345678U);
+    }
+
+    TEST_F(AnalysisObservation, CompatibilityStackAddsCurrentSsBaseWithoutChangingCpu)
+    {
+        constexpr uint32_t base = 0x46000000;
+        ASSERT_TRUE(win_emu.memory.allocate_memory(base, 0x1000, memory_permission::read_write));
+        set_fault_stack_descriptor(base, 0xFFF, 0x40);
+        win_emu.emu().reg(x86_register::rsp, 0x1234567800000200ULL);
+        win_emu.emu().write_memory<uint64_t>(base + 0x200, 0xDEADBEEF76543210ULL);
+        const auto before = win_emu.emu().save_registers();
+        win_emu.callbacks.on_memory_violate(0, 4, memory_operation::read, memory_violation_type::unmapped);
+        EXPECT_EQ(win_emu.emu().save_registers(), before);
+        const auto& slot = violations.back().stack_slot;
+        EXPECT_EQ(slot.pointer_bits, 32U);
+        EXPECT_EQ(slot.address_bits, 32U);
+        EXPECT_EQ(slot.segment_base, base);
+        EXPECT_EQ(slot.address, base + 0x200U);
+        EXPECT_EQ(slot.value, 0x76543210U);
+        EXPECT_EQ(slot.width_source, "fault_cs_default_near_return_operand");
+        EXPECT_EQ(slot.address_source, "current_descriptor_table");
+    }
+
+    TEST_F(AnalysisObservation, CompatibilityStackBZeroUsesSpButSamplesCsDefaultFourBytes)
+    {
+        constexpr uint32_t base = 0x47000000;
+        ASSERT_TRUE(win_emu.memory.allocate_memory(base, 0x1000, memory_permission::read_write));
+        set_fault_stack_descriptor(base, 0xFFF, 0);
+        win_emu.emu().reg(x86_register::rsp, 0x12345678BEEF0200ULL);
+        win_emu.emu().write_memory<uint64_t>(base + 0x200, 0xDEADBEEF12345678ULL);
+        const auto before = win_emu.emu().save_registers();
+        win_emu.callbacks.on_memory_violate(0, 4, memory_operation::read, memory_violation_type::unmapped);
+        EXPECT_EQ(win_emu.emu().save_registers(), before);
+        const auto& slot = violations.back().stack_slot;
+        EXPECT_EQ(slot.pointer_bits, 32U);
+        EXPECT_EQ(slot.address_bits, 16U);
+        EXPECT_EQ(slot.address, base + 0x200U);
+        EXPECT_EQ(slot.value, 0x12345678U);
+    }
+
+    TEST_F(AnalysisObservation, StackDescriptorLimitsAndInvalidSelectorsProduceNoSample)
+    {
+        constexpr uint32_t base = 0x48000000;
+        ASSERT_TRUE(win_emu.memory.allocate_memory(base, 0x1000, memory_permission::read_write));
+        set_fault_stack_descriptor(base, 0x201, 0x40);
+        win_emu.emu().reg(x86_register::rsp, 0x200ULL);
+        win_emu.callbacks.on_memory_violate(0, 4, memory_operation::read, memory_violation_type::unmapped);
+        EXPECT_FALSE(violations.back().stack_slot.value);
+        EXPECT_NE(violations.back().stack_slot.error.find("limit"), std::string::npos);
+        set_fault_stack_descriptor(base, 0x100, 0x40, 0xF7);
+        win_emu.callbacks.on_memory_violate(0, 4, memory_operation::read, memory_violation_type::unmapped);
+        EXPECT_EQ(violations.back().stack_slot.address, base + 0x200U);
+        win_emu.emu().reg(x86_register::rsp, 0x100ULL);
+        win_emu.callbacks.on_memory_violate(0, 4, memory_operation::read, memory_violation_type::unmapped);
+        EXPECT_FALSE(violations.back().stack_slot.value);
+        set_fault_stack_descriptor(base, 0xFFFF, 0);
+        win_emu.emu().reg(x86_register::rsp, 0xFFFEULL);
+        win_emu.callbacks.on_memory_violate(0, 4, memory_operation::read, memory_violation_type::unmapped);
+        EXPECT_FALSE(violations.back().stack_slot.value);
+        EXPECT_NE(violations.back().stack_slot.error.find("boundary"), std::string::npos);
+        win_emu.emu().reg(x86_register::ss, 0);
+        win_emu.callbacks.on_memory_violate(0, 4, memory_operation::read, memory_violation_type::unmapped);
+        EXPECT_FALSE(violations.back().stack_slot.value);
+        EXPECT_FALSE(violations.back().stack_slot.error.empty());
+    }
+
+    TEST_F(AnalysisObservation, CompatibilityStackLdtResolutionExcludesMmioReads)
+    {
+        constexpr uint32_t base = 0x49000000;
+        constexpr uint32_t ldt_base = 0x4A000000;
+        ASSERT_TRUE(win_emu.memory.allocate_memory(base, 0x1000, memory_permission::read_write));
+        ASSERT_TRUE(win_emu.memory.allocate_memory(ldt_base, 0x1000, memory_permission::read_write));
+        set_fault_stack_descriptor(base, 0xFFF, 0x40);
+        const auto gdt = segment_utils::read_descriptor_table(win_emu.emu(), x86_register::gdtr);
+        ASSERT_TRUE(gdt);
+        const auto stack_descriptor = win_emu.emu().read_memory<uint64_t>(gdt->base + 0x58);
+        win_emu.emu().write_memory<uint64_t>(ldt_base + 8, stack_descriptor);
+        const uint64_t ldt_descriptor = 0x0000820000000FFFULL | (static_cast<uint64_t>(ldt_base & 0xFFFF) << 16) |
+                                        (static_cast<uint64_t>((ldt_base >> 16) & 0xFF) << 32) |
+                                        (static_cast<uint64_t>(ldt_base >> 24) << 56);
+        win_emu.emu().write_memory<uint64_t>(gdt->base + 0x60, ldt_descriptor);
+        win_emu.emu().write_memory<uint64_t>(gdt->base + 0x68, 0);
+        win_emu.emu().reg(x86_register::ldtr, 0x60);
+        win_emu.emu().reg(x86_register::ss, 0x0F);
+        win_emu.emu().reg(x86_register::rsp, 0x200ULL);
+        win_emu.emu().write_memory<uint32_t>(base + 0x200, 0x12345678);
+        auto before = win_emu.emu().save_registers();
+        win_emu.callbacks.on_memory_violate(0, 4, memory_operation::read, memory_violation_type::unmapped);
+        EXPECT_EQ(win_emu.emu().save_registers(), before);
+        EXPECT_EQ(violations.back().stack_slot.address, base + 0x200U);
+        EXPECT_EQ(violations.back().stack_slot.value, 0x12345678U);
+        ASSERT_TRUE(win_emu.memory.release_memory(ldt_base, 0));
+        size_t reads{};
+        ASSERT_TRUE(win_emu.memory.allocate_mmio(
+            ldt_base, 0x1000, [&](uint64_t, void*, size_t) { ++reads; }, [](uint64_t, const void*, size_t) {}));
+        before = win_emu.emu().save_registers();
+        win_emu.callbacks.on_memory_violate(0, 4, memory_operation::read, memory_violation_type::unmapped);
+        EXPECT_EQ(win_emu.emu().save_registers(), before);
+        EXPECT_EQ(reads, 0U);
+        EXPECT_FALSE(violations.back().stack_slot.value);
+        EXPECT_FALSE(violations.back().stack_slot.error.empty());
+    }
+
+    TEST_F(AnalysisObservation, UnreadableInstructionRetainsFaultAddressAndCpuState)
+    {
+        const auto address = win_emu.memory.allocate_memory(0x1000, memory_permission::read_write, true);
+        ASSERT_NE(address, 0U);
+        win_emu.emu().reg(x86_register::rip, address);
+        const auto before = win_emu.emu().save_registers();
+        win_emu.callbacks.on_memory_violate(address, 1, memory_operation::exec, memory_violation_type::unmapped);
+        EXPECT_EQ(win_emu.emu().save_registers(), before);
+        ASSERT_EQ(violations.size(), 1U);
+        const auto& instruction = violations[0].actual_instruction;
+        EXPECT_EQ(instruction.location.address, address);
+        ASSERT_TRUE(instruction.location.region);
+        EXPECT_EQ(instruction.location.region->allocation_base, address);
+        EXPECT_FALSE(instruction.location.region->committed);
+        EXPECT_TRUE(instruction.bytes_hex.empty());
+        EXPECT_TRUE(instruction.assembly.empty());
+        EXPECT_EQ(instruction.decoded_size, 0U);
+        EXPECT_FALSE(instruction.error.empty());
+    }
+
+    TEST_F(AnalysisObservation, DecodeUsesOnlyReadableBytesAtAllocationBoundary)
+    {
+        const auto address = win_emu.memory.allocate_memory(0x2000, memory_permission::read_write);
+        ASSERT_NE(address, 0U);
+        ASSERT_TRUE(win_emu.memory.decommit_memory(address + 0x1000, 0x1000));
+        win_emu.emu().write_memory<uint8_t>(address + 0xFFF, 0xC3);
+        win_emu.emu().reg(x86_register::rip, address + 0xFFF);
+        auto before = win_emu.emu().save_registers();
+        win_emu.callbacks.on_memory_violate(0, 8, memory_operation::read, memory_violation_type::unmapped);
+        EXPECT_EQ(win_emu.emu().save_registers(), before);
+        EXPECT_EQ(violations.back().actual_instruction.bytes_hex, "c3");
+        EXPECT_EQ(violations.back().actual_instruction.assembly, "ret");
+        EXPECT_EQ(violations.back().actual_instruction.decoded_size, 1U);
+        EXPECT_TRUE(violations.back().actual_instruction.error.empty());
+        win_emu.emu().write_memory<uint16_t>(address + 0xFFE, 0x8B48);
+        win_emu.emu().reg(x86_register::rip, address + 0xFFE);
+        before = win_emu.emu().save_registers();
+        win_emu.callbacks.on_memory_violate(0, 8, memory_operation::read, memory_violation_type::unmapped);
+        EXPECT_EQ(win_emu.emu().save_registers(), before);
+        EXPECT_EQ(violations.back().actual_instruction.bytes_hex, "488b");
+        EXPECT_TRUE(violations.back().actual_instruction.assembly.empty());
+        EXPECT_EQ(violations.back().actual_instruction.decoded_size, 0U);
+        EXPECT_FALSE(violations.back().actual_instruction.error.empty());
+    }
+
+    TEST_F(AnalysisObservation, FaultCaptureDoesNotReadMmioOrMutateGuards)
+    {
+        constexpr uint64_t mmio = 0x42000000;
+        size_t reads = 0;
+        size_t writes = 0;
+        ASSERT_TRUE(win_emu.memory.allocate_mmio(
+            mmio, 0x1000, [&](uint64_t, void*, size_t) { ++reads; }, [&](uint64_t, const void*, size_t) { ++writes; }));
+        win_emu.emu().reg(x86_register::rip, mmio);
+        win_emu.emu().reg(x86_register::rsp, mmio);
+        auto before = win_emu.emu().save_registers();
+        win_emu.callbacks.on_memory_violate(mmio, 1, memory_operation::exec, memory_violation_type::protection);
+        EXPECT_EQ(win_emu.emu().save_registers(), before);
+        EXPECT_EQ(reads, 0U);
+        EXPECT_EQ(writes, 0U);
+        EXPECT_TRUE(violations.back().actual_instruction.bytes_hex.empty());
+        EXPECT_FALSE(violations.back().stack_slot.value);
+        const auto guarded = win_emu.memory.allocate_memory(0x1000, memory_permission::read_write);
+        ASSERT_NE(guarded, 0U);
+        ASSERT_TRUE(win_emu.memory.protect_memory(guarded, 0x1000, memory_permission::read_write | memory_permission_ext::guard));
+        win_emu.emu().reg(x86_register::rip, guarded);
+        win_emu.emu().reg(x86_register::rsp, guarded);
+        before = win_emu.emu().save_registers();
+        const auto layout = win_emu.memory.get_layout_version();
+        win_emu.callbacks.on_memory_violate(guarded, 1, memory_operation::exec, memory_violation_type::protection);
+        EXPECT_EQ(win_emu.emu().save_registers(), before);
+        EXPECT_EQ(win_emu.memory.get_layout_version(), layout);
+        EXPECT_TRUE(win_emu.memory.get_region_info(guarded).permissions.is_guarded());
+        EXPECT_TRUE(violations.back().actual_instruction.bytes_hex.empty());
+        EXPECT_FALSE(violations.back().stack_slot.value);
+        ASSERT_TRUE(violations.back().actual_instruction.location.region);
+        EXPECT_TRUE(violations.back().actual_instruction.location.region->guarded);
+    }
+
+    TEST_F(AnalysisObservation, FaultModeLookupDoesNotReadAnMmioDescriptorTable)
+    {
+        constexpr uint64_t mmio = 0x43000000;
+        size_t reads = 0;
+        ASSERT_TRUE(
+            win_emu.memory.allocate_mmio(mmio, 0x1000, [&](uint64_t, void*, size_t) { ++reads; }, [](uint64_t, const void*, size_t) {}));
+        win_emu.emu().load_gdt(mmio, 0x1000);
+        const auto before = win_emu.emu().save_registers();
+        win_emu.callbacks.on_memory_violate(0, 4, memory_operation::read, memory_violation_type::unmapped);
+        EXPECT_EQ(win_emu.emu().save_registers(), before);
+        EXPECT_EQ(reads, 0U);
+        ASSERT_EQ(violations.size(), 1U);
+        EXPECT_FALSE(violations[0].code_bits);
+        EXPECT_FALSE(violations[0].capture_error.empty());
+        EXPECT_FALSE(violations[0].stack_slot.value);
+    }
+
+    TEST_F(AnalysisObservation, FaultReportersConsumeOnlyTheSavedSnapshot)
+    {
+        const std::array<uint8_t, 2> call{0xFF, 0xD0};
+        win_emu.emu().write_memory(caller, call.data(), call.size());
+        win_emu.current_thread().current_ip = caller;
+        win_emu.current_thread().previous_ip = callee;
+        win_emu.current_thread().executed_instructions = 2;
+        win_emu.emu().reg(x86_register::rip, caller);
+        win_emu.emu().write_memory<uint64_t>(stack, 0x1122334455667788ULL);
+        win_emu.callbacks.on_memory_violate(0, 8, memory_operation::read, memory_violation_type::unmapped);
+        ASSERT_EQ(violations.size(), 1U);
+        win_emu.emu().reg(x86_register::rip, callee);
+        win_emu.emu().write_memory<uint64_t>(stack, 0);
+        const auto before = win_emu.emu().save_registers();
+        std::string text;
+        std::vector<color> colors;
+        logger log;
+        log.set_silent(true);
+        log.set_sink([&](const color shade, const std::string_view line) {
+            text += line;
+            colors.push_back(shade);
+        });
+        auto console = create_console_reporter(log, {});
+        console->report(violations[0]);
+        EXPECT_NE(text.find("Stack slot64"), std::string::npos);
+        EXPECT_NE(text.find("0x1122334455667788"), std::string::npos);
+        EXPECT_NE(text.find("Last tracked (fault CS)"), std::string::npos);
+        EXPECT_EQ(text.find("near-null execute"), std::string::npos);
+        EXPECT_EQ(text.find("return address"), std::string::npos);
+        EXPECT_EQ(text.find("Null-pointer call"), std::string::npos);
+        EXPECT_NE(std::ranges::find(colors, color::red), colors.end());
+        const auto file = std::filesystem::temp_directory_path() /
+                          ("sogen-fault-observation-" + std::to_string(getpid()) + "-" +
+                           std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".jsonl");
+        const auto cleanup = utils::finally([&] {
+            std::error_code error;
+            std::filesystem::remove(file, error);
+        });
+        auto jsonl = create_jsonl_reporter(file);
+        jsonl->report(violations[0]);
+        jsonl->flush();
+        const auto bytes = utils::io::read_file(file);
+        const std::string json(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        EXPECT_NE(json.find("\"nearNullExecute\":false"), std::string::npos);
+        EXPECT_NE(json.find("\"actualInstruction\":"), std::string::npos);
+        EXPECT_NE(json.find("\"lastTrackedInstruction\":"), std::string::npos);
+        EXPECT_NE(json.find("\"bytes\":\"ffd0\""), std::string::npos);
+        EXPECT_NE(json.find("\"asm\":\"call rax\""), std::string::npos);
+        EXPECT_NE(json.find("\"moduleBase\":"), std::string::npos);
+        EXPECT_NE(json.find("\"moduleRva\":"), std::string::npos);
+        EXPECT_NE(json.find("\"allocationBase\":"), std::string::npos);
+        EXPECT_NE(json.find("\"pointerBits\":64"), std::string::npos);
+        EXPECT_NE(json.find("\"addressBits\":64"), std::string::npos);
+        EXPECT_NE(json.find("\"widthSource\":\"fault_cs_default_near_return_operand\""), std::string::npos);
+        EXPECT_NE(json.find("\"addressSource\":\"64_bit_rsp\""), std::string::npos);
+        EXPECT_NE(json.find("\"value\":\"0x1122334455667788\""), std::string::npos);
+        EXPECT_NE(json.find("\"prev\":"), std::string::npos);
+        EXPECT_EQ(json.find("returnAddress"), std::string::npos);
+        EXPECT_EQ(win_emu.emu().save_registers(), before);
+    }
 
     TEST_F(AnalysisObservation, FunctionDetailsPreserveGuestRegistersAndReturnSlot)
     {

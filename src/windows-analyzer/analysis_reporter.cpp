@@ -145,6 +145,14 @@ namespace sogen
             }
 
             template <typename Callback>
+            void object_field(std::string_view key, Callback&& callback)
+            {
+                this->key(key);
+                json_object_builder object{this->output_};
+                callback(object);
+            }
+
+            template <typename Callback>
             void array_field(std::string_view key, Callback&& callback)
             {
                 this->key(key);
@@ -468,12 +476,92 @@ namespace sogen
                 object.field("perms", event.permissions);
             }
 
+            static void write_fault_address(json_object_builder& object, const fault_address_snapshot& location)
+            {
+                object.hex_field("address", location.address);
+                object.optional_string_field("module", location.module);
+                object.optional_hex_field("moduleBase", location.module_base);
+                object.optional_hex_field("moduleRva", location.module_rva);
+                object.field("locationError", location.error);
+                if (location.region)
+                {
+                    object.object_field("region", [&](auto& region) {
+                        const auto& value = *location.region;
+                        region.hex_field("start", value.start);
+                        region.hex_field("length", value.length);
+                        region.hex_field("allocationBase", value.allocation_base);
+                        region.hex_field("allocationLength", value.allocation_length);
+                        region.field("permissions", value.permissions);
+                        region.field("kind", value.kind);
+                        region.field("reserved", value.reserved);
+                        region.field("committed", value.committed);
+                        region.field("guarded", value.guarded);
+                    });
+                }
+            }
+
+            static void write_fault_instruction(json_object_builder& object, const fault_instruction_snapshot& instruction)
+            {
+                write_fault_address(object, instruction.location);
+                object.field("bytes", instruction.bytes_hex);
+                object.field("asm", instruction.assembly);
+                object.field("decodedSize", instruction.decoded_size);
+                object.field("error", instruction.error.empty() ? instruction.location.error : instruction.error);
+            }
+
             static void write_fields(json_object_builder& object, const memory_violation_event& event)
             {
                 object.hex_field("addr", event.address);
                 object.field("size", event.size);
                 object.field("op", event.operation);
                 object.field("violation", event.violation_type);
+                object.field("nearNullExecute", event.near_null_execute);
+                object.field("captureError", event.capture_error);
+                if (event.code_bits)
+                {
+                    object.field("codeBits", *event.code_bits);
+                }
+                object.object_field("faultAddress", [&](auto& value) { write_fault_address(value, event.fault_address); });
+                object.object_field("actualInstruction", [&](auto& value) { write_fault_instruction(value, event.actual_instruction); });
+                if (event.last_tracked_instruction)
+                {
+                    object.object_field("lastTrackedInstruction", [&](auto& value) {
+                        write_fault_instruction(value, *event.last_tracked_instruction);
+                        value.field("decodeModeSource", "fault_cs");
+                    });
+                }
+                object.array_field("registers", [&](const auto& emit) {
+                    for (const auto& reg : event.registers)
+                    {
+                        emit([&](std::string& output) {
+                            json_object_builder value{output};
+                            value.field("name", reg.name);
+                            value.optional_hex_field("value", reg.value);
+                            value.field("error", reg.error);
+                        });
+                    }
+                });
+                object.object_field("stackSlot", [&](auto& value) {
+                    if (event.stack_slot.pointer_bits)
+                    {
+                        value.field("pointerBits", *event.stack_slot.pointer_bits);
+                    }
+                    if (event.stack_slot.address_bits)
+                    {
+                        value.field("addressBits", *event.stack_slot.address_bits);
+                    }
+                    value.optional_hex_field("segmentBase", event.stack_slot.segment_base);
+                    value.field("widthSource", event.stack_slot.width_source);
+                    value.field("addressSource", event.stack_slot.address_source);
+                    value.optional_hex_field("address", event.stack_slot.address);
+                    value.optional_hex_field("value", event.stack_slot.value);
+                    value.field("error", event.stack_slot.error);
+                    if (event.stack_slot.value_location)
+                    {
+                        value.object_field("valueLocation",
+                                           [&](auto& location) { write_fault_address(location, *event.stack_slot.value_location); });
+                    }
+                });
             }
 
             static void write_fields(json_object_builder& object, const io_control_event& event)

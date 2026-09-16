@@ -156,12 +156,72 @@ namespace sogen
         std::string permissions{};
     };
 
+    struct fault_region_snapshot
+    {
+        uint64_t start{};
+        uint64_t length{};
+        uint64_t allocation_base{};
+        uint64_t allocation_length{};
+        std::string permissions{};
+        std::string kind{};
+        bool reserved{};
+        bool committed{};
+        bool guarded{};
+    };
+
+    struct fault_address_snapshot
+    {
+        uint64_t address{};
+        std::optional<std::string> module{};
+        std::optional<uint64_t> module_base{};
+        std::optional<uint64_t> module_rva{};
+        std::optional<fault_region_snapshot> region{};
+        std::string error{};
+    };
+
+    struct fault_instruction_snapshot
+    {
+        fault_address_snapshot location{};
+        std::string bytes_hex{};
+        std::string assembly{};
+        uint32_t decoded_size{};
+        std::string error{};
+    };
+
+    struct fault_register_snapshot
+    {
+        std::string name{};
+        std::optional<uint64_t> value{};
+        std::string error{};
+    };
+
+    struct fault_stack_snapshot
+    {
+        std::optional<uint32_t> pointer_bits{};
+        std::optional<uint32_t> address_bits{};
+        std::optional<uint64_t> segment_base{};
+        std::string width_source{};
+        std::string address_source{};
+        std::optional<uint64_t> address{};
+        std::optional<uint64_t> value{};
+        std::optional<fault_address_snapshot> value_location{};
+        std::string error{};
+    };
+
     struct memory_violation_event : observation_event
     {
         uint64_t address{};
         uint64_t size{};
         std::string operation{};
         std::string violation_type{};
+        fault_address_snapshot fault_address{};
+        fault_instruction_snapshot actual_instruction{};
+        std::optional<fault_instruction_snapshot> last_tracked_instruction{};
+        std::vector<fault_register_snapshot> registers{};
+        std::optional<uint32_t> code_bits{};
+        fault_stack_snapshot stack_slot{};
+        bool near_null_execute{};
+        std::string capture_error{};
     };
 
     struct io_control_event : observation_event

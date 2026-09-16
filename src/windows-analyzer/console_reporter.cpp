@@ -14,6 +14,27 @@ namespace sogen
 
     namespace
     {
+        std::string fault_hex(const uint64_t value)
+        {
+            std::array<char, 24> buffer{};
+            snprintf(buffer.data(), buffer.size(), "0x%" PRIx64, value);
+            return buffer.data();
+        }
+
+        std::string fault_location(const fault_address_snapshot& location)
+        {
+            std::string result = location.module.value_or(location.region ? location.region->kind : "unknown");
+            if (location.module_rva)
+            {
+                result += "+" + fault_hex(*location.module_rva);
+            }
+            if (location.region && location.region->reserved)
+            {
+                result += " alloc=" + fault_hex(location.region->allocation_base);
+            }
+            return result;
+        }
+
         class console_analysis_reporter final : public analysis_reporter
         {
           public:
@@ -154,8 +175,55 @@ namespace sogen
                         },
                         [&](const memory_violation_event& e) {
                             const auto* label = e.violation_type == "protection" ? "Protection violation" : "Mapping violation";
-                            this->log_.print(color::gray, "%s: 0x%" PRIx64 " (%" PRIx64 ") - %s at 0x%" PRIx64 " (%s)\n", label, e.address,
-                                             e.size, e.operation.c_str(), e.execution.rip, e.execution.rip_module.c_str());
+                            this->log_.print(color::red, "%s: %s 0x%" PRIx64 " size=0x%" PRIx64 " tid=%u%s\n", label, e.operation.c_str(),
+                                             e.address, e.size, e.execution.thread_id, e.near_null_execute ? " [near-null execute]" : "");
+                            const auto instruction = [&](const char* name, const fault_instruction_snapshot& value) {
+                                this->log_.print(color::cyan, "  %s: 0x%" PRIx64 " (%s) [%s] %s%s%s\n", name, value.location.address,
+                                                 fault_location(value.location).c_str(), value.bytes_hex.c_str(), value.assembly.c_str(),
+                                                 value.error.empty() ? "" : " | ", value.error.c_str());
+                            };
+                            instruction("CPU IP", e.actual_instruction);
+                            if (e.last_tracked_instruction)
+                            {
+                                instruction("Last tracked (fault CS)", *e.last_tracked_instruction);
+                            }
+                            if (e.stack_slot.address)
+                            {
+                                this->log_.print(color::yellow, "  Stack sample: width=%s address=%s addressBits=%u base=%s\n",
+                                                 e.stack_slot.width_source.c_str(), e.stack_slot.address_source.c_str(),
+                                                 e.stack_slot.address_bits.value_or(0),
+                                                 e.stack_slot.segment_base ? fault_hex(*e.stack_slot.segment_base).c_str()
+                                                                           : "<unavailable>");
+                                this->log_.print(color::yellow, "  Stack slot%u [%s]=%s%s%s\n", e.stack_slot.pointer_bits.value_or(0),
+                                                 fault_hex(*e.stack_slot.address).c_str(),
+                                                 e.stack_slot.value ? fault_hex(*e.stack_slot.value).c_str() : "<unreadable>",
+                                                 e.stack_slot.value_location || !e.stack_slot.error.empty() ? " " : "",
+                                                 e.stack_slot.value_location ? fault_location(*e.stack_slot.value_location).c_str()
+                                                                             : e.stack_slot.error.c_str());
+                            }
+                            else if (!e.stack_slot.error.empty())
+                            {
+                                this->log_.print(color::yellow, "  Stack slot: %s\n", e.stack_slot.error.c_str());
+                            }
+                            std::string registers;
+                            size_t count = 0;
+                            for (const auto& reg : e.registers)
+                            {
+                                registers += " " + reg.name + "=" + (reg.value ? fault_hex(*reg.value) : "<unavailable>");
+                                if (++count % 4 == 0)
+                                {
+                                    this->log_.print(color::gray, " %s\n", registers.c_str());
+                                    registers.clear();
+                                }
+                            }
+                            if (!registers.empty())
+                            {
+                                this->log_.print(color::gray, " %s\n", registers.c_str());
+                            }
+                            if (!e.capture_error.empty())
+                            {
+                                this->log_.error("  Capture: %s\n", e.capture_error.c_str());
+                            }
                         },
                         [&](const io_control_event& e) {
                             this->log_.print(color::dark_gray, "--> %s: 0x%X\n", e.device_name.c_str(), e.code);

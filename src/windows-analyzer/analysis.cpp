@@ -1,5 +1,6 @@
 #include "std_include.hpp"
 #include "debug_print.hpp"
+#include "fault_observation.hpp"
 
 #include "analysis.hpp"
 #include "analysis_reporter.hpp"
@@ -216,11 +217,18 @@ namespace sogen
         void handle_memory_violate(const analysis_context& c, const uint64_t address, const uint64_t size, const memory_operation operation,
                                    const memory_violation_type type)
         {
-            c.emit_observation<memory_violation_event>([&](auto& event) {
+            const auto execution = c.make_execution_context();
+            c.emit_observation<memory_violation_event>(execution, [&](auto& event) {
                 event.address = address;
                 event.size = size;
                 event.operation = get_permission_string(operation);
                 event.violation_type = type == memory_violation_type::protection ? "protection"s : "unmapped"s;
+                // A fault on a null/near-null address is almost always a call through a null function
+                // pointer (e.g. a Vulkan entry point the shim doesn't implement). Log the caller's
+                // return address so the missing function's call site can be identified.
+                // An execute fault can also follow JMP/RET, so a sampled stack slot alone does not prove a caller.
+                event.near_null_execute = operation == memory_operation::exec && address < 0x1000;
+                capture_memory_violation(c, event, execution.rip);
             });
 
             if (type == memory_violation_type::unmapped)
