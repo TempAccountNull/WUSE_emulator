@@ -1025,6 +1025,20 @@ impl IcicleEmulator {
         return self.get_mem().map_memory_len(address, length, mapping);
     }
 
+    pub unsafe fn map_host_memory(&mut self, address: u64, pointer: *mut u8, length: u64, permissions: u8) -> bool {
+        unsafe { self.get_mem().map_host_memory(address, pointer, length, map_permissions(permissions)) }
+    }
+
+    pub fn has_host_mappings(&self) -> bool {
+        self.vm.cpu.mem.has_host_mappings()
+    }
+
+    pub fn flush_host_memory_cache(&mut self, pointer: usize, length: usize) {
+        for (address, size) in self.vm.cpu.mem.host_mapping_aliases(pointer, length) {
+            self.invalidate_code_range(address, size);
+        }
+    }
+
     pub fn map_shared_memory(
         &mut self,
         address: u64,
@@ -1223,6 +1237,7 @@ impl IcicleEmulator {
     }
 
     pub fn create_snapshot(&mut self) -> u32 {
+        if self.has_host_mappings() { return u32::MAX; }
         let snap = self.vm.snapshot();
 
         let id = self.snapshots.len() as u32;

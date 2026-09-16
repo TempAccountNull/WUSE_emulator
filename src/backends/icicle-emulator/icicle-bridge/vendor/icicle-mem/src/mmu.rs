@@ -459,6 +459,59 @@ impl Mmu {
         true
     }
 
+    /// Maps caller-owned host pages without copying their data.
+    ///
+    /// # Safety
+    /// The host range must remain valid and synchronized until every guest alias is unmapped.
+    pub unsafe fn map_host_memory(&mut self, address: u64, pointer: *mut u8, length: u64, permissions: u8) -> bool {
+        let page_size = self.page_size();
+        if pointer.is_null() || length == 0 || length > isize::MAX as u64
+            || address % page_size != 0 || length % page_size != 0
+            || (pointer as usize) % page_size as usize != 0 {
+            return false;
+        }
+        let Some(last) = address.checked_add(length - 1) else { return false; };
+        if (pointer as usize).checked_add(length as usize).is_none()
+            || self.mapping.get_range(address..=last).is_some() {
+            return false;
+        }
+        let mut pages = Vec::new();
+        for offset in (0..length).step_by(page_size as usize) {
+            let Some(index) = self.physical.alloc() else {
+                for (_, index) in pages { self.physical.free(index); }
+                return false;
+            };
+            let page = self.physical.get_mut(index).data_mut();
+            page.data = physical::PageBytes::borrowed(std::ptr::NonNull::new_unchecked(pointer.add(offset as usize)));
+            page.perm.fill(permissions | perm::MAP | perm::INIT);
+            pages.push((address + offset, index));
+        }
+        for (addr, index) in pages {
+            let mapping = PhysicalMapping { addr, index, shared_perm: permissions | perm::MAP | perm::INIT };
+            assert!(self.map_memory_len(addr, page_size, MemoryMapping::Physical(mapping)));
+        }
+        self.clear_tlb();
+        true
+    }
+
+    pub fn has_host_mappings(&self) -> bool {
+        self.mapping.iter().any(|(_, _, mapping)| match mapping {
+            MemoryMapping::Physical(page) => self.physical.get(page.index).data().data.is_external(),
+            _ => false,
+        })
+    }
+
+    pub fn host_mapping_aliases(&self, pointer: usize, length: usize) -> Vec<(u64, u64)> {
+        let Some(end) = pointer.checked_add(length) else { return Vec::new(); };
+        self.mapping.iter().filter_map(|(start, last, mapping)| {
+            let MemoryMapping::Physical(page) = mapping else { return None; };
+            let host = self.physical.get(page.index).data().data.host_address()?;
+            let host_start = host + PageData::offset(start);
+            let host_end = host_start + (last - start + 1) as usize;
+            (host_start < end && pointer < host_end).then_some((start, last - start + 1))
+        }).collect()
+    }
+
     pub fn map_shared(&mut self, dst: u64, src: u64, len: u64, permissions: u8) -> MemResult<()> {
         let page_size = self.page_size();
         if len == 0 || (dst | src | len) & (page_size - 1) != 0 {
@@ -793,6 +846,7 @@ impl Mmu {
 
     /// Create a full snapshot of memory that can later be restored
     pub fn snapshot(&mut self) -> Snapshot {
+        assert!(!self.has_host_mappings(), "Cannot snapshot caller-owned host memory");
         // TLB is invalidated whenever we clone the physical memory state.
         self.tlb.clear();
 
@@ -826,6 +880,7 @@ impl Mmu {
 
     /// Create a snapshot of just the virtual address space
     pub fn snapshot_virtual_mapping(&mut self) -> VirtualMemoryMap {
+        assert!(!self.has_host_mappings(), "Cannot snapshot caller-owned host memory");
         // Clear the TLB to ensure that no writes will be missed.
         self.tlb.clear();
         self.last_io_handler = None;
@@ -1016,6 +1071,12 @@ impl Mmu {
                     *entry = Some(MemoryMapping::Physical(new_mapping));
                     init
                 }
+                // Preserve the backing identity of surviving aliases when filling a hole in their page.
+                Some(MemoryMapping::Physical(existing))
+                    if existing.shared_perm != 0 || physical.get(existing.index).data().data.is_external() =>
+                {
+                    (crate::UNINIT_VALUE, perm::NONE)
+                }
                 Some(MemoryMapping::Physical(existing)) => {
                     // Rare case where there was an existing page map at this location. This should
                     // only occur when a page is partially mapped. Copy any memory that could be
@@ -1126,16 +1187,16 @@ impl Mmu {
     ) -> MemResult<[u8; N]> {
         let page_size = self.page_size();
         let page = self.physical.get_mut(index);
-        let shared_perm = match self.mapping.get(addr) {
-            Some(MemoryMapping::Physical(mapping)) => mapping.shared_perm,
-            _ => 0,
+        let shared_perm = match self.mapping.get_with_range(addr) {
+            Some((_, last, MemoryMapping::Physical(mapping))) if last - addr >= (N - 1) as u64 => mapping.shared_perm,
+            _ => return Err(MemError::Unmapped),
         };
         if shared_perm != 0 { perm::check(shared_perm, perm)?; }
         let result = page.data().read(addr, if shared_perm != 0 { perm::NONE } else { perm })?;
 
         // If there is no memory hook set on the current page, cache the translated address in the
         // TLB.
-        let uncachable = shared_perm != 0 || self.read_hooks.contains_address(addr, page_size)
+        let uncachable = shared_perm != 0 || page.data().data.is_external() || self.read_hooks.contains_address(addr, page_size)
             || self.read_after_hooks.contains_address(addr, page_size);
         if !uncachable {
             self.tlb.insert_read(addr, unsafe { page.read_ptr() });
@@ -1153,9 +1214,9 @@ impl Mmu {
         let page_start = self.page_aligned(addr);
         let page_size = self.page_size();
 
-        let shared_perm = match self.mapping.get(addr) {
-            Some(MemoryMapping::Physical(mapping)) => mapping.shared_perm,
-            _ => 0,
+        let shared_perm = match self.mapping.get_with_range(addr) {
+            Some((_, last, MemoryMapping::Physical(mapping))) if last - addr >= (N - 1) as u64 => mapping.shared_perm,
+            _ => return Err(MemError::Unmapped),
         };
         if shared_perm != 0 { perm::check(shared_perm, perm)?; }
         let mut page = self.physical.get_mut(index);
@@ -1203,7 +1264,7 @@ impl Mmu {
         page.modified = true;
         page.data_mut().write(addr, value, if shared_perm != 0 { perm::NONE } else { perm })?;
 
-        let uncachable = shared_perm != 0 || self.write_hooks.contains_address(addr, page_size);
+        let uncachable = shared_perm != 0 || page.data().data.is_external() || self.write_hooks.contains_address(addr, page_size);
         if shared_perm != 0 { self.tlb.clear(); }
         if !uncachable {
             // Safety: `page.data_mut()` ensures the page is a unique copy of the underlying data.

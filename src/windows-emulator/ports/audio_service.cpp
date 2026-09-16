@@ -1,4 +1,5 @@
 #include "../std_include.hpp"
+#include <cstdio>
 #include "audio_service.hpp"
 
 #include "binary_writer.hpp"
@@ -278,20 +279,31 @@ namespace sogen
                   stream_format_(format),
                   buffer_bytes_(buffer_bytes),
                   section_size_(section_size),
-                  host_storage_(static_cast<size_t>(section_size) + k_audio_page_size)
+                  host_storage_(std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(section_size) + k_audio_page_size))
             {
                 this->initialize_host_storage();
                 std::memcpy(this->host_ptr_, control_header, control_header_size);
 
-                this->guest_address_ =
-                    win_emu.memory.allocate_host_memory(static_cast<size_t>(section_size), this->host_ptr_, memory_permission::read_write);
+                this->guest_address_ = win_emu.memory.allocate_host_memory(static_cast<size_t>(section_size), this->host_ptr_,
+                                                                           memory_permission::read_write, this->host_storage_);
                 if (this->guest_address_ == 0)
                 {
                     return;
                 }
 
                 this->mapped_ = true;
-                this->start();
+                this->backing_ = win_emu.memory.host_memory_backing_at(this->guest_address_);
+                this->backing_->snapshot_reconstructible = true;
+                try
+                {
+                    this->start();
+                }
+                catch (...)
+                {
+                    this->backing_->snapshot_reconstructible = false;
+                    win_emu.memory.revoke_host_memory(this->backing_);
+                    throw;
+                }
             }
 
             render_stream(windows_emulator& win_emu, state restored)
@@ -301,7 +313,7 @@ namespace sogen
                   section_size_(restored.section_size),
                   guest_address_(restored.guest_address),
                   submitted_(restored.submitted),
-                  host_storage_(validated_storage_size(restored))
+                  host_storage_(std::make_shared<std::vector<uint8_t>>(validated_storage_size(restored)))
             {
                 this->initialize_host_storage();
                 std::memcpy(this->host_ptr_, restored.contents.data(), restored.contents.size());
@@ -312,12 +324,15 @@ namespace sogen
                 }
 
                 if (!win_emu.memory.allocate_host_memory_at(this->guest_address_, static_cast<size_t>(this->section_size_), this->host_ptr_,
-                                                            memory_permission::read_write))
+                                                            memory_permission::read_write, this->host_storage_))
                 {
                     throw std::runtime_error("[audio-service] Cannot restore render stream: saved guest buffer address is unavailable");
                 }
 
                 this->mapped_ = true;
+                this->backing_ = win_emu.memory.host_memory_backing_at(this->guest_address_);
+                this->backing_->snapshot_reconstructible = true;
+                this->section_owned_ = true;
                 // The prior backend queue is opaque and no longer exists, so only samples not submitted before the snapshot remain pending.
                 this->write_play_cursor(std::max(this->read_cursor(k_play_cursor_offset), this->submitted_));
             }
@@ -334,7 +349,24 @@ namespace sogen
                 if (this->mapped_)
                 {
                     this->win_emu_.audio().stop();
-                    this->win_emu_.memory.release_memory(this->guest_address_, static_cast<size_t>(this->section_size_));
+                    this->backing_->snapshot_reconstructible = false;
+                    if (!this->section_owned_)
+                    {
+                        try
+                        {
+                            this->win_emu_.memory.revoke_host_memory(this->backing_);
+                        }
+                        catch (const std::exception& error)
+                        {
+                            std::fprintf(stderr, "[audio-service] Retaining host backing at %llx after cleanup failure: %s\n",
+                                         static_cast<unsigned long long>(this->guest_address_), error.what());
+                        }
+                        catch (...)
+                        {
+                            std::fprintf(stderr, "[audio-service] Retaining host backing at %llx after unknown cleanup failure\n",
+                                         static_cast<unsigned long long>(this->guest_address_));
+                        }
+                    }
                 }
             }
 
@@ -346,6 +378,12 @@ namespace sogen
             uint64_t guest_address() const
             {
                 return this->guest_address_;
+            }
+
+            void transfer_to_section()
+            {
+                // The worker may stop while the guest still owns the section or a view of its render buffer.
+                this->section_owned_ = true;
             }
 
             void start()
@@ -415,7 +453,7 @@ namespace sogen
             void initialize_host_storage()
             {
                 this->host_ptr_ = reinterpret_cast<uint8_t*>(
-                    (reinterpret_cast<uintptr_t>(this->host_storage_.data()) + (k_audio_page_size - 1)) & ~(k_audio_page_size - 1));
+                    (reinterpret_cast<uintptr_t>(this->host_storage_->data()) + (k_audio_page_size - 1)) & ~(k_audio_page_size - 1));
             }
 
             uint64_t read_cursor(const uint32_t offset) const
@@ -546,7 +584,9 @@ namespace sogen
             uint64_t section_size_{};
             uint64_t guest_address_{0};
             uint64_t submitted_{};
-            std::vector<uint8_t> host_storage_;
+            std::shared_ptr<std::vector<uint8_t>> host_storage_;
+            memory_manager::host_memory_token backing_{};
+            bool section_owned_{};
             uint8_t* host_ptr_{nullptr};
             bool mapped_{};
             mutable std::atomic<worker_status> worker_status_{worker_status::running};
@@ -690,11 +730,8 @@ namespace sogen
             {
                 this->render_stream_.reset();
                 this->restored_stream_.reset();
-                if (auto* section = win_emu.process.sections.get(this->render_section_handle_))
-                {
-                    section->backing_address = 0;
-                }
                 this->render_section_handle_ = {};
+                (void)win_emu;
             }
 
             // {D574D111} opnum 0: AudioServerGetMixFormat(endpointId, VadServerSettings*, [out] WAVEFORMATEX**).
@@ -924,6 +961,7 @@ namespace sogen
 
                 const auto section_handle = win_emu.process.sections.store(std::move(render_section));
                 this->render_section_handle_ = section_handle;
+                this->render_stream_->transfer_to_section();
 
                 // Deliver the render section. The op7 NDR references it as an sh_section handle (the _Struct_9
                 // union arm). rpcrt4!LRPC_SYSTEM_HANDLE_DATA::GetSystemHandle requires the handle's ObjectType

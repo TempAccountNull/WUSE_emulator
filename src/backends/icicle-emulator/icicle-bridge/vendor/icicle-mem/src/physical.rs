@@ -118,6 +118,7 @@ impl PhysicalMemory {
     }
 
     pub fn free(&mut self, index: Index) {
+        self.get_mut(index).data_mut().data.external = None;
         self.free.push(index);
     }
 
@@ -277,11 +278,60 @@ impl Page {
     }
 }
 
+// The JIT addresses inline bytes from offset zero; external pages must never enter its direct-access TLB.
+#[derive(Clone)]
+#[repr(C, align(16))]
+pub struct PageBytes {
+    inline: [u8; PAGE_SIZE],
+    external: Option<NonNull<[u8; PAGE_SIZE]>>,
+}
+
+impl Default for PageBytes {
+    fn default() -> Self {
+        Self { inline: [0; PAGE_SIZE], external: None }
+    }
+}
+
+impl PageBytes {
+    /// The caller owns this page and must keep it valid and synchronized until all aliases are unmapped.
+    pub unsafe fn borrowed(pointer: NonNull<u8>) -> Self {
+        Self { inline: [0; PAGE_SIZE], external: Some(pointer.cast()) }
+    }
+
+    pub fn host_address(&self) -> Option<usize> {
+        self.external.map(|pointer| pointer.as_ptr() as usize)
+    }
+
+    pub fn is_external(&self) -> bool {
+        self.external.is_some()
+    }
+}
+
+impl std::ops::Deref for PageBytes {
+    type Target = [u8; PAGE_SIZE];
+
+    fn deref(&self) -> &Self::Target {
+        match self.external {
+            Some(pointer) => unsafe { pointer.as_ref() },
+            None => &self.inline,
+        }
+    }
+}
+
+impl std::ops::DerefMut for PageBytes {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self.external {
+            Some(mut pointer) => unsafe { pointer.as_mut() },
+            None => &mut self.inline,
+        }
+    }
+}
+
 #[derive(Clone)]
 #[repr(C)]
 pub struct PageData {
     /// The actual data stored in this page.
-    pub data: [u8; PAGE_SIZE],
+    pub data: PageBytes,
 
     /// The permissions associated with each byte in the page
     pub perm: [u8; PAGE_SIZE],
@@ -289,7 +339,7 @@ pub struct PageData {
 
 impl Default for PageData {
     fn default() -> Self {
-        Self { data: [0; PAGE_SIZE], perm: [0; PAGE_SIZE] }
+        Self { data: PageBytes::default(), perm: [0; PAGE_SIZE] }
     }
 }
 
@@ -297,7 +347,7 @@ impl PageData {
     #[allow(unused)]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         assert_eq!(bytes.len(), 2 * PAGE_SIZE);
-        let mut data = Self { data: [0; PAGE_SIZE], perm: [0; PAGE_SIZE] };
+        let mut data = Self { data: PageBytes::default(), perm: [0; PAGE_SIZE] };
         data.data.copy_from_slice(&bytes[..PAGE_SIZE]);
         data.perm[..PAGE_SIZE].copy_from_slice(&bytes[PAGE_SIZE..]);
         data
@@ -306,7 +356,7 @@ impl PageData {
     #[allow(unused)]
     pub fn as_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(2 * PAGE_SIZE);
-        bytes.extend_from_slice(&self.data);
+        bytes.extend_from_slice(&self.data[..]);
         bytes.extend_from_slice(&self.perm[..PAGE_SIZE]);
         bytes
     }

@@ -4,6 +4,7 @@
 #include "../windows_emulator.hpp"
 
 #include <gpu_bridge_protocol.hpp>
+#include <cstdio>
 
 namespace sogen
 {
@@ -17,6 +18,32 @@ namespace sogen
         // Host Vulkan objects cannot be reconstructed from the serialized guest handles.
         struct gpu_bridge_device : io_device
         {
+            void create(windows_emulator& win_emu, const io_device_creation_data&) override
+            {
+                this->memory_ = &win_emu.memory;
+            }
+
+            ~gpu_bridge_device() override
+            {
+                // NtClose can destroy the bridge without issuing the explicit Vulkan teardown IOCTLs.
+                try
+                {
+                    for (const auto& [id, mapping] : this->direct_mappings_)
+                    {
+                        this->memory_->revoke_host_memory(mapping.backing);
+                        this->vulkan_.unmap_memory(mapping.device, id);
+                    }
+                }
+                catch (const std::exception& error)
+                {
+                    this->retain_failed_cleanup(error.what());
+                }
+                catch (...)
+                {
+                    this->retain_failed_cleanup("unknown exception");
+                }
+            }
+
             void work(windows_emulator& win_emu) override
             {
                 for (auto& frame : this->vulkan_.poll_presented_frames())
@@ -265,7 +292,9 @@ namespace sogen
             }
 
           private:
-            vulkan_host vulkan_{};
+            std::unique_ptr<vulkan_host> vulkan_owner_{std::make_unique<vulkan_host>()};
+            vulkan_host& vulkan_{*this->vulkan_owner_};
+            memory_manager* memory_{};
 
             // VkDeviceMemory aliased directly into the guest address space (see handle_map_memory_direct),
             // keyed by memory object id, so unmap can release the guest range and the host mapping.
@@ -275,9 +304,24 @@ namespace sogen
                 uint64_t size{};
                 uint64_t device{};
                 void* host_ptr{};
+                memory_manager::host_memory_token backing{};
             };
 
             std::unordered_map<uint64_t, direct_mapping> direct_mappings_{};
+
+            void retain_failed_cleanup(const char* cause) noexcept
+            {
+                std::fprintf(stderr, "[gpu-bridge] Guest mapping revocation failed during destruction: %s; retaining Vulkan owner\n",
+                             cause);
+                for (const auto& [id, mapping] : this->direct_mappings_)
+                {
+                    std::fprintf(stderr, "[gpu-bridge] retained memory=%llx device=%llx guest=%llx size=%llx\n",
+                                 static_cast<unsigned long long>(id), static_cast<unsigned long long>(mapping.device),
+                                 static_cast<unsigned long long>(mapping.guest_address), static_cast<unsigned long long>(mapping.size));
+                }
+                // Freeing Vulkan after failed revocation would leave guest mappings pointing to freed host storage.
+                (void)this->vulkan_owner_.release();
+            }
 
             // Before the host GPU reads guest-produced data, make the guest's writes to every directly-aliased
             // buffer visible. On backends that alias host memory non-coherently (KVM: guest writes are
@@ -429,7 +473,14 @@ namespace sogen
                 // aliases first to prevent stale mappings to freed host pages.
                 for (auto it = this->direct_mappings_.begin(); it != this->direct_mappings_.end();)
                 {
-                    win_emu.memory.release_memory(it->second.guest_address, static_cast<size_t>(it->second.size));
+                    // The host's ownership table also makes unknown instance destruction leave live aliases intact.
+                    if (!this->vulkan_.owns_device(request.instance, it->second.device))
+                    {
+                        ++it;
+                        continue;
+                    }
+
+                    win_emu.memory.revoke_host_memory(it->second.backing);
                     this->vulkan_.unmap_memory(it->second.device, it->first);
                     it = this->direct_mappings_.erase(it);
                 }
@@ -923,7 +974,7 @@ namespace sogen
                         continue;
                     }
 
-                    win_emu.memory.release_memory(it->second.guest_address, static_cast<size_t>(it->second.size));
+                    win_emu.memory.revoke_host_memory(it->second.backing);
                     this->vulkan_.unmap_memory(it->second.device, it->first);
                     it = this->direct_mappings_.erase(it);
                 }
@@ -1531,7 +1582,7 @@ namespace sogen
                 // dereference (e.g. while DXVK frees buffers during shutdown).
                 if (const auto it = this->direct_mappings_.find(request.memory); it != this->direct_mappings_.end())
                 {
-                    win_emu.memory.release_memory(it->second.guest_address, static_cast<size_t>(it->second.size));
+                    win_emu.memory.revoke_host_memory(it->second.backing);
                     this->vulkan_.unmap_memory(it->second.device, request.memory);
                     this->direct_mappings_.erase(it);
                 }
@@ -1689,33 +1740,45 @@ namespace sogen
                     return write_output(win_emu, context, response);
                 }
 
-                void* host_ptr = nullptr;
-                uint64_t host_size = 0;
-                response.vk_result = this->vulkan_.map_memory(request.device, request.memory, host_ptr, host_size);
-
-                constexpr uint64_t page = 0x1000;
-                if (response.vk_result != 0 || !host_ptr || host_size == 0 || (reinterpret_cast<uintptr_t>(host_ptr) % page) != 0 ||
-                    (host_size % page) != 0)
+                const auto entry = this->direct_mappings_.try_emplace(request.memory).first;
+                auto& mapping = entry->second;
+                mapping.device = request.device;
+                this->memory_ = &win_emu.memory;
+                bool committed{};
+                try
                 {
-                    if (host_ptr)
+                    response.vk_result = this->vulkan_.map_memory(request.device, request.memory, mapping.host_ptr, mapping.size);
+                    constexpr uint64_t page = 0x1000;
+                    if (response.vk_result == 0 && mapping.host_ptr && mapping.size != 0 &&
+                        (reinterpret_cast<uintptr_t>(mapping.host_ptr) % page) == 0 && (mapping.size % page) == 0)
+                    {
+                        mapping.guest_address = win_emu.memory.allocate_host_memory(static_cast<size_t>(mapping.size), mapping.host_ptr,
+                                                                                    memory_permission::read_write);
+                        if (mapping.guest_address != 0)
+                        {
+                            mapping.backing = win_emu.memory.host_memory_backing_at(mapping.guest_address);
+                            committed = true;
+                            response.guest_address = request.offset < mapping.size ? mapping.guest_address + request.offset : 0;
+                        }
+                    }
+                }
+                catch (...)
+                {
+                    if (mapping.host_ptr)
                     {
                         this->vulkan_.unmap_memory(request.device, request.memory);
                     }
-                    return write_output(win_emu, context, response);
+                    this->direct_mappings_.erase(entry);
+                    throw;
                 }
-
-                const uint64_t mapped_size = (host_size + page - 1) & ~(page - 1);
-                const uint64_t va =
-                    win_emu.memory.allocate_host_memory(static_cast<size_t>(mapped_size), host_ptr, memory_permission::read_write);
-                if (va == 0)
+                if (!committed)
                 {
-                    this->vulkan_.unmap_memory(request.device, request.memory);
-                    return write_output(win_emu, context, response);
+                    if (mapping.host_ptr)
+                    {
+                        this->vulkan_.unmap_memory(request.device, request.memory);
+                    }
+                    this->direct_mappings_.erase(entry);
                 }
-
-                this->direct_mappings_[request.memory] =
-                    direct_mapping{.guest_address = va, .size = mapped_size, .device = request.device, .host_ptr = host_ptr};
-                response.guest_address = (request.offset < mapped_size) ? (va + request.offset) : 0;
                 return write_output(win_emu, context, response);
             }
 
@@ -1730,7 +1793,7 @@ namespace sogen
                 const auto it = this->direct_mappings_.find(request.memory);
                 if (it != this->direct_mappings_.end())
                 {
-                    win_emu.memory.release_memory(it->second.guest_address, static_cast<size_t>(it->second.size));
+                    win_emu.memory.revoke_host_memory(it->second.backing);
                     this->vulkan_.unmap_memory(it->second.device, request.memory);
                     this->direct_mappings_.erase(it);
                 }

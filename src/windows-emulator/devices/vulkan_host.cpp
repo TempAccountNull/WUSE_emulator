@@ -1136,6 +1136,12 @@ namespace sogen
         return VK_SUCCESS;
     }
 
+    bool vulkan_host::owns_device(const uint64_t instance, const uint64_t device) const
+    {
+        const auto entry = this->impl_->devices.find(device);
+        return this->impl_->instances.contains(instance) && entry != this->impl_->devices.end() && entry->second.instance_id == instance;
+    }
+
     void vulkan_host::destroy_instance(uint64_t instance)
     {
         const auto it = this->impl_->instances.find(instance);

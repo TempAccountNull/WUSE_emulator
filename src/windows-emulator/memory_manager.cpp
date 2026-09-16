@@ -177,6 +177,7 @@ namespace sogen
 
         static void serialize(buffer_serializer& buffer, const memory_manager::reserved_region& region)
         {
+            // Host ownership is runtime state. Keep the existing region format and let the device restore its backing.
             buffer.write(region.kind);
             buffer.write(region.mapped_filename);
             buffer.write(region.initial_permission);
@@ -191,6 +192,7 @@ namespace sogen
             buffer.read(region.initial_permission);
             region.length = static_cast<size_t>(buffer.read<uint64_t>());
             buffer.read_map(region.committed_regions);
+            region.host_backing.reset();
         }
     }
 
@@ -260,6 +262,13 @@ namespace sogen
 
     void memory_manager::serialize_memory_state(utils::buffer_serializer& buffer, const bool is_snapshot) const
     {
+        for (const auto& [address, region] : this->reserved_regions_)
+        {
+            if (region.host_backing && !region.host_backing->snapshot_reconstructible)
+            {
+                throw std::runtime_error("Cannot serialize host-backed memory without a reconstruction owner");
+            }
+        }
         buffer.write_atomic(this->layout_version_);
         buffer.write(this->default_allocation_address_);
         buffer.write(this->dep_enabled_);
@@ -410,34 +419,67 @@ namespace sogen
     }
 
     bool memory_manager::allocate_host_memory_at(const uint64_t address, const size_t size, void* host_pointer,
-                                                 const nt_memory_permission permissions)
+                                                 const nt_memory_permission permissions, std::shared_ptr<void> storage)
     {
-        if (this->overlaps_reserved_region(address, size))
+        if (!size || !host_pointer || address > MAX_ALLOCATION_END_EXCL || size > MAX_ALLOCATION_END_EXCL - address ||
+            this->overlaps_reserved_region(address, size))
         {
             return false;
         }
 
-        this->map_host_memory(address, size, host_pointer, this->get_effective_permissions(permissions));
-
-        const auto entry = this->reserved_regions_
-                               .try_emplace(address,
-                                            reserved_region{
-                                                .length = size,
-                                                .kind = memory_region_kind::mmio,
-                                            })
-                               .first;
-
-        entry->second.committed_regions[address] = committed_region{
-            .length = size,
-            .permissions = permissions,
-        };
-
+        reserved_region region{.length = size, .kind = memory_region_kind::mmio};
+        region.host_backing = std::make_shared<host_memory_backing>();
+        region.host_backing->storage = std::move(storage);
+        region.committed_regions.emplace(address, committed_region{.length = size, .permissions = permissions});
+        const auto entry = this->reserved_regions_.emplace(address, std::move(region)).first;
+        try
+        {
+            this->map_host_memory(address, size, host_pointer, this->get_effective_permissions(permissions));
+        }
+        catch (...)
+        {
+            this->reserved_regions_.erase(entry);
+            throw;
+        }
         this->update_layout_version();
-
         return true;
     }
 
-    uint64_t memory_manager::allocate_host_memory(const size_t size, void* host_pointer, const nt_memory_permission permissions)
+    memory_manager::host_memory_token memory_manager::host_memory_backing_at(const uint64_t address) const
+    {
+        auto region = this->reserved_regions_.upper_bound(address);
+        if (region == this->reserved_regions_.begin())
+        {
+            return {};
+        }
+        --region;
+        return address - region->first < region->second.length ? region->second.host_backing : nullptr;
+    }
+
+    void memory_manager::revoke_host_memory(const host_memory_token& backing)
+    {
+        const auto retained = backing;
+        if (!retained)
+        {
+            return;
+        }
+        for (auto entry = this->reserved_regions_.begin(); entry != this->reserved_regions_.end();)
+        {
+            if (entry->second.host_backing == retained)
+            {
+                const auto address = entry->first;
+                ++entry;
+                this->release_memory(address, 0);
+            }
+            else
+            {
+                ++entry;
+            }
+        }
+    }
+
+    uint64_t memory_manager::allocate_host_memory(const size_t size, void* host_pointer, const nt_memory_permission permissions,
+                                                  std::shared_ptr<void> storage)
     {
         if (size == 0 || host_pointer == nullptr)
         {
@@ -467,16 +509,26 @@ namespace sogen
             this->memory_->reserve_guest_address_range(address, size);
         }
 
-        if (!this->allocate_host_memory_at(address, size, host_pointer, permissions))
+        try
+        {
+            if (this->allocate_host_memory_at(address, size, host_pointer, permissions, std::move(storage)))
+            {
+                return address;
+            }
+        }
+        catch (...)
         {
             if (!uses_existing_host_mapping)
             {
                 this->release_host_claims(address + size);
             }
-            return 0;
+            throw;
         }
-
-        return address;
+        if (!uses_existing_host_mapping)
+        {
+            this->release_host_claims(address + size);
+        }
+        return 0;
     }
 
     void memory_manager::reserve_host_memory_ranges()
@@ -677,24 +729,45 @@ namespace sogen
             return false;
         }
         auto& view = this->reserved_regions_.at(address);
-        for (const auto& [start, region] : backing->second.committed_regions)
+        view.host_backing = backing->second.host_backing;
+        try
         {
-            const auto first = std::max(source, start);
-            const auto end = std::min(source + size, start + region.length);
-            if (first >= end)
+            for (const auto& [start, region] : backing->second.committed_regions)
             {
-                continue;
+                const auto first = std::max(source, start);
+                const auto end = std::min(source + size, start + region.length);
+                if (first >= end)
+                {
+                    continue;
+                }
+                const auto target = address + first - source;
+                const auto length = static_cast<size_t>(end - first);
+                const auto committed =
+                    view.committed_regions.emplace(target, committed_region{.length = length, .permissions = permissions}).first;
+                bool mapped{};
+                try
+                {
+                    mapped = this->memory_->map_shared_memory(target, first, length, this->get_effective_permissions(permissions));
+                }
+                catch (...)
+                {
+                    view.committed_regions.erase(committed);
+                    throw;
+                }
+                if (!mapped)
+                {
+                    view.committed_regions.erase(committed);
+                    this->release_memory(address, 0);
+                    return false;
+                }
             }
-            const auto target = address + first - source;
-            const auto length = static_cast<size_t>(end - first);
-            if (!this->memory_->map_shared_memory(target, first, length, this->get_effective_permissions(permissions)))
-            {
-                this->release_memory(address, 0);
-                return false;
-            }
-            view.committed_regions.emplace(target, committed_region{.length = length, .permissions = permissions});
+            this->shared_views_.emplace(address, source);
         }
-        this->shared_views_.emplace(address, source);
+        catch (...)
+        {
+            this->release_memory(address, 0);
+            throw;
+        }
         this->update_layout_version();
         return true;
     }
@@ -723,12 +796,20 @@ namespace sogen
         {
             const auto view = this->reserved_regions_.find(address);
             const auto backing = this->find_reserved_region(source);
-            if (view == this->reserved_regions_.end() || backing == this->reserved_regions_.end() ||
-                view->second.kind != memory_region_kind::pagefile_section_view || source + view->second.length < source ||
-                source + view->second.length > backing->first + backing->second.length)
+            if (view == this->reserved_regions_.end() || view->second.kind != memory_region_kind::pagefile_section_view ||
+                source + view->second.length < source)
             {
                 throw std::runtime_error("Invalid saved shared view");
             }
+            if (backing == this->reserved_regions_.end())
+            {
+                throw std::runtime_error("Invalid saved shared view backing");
+            }
+            if (source + view->second.length > backing->first + backing->second.length)
+            {
+                throw std::runtime_error("Invalid saved shared view extent");
+            }
+            view->second.host_backing = backing->second.host_backing;
             for (const auto& [start, region] : view->second.committed_regions)
             {
                 this->unmap_memory(start, region.length);
@@ -989,6 +1070,7 @@ namespace sogen
             {
                 this->unmap_memory(i->first, i->second.length);
                 i = committed_regions.erase(i);
+                this->update_layout_version();
             }
 
             this->reserved_regions_.erase(entry);
@@ -1016,11 +1098,13 @@ namespace sogen
             throw std::runtime_error("Cross region release not supported yet!");
         }
 
-        reserved_region region = std::move(entry->second);
-        this->reserved_regions_.erase(entry);
+        reserved_region region = entry->second;
+        const auto shared_source = this->shared_view_source(reserved_start);
 
         auto& committed_regions = region.committed_regions;
         split_regions(committed_regions, {aligned_start, aligned_end});
+        auto pending_committed_regions = committed_regions;
+        std::vector<std::pair<uint64_t, size_t>> removed_ranges;
 
         for (auto i = committed_regions.begin(); i != committed_regions.end();)
         {
@@ -1032,7 +1116,7 @@ namespace sogen
             const auto sub_region_end = i->first + i->second.length;
             if (i->first >= aligned_start && sub_region_end <= aligned_end)
             {
-                this->unmap_memory(i->first, i->second.length);
+                removed_ranges.emplace_back(i->first, i->second.length);
                 i = committed_regions.erase(i);
             }
             else
@@ -1041,6 +1125,9 @@ namespace sogen
             }
         }
 
+        reserved_region_map surviving_regions;
+        std::map<uint64_t, uint64_t> surviving_views;
+        // Allocate replacement bookkeeping before unmapping, so allocation failure cannot orphan surviving host aliases.
         committed_region_map left_committed{};
         committed_region_map right_committed{};
 
@@ -1063,8 +1150,13 @@ namespace sogen
             left_region.initial_permission = region.initial_permission;
             left_region.kind = region.kind;
             left_region.mapped_filename = region.mapped_filename;
+            left_region.host_backing = region.host_backing;
             left_region.committed_regions = std::move(left_committed);
-            this->reserved_regions_.try_emplace(reserved_start, std::move(left_region));
+            surviving_regions.try_emplace(reserved_start, std::move(left_region));
+            if (shared_source)
+            {
+                surviving_views.emplace(reserved_start, shared_source);
+            }
         }
 
         if (aligned_end < reserved_end)
@@ -1074,10 +1166,28 @@ namespace sogen
             right_region.initial_permission = region.initial_permission;
             right_region.kind = region.kind;
             right_region.mapped_filename = region.mapped_filename;
+            right_region.host_backing = region.host_backing;
             right_region.committed_regions = std::move(right_committed);
-            this->reserved_regions_.try_emplace(aligned_end, std::move(right_region));
+            surviving_regions.try_emplace(aligned_end, std::move(right_region));
+            if (shared_source)
+            {
+                surviving_views.emplace(aligned_end, shared_source + aligned_end - reserved_start);
+            }
         }
 
+        // Keep the reservation and its owner until every unmap succeeds, but record each completed
+        // subrange immediately. Retrying after a later failure must not unmap an already removed range.
+        entry->second.committed_regions.swap(pending_committed_regions);
+        for (const auto& [removed_address, removed_size] : removed_ranges)
+        {
+            this->unmap_memory(removed_address, removed_size);
+            entry->second.committed_regions.erase(removed_address);
+            this->update_layout_version();
+        }
+        this->reserved_regions_.erase(entry);
+        this->shared_views_.erase(reserved_start);
+        this->reserved_regions_.merge(surviving_regions);
+        this->shared_views_.merge(surviving_views);
         this->release_host_claims(aligned_end);
         this->update_layout_version();
         return true;

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <optional>
+#include <memory>
 #include <vector>
 
 #include "memory_permission_ext.hpp"
@@ -70,6 +71,16 @@ namespace sogen
 
         using committed_region_map = std::map<uint64_t, committed_region>;
 
+        struct host_memory_backing
+        {
+            // Shared views keep the host allocation alive independently of the producer and the original guest mapping.
+            std::shared_ptr<void> storage{};
+            // The owner must recreate this allocation during restore; neither its pointer nor its token is serialized.
+            bool snapshot_reconstructible{};
+        };
+
+        using host_memory_token = std::shared_ptr<host_memory_backing>;
+
         struct reserved_region
         {
             size_t length{};
@@ -77,6 +88,7 @@ namespace sogen
             committed_region_map committed_regions{};
             memory_region_kind kind{memory_region_kind::private_allocation};
             std::u16string mapped_filename{};
+            host_memory_token host_backing{};
         };
 
         using reserved_region_map = std::map<uint64_t, reserved_region>;
@@ -110,10 +122,17 @@ namespace sogen
         void reset_host_memory_ranges();
 
         bool allocate_mmio(uint64_t address, size_t size, mmio_read_callback read_cb, mmio_write_callback write_cb);
-        bool allocate_host_memory_at(uint64_t address, size_t size, void* host_pointer, nt_memory_permission permissions);
+        bool allocate_host_memory_at(uint64_t address, size_t size, void* host_pointer, nt_memory_permission permissions,
+                                     std::shared_ptr<void> storage = {});
         // Chooses a compatible guest address and aliases it onto caller-owned host memory (e.g. a host Vulkan
         // mapping). The region is treated like MMIO: not serialized, host_pointer not owned. Returns 0 on failure.
-        uint64_t allocate_host_memory(size_t size, void* host_pointer, nt_memory_permission permissions);
+
+        // An optional storage owner keeps that caller-owned allocation alive through surviving shared views.
+        uint64_t allocate_host_memory(size_t size, void* host_pointer, nt_memory_permission permissions,
+                                      std::shared_ptr<void> storage = {});
+        host_memory_token host_memory_backing_at(uint64_t address) const;
+        // External-resource teardown revokes every alias of this allocation, even if its original VA has been reused.
+        void revoke_host_memory(const host_memory_token& backing);
 
         // Backend coherency hooks for host-aliased memory (see memory_interface). Device emulation such as
         // the GPU bridge uses these to make guest writes visible to the host GPU on backends (e.g. KVM) that

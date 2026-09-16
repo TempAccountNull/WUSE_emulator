@@ -35,6 +35,7 @@ namespace sogen
         // on success, or 0 on failure.
         int32_t create_instance(uint64_t& out_instance);
         void destroy_instance(uint64_t instance);
+        bool owns_device(uint64_t instance, uint64_t device) const;
 
         // Reports the host physical devices for the instance. out_count always receives the true
         // device count; up to out_devices.size() ids are written. Ids are stable across calls.

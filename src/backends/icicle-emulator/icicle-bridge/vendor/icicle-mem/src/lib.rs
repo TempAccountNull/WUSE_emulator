@@ -236,3 +236,6 @@ mod reclamation_tests;
 
 #[cfg(test)]
 mod shared_pages_tests;
+
+#[cfg(test)]
+mod host_pages_tests;

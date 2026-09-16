@@ -550,6 +550,192 @@ namespace
         return ok;
     }
 
+    bool persistent_coherent_buffer(PFN_vkGetInstanceProcAddr get_proc, VkInstance instance, VkPhysicalDevice physical_device,
+                                    VkDevice device, VkQueue queue, uint32_t queue_family)
+    {
+        const auto memory_properties =
+            reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(get_proc(instance, "vkGetPhysicalDeviceMemoryProperties"));
+        const auto create_buffer = reinterpret_cast<PFN_vkCreateBuffer>(get_proc(instance, "vkCreateBuffer"));
+        const auto destroy_buffer = reinterpret_cast<PFN_vkDestroyBuffer>(get_proc(instance, "vkDestroyBuffer"));
+        const auto requirements = reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(get_proc(instance, "vkGetBufferMemoryRequirements"));
+        const auto allocate = reinterpret_cast<PFN_vkAllocateMemory>(get_proc(instance, "vkAllocateMemory"));
+        const auto free_memory = reinterpret_cast<PFN_vkFreeMemory>(get_proc(instance, "vkFreeMemory"));
+        const auto bind = reinterpret_cast<PFN_vkBindBufferMemory>(get_proc(instance, "vkBindBufferMemory"));
+        const auto map = reinterpret_cast<PFN_vkMapMemory>(get_proc(instance, "vkMapMemory"));
+        const auto unmap = reinterpret_cast<PFN_vkUnmapMemory>(get_proc(instance, "vkUnmapMemory"));
+        const auto create_pool = reinterpret_cast<PFN_vkCreateCommandPool>(get_proc(instance, "vkCreateCommandPool"));
+        const auto destroy_pool = reinterpret_cast<PFN_vkDestroyCommandPool>(get_proc(instance, "vkDestroyCommandPool"));
+        const auto allocate_commands = reinterpret_cast<PFN_vkAllocateCommandBuffers>(get_proc(instance, "vkAllocateCommandBuffers"));
+        const auto begin = reinterpret_cast<PFN_vkBeginCommandBuffer>(get_proc(instance, "vkBeginCommandBuffer"));
+        const auto end = reinterpret_cast<PFN_vkEndCommandBuffer>(get_proc(instance, "vkEndCommandBuffer"));
+        const auto barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(get_proc(instance, "vkCmdPipelineBarrier"));
+        const auto copy = reinterpret_cast<PFN_vkCmdCopyBuffer>(get_proc(instance, "vkCmdCopyBuffer"));
+        const auto create_fence = reinterpret_cast<PFN_vkCreateFence>(get_proc(instance, "vkCreateFence"));
+        const auto destroy_fence = reinterpret_cast<PFN_vkDestroyFence>(get_proc(instance, "vkDestroyFence"));
+        const auto reset_fences = reinterpret_cast<PFN_vkResetFences>(get_proc(instance, "vkResetFences"));
+        const auto submit = reinterpret_cast<PFN_vkQueueSubmit>(get_proc(instance, "vkQueueSubmit"));
+        const auto wait = reinterpret_cast<PFN_vkWaitForFences>(get_proc(instance, "vkWaitForFences"));
+        const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(get_proc(instance, "vkDeviceWaitIdle"));
+        if (!memory_properties || !create_buffer || !destroy_buffer || !requirements || !allocate || !free_memory || !bind || !map ||
+            !unmap || !create_pool || !destroy_pool || !allocate_commands || !begin || !end || !barrier || !copy || !create_fence ||
+            !destroy_fence || !reset_fences || !submit || !wait || !idle)
+        {
+            std::printf("[shim-test] persistent coherent buffer missing entry point -> FAIL\n");
+            return false;
+        }
+        VkBuffer buffer{};
+        VkDeviceMemory memory{};
+        VkCommandPool pool{};
+        VkFence fence{};
+        void* pointer = nullptr;
+        const auto cleanup = [&] {
+            idle(device);
+            if (pointer)
+            {
+                unmap(device, memory);
+            }
+            if (fence)
+            {
+                destroy_fence(device, fence, nullptr);
+            }
+            if (pool)
+            {
+                destroy_pool(device, pool, nullptr);
+            }
+            if (buffer)
+            {
+                destroy_buffer(device, buffer, nullptr);
+            }
+            if (memory)
+            {
+                free_memory(device, memory, nullptr);
+            }
+        };
+        const auto check = [&](VkResult result, const char* name) {
+            if (result == VK_SUCCESS)
+            {
+                return true;
+            }
+            std::printf("[shim-test] persistent coherent %s -> %d FAIL\n", name, result);
+            cleanup();
+            return false;
+        };
+        VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        buffer_info.size = 512;
+        buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (!check(create_buffer(device, &buffer_info, nullptr, &buffer), "create buffer"))
+        {
+            return false;
+        }
+        VkMemoryRequirements req{};
+        requirements(device, buffer, &req);
+        VkPhysicalDeviceMemoryProperties properties{};
+        memory_properties(physical_device, &properties);
+        const uint32_t memory_type =
+            find_memory_type(properties, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (memory_type == UINT32_MAX)
+        {
+            std::printf("[shim-test] persistent coherent memory type -> FAIL\n");
+            cleanup();
+            return false;
+        }
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = req.size;
+        allocation.memoryTypeIndex = memory_type;
+        if (!check(allocate(device, &allocation, nullptr, &memory), "allocate"))
+        {
+            return false;
+        }
+        if (!check(bind(device, buffer, memory, 0), "bind"))
+        {
+            return false;
+        }
+        if (!check(map(device, memory, 0, 512, 0, &pointer), "map"))
+        {
+            return false;
+        }
+        if (!pointer)
+        {
+            cleanup();
+            return false;
+        }
+        VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pool_info.queueFamilyIndex = queue_family;
+        if (!check(create_pool(device, &pool_info, nullptr, &pool), "create pool"))
+        {
+            return false;
+        }
+        VkCommandBufferAllocateInfo command_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        command_info.commandPool = pool;
+        command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        command_info.commandBufferCount = 1;
+        VkCommandBuffer command{};
+        if (!check(allocate_commands(device, &command_info, &command), "allocate commands"))
+        {
+            return false;
+        }
+        VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        if (!check(begin(command, &begin_info), "begin"))
+        {
+            return false;
+        }
+        VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        before.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier(command, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+        VkBufferCopy range{0, 256, 256};
+        copy(command, buffer, buffer, 1, &range);
+        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+        if (!check(end(command), "end"))
+        {
+            return false;
+        }
+        VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (!check(create_fence(device, &fence_info, nullptr, &fence), "create fence"))
+        {
+            return false;
+        }
+        VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submission.commandBufferCount = 1;
+        submission.pCommandBuffers = &command;
+        auto* words = static_cast<uint32_t*>(pointer);
+        for (uint32_t iteration = 1; iteration <= 16; ++iteration)
+        {
+            for (uint32_t index = 0; index < 64; ++index)
+            {
+                words[index] = 0x13570000u ^ (iteration << 8) ^ index;
+            }
+            if (!check(submit(queue, 1, &submission, fence), "submit"))
+            {
+                return false;
+            }
+            if (!check(wait(device, 1, &fence, VK_TRUE, 30000000000ULL), "wait"))
+            {
+                return false;
+            }
+            for (uint32_t index = 0; index < 64; ++index)
+            {
+                if (words[index + 64] != words[index])
+                {
+                    std::printf("[shim-test] persistent coherent iteration=%u word=%u actual=%08X expected=%08X -> FAIL\n", iteration,
+                                index, words[index + 64], words[index]);
+                    cleanup();
+                    return false;
+                }
+            }
+            if (!check(reset_fences(device, 1, &fence), "reset fence"))
+            {
+                return false;
+            }
+        }
+        cleanup();
+        std::printf("[shim-test] persistent coherent guest write -> GPU copy -> guest read, 16 submissions -> PASS\n");
+        return true;
+    }
+
     // Renders into an image the simplest possible way -- clears it to a known color on the GPU -- then
     // copies it into a host-visible buffer and reads the pixels back. This is the offscreen render
     // target + readback path that windowed present will reuse (present = clear/draw -> copy -> readback).
@@ -959,6 +1145,9 @@ int main(int argc, char** argv)
     bool transform_feedback_capabilities_ok = true;
     bool shader_identifier_test_ok = true;
     bool pipeline_cache_test_ok = true;
+    bool fill_readback_ok = false;
+    bool persistent_coherent_ok = false;
+    bool image_readback_ok = false;
     uint32_t count = 0;
     result = enumerate(instance, &count, nullptr);
     std::printf("[shim-test] vkEnumeratePhysicalDevices -> %d, count=%u\n", result, count);
@@ -1235,8 +1424,10 @@ int main(int argc, char** argv)
                     std::printf("[shim-test] transform feedback command recording -> SKIP (feature unavailable)\n");
                 }
                 submit_and_wait(get_instance_proc, instance, device, queue, graphics_family);
-                fill_buffer_and_readback(get_instance_proc, instance, devices[0], device, queue, graphics_family);
-                clear_image_and_readback(get_instance_proc, instance, devices[0], device, queue, graphics_family);
+                fill_readback_ok = fill_buffer_and_readback(get_instance_proc, instance, devices[0], device, queue, graphics_family);
+                persistent_coherent_ok =
+                    persistent_coherent_buffer(get_instance_proc, instance, devices[0], device, queue, graphics_family);
+                image_readback_ok = clear_image_and_readback(get_instance_proc, instance, devices[0], device, queue, graphics_family);
                 if (shader_identifier_supported)
                 {
                     shader_identifier_test_ok = test_shader_module_identifier(get_instance_proc, instance, device);
@@ -1254,7 +1445,8 @@ int main(int argc, char** argv)
     }
 
     const bool all_ok = timestamp2_test_ok && calibrated_timestamps_test_ok && transform_feedback_test_ok &&
-                        transform_feedback_capabilities_ok && shader_identifier_test_ok && pipeline_cache_test_ok;
+                        transform_feedback_capabilities_ok && shader_identifier_test_ok && pipeline_cache_test_ok && fill_readback_ok &&
+                        persistent_coherent_ok && image_readback_ok;
     std::printf("[shim-test] %s\n", all_ok ? "ok" : "FAILED");
     return all_ok ? 0 : 6;
 }

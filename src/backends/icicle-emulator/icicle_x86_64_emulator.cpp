@@ -48,6 +48,9 @@ extern "C"
     void icicle_restore_registers(icicle_emulator*, const void* data, size_t length);
     void icicle_reset_volatile_state(icicle_emulator*);
     uint32_t icicle_create_snapshot(icicle_emulator*);
+    int32_t icicle_map_host_memory(icicle_emulator*, uint64_t, void*, uint64_t, uint8_t);
+    int32_t icicle_has_host_mappings(icicle_emulator*);
+    void icicle_flush_host_memory_cache(icicle_emulator*, const void*, size_t);
     void icicle_restore_snapshot(icicle_emulator*, uint32_t id);
     uint32_t icicle_add_syscall_hook(icicle_emulator*, raw_func* callback, void* data);
     uint32_t icicle_add_timestamp_hook(icicle_emulator*, int32_t serializing, instruction_func* callback, void* data);
@@ -309,6 +312,17 @@ namespace sogen::icicle
             ice(res, "Failed to map memory");
         }
 
+        void map_host_memory(const uint64_t address, const size_t size, void* host_pointer, memory_permission permissions) override
+        {
+            ice(icicle_map_host_memory(this->emu_, address, host_pointer, size, static_cast<uint8_t>(permissions)),
+                "Failed to map host memory");
+        }
+
+        void flush_host_memory_cache(const void* host_pointer, const size_t size) override
+        {
+            icicle_flush_host_memory_cache(this->emu_, host_pointer, size);
+        }
+
         bool map_shared_memory(const uint64_t address, const uint64_t source, const size_t size,
                                const memory_permission permissions) override
         {
@@ -527,6 +541,10 @@ namespace sogen::icicle
 
         void serialize_state(utils::buffer_serializer& buffer, const bool is_snapshot) const override
         {
+            if (icicle_has_host_mappings(this->emu_))
+            {
+                throw std::runtime_error("Cannot save or restore Icicle state while caller-owned host memory is mapped");
+            }
             if (is_snapshot)
             {
                 const auto snapshot = icicle_create_snapshot(this->emu_);
@@ -540,6 +558,10 @@ namespace sogen::icicle
 
         void deserialize_state(utils::buffer_deserializer& buffer, const bool is_snapshot) override
         {
+            if (icicle_has_host_mappings(this->emu_))
+            {
+                throw std::runtime_error("Cannot save or restore Icicle state while caller-owned host memory is mapped");
+            }
             if (is_snapshot)
             {
                 const auto snapshot = buffer.read<uint32_t>();

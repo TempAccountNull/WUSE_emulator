@@ -122,6 +122,30 @@ pub fn icicle_map_memory(ptr: *mut c_void, address: u64, length: u64, permission
 }
 
 #[unsafe(no_mangle)]
+pub unsafe fn icicle_map_host_memory(ptr: *mut c_void, address: u64, pointer: *mut u8, length: u64, permissions: u8) -> i32 {
+    unsafe {
+        let emulator = &mut *(ptr as *mut IcicleEmulator);
+        to_cbool(emulator.map_host_memory(address, pointer, length, permissions))
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe fn icicle_has_host_mappings(ptr: *mut c_void) -> i32 {
+    unsafe {
+        let emulator = &*(ptr as *mut IcicleEmulator);
+        to_cbool(emulator.has_host_mappings())
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe fn icicle_flush_host_memory_cache(ptr: *mut c_void, pointer: *const c_void, length: usize) {
+    unsafe {
+        let emulator = &mut *(ptr as *mut IcicleEmulator);
+        emulator.flush_host_memory_cache(pointer as usize, length);
+    }
+}
+
+#[unsafe(no_mangle)]
 pub fn icicle_map_shared_memory(ptr: *mut c_void, address: u64, source: u64, length: u64, permissions: u8) -> i32 {
     unsafe {
         let emulator = &mut *(ptr as *mut IcicleEmulator);
