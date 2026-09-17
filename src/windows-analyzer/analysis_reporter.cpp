@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <cinttypes>
 #include <cstdio>
@@ -231,6 +232,13 @@ namespace sogen
             {
                 this->observe_location(event);
 
+                if (!this->settings_.hidden_modules.empty() && event_from_hidden_module(event, this->settings_.hidden_modules))
+                {
+                    ++this->hidden_events_;
+                    this->maybe_publish_status(false);
+                    return;
+                }
+
                 if (this->settings_.mode == jsonl_report_mode::audit && this->summarize(event))
                 {
                     this->maybe_publish_status(false);
@@ -300,6 +308,7 @@ namespace sogen
             std::chrono::steady_clock::time_point last_status_{};
             uint64_t retained_events_{};
             uint64_t deduplicated_events_{};
+            uint64_t hidden_events_{};
             std::unordered_set<uint64_t> seen_content_{}; // content hashes of written records (dedupe)
             uint64_t summarized_events_{};
             uint64_t window_events_{};
@@ -573,6 +582,7 @@ namespace sogen
                         object.field("dedupe", this->settings_.dedupe);
                         object.field("deduplicated_events", this->deduplicated_events_);
                         object.field("dedupe_keys", static_cast<uint64_t>(this->seen_content_.size()));
+                        object.field("hidden_events", this->hidden_events_);
                         object.field("last_event_type", this->last_event_type_);
                         object.field("updated_unix_ms",
                                      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1144,6 +1154,69 @@ namespace sogen
                                           [](const fast_fail_event&) { return false; },
                                           [](const entry_point_execution_event&) { return false; },
                                           [](const auto&) { return true; }),
+                          event);
+    }
+
+    namespace
+    {
+        bool equals_ignoring_case(const std::string_view left, const std::string_view right)
+        {
+            if (left.size() != right.size())
+            {
+                return false;
+            }
+            for (size_t index = 0; index < left.size(); ++index)
+            {
+                const auto a = static_cast<unsigned char>(left[index]);
+                const auto b = static_cast<unsigned char>(right[index]);
+                if (std::tolower(a) != std::tolower(b))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool module_is_hidden(const std::string_view module, const std::vector<std::string>& hidden)
+        {
+            for (const auto& name : hidden)
+            {
+                if (equals_ignoring_case(module, name))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    bool event_from_hidden_module(const analysis_event& event, const std::vector<std::string>& hidden_lowercase)
+    {
+        if (hidden_lowercase.empty())
+        {
+            return false;
+        }
+        return std::visit(make_overloaded([](const run_started_event&) { return false; },
+                                          [](const run_finished_event&) { return false; },
+                                          [](const run_failed_event&) { return false; },
+                                          [](const memory_violation_event&) { return false; },
+                                          [](const fast_fail_event&) { return false; },
+                                          [&](const auto& e) {
+                                              using event_type = std::decay_t<decltype(e)>;
+                                              if constexpr (std::is_base_of_v<observation_event, event_type>)
+                                              {
+                                                  if (module_is_hidden(e.execution.rip_module, hidden_lowercase))
+                                                  {
+                                                      return true;
+                                                  }
+                                                  return e.execution.previous_ip_module.has_value() &&
+                                                         module_is_hidden(*e.execution.previous_ip_module, hidden_lowercase);
+                                              }
+                                              else
+                                              {
+                                                  return false;
+                                              }
+                                          }),
                           event);
     }
 

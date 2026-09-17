@@ -422,6 +422,48 @@ namespace sogen
         EXPECT_NE(console.text.find("~ suppressed 2 duplicate lines"), std::string::npos) << console.text;
     }
 
+    // ------------------------------------------------------------------ hidden modules
+
+    TEST(HiddenModules, ObservationsOfHiddenModulesAreDroppedByBothReporters)
+    {
+        const auto path = unique_path("sogen-hidden", ".jsonl");
+        const auto status = unique_path("sogen-hidden-status", ".json");
+        const auto cleanup = utils::finally([&] {
+            std::error_code error;
+            std::filesystem::remove(path, error);
+            std::filesystem::remove(status, error);
+        });
+        jsonl_report_settings settings{};
+        settings.hidden_modules = {"steam_api64.dll"};
+        settings.status_path = status;
+        auto jsonl = create_jsonl_reporter(path, settings);
+        captured_console console{{.hidden_modules = {"steam_api64.dll"}}};
+
+        auto in_hidden = function_call(8, 1, "SteamAPI_Init");
+        in_hidden.execution.rip_module = "STEAM_API64.DLL"; // case-insensitive
+        auto from_hidden = function_call(8, 2, "memcpy");
+        from_hidden.execution.previous_ip_module = "steam_api64.dll";
+        auto unrelated = function_call(8, 3, "memcpy");
+        memory_violation_event violation{};
+        violation.execution.thread_id = 8;
+        violation.execution.rip_module = "steam_api64.dll";
+        for (const analysis_event event : {analysis_event{in_hidden}, analysis_event{from_hidden}, analysis_event{unrelated}, analysis_event{violation}})
+        {
+            jsonl->report(event);
+            console.console->report(event);
+        }
+        jsonl->flush();
+        console.console->flush();
+
+        const auto text = read_text(path);
+        EXPECT_EQ(count_prefixed(text, "{\"type\":\"function_execution\""), 1U) << text;
+        EXPECT_EQ(count_prefixed(text, "{\"type\":\"memory_violation\""), 1U) << text;
+        EXPECT_NE(read_text(status).find("\"hidden_events\":\"2\""), std::string::npos) << read_text(status);
+        EXPECT_EQ(count_prefixed(console.text, "Executing function: memcpy"), 1U) << console.text;
+        EXPECT_EQ(count_prefixed(console.text, "Executing function: SteamAPI_Init"), 0U) << console.text;
+        EXPECT_NE(console.text.find("violation"), std::string::npos) << console.text;
+    }
+
     // ------------------------------------------------------------------ logger never throws
 
 #ifdef _WIN32

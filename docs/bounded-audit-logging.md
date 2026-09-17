@@ -95,3 +95,12 @@ prints `~ suppressed N duplicate lines` at most once per summary interval and at
 Failure packets (memory violations, fast fails, the run footer), guest stdout and progress
 heartbeats are never deduplicated. The first 2^20 distinct records are tracked; beyond that, new
 distinct records are still written but no longer remembered.
+
+## Hidden modules (`--hide-module NAME`)
+
+Some modules are noise for a given investigation (a shim DLL such as `steam_api64.dll` that is not
+the code under study). `--hide-module NAME` (repeatable, case-insensitive file name) drops every
+observation that executes in the module or was reached from it, at both the console and the report;
+`report-status.json` counts them as `hidden_events`. Failure packets and run start/end are always
+kept. The panel's Modules popover hides the same names on display without the flag; its Launch tab
+can ask the runner to pass them as `--hide-module` for the next launch.

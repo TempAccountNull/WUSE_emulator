@@ -76,6 +76,10 @@ namespace sogen
                     report_silent(event);
                     return;
                 }
+                if (!this->settings_.hidden_modules.empty() && event_from_hidden_module(event, this->settings_.hidden_modules))
+                {
+                    return;
+                }
                 if (this->settings_.dedupe && event_is_deduplicable(event) && !uses_repeat_key(event) &&
                     this->already_shown(event_content_hash(event)))
                 {

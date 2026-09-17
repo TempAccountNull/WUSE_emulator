@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace sogen
 {
@@ -31,6 +33,8 @@ namespace sogen
         // Write a record only when its data differs from one already written (counters excluded);
         // duplicates are counted in report-status.json. The first 2^20 distinct records are tracked.
         bool dedupe{};
+        // Lower-case module file names whose observations are dropped (counted as hidden_events).
+        std::vector<std::string> hidden_modules{};
         // Optional small sidecar (rewritten atomically) with counters and the last guest location.
         std::filesystem::path status_path{};
     };
