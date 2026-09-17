@@ -6,6 +6,7 @@
 #include <utils/async_file_writer.hpp>
 
 #include <array>
+#include <charconv>
 #include <cinttypes>
 #include <cstdio>
 #include <optional>
@@ -19,59 +20,58 @@ namespace sogen
     {
         using analysis_reporter_detail::make_overloaded;
 
-        std::string hex_string(const uint64_t value)
+        void append_escaped_json(std::string& output, const std::string_view value)
         {
-            std::array<char, 32> buffer{};
-            snprintf(buffer.data(), buffer.size(), "0x%" PRIx64, value);
-            return buffer.data();
-        }
-
-        std::string escape_json(std::string_view value)
-        {
-            std::string escaped{};
-            escaped.reserve(value.size() + 8);
-
             for (const auto ch : value)
             {
                 switch (ch)
                 {
                 case '\\':
-                    escaped += "\\\\";
+                    output += "\\\\";
                     break;
                 case '"':
-                    escaped += "\\\"";
+                    output += "\\\"";
                     break;
                 case '\b':
-                    escaped += "\\b";
+                    output += "\\b";
                     break;
                 case '\f':
-                    escaped += "\\f";
+                    output += "\\f";
                     break;
                 case '\n':
-                    escaped += "\\n";
+                    output += "\\n";
                     break;
                 case '\r':
-                    escaped += "\\r";
+                    output += "\\r";
                     break;
                 case '\t':
-                    escaped += "\\t";
+                    output += "\\t";
                     break;
                 default:
                     if (static_cast<unsigned char>(ch) < 0x20)
                     {
                         std::array<char, 8> buffer{};
                         snprintf(buffer.data(), buffer.size(), "\\u%04x", static_cast<unsigned char>(ch));
-                        escaped += buffer.data();
+                        output += buffer.data();
                     }
                     else
                     {
-                        escaped.push_back(ch);
+                        output.push_back(ch);
                     }
                     break;
                 }
             }
+        }
 
-            return escaped;
+        void append_unsigned(std::string& output, const uint64_t value, const int base = 10)
+        {
+            std::array<char, 32> buffer{};
+            const auto result = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value, base);
+            if (result.ec != std::errc{})
+            {
+                throw std::runtime_error("Failed to serialize integer");
+            }
+            output.append(buffer.data(), result.ptr);
         }
 
         class json_object_builder
@@ -92,7 +92,7 @@ namespace sogen
             {
                 this->key(key);
                 this->output_ += '"';
-                this->output_ += escape_json(value);
+                append_escaped_json(this->output_, value);
                 this->output_ += '"';
             }
 
@@ -115,17 +115,23 @@ namespace sogen
             void field(std::string_view key, const uint32_t value)
             {
                 this->key(key);
-                this->output_ += std::to_string(value);
+                append_unsigned(this->output_, value);
             }
 
             void field(std::string_view key, const uint64_t value)
             {
-                this->field(key, std::to_string(value));
+                this->key(key);
+                this->output_ += '"';
+                append_unsigned(this->output_, value);
+                this->output_ += '"';
             }
 
             void hex_field(std::string_view key, const uint64_t value)
             {
-                this->field(key, hex_string(value));
+                this->key(key);
+                this->output_ += "\"0x";
+                append_unsigned(this->output_, value, 16);
+                this->output_ += '"';
             }
 
             void optional_hex_field(std::string_view key, const std::optional<uint64_t>& value)
@@ -183,7 +189,7 @@ namespace sogen
 
                 this->first_ = false;
                 this->output_ += '"';
-                this->output_ += escape_json(key);
+                append_escaped_json(this->output_, key);
                 this->output_ += "\":";
             }
         };
@@ -213,8 +219,12 @@ namespace sogen
 
             void report(const analysis_event& event) override
             {
-                std::string line{};
-                line.reserve(768);
+                thread_local std::string line;
+                line.clear();
+                if (line.capacity() < 768)
+                {
+                    line.reserve(768);
+                }
 
                 {
                     json_object_builder object{line};
@@ -331,7 +341,7 @@ namespace sogen
                     {
                         emit([&](std::string& out) {
                             out += '"';
-                            out += escape_json(arg);
+                            append_escaped_json(out, arg);
                             out += '"';
                         });
                     }
@@ -580,7 +590,7 @@ namespace sogen
                     {
                         emit([&](std::string& out) {
                             out += '"';
-                            out += escape_json(flag);
+                            append_escaped_json(out, flag);
                             out += '"';
                         });
                     }
