@@ -76,7 +76,8 @@ namespace sogen
                     report_silent(event);
                     return;
                 }
-                if (!this->settings_.hidden_modules.empty() && event_from_hidden_module(event, this->settings_.hidden_modules))
+                if ((!this->settings_.hidden_modules.empty() && event_from_hidden_module(event, this->settings_.hidden_modules)) ||
+                    (!this->settings_.hidden_event_types.empty() && event_of_hidden_type(event, this->settings_.hidden_event_types)))
                 {
                     return;
                 }

@@ -32,6 +32,7 @@ namespace sogen
         std::chrono::milliseconds status_interval{1000};
         bool dedupe{};
         std::vector<std::string> hidden_modules{};
+        std::vector<std::string> hidden_event_types{};
         // Optional small sidecar (rewritten atomically) with counters and the last guest location.
         std::filesystem::path status_path{};
     };

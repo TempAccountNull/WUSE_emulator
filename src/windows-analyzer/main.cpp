@@ -69,6 +69,7 @@ namespace sogen
             bool console_coalesce_repeats{false};
             bool report_dedupe{false};
             std::vector<std::string> hide_modules{};
+            std::vector<std::string> hide_events{};
             std::string report_mode{"full"};
 #if defined(OS_EMSCRIPTEN) && !defined(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS)
             bool pause_before_start{false};
@@ -720,15 +721,20 @@ namespace sogen
             apply_registry_files(*win_emu, options);
             context.win_emu = win_emu.get();
 
-            std::vector<std::string> hidden_modules{};
-            for (auto name : options.hide_modules)
-            {
-                std::ranges::transform(name, name.begin(), [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                if (!name.empty())
+            const auto lower_cased = [](const std::vector<std::string>& names) {
+                std::vector<std::string> result{};
+                for (auto name : names)
                 {
-                    hidden_modules.push_back(std::move(name));
+                    std::ranges::transform(name, name.begin(), [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    if (!name.empty())
+                    {
+                        result.push_back(std::move(name));
+                    }
                 }
-            }
+                return result;
+            };
+            const auto hidden_modules = lower_cased(options.hide_modules);
+            const auto hidden_event_types = lower_cased(options.hide_events);
 
             std::vector<std::unique_ptr<analysis_reporter>> reporters{};
             reporters.emplace_back(create_console_reporter(win_emu->log, console_reporter_settings{
@@ -739,6 +745,7 @@ namespace sogen
                                                                              .coalesce_repeats = options.console_coalesce_repeats,
                                                                              .dedupe = options.report_dedupe,
                                                                              .hidden_modules = hidden_modules,
+                                                                             .hidden_event_types = hidden_event_types,
                                                                          }));
 
             if (!options.report_path.empty())
@@ -752,6 +759,7 @@ namespace sogen
                 report_settings.mode = options.report_mode == "audit" ? jsonl_report_mode::audit : jsonl_report_mode::full;
                 report_settings.dedupe = options.report_dedupe;
                 report_settings.hidden_modules = hidden_modules;
+                report_settings.hidden_event_types = hidden_event_types;
                 // Live counters and the last guest location for panels/MCP readers, next to the report.
                 report_settings.status_path = options.report_path.parent_path() / "report-status.json";
                 reporters.emplace_back(create_jsonl_reporter(options.report_path, report_settings));
@@ -1009,6 +1017,9 @@ namespace sogen
             app.add_option("--hide-module", options.hide_modules,
                            "Drop observations executing in or called from this module file name (repeatable; failure packets "
                            "and run events are kept)");
+            app.add_option(
+                "--hide-event", options.hide_events,
+                "Drop every event of this report type, e.g. object_access (repeatable; failure packets and run events are kept)");
             app.add_flag("--report-dedupe", options.report_dedupe,
                          "Keep a report record and print a console line only when its data differs from one already kept "
                          "(counters such as ic and callCount excluded); duplicates are counted");

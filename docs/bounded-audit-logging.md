@@ -104,3 +104,10 @@ observation that executes in the module or was reached from it, at both the cons
 `report-status.json` counts them as `hidden_events`. Failure packets and run start/end are always
 kept. The panel's Modules popover hides the same names on display without the flag; its Launch tab
 can ask the runner to pass them as `--hide-module` for the next launch.
+
+## Hidden event types (`--hide-event TYPE`)
+
+`--hide-event TYPE` (repeatable) drops every event of one report type, named as it appears in the
+`type` field of the JSONL report (`function_execution`, `object_access`, `syscall`, ...), at both the
+console and the report; they count as `hidden_events`. Failure packets and run start/end are
+always kept. The panel's Launch tab writes the list for the next launch.

@@ -465,6 +465,41 @@ namespace sogen
         EXPECT_NE(console.text.find("violation"), std::string::npos) << console.text;
     }
 
+    TEST(HiddenEventTypes, EventsOfHiddenTypesAreDroppedButFailuresKept)
+    {
+        const auto path = unique_path("sogen-hidden-types", ".jsonl");
+        const auto cleanup = utils::finally([&] {
+            std::error_code error;
+            std::filesystem::remove(path, error);
+        });
+        jsonl_report_settings settings{};
+        settings.hidden_event_types = {"function_execution", "memory_violation"};
+        auto jsonl = create_jsonl_reporter(path, settings);
+        captured_console console{{.hidden_event_types = {"function_execution", "memory_violation"}}};
+
+        suspicious_activity_event suspicious{};
+        suspicious.execution.thread_id = 8;
+        suspicious.details = "Illegal instruction";
+        memory_violation_event violation{};
+        violation.execution.thread_id = 8;
+        for (const analysis_event event :
+             {analysis_event{function_call(8, 1, "memcpy")}, analysis_event{suspicious}, analysis_event{violation}})
+        {
+            jsonl->report(event);
+            console.console->report(event);
+        }
+        jsonl->flush();
+        console.console->flush();
+
+        const auto text = read_text(path);
+        EXPECT_EQ(count_prefixed(text, "{\"type\":\"function_execution\""), 0U) << text;
+        EXPECT_EQ(count_prefixed(text, "{\"type\":\"suspicious_activity\""), 1U) << text;
+        EXPECT_EQ(count_prefixed(text, "{\"type\":\"memory_violation\""), 1U) << text;
+        EXPECT_EQ(count_prefixed(console.text, "Executing function: memcpy"), 0U) << console.text;
+        EXPECT_EQ(count_prefixed(console.text, "Suspicious: Illegal instruction"), 1U) << console.text;
+        EXPECT_NE(console.text.find("violation"), std::string::npos) << console.text;
+    }
+
     // ------------------------------------------------------------------ logger never throws
 
 #ifdef _WIN32

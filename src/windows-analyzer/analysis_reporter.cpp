@@ -232,7 +232,8 @@ namespace sogen
             {
                 this->observe_location(event);
 
-                if (!this->settings_.hidden_modules.empty() && event_from_hidden_module(event, this->settings_.hidden_modules))
+                if ((!this->settings_.hidden_modules.empty() && event_from_hidden_module(event, this->settings_.hidden_modules)) ||
+                    (!this->settings_.hidden_event_types.empty() && event_of_hidden_type(event, this->settings_.hidden_event_types)))
                 {
                     ++this->hidden_events_;
                     this->maybe_publish_status(false);
@@ -283,6 +284,11 @@ namespace sogen
                 this->emit_aggregate(true);
                 this->file_.flush();
                 this->maybe_publish_status(true);
+            }
+
+            static std::string_view type_name(const analysis_event& event)
+            {
+                return std::visit([](const auto& e) { return event_name(e); }, event);
             }
 
             static uint64_t content_hash(const analysis_event& event)
@@ -1245,5 +1251,21 @@ namespace sogen
     uint64_t event_content_hash(const analysis_event& event)
     {
         return jsonl_analysis_reporter::content_hash(event);
+    }
+
+    std::string_view event_type_name(const analysis_event& event)
+    {
+        return jsonl_analysis_reporter::type_name(event);
+    }
+
+    bool event_of_hidden_type(const analysis_event& event, const std::vector<std::string>& hidden_types)
+    {
+        if (hidden_types.empty() || std::holds_alternative<run_started_event>(event) || std::holds_alternative<run_finished_event>(event) ||
+            std::holds_alternative<run_failed_event>(event) || std::holds_alternative<memory_violation_event>(event) ||
+            std::holds_alternative<fast_fail_event>(event))
+        {
+            return false;
+        }
+        return module_is_hidden(event_type_name(event), hidden_types);
     }
 } // namespace sogen

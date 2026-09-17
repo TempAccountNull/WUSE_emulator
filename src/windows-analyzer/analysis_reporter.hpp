@@ -26,6 +26,7 @@ namespace sogen
         bool coalesce_repeats{};
         bool dedupe{};
         std::vector<std::string> hidden_modules{};
+        std::vector<std::string> hidden_event_types{};
         uint64_t repeat_summary_every{1000};
         std::chrono::milliseconds repeat_summary_interval{1000};
     };
@@ -43,6 +44,8 @@ namespace sogen
 
     bool event_is_deduplicable(const analysis_event& event);
     bool event_from_hidden_module(const analysis_event& event, const std::vector<std::string>& hidden);
+    bool event_of_hidden_type(const analysis_event& event, const std::vector<std::string>& hidden_types);
+    std::string_view event_type_name(const analysis_event& event);
     uint64_t event_content_hash(const analysis_event& event);
     uint64_t record_content_hash(std::string_view record);
 
