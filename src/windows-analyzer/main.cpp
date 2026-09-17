@@ -723,8 +723,7 @@ namespace sogen
             std::vector<std::string> hidden_modules{};
             for (auto name : options.hide_modules)
             {
-                std::transform(name.begin(), name.end(), name.begin(),
-                               [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                std::ranges::transform(name, name.begin(), [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
                 if (!name.empty())
                 {
                     hidden_modules.push_back(std::move(name));

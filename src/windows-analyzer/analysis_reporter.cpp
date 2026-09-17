@@ -1161,20 +1161,9 @@ namespace sogen
     {
         bool equals_ignoring_case(const std::string_view left, const std::string_view right)
         {
-            if (left.size() != right.size())
-            {
-                return false;
-            }
-            for (size_t index = 0; index < left.size(); ++index)
-            {
-                const auto a = static_cast<unsigned char>(left[index]);
-                const auto b = static_cast<unsigned char>(right[index]);
-                if (std::tolower(a) != std::tolower(b))
-                {
-                    return false;
-                }
-            }
-            return true;
+            return std::ranges::equal(left, right, [](const char a, const char b) {
+                return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+            });
         }
 
         bool module_is_hidden(const std::string_view module, const std::vector<std::string>& hidden)
@@ -1224,38 +1213,31 @@ namespace sogen
         static constexpr std::array<std::string_view, 6> volatile_keys{
             "\"ic\":", "\"callCount\":", "\"call_id\":", "\"stack_pointer\":", "\"raw\":", "\"data_address\":"};
         uint64_t hash = 14695981039346656037ULL;
-        size_t index = 0;
-        while (index < record.size())
+        auto rest = record;
+        while (!rest.empty())
         {
-            bool skipped = false;
-            for (const auto key : volatile_keys)
+            const auto key =
+                std::ranges::find_if(volatile_keys, [&](const std::string_view candidate) { return rest.starts_with(candidate); });
+            if (key != volatile_keys.end())
             {
-                if (record.compare(index, key.size(), key) != 0)
+                rest.remove_prefix(key->size());
+                if (rest.starts_with('"'))
                 {
-                    continue;
-                }
-                index += key.size();
-                if (index < record.size() && record[index] == '"')
-                {
-                    const auto end = record.find('"', index + 1);
-                    index = end == std::string_view::npos ? record.size() : end + 1;
+                    const auto end = rest.find('"', 1);
+                    rest = end == std::string_view::npos ? std::string_view{} : rest.substr(end + 1);
                 }
                 else
                 {
-                    while (index < record.size() && record[index] >= '0' && record[index] <= '9')
+                    while (!rest.empty() && rest.front() >= '0' && rest.front() <= '9')
                     {
-                        ++index;
+                        rest.remove_prefix(1);
                     }
                 }
-                skipped = true;
-                break;
-            }
-            if (skipped)
-            {
                 continue;
             }
-            hash ^= static_cast<unsigned char>(record[index++]);
+            hash ^= static_cast<unsigned char>(rest.front());
             hash *= 1099511628211ULL;
+            rest.remove_prefix(1);
         }
         return hash;
     }
