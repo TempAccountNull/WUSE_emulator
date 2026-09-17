@@ -102,9 +102,8 @@ namespace sogen
                 this->print_suppressed_summary();
             }
 
-            // Routine classes build their console text anyway and pass it through absorb_repeat, which
-            // applies the duplicate check to that text; hashing their records as well would cost a
-            // serialization per event at the highest event rates.
+            // These classes are checked in absorb_repeat on the text they already build; serializing
+            // their records as well would cost a JSON encode per event at the highest event rates.
             static bool uses_repeat_key(const analysis_event& event)
             {
                 return std::holds_alternative<function_execution_event>(event) || std::holds_alternative<syscall_event>(event) ||
@@ -373,9 +372,10 @@ namespace sogen
                                 return;
                             }
                             const auto line_color = e.interesting ? color::yellow : color::dark_gray;
-                            auto text = format_text("Executing function: %s (%s) (0x%" PRIx64 ") via 0x%" PRIx64 " (%s)",
-                                                    e.function_name.c_str(), e.execution.rip_module.c_str(), e.execution.rip,
-                                                    e.execution.previous_ip.value_or(0), e.execution.previous_ip_module.value_or("<N/A>").c_str());
+                            auto text =
+                                format_text("Executing function: %s (%s) (0x%" PRIx64 ") via 0x%" PRIx64 " (%s)", e.function_name.c_str(),
+                                            e.execution.rip_module.c_str(), e.execution.rip, e.execution.previous_ip.value_or(0),
+                                            e.execution.previous_ip_module.value_or("<N/A>").c_str());
                             std::string key = "fn|" + text;
                             for (const auto& detail : e.details)
                             {
@@ -409,9 +409,10 @@ namespace sogen
                                 return;
                             }
                             const auto line_color = e.interesting ? color::yellow : color::dark_gray;
-                            auto text = format_text("Transition to foreign code: %s+0x%" PRIx64 " (%s) (0x%" PRIx64 ") via 0x%" PRIx64 " (%s)",
-                                                    e.function_name.c_str(), e.function_offset, e.execution.rip_module.c_str(), e.execution.rip,
-                                                    e.execution.previous_ip.value_or(0), e.execution.previous_ip_module.value_or("<N/A>").c_str());
+                            auto text =
+                                format_text("Transition to foreign code: %s+0x%" PRIx64 " (%s) (0x%" PRIx64 ") via 0x%" PRIx64 " (%s)",
+                                            e.function_name.c_str(), e.function_offset, e.execution.rip_module.c_str(), e.execution.rip,
+                                            e.execution.previous_ip.value_or(0), e.execution.previous_ip_module.value_or("<N/A>").c_str());
                             if (this->absorb_repeat(e.execution.thread_id, "ft|" + text, 0, line_color, text))
                             {
                                 return;
@@ -456,7 +457,8 @@ namespace sogen
                             case syscall_classification::crafted_out_of_line:
                                 text = format_text("Crafted out-of-line syscall: %s (0x%X) at 0x%" PRIx64 " (%s) via 0x%" PRIx64 " (%s)",
                                                    e.syscall_name.c_str(), e.syscall_id, e.execution.rip, e.execution.rip_module.c_str(),
-                                                   e.execution.previous_ip.value_or(0), e.execution.previous_ip_module.value_or("<N/A>").c_str());
+                                                   e.execution.previous_ip.value_or(0),
+                                                   e.execution.previous_ip_module.value_or("<N/A>").c_str());
                                 break;
                             case syscall_classification::regular:
                             default:
@@ -465,8 +467,8 @@ namespace sogen
                                     return;
                                 }
                                 line_color = color::dark_gray;
-                                text = format_text("Executing syscall: %s (0x%X) at 0x%" PRIx64 " via 0x%" PRIx64 " (%s)", e.syscall_name.c_str(),
-                                                   e.syscall_id, e.execution.rip, e.caller_rip.value_or(0),
+                                text = format_text("Executing syscall: %s (0x%X) at 0x%" PRIx64 " via 0x%" PRIx64 " (%s)",
+                                                   e.syscall_name.c_str(), e.syscall_id, e.execution.rip, e.caller_rip.value_or(0),
                                                    e.caller_module.value_or("<N/A>").c_str());
                                 break;
                             }
@@ -546,7 +548,6 @@ namespace sogen
                     return true;
                 }
 
-                // A new line for this thread that any thread already printed is a duplicate, not a run.
                 if (this->settings_.dedupe && this->already_shown(record_content_hash(key)))
                 {
                     return true;
@@ -573,8 +574,9 @@ namespace sogen
                 }
                 if (state.last_call != 0)
                 {
-                    this->log_.print(state.line_color, "~ tid %" PRIu32 " repeated %" PRIu64 " more times [calls %" PRIu64 "..%" PRIu64 "]: %s\n",
-                                     tid, pending, state.pending_first_call, state.last_call, state.text.c_str());
+                    this->log_.print(state.line_color,
+                                     "~ tid %" PRIu32 " repeated %" PRIu64 " more times [calls %" PRIu64 "..%" PRIu64 "]: %s\n", tid,
+                                     pending, state.pending_first_call, state.last_call, state.text.c_str());
                 }
                 else
                 {
@@ -592,8 +594,6 @@ namespace sogen
                 state.reported = 0;
             }
 
-            // Returns true when a line with this data was already printed; duplicates are counted and
-            // summarized at most once per repeat_summary_interval and at flush.
             bool already_shown(const uint64_t hash)
             {
                 const std::scoped_lock lock(this->dedupe_mutex_);

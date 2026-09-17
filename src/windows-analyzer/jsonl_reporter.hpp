@@ -30,16 +30,12 @@ namespace sogen
         uint64_t aggregate_interval_events{100000};
         std::chrono::milliseconds aggregate_interval{5000};
         std::chrono::milliseconds status_interval{1000};
-        // Write a record only when its data differs from one already written (counters excluded);
-        // duplicates are counted in report-status.json. The first 2^20 distinct records are tracked.
         bool dedupe{};
-        // Lower-case module file names whose observations are dropped (counted as hidden_events).
         std::vector<std::string> hidden_modules{};
         // Optional small sidecar (rewritten atomically) with counters and the last guest location.
         std::filesystem::path status_path{};
     };
 
-    std::unique_ptr<analysis_reporter> create_jsonl_reporter(const std::filesystem::path& path,
-                                                             jsonl_report_settings settings = {});
+    std::unique_ptr<analysis_reporter> create_jsonl_reporter(const std::filesystem::path& path, jsonl_report_settings settings = {});
 
 } // namespace sogen

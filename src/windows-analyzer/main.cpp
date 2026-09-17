@@ -447,8 +447,7 @@ namespace sogen
                     // an exhausted volume). The failure packet must still leave the process, so fall
                     // back to stderr instead of letting a second exception unwind through the emulator
                     // teardown, which terminates the process without any record.
-                    (void)fprintf(stderr,
-                                  "\033[91mEmulation failed at: 0x%llx - %s\nReporting the failure also failed: %s\033[0m\n",
+                    (void)fprintf(stderr, "\033[91mEmulation failed at: 0x%llx - %s\nReporting the failure also failed: %s\033[0m\n",
                                   static_cast<unsigned long long>(rip), message.c_str(), e.what());
                     (void)fflush(stderr);
                 }
@@ -724,7 +723,8 @@ namespace sogen
             std::vector<std::string> hidden_modules{};
             for (auto name : options.hide_modules)
             {
-                std::transform(name.begin(), name.end(), name.begin(), [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                std::transform(name.begin(), name.end(), name.begin(),
+                               [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
                 if (!name.empty())
                 {
                     hidden_modules.push_back(std::move(name));

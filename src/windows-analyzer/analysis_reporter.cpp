@@ -285,7 +285,6 @@ namespace sogen
                 this->maybe_publish_status(true);
             }
 
-            // Hash of the event's serialized record with the counters skipped (see record_content_hash).
             static uint64_t content_hash(const analysis_event& event)
             {
                 thread_local std::string record;
@@ -309,7 +308,7 @@ namespace sogen
             uint64_t retained_events_{};
             uint64_t deduplicated_events_{};
             uint64_t hidden_events_{};
-            std::unordered_set<uint64_t> seen_content_{}; // content hashes of written records (dedupe)
+            std::unordered_set<uint64_t> seen_content_{};
             uint64_t summarized_events_{};
             uint64_t window_events_{};
             uint64_t clock_check_counter_{};
@@ -320,8 +319,8 @@ namespace sogen
             std::string last_module_{};
             std::string last_event_type_{};
             std::map<std::string, uint64_t, std::less<>> summarized_by_type_{}; // cumulative per event type
-            std::unordered_map<std::string, uint64_t> window_counts_{}; // "type|key" -> count in the current window
-            std::unordered_map<std::string, uint32_t> retained_seen_{}; // "type|key" -> retained occurrences
+            std::unordered_map<std::string, uint64_t> window_counts_{};         // "type|key" -> count in the current window
+            std::unordered_map<std::string, uint32_t> retained_seen_{};         // "type|key" -> retained occurrences
 
             void observe_location(const analysis_event& event)
             {
@@ -373,61 +372,68 @@ namespace sogen
             {
                 thread_local std::string key;
                 key.clear();
-                return std::visit(
-                    make_overloaded(
-                        [&](const function_execution_event& e) {
-                            key.append(e.function_name).append(" (").append(e.execution.rip_module).append(")");
-                            if (!e.interesting)
-                            {
-                                // Library-to-library traffic: counted only.
-                                return this->count("function_execution", key);
-                            }
-                            key.append(" via ").append(e.execution.previous_ip_module.value_or("<N/A>")).append("+");
-                            append_hex(key, e.execution.previous_ip.value_or(0));
-                            return this->count_after_retained("function_execution", key);
-                        },
-                        [&](const object_access_event& e) {
-                            key.append(e.type_name).append("+");
-                            append_hex(key, e.offset);
-                            key.append(" (").append(e.member_name.value_or("<N/A>")).append(") at ").append(e.execution.rip_module).append("+");
-                            append_hex(key, e.execution.rip);
-                            return e.main_access ? this->count_after_retained("object_access", key) : this->count("object_access", key);
-                        },
-                        [&](const environment_access_event& e) {
-                            append_hex(key, e.offset);
-                            key.append(" at ").append(e.execution.rip_module).append("+");
-                            append_hex(key, e.execution.rip);
-                            return e.main_access ? this->count_after_retained("environment_access", key)
-                                                 : this->count("environment_access", key);
-                        },
-                        [&](const syscall_event& e) {
-                            if (e.classification != syscall_classification::regular)
-                            {
-                                // Inline and crafted syscalls are anti-analysis signals; always retained.
-                                return false;
-                            }
-                            key.append(e.syscall_name);
-                            return this->count("syscall", key);
-                        },
-                        [&](const foreign_code_transition_event& e) {
-                            key.append(e.function_name).append("+");
-                            append_hex(key, e.function_offset);
-                            key.append(" (").append(e.execution.rip_module).append(") via ").append(e.execution.previous_ip_module.value_or("<N/A>"));
-                            return e.interesting ? this->count_after_retained("foreign_code_transition", key)
-                                                 : this->count("foreign_code_transition", key);
-                        },
-                        [&](const thread_switch_event&) { return this->count("thread_switch", key); },
-                        [&](const generic_access_event& e) {
-                            key.append(e.type).append(": ").append(e.name);
-                            return this->count_after_retained("generic_access", key);
-                        },
-                        [&](const io_control_event& e) {
-                            key.append(e.device_name).append(" ");
-                            append_hex(key, e.code);
-                            return this->count_after_retained("io_control", key);
-                        },
-                        [&](const auto&) { return false; }),
-                    event);
+                return std::visit(make_overloaded(
+                                      [&](const function_execution_event& e) {
+                                          key.append(e.function_name).append(" (").append(e.execution.rip_module).append(")");
+                                          if (!e.interesting)
+                                          {
+                                              // Library-to-library traffic: counted only.
+                                              return this->count("function_execution", key);
+                                          }
+                                          key.append(" via ").append(e.execution.previous_ip_module.value_or("<N/A>")).append("+");
+                                          append_hex(key, e.execution.previous_ip.value_or(0));
+                                          return this->count_after_retained("function_execution", key);
+                                      },
+                                      [&](const object_access_event& e) {
+                                          key.append(e.type_name).append("+");
+                                          append_hex(key, e.offset);
+                                          key.append(" (")
+                                              .append(e.member_name.value_or("<N/A>"))
+                                              .append(") at ")
+                                              .append(e.execution.rip_module)
+                                              .append("+");
+                                          append_hex(key, e.execution.rip);
+                                          return e.main_access ? this->count_after_retained("object_access", key)
+                                                               : this->count("object_access", key);
+                                      },
+                                      [&](const environment_access_event& e) {
+                                          append_hex(key, e.offset);
+                                          key.append(" at ").append(e.execution.rip_module).append("+");
+                                          append_hex(key, e.execution.rip);
+                                          return e.main_access ? this->count_after_retained("environment_access", key)
+                                                               : this->count("environment_access", key);
+                                      },
+                                      [&](const syscall_event& e) {
+                                          if (e.classification != syscall_classification::regular)
+                                          {
+                                              // Inline and crafted syscalls are anti-analysis signals; always retained.
+                                              return false;
+                                          }
+                                          key.append(e.syscall_name);
+                                          return this->count("syscall", key);
+                                      },
+                                      [&](const foreign_code_transition_event& e) {
+                                          key.append(e.function_name).append("+");
+                                          append_hex(key, e.function_offset);
+                                          key.append(" (")
+                                              .append(e.execution.rip_module)
+                                              .append(") via ")
+                                              .append(e.execution.previous_ip_module.value_or("<N/A>"));
+                                          return e.interesting ? this->count_after_retained("foreign_code_transition", key)
+                                                               : this->count("foreign_code_transition", key);
+                                      },
+                                      [&](const thread_switch_event&) { return this->count("thread_switch", key); },
+                                      [&](const generic_access_event& e) {
+                                          key.append(e.type).append(": ").append(e.name);
+                                          return this->count_after_retained("generic_access", key);
+                                      },
+                                      [&](const io_control_event& e) {
+                                          key.append(e.device_name).append(" ");
+                                          append_hex(key, e.code);
+                                          return this->count_after_retained("io_control", key);
+                                      },
+                                      [&](const auto&) { return false; }),
+                                  event);
             }
 
             bool count(const std::string_view type, const std::string& key)
@@ -584,10 +590,9 @@ namespace sogen
                         object.field("dedupe_keys", static_cast<uint64_t>(this->seen_content_.size()));
                         object.field("hidden_events", this->hidden_events_);
                         object.field("last_event_type", this->last_event_type_);
-                        object.field("updated_unix_ms",
-                                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                               std::chrono::system_clock::now().time_since_epoch())
-                                                               .count()));
+                        object.field("updated_unix_ms", static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                                                  std::chrono::system_clock::now().time_since_epoch())
+                                                                                  .count()));
                         object.object_field("summarized_by_type", [&](json_object_builder& by_type) {
                             for (const auto& [name, value] : this->summarized_by_type_)
                             {
@@ -1142,19 +1147,14 @@ namespace sogen
 
     bool event_is_deduplicable(const analysis_event& event)
     {
-        return std::visit(make_overloaded([](const run_started_event&) { return false; },
-                                          [](const run_finished_event&) { return false; },
-                                          [](const run_failed_event&) { return false; },
-                                          [](const stdout_chunk_event&) { return false; },
-                                          [](const buffered_stdout_event&) { return false; },
-                                          [](const instruction_summary_event&) { return false; },
-                                          [](const execution_progress_event&) { return false; },
-                                          [](const thread_switch_event&) { return false; },
-                                          [](const memory_violation_event&) { return false; },
-                                          [](const fast_fail_event&) { return false; },
-                                          [](const entry_point_execution_event&) { return false; },
-                                          [](const auto&) { return true; }),
-                          event);
+        return std::visit(
+            make_overloaded([](const run_started_event&) { return false; }, [](const run_finished_event&) { return false; },
+                            [](const run_failed_event&) { return false; }, [](const stdout_chunk_event&) { return false; },
+                            [](const buffered_stdout_event&) { return false; }, [](const instruction_summary_event&) { return false; },
+                            [](const execution_progress_event&) { return false; }, [](const thread_switch_event&) { return false; },
+                            [](const memory_violation_event&) { return false; }, [](const fast_fail_event&) { return false; },
+                            [](const entry_point_execution_event&) { return false; }, [](const auto&) { return true; }),
+            event);
     }
 
     namespace
@@ -1190,27 +1190,25 @@ namespace sogen
         }
     }
 
-    bool event_from_hidden_module(const analysis_event& event, const std::vector<std::string>& hidden_lowercase)
+    bool event_from_hidden_module(const analysis_event& event, const std::vector<std::string>& hidden)
     {
-        if (hidden_lowercase.empty())
+        if (hidden.empty())
         {
             return false;
         }
-        return std::visit(make_overloaded([](const run_started_event&) { return false; },
-                                          [](const run_finished_event&) { return false; },
+        return std::visit(make_overloaded([](const run_started_event&) { return false; }, [](const run_finished_event&) { return false; },
                                           [](const run_failed_event&) { return false; },
-                                          [](const memory_violation_event&) { return false; },
-                                          [](const fast_fail_event&) { return false; },
+                                          [](const memory_violation_event&) { return false; }, [](const fast_fail_event&) { return false; },
                                           [&](const auto& e) {
                                               using event_type = std::decay_t<decltype(e)>;
                                               if constexpr (std::is_base_of_v<observation_event, event_type>)
                                               {
-                                                  if (module_is_hidden(e.execution.rip_module, hidden_lowercase))
+                                                  if (module_is_hidden(e.execution.rip_module, hidden))
                                                   {
                                                       return true;
                                                   }
                                                   return e.execution.previous_ip_module.has_value() &&
-                                                         module_is_hidden(*e.execution.previous_ip_module, hidden_lowercase);
+                                                         module_is_hidden(*e.execution.previous_ip_module, hidden);
                                               }
                                               else
                                               {
@@ -1222,11 +1220,9 @@ namespace sogen
 
     uint64_t record_content_hash(const std::string_view record)
     {
-        // FNV-1a over the record with the values of the counter fields skipped: "key":"digits"
-        // (uint64), "key":digits (uint32) or "key":"0x..." (guest pointers of printed-call arguments
-        // and the stack pointer, which change per call while the printed data does not).
-        static constexpr std::array<std::string_view, 6> volatile_keys{"\"ic\":",           "\"callCount\":", "\"call_id\":",
-                                                                       "\"stack_pointer\":", "\"raw\":",       "\"data_address\":"};
+        // Values are skipped in the three shapes json_object_builder writes them: "digits", digits, "0x...".
+        static constexpr std::array<std::string_view, 6> volatile_keys{
+            "\"ic\":", "\"callCount\":", "\"call_id\":", "\"stack_pointer\":", "\"raw\":", "\"data_address\":"};
         uint64_t hash = 14695981039346656037ULL;
         size_t index = 0;
         while (index < record.size())

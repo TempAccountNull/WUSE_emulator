@@ -254,7 +254,7 @@ namespace sogen
 
         for (uint64_t i = 1; i <= 100; ++i)
         {
-            jsonl->report(function_call(8, i, "memcpy"));       // interesting: first 3 retained, 97 counted
+            jsonl->report(function_call(8, i, "memcpy"));                 // interesting: first 3 retained, 97 counted
             jsonl->report(function_call(8, i, "RtlAllocateHeap", false)); // routine: all counted
         }
         object_access_event access{};
@@ -356,19 +356,19 @@ namespace sogen
         suspicious.details = "Anti-debug check with ProcessDebugObjectHandle";
         for (uint64_t i = 0; i < 5; ++i)
         {
-            suspicious.header.instruction_count = 1000 + i; // counters differ, the data does not
+            suspicious.header.instruction_count = 1000 + i;
             jsonl->report(suspicious);
         }
         suspicious.details = "Illegal instruction";
         jsonl->report(suspicious);
         for (uint64_t i = 1; i <= 3; ++i)
         {
-            jsonl->report(function_call(8, i, "memcpy")); // only callCount differs
+            jsonl->report(function_call(8, i, "memcpy"));
         }
         memory_violation_event violation{};
         violation.execution.thread_id = 76;
         jsonl->report(violation);
-        jsonl->report(violation); // failure packets are never suppressed
+        jsonl->report(violation);
         jsonl->flush();
 
         const auto text = read_text(path);
@@ -440,14 +440,15 @@ namespace sogen
         captured_console console{{.hidden_modules = {"steam_api64.dll"}}};
 
         auto in_hidden = function_call(8, 1, "SteamAPI_Init");
-        in_hidden.execution.rip_module = "STEAM_API64.DLL"; // case-insensitive
+        in_hidden.execution.rip_module = "STEAM_API64.DLL";
         auto from_hidden = function_call(8, 2, "memcpy");
         from_hidden.execution.previous_ip_module = "steam_api64.dll";
         auto unrelated = function_call(8, 3, "memcpy");
         memory_violation_event violation{};
         violation.execution.thread_id = 8;
         violation.execution.rip_module = "steam_api64.dll";
-        for (const analysis_event event : {analysis_event{in_hidden}, analysis_event{from_hidden}, analysis_event{unrelated}, analysis_event{violation}})
+        for (const analysis_event event :
+             {analysis_event{in_hidden}, analysis_event{from_hidden}, analysis_event{unrelated}, analysis_event{violation}})
         {
             jsonl->report(event);
             console.console->report(event);
