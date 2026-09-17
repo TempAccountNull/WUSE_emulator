@@ -145,7 +145,8 @@ namespace sogen
             return value && std::string_view(value) != "0";
         }
 
-        void print_ansi_colored(const std::string_view line, const color_type base_color, utils::async_file_writer* writer)
+        void print_ansi_colored(const std::string_view line, const color_type base_color, utils::async_file_writer* writer,
+                                std::FILE* fallback)
         {
             constexpr std::array ansi_colors{30, 34, 32, 36, 31, 35, 33, 37, 90, 94, 92, 96, 91, 95, 93, 97};
             std::array<char, 16> prefix{};
@@ -161,8 +162,8 @@ namespace sogen
             }
             else
             {
-                (void)fwrite(record.data(), 1, record.size(), stdout);
-                (void)fflush(stdout);
+                (void)fwrite(record.data(), 1, record.size(), fallback);
+                (void)fflush(fallback);
             }
         }
 #endif
@@ -172,7 +173,7 @@ namespace sogen
 #ifdef _WIN32
             if (use_ansi_colors())
             {
-                print_ansi_colored(line, base_color, nullptr);
+                print_ansi_colored(line, base_color, nullptr, stdout);
                 return;
             }
 #endif
@@ -198,6 +199,13 @@ namespace sogen
         this->console_output_.reset();
         SetConsoleOutputCP(old_cp);
     }
+
+    void logger::set_console_output(std::unique_ptr<utils::async_file_writer> writer)
+    {
+        const std::scoped_lock lock(this->print_mutex_);
+        this->console_output_ = std::move(writer);
+        this->console_output_failure_.clear();
+    }
 #endif
 
     void logger::print_message(const color c, const std::string_view message, const bool force) const
@@ -217,11 +225,32 @@ namespace sogen
 #ifdef _WIN32
         if (this->console_output_)
         {
-            print_ansi_colored(message, get_color_type(c), this->console_output_.get());
-            if (force)
+            try
             {
-                this->console_output_->flush();
+                print_ansi_colored(message, get_color_type(c), this->console_output_.get(), stdout);
+                if (force)
+                {
+                    this->console_output_->flush();
+                }
+                return;
             }
+            catch (const std::exception& e)
+            {
+                // The writer thread stopped on a failed write (exhausted volume, closed handle).
+                // Logging must never throw: this path also runs from destructors during stack
+                // unwinding, where a second exception terminates the process without any record
+                // (analyzer.exe.64244.dmp: terminate -> abort -> FAST_FAIL_FATAL_APP_EXIT). Retire the
+                // writer once and continue synchronously on stderr so evidence keeps flowing.
+                this->console_output_failure_ = e.what();
+                this->console_output_.reset();
+                (void)fprintf(stderr, "\033[91m[logger] console output writer failed: %s; continuing on stderr\033[0m\n", e.what());
+                (void)fflush(stderr);
+            }
+        }
+
+        if (!this->console_output_failure_.empty())
+        {
+            print_ansi_colored(message, get_color_type(c), nullptr, stderr);
             return;
         }
 #endif

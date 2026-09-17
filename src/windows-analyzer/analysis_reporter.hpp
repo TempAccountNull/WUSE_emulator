@@ -2,6 +2,8 @@
 
 #include "analysis_event.hpp"
 
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 
@@ -16,6 +18,11 @@ namespace sogen
         bool buffer_stdout{};
         bool interesting_only{};
         bool prepend_call_count{};
+        // Console only: fold consecutive identical events of one guest thread into bounded repeat
+        // summaries. Every event still reaches the structured reporters unchanged.
+        bool coalesce_repeats{};
+        uint64_t repeat_summary_every{1000};
+        std::chrono::milliseconds repeat_summary_interval{1000};
     };
 
     class analysis_reporter

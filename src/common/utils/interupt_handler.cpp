@@ -33,7 +33,10 @@ namespace sogen
             {
                 const auto& data = get_signal_data();
 
-                if (signal == CTRL_C_EVENT && data.handler)
+                // A controller that owns the analyzer as its own process group can only deliver
+                // CTRL_BREAK_EVENT to that group (GenerateConsoleCtrlEvent routes CTRL_C_EVENT to
+                // every console client). Treat both as the same graceful stop request.
+                if ((signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT) && data.handler)
                 {
                     data.handler();
                 }

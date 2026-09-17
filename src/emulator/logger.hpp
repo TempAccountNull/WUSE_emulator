@@ -30,6 +30,17 @@ namespace sogen
 #ifdef _WIN32
         logger();
         ~logger() override;
+
+        // Route colored console output through a background writer. The constructor installs one
+        // automatically when FORCE_COLOR is set and stdout is a disk file; tests inject writers whose
+        // stream fails to prove that logging never throws.
+        void set_console_output(std::unique_ptr<utils::async_file_writer> writer);
+
+        // Non-empty once the console writer failed. Later lines are written synchronously to stderr.
+        const std::string& console_output_failure() const
+        {
+            return this->console_output_failure_;
+        }
 #endif
         void print(color c, std::string_view message) override;
         void print(color c, const char* message, ...) override FORMAT_ATTRIBUTE(3, 4);
@@ -72,7 +83,9 @@ namespace sogen
       private:
 #ifdef _WIN32
         UINT old_cp{};
-        std::unique_ptr<utils::async_file_writer> console_output_;
+        // Mutable: print_message is const but must be able to retire a failed writer.
+        mutable std::unique_ptr<utils::async_file_writer> console_output_;
+        mutable std::string console_output_failure_{};
 #endif
         bool disable_output_{false};
         bool silent_{false};

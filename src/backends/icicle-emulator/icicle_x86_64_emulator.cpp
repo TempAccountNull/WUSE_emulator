@@ -159,7 +159,7 @@ namespace sogen::icicle
         };
     }
 
-    class icicle_x86_64_emulator : public x86_64_emulator
+    class icicle_x86_64_emulator : public x86_64_emulator, public detail::hook_exception_sink
     {
       public:
         icicle_x86_64_emulator()
@@ -187,8 +187,20 @@ namespace sogen::icicle
         void start(const size_t count) override
         {
             icicle_start(this->emu_, count);
+            this->rethrow_deferred_hook_exception();
             this->throw_if_unhandled_stop();
             this->perform_pending_actions();
+        }
+
+        // See detail::hook_exception_sink. Only the first exception of a run is kept; it stops
+        // icicle immediately and surfaces from start() on the C++ side of the boundary.
+        void defer_hook_exception(std::exception_ptr exception) noexcept override
+        {
+            if (!this->pending_hook_exception_)
+            {
+                this->pending_hook_exception_ = std::move(exception);
+            }
+            icicle_stop(this->emu_);
         }
 
         void stop() override
@@ -371,7 +383,22 @@ namespace sogen::icicle
         template <typename Ret, typename... Args>
         std::function<Ret(Args...)> bind_cpu(std::function<Ret(cpu_interface&, Args...)> callback)
         {
-            return [this, c = std::move(callback)](Args... args) { return c(*this, std::forward<Args>(args)...); };
+            return [this, c = std::move(callback)](Args... args) -> Ret {
+                try
+                {
+                    return c(*this, std::forward<Args>(args)...);
+                }
+                catch (...)
+                {
+                    // Never let a host exception reach icicle's Rust frames (hook_exception_sink).
+                    // The default result (stop / run_instruction / 0) is harmless: icicle stops now.
+                    this->defer_hook_exception(std::current_exception());
+                    if constexpr (!std::is_void_v<Ret>)
+                    {
+                        return Ret{};
+                    }
+                }
+            };
         }
 
         emulator_hook* hook_instruction(int instruction_type, instruction_hook_callback callback) override
@@ -461,7 +488,7 @@ namespace sogen::icicle
 
         emulator_hook* hook_memory_execution(const uint64_t address, memory_execution_hook_callback callback) override
         {
-            auto object = std::make_unique<detail::execution_hook>(*this, std::move(callback), this->is_in_hook_);
+            auto object = std::make_unique<detail::execution_hook>(*this, std::move(callback), this->is_in_hook_, this);
             auto* ptr = object.get();
             auto* wrapper = +[](void* user, const uint64_t addr) {
                 const auto& func = *static_cast<decltype(ptr)>(user);
@@ -482,7 +509,7 @@ namespace sogen::icicle
                 return this->hook_memory_execution(address, std::move(callback));
             }
 
-            auto object = std::make_unique<detail::execution_hook>(*this, std::move(callback), this->is_in_hook_);
+            auto object = std::make_unique<detail::execution_hook>(*this, std::move(callback), this->is_in_hook_, this);
             auto* ptr = object.get();
             auto* wrapper = +[](void* user, const uint64_t addr) {
                 const auto& func = *static_cast<decltype(ptr)>(user);
@@ -497,7 +524,7 @@ namespace sogen::icicle
 
         emulator_hook* hook_memory_execution(memory_execution_hook_callback callback) override
         {
-            auto object = std::make_unique<detail::execution_hook>(*this, std::move(callback), this->is_in_hook_);
+            auto object = std::make_unique<detail::execution_hook>(*this, std::move(callback), this->is_in_hook_, this);
             auto* ptr = object.get();
             auto* wrapper = +[](void* user, const uint64_t addr) {
                 const auto& func = *static_cast<decltype(ptr)>(user);
@@ -539,10 +566,17 @@ namespace sogen::icicle
                 .observation =
                     [this, callback = std::move(callback)](uint64_t access, const void* data, size_t length, uint64_t error,
                                                            int32_t host_write) {
-                        callback(*this, access, data, length,
-                                 {.outcome = error == 0 ? memory_access_outcome::completed : memory_access_outcome::failed,
-                                  .backend_error = error,
-                                  .origin = host_write != 0 ? memory_write_origin::host : memory_write_origin::guest});
+                        try
+                        {
+                            callback(*this, access, data, length,
+                                     {.outcome = error == 0 ? memory_access_outcome::completed : memory_access_outcome::failed,
+                                      .backend_error = error,
+                                      .origin = host_write != 0 ? memory_write_origin::host : memory_write_origin::guest});
+                        }
+                        catch (...)
+                        {
+                            this->defer_hook_exception(std::current_exception());
+                        }
                     },
             });
         }
@@ -641,6 +675,7 @@ namespace sogen::icicle
 
       private:
         bool is_in_hook_{false};
+        std::exception_ptr pending_hook_exception_{};
         std::list<std::unique_ptr<utils::object>> storage_{};
         std::unordered_map<uint32_t, std::unique_ptr<utils::object>> hooks_{};
         std::unordered_map<emulator_hook*, std::optional<uint32_t>> id_mapping_{};
@@ -658,6 +693,15 @@ namespace sogen::icicle
             this->id_mapping_[hook] = icicle_id;
 
             return hook;
+        }
+
+        void rethrow_deferred_hook_exception()
+        {
+            if (this->pending_hook_exception_)
+            {
+                auto exception = std::exchange(this->pending_hook_exception_, std::exception_ptr{});
+                std::rethrow_exception(exception);
+            }
         }
 
         void throw_if_unhandled_stop()
@@ -824,9 +868,20 @@ namespace sogen::icicle
             });
         }
 
-        void run_on_next_instruction(std::function<void()> func) const
+        void run_on_next_instruction(std::function<void()> func)
         {
-            auto* heap_func = new std::function(std::move(func));
+            // Deferred actions run inside icicle's Rust frames too: report failures instead of
+            // silently ignoring them, but never let them unwind across the boundary.
+            auto* heap_func = new std::function<void()>([this, action = std::move(func)] {
+                try
+                {
+                    action();
+                }
+                catch (...)
+                {
+                    this->defer_hook_exception(std::current_exception());
+                }
+            });
             auto* callback = +[](void* data) {
                 auto* cb = static_cast<std::function<void()>*>(data);
 
@@ -836,7 +891,7 @@ namespace sogen::icicle
                 }
                 catch (...)
                 {
-                    // Ignore
+                    // Last resort: defer_hook_exception itself is noexcept, so nothing should reach here.
                 }
 
                 delete cb;

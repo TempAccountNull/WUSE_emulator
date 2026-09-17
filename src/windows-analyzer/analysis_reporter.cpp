@@ -5,13 +5,19 @@
 #include "jsonl_reporter.hpp"
 #include <utils/async_file_writer.hpp>
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <cinttypes>
 #include <cstdio>
+#include <fstream>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace sogen
 {
@@ -212,13 +218,24 @@ namespace sogen
         class jsonl_analysis_reporter final : public analysis_reporter
         {
           public:
-            explicit jsonl_analysis_reporter(const std::filesystem::path& path)
-                : file_(path)
+            explicit jsonl_analysis_reporter(const std::filesystem::path& path, jsonl_report_settings settings)
+                : file_(path),
+                  settings_(std::move(settings)),
+                  last_aggregate_(std::chrono::steady_clock::now()),
+                  last_status_(last_aggregate_)
             {
             }
 
             void report(const analysis_event& event) override
             {
+                this->observe_location(event);
+
+                if (this->settings_.mode == jsonl_report_mode::audit && this->summarize(event))
+                {
+                    this->maybe_publish_status(false);
+                    return;
+                }
+
                 thread_local std::string line;
                 line.clear();
                 if (line.capacity() < 768)
@@ -233,15 +250,326 @@ namespace sogen
 
                 line.push_back('\n');
                 this->file_.write(line);
+                ++this->retained_events_;
+                this->maybe_publish_status(false);
             }
 
             void flush() override
             {
+                this->emit_aggregate(true);
                 this->file_.flush();
+                this->maybe_publish_status(true);
             }
 
           private:
+            static constexpr size_t max_window_keys = 4096;
+            static constexpr size_t max_retained_keys = 65536;
+
             utils::async_file_writer file_;
+            jsonl_report_settings settings_{};
+            std::chrono::steady_clock::time_point last_aggregate_{};
+            std::chrono::steady_clock::time_point last_status_{};
+            uint64_t retained_events_{};
+            uint64_t summarized_events_{};
+            uint64_t window_events_{};
+            uint64_t clock_check_counter_{};
+            uint64_t aggregates_written_{};
+            uint64_t last_instruction_count_{};
+            uint32_t last_tid_{};
+            uint64_t last_rip_{};
+            std::string last_module_{};
+            std::string last_event_type_{};
+            std::map<std::string, uint64_t, std::less<>> summarized_by_type_{}; // cumulative per event type
+            std::unordered_map<std::string, uint64_t> window_counts_{}; // "type|key" -> count in the current window
+            std::unordered_map<std::string, uint32_t> retained_seen_{}; // "type|key" -> retained occurrences
+
+            void observe_location(const analysis_event& event)
+            {
+                std::visit(
+                    [&](const auto& e) {
+                        using event_type = std::decay_t<decltype(e)>;
+                        this->last_instruction_count_ = e.header.instruction_count;
+                        const std::string_view name = event_name(e);
+                        if (this->last_event_type_ != name)
+                        {
+                            this->last_event_type_.assign(name);
+                        }
+                        if constexpr (std::is_base_of_v<observation_event, event_type>)
+                        {
+                            this->last_tid_ = e.execution.thread_id;
+                            this->last_rip_ = e.execution.rip;
+                            if (this->last_module_ != e.execution.rip_module)
+                            {
+                                this->last_module_ = e.execution.rip_module;
+                            }
+                        }
+                    },
+                    event);
+            }
+
+            static std::string_view event_name(const run_started_event&)
+            {
+                return "header";
+            }
+
+            static std::string_view event_name(const run_finished_event&)
+            {
+                return "footer";
+            }
+
+            static std::string_view event_name(const run_failed_event&)
+            {
+                return "footer";
+            }
+
+            static void append_hex(std::string& key, const uint64_t value)
+            {
+                key += "0x";
+                append_unsigned(key, value, 16);
+            }
+
+            // Returns true when the event is routine in audit mode and was counted instead of written.
+            bool summarize(const analysis_event& event)
+            {
+                thread_local std::string key;
+                key.clear();
+                return std::visit(
+                    make_overloaded(
+                        [&](const function_execution_event& e) {
+                            key.append(e.function_name).append(" (").append(e.execution.rip_module).append(")");
+                            if (!e.interesting)
+                            {
+                                // Library-to-library traffic: counted only.
+                                return this->count("function_execution", key);
+                            }
+                            key.append(" via ").append(e.execution.previous_ip_module.value_or("<N/A>")).append("+");
+                            append_hex(key, e.execution.previous_ip.value_or(0));
+                            return this->count_after_retained("function_execution", key);
+                        },
+                        [&](const object_access_event& e) {
+                            key.append(e.type_name).append("+");
+                            append_hex(key, e.offset);
+                            key.append(" (").append(e.member_name.value_or("<N/A>")).append(") at ").append(e.execution.rip_module).append("+");
+                            append_hex(key, e.execution.rip);
+                            return e.main_access ? this->count_after_retained("object_access", key) : this->count("object_access", key);
+                        },
+                        [&](const environment_access_event& e) {
+                            append_hex(key, e.offset);
+                            key.append(" at ").append(e.execution.rip_module).append("+");
+                            append_hex(key, e.execution.rip);
+                            return e.main_access ? this->count_after_retained("environment_access", key)
+                                                 : this->count("environment_access", key);
+                        },
+                        [&](const syscall_event& e) {
+                            if (e.classification != syscall_classification::regular)
+                            {
+                                // Inline and crafted syscalls are anti-analysis signals; always retained.
+                                return false;
+                            }
+                            key.append(e.syscall_name);
+                            return this->count("syscall", key);
+                        },
+                        [&](const foreign_code_transition_event& e) {
+                            key.append(e.function_name).append("+");
+                            append_hex(key, e.function_offset);
+                            key.append(" (").append(e.execution.rip_module).append(") via ").append(e.execution.previous_ip_module.value_or("<N/A>"));
+                            return e.interesting ? this->count_after_retained("foreign_code_transition", key)
+                                                 : this->count("foreign_code_transition", key);
+                        },
+                        [&](const thread_switch_event&) { return this->count("thread_switch", key); },
+                        [&](const generic_access_event& e) {
+                            key.append(e.type).append(": ").append(e.name);
+                            return this->count_after_retained("generic_access", key);
+                        },
+                        [&](const io_control_event& e) {
+                            key.append(e.device_name).append(" ");
+                            append_hex(key, e.code);
+                            return this->count_after_retained("io_control", key);
+                        },
+                        [&](const auto&) { return false; }),
+                    event);
+            }
+
+            bool count(const std::string_view type, const std::string& key)
+            {
+                thread_local std::string full;
+                full.assign(type).append("|").append(key);
+                auto entry = this->window_counts_.find(full);
+                if (entry == this->window_counts_.end())
+                {
+                    if (this->window_counts_.size() >= max_window_keys)
+                    {
+                        // Bounded memory: further distinct keys of this window share one overflow bucket.
+                        full.assign(type).append("|<other>");
+                    }
+                    entry = this->window_counts_.try_emplace(full, 0).first;
+                }
+                ++entry->second;
+                auto by_type = this->summarized_by_type_.find(type);
+                if (by_type == this->summarized_by_type_.end())
+                {
+                    by_type = this->summarized_by_type_.emplace(std::string(type), 0).first;
+                }
+                ++by_type->second;
+                ++this->summarized_events_;
+                ++this->window_events_;
+                this->maybe_emit_aggregate();
+                return true;
+            }
+
+            // Keep the first `retained_per_key` occurrences of a distinct key in the report, count the rest.
+            bool count_after_retained(const std::string_view type, const std::string& key)
+            {
+                thread_local std::string full;
+                full.assign(type).append("|").append(key);
+                auto entry = this->retained_seen_.find(full);
+                if (entry == this->retained_seen_.end())
+                {
+                    if (this->retained_seen_.size() >= max_retained_keys)
+                    {
+                        return this->count(type, key);
+                    }
+                    entry = this->retained_seen_.try_emplace(full, 0).first;
+                }
+                if (entry->second < this->settings_.retained_per_key)
+                {
+                    ++entry->second;
+                    return false;
+                }
+                return this->count(type, key);
+            }
+
+            void maybe_emit_aggregate()
+            {
+                if (this->window_events_ >= this->settings_.aggregate_interval_events)
+                {
+                    this->emit_aggregate(false);
+                    return;
+                }
+                if ((++this->clock_check_counter_ & 1023) == 0 &&
+                    std::chrono::steady_clock::now() - this->last_aggregate_ >= this->settings_.aggregate_interval)
+                {
+                    this->emit_aggregate(false);
+                }
+            }
+
+            void emit_aggregate(const bool final)
+            {
+                if (this->window_events_ == 0)
+                {
+                    return;
+                }
+                std::vector<std::pair<std::string_view, uint64_t>> top;
+                top.reserve(this->window_counts_.size());
+                for (const auto& [name, value] : this->window_counts_)
+                {
+                    top.emplace_back(name, value);
+                }
+                std::partial_sort(top.begin(), top.begin() + std::min<size_t>(top.size(), 24), top.end(),
+                                  [](const auto& a, const auto& b) { return a.second > b.second; });
+                top.resize(std::min<size_t>(top.size(), 24));
+
+                std::string line;
+                line.reserve(4096);
+                {
+                    json_object_builder object{line};
+                    object.field("type", "event_aggregate");
+                    object.field("ic", this->last_instruction_count_);
+                    object.field("tid", this->last_tid_);
+                    object.field("windowEvents", this->window_events_);
+                    object.field("summarizedEvents", this->summarized_events_);
+                    object.field("retainedEvents", this->retained_events_);
+                    object.field("distinctKeys", static_cast<uint64_t>(this->window_counts_.size()));
+                    object.field("final", final);
+                    object.object_field("byType", [&](json_object_builder& by_type) {
+                        for (const auto& [name, value] : this->summarized_by_type_)
+                        {
+                            by_type.field(name, value);
+                        }
+                    });
+                    object.array_field("top", [&](const auto& emit) {
+                        for (const auto& [name, value] : top)
+                        {
+                            emit([&](std::string& out) {
+                                json_object_builder row{out};
+                                const auto split = name.find('|');
+                                row.field("type", name.substr(0, split));
+                                row.field("key", split == std::string_view::npos ? std::string_view{} : name.substr(split + 1));
+                                row.field("count", value);
+                            });
+                        }
+                    });
+                }
+                line.push_back('\n');
+                this->file_.write(line);
+                ++this->retained_events_;
+                ++this->aggregates_written_;
+                this->window_counts_.clear();
+                this->window_events_ = 0;
+                this->last_aggregate_ = std::chrono::steady_clock::now();
+            }
+
+            // Small sidecar for panels/MCP readers; best effort and never throws.
+            void maybe_publish_status(const bool force)
+            {
+                if (this->settings_.status_path.empty())
+                {
+                    return;
+                }
+                if (!force)
+                {
+                    if ((++this->clock_check_counter_ & 1023) != 0)
+                    {
+                        return;
+                    }
+                    if (std::chrono::steady_clock::now() - this->last_status_ < this->settings_.status_interval)
+                    {
+                        return;
+                    }
+                }
+                this->last_status_ = std::chrono::steady_clock::now();
+                try
+                {
+                    std::string text;
+                    text.reserve(1024);
+                    {
+                        json_object_builder object{text};
+                        object.field("schema_version", 1U);
+                        object.field("mode", this->settings_.mode == jsonl_report_mode::audit ? "audit" : "full");
+                        object.field("retained_events", this->retained_events_);
+                        object.field("summarized_events", this->summarized_events_);
+                        object.field("aggregates_written", this->aggregates_written_);
+                        object.field("last_event_type", this->last_event_type_);
+                        object.field("updated_unix_ms",
+                                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                               std::chrono::system_clock::now().time_since_epoch())
+                                                               .count()));
+                        object.object_field("summarized_by_type", [&](json_object_builder& by_type) {
+                            for (const auto& [name, value] : this->summarized_by_type_)
+                            {
+                                by_type.field(name, value);
+                            }
+                        });
+                        object.object_field("last_location", [&](json_object_builder& location) {
+                            location.hex_field("rip", this->last_rip_);
+                            location.field("module", this->last_module_);
+                            location.field("tid", this->last_tid_);
+                            location.field("ic", this->last_instruction_count_);
+                        });
+                    }
+                    text.push_back('\n');
+                    const auto temporary = this->settings_.status_path.string() + ".tmp";
+                    {
+                        std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+                        stream.write(text.data(), static_cast<std::streamsize>(text.size()));
+                    }
+                    std::filesystem::rename(temporary, this->settings_.status_path);
+                }
+                catch (...)
+                {
+                    // Status is advisory; the report stream and the run must not depend on it.
+                }
+            }
 
             static void write_record(json_object_builder& object, const run_started_event& event)
             {
@@ -763,9 +1091,9 @@ namespace sogen
         };
     }
 
-    std::unique_ptr<analysis_reporter> create_jsonl_reporter(const std::filesystem::path& path)
+    std::unique_ptr<analysis_reporter> create_jsonl_reporter(const std::filesystem::path& path, jsonl_report_settings settings)
     {
-        return std::make_unique<jsonl_analysis_reporter>(path);
+        return std::make_unique<jsonl_analysis_reporter>(path, std::move(settings));
     }
 
 } // namespace sogen

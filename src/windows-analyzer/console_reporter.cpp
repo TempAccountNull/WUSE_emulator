@@ -4,7 +4,12 @@
 #include "analysis_reporter.hpp"
 #include "analysis_reporter_common.hpp"
 
+#include <chrono>
 #include <cinttypes>
+#include <cstdarg>
+#include <cstdio>
+#include <mutex>
+#include <unordered_map>
 #include <logger.hpp>
 
 namespace sogen
@@ -19,6 +24,25 @@ namespace sogen
             std::array<char, 24> buffer{};
             snprintf(buffer.data(), buffer.size(), "0x%" PRIx64, value);
             return buffer.data();
+        }
+
+        // NOLINTNEXTLINE(cert-dcl50-cpp)
+        std::string format_text(const char* format, ...)
+        {
+            va_list args;
+            va_start(args, format);
+            va_list copy;
+            va_copy(copy, args);
+            const auto needed = vsnprintf(nullptr, 0, format, copy);
+            va_end(copy);
+            std::string text;
+            if (needed > 0)
+            {
+                text.resize(static_cast<size_t>(needed));
+                (void)vsnprintf(text.data(), text.size() + 1, format, args);
+            }
+            va_end(args);
+            return text;
         }
 
         std::string fault_location(const fault_address_snapshot& location)
@@ -53,6 +77,16 @@ namespace sogen
                 else
                 {
                     report_regular(event);
+                }
+            }
+
+            // Print the pending repeat summaries of every guest thread (run end, failure packets).
+            void flush() override
+            {
+                const std::scoped_lock lock(this->repeat_mutex_);
+                for (auto& [tid, state] : this->repeats_)
+                {
+                    this->flush_repeat(tid, state);
                 }
             }
 
@@ -162,7 +196,12 @@ namespace sogen
                         },
                         [&](const generic_activity_event& e) { this->log_.print(color::dark_gray, "%s\n", e.details.c_str()); },
                         [&](const generic_access_event& e) {
-                            this->log_.print(color::dark_gray, "--> %s: %s\n", e.type.c_str(), e.name.c_str());
+                            auto text = format_text("--> %s: %s", e.type.c_str(), e.name.c_str());
+                            if (this->absorb_repeat(e.execution.thread_id, "ga|" + text, 0, color::dark_gray, text))
+                            {
+                                return;
+                            }
+                            this->log_.print(color::dark_gray, "%s\n", text.c_str());
                         },
                         [&](const memory_allocate_event& e) {
                             this->log_.print(e.permissions.find('x') != std::string::npos ? color::gray : color::dark_gray,
@@ -226,7 +265,12 @@ namespace sogen
                             }
                         },
                         [&](const io_control_event& e) {
-                            this->log_.print(color::dark_gray, "--> %s: 0x%X\n", e.device_name.c_str(), e.code);
+                            auto text = format_text("--> %s: 0x%X", e.device_name.c_str(), e.code);
+                            if (this->absorb_repeat(e.execution.thread_id, "io|" + text, 0, color::dark_gray, text))
+                            {
+                                return;
+                            }
+                            this->log_.print(color::dark_gray, "%s\n", text.c_str());
                         },
                         [&](const thread_create_event& e) {
                             std::string flags{};
@@ -276,30 +320,50 @@ namespace sogen
                             {
                                 return;
                             }
-                            this->log_.print(e.main_access ? color::green : color::dark_gray,
-                                             "Object access: %s - 0x%" PRIx64 " 0x%" PRIx64 " (%s) at 0x%" PRIx64 " (%s)\n",
-                                             e.type_name.c_str(), e.offset, e.size, e.member_name.value_or("<N/A>").c_str(),
-                                             e.execution.rip, e.execution.rip_module.c_str());
+                            const auto line_color = e.main_access ? color::green : color::dark_gray;
+                            auto text = format_text("Object access: %s - 0x%" PRIx64 " 0x%" PRIx64 " (%s) at 0x%" PRIx64 " (%s)",
+                                                    e.type_name.c_str(), e.offset, e.size, e.member_name.value_or("<N/A>").c_str(),
+                                                    e.execution.rip, e.execution.rip_module.c_str());
+                            if (this->absorb_repeat(e.execution.thread_id, "oa|" + text, 0, line_color, text))
+                            {
+                                return;
+                            }
+                            this->log_.print(line_color, "%s\n", text.c_str());
                         },
                         [&](const environment_access_event& e) {
                             if (this->settings_.interesting_only && !e.main_access)
                             {
                                 return;
                             }
-                            this->log_.print(e.main_access ? color::green : color::dark_gray,
-                                             "Environment access: 0x%" PRIx64 " (0x%zX) at 0x%" PRIx64 " (%s)\n", e.offset,
-                                             static_cast<size_t>(e.size), e.execution.rip, e.execution.rip_module.c_str());
+                            const auto line_color = e.main_access ? color::green : color::dark_gray;
+                            auto text = format_text("Environment access: 0x%" PRIx64 " (0x%zX) at 0x%" PRIx64 " (%s)", e.offset,
+                                                    static_cast<size_t>(e.size), e.execution.rip, e.execution.rip_module.c_str());
+                            if (this->absorb_repeat(e.execution.thread_id, "ea|" + text, 0, line_color, text))
+                            {
+                                return;
+                            }
+                            this->log_.print(line_color, "%s\n", text.c_str());
                         },
                         [&](const function_execution_event& e) {
                             if (this->settings_.interesting_only && !e.interesting)
                             {
                                 return;
                             }
+                            const auto line_color = e.interesting ? color::yellow : color::dark_gray;
+                            auto text = format_text("Executing function: %s (%s) (0x%" PRIx64 ") via 0x%" PRIx64 " (%s)",
+                                                    e.function_name.c_str(), e.execution.rip_module.c_str(), e.execution.rip,
+                                                    e.execution.previous_ip.value_or(0), e.execution.previous_ip_module.value_or("<N/A>").c_str());
+                            std::string key = "fn|" + text;
+                            for (const auto& detail : e.details)
+                            {
+                                key += "|" + detail.label + "=" + detail.value;
+                            }
+                            if (this->absorb_repeat(e.execution.thread_id, std::move(key), e.call_count, line_color, text))
+                            {
+                                return;
+                            }
                             const auto prefix = this->make_call_prefix(e.call_count);
-                            this->log_.print(e.interesting ? color::yellow : color::dark_gray,
-                                             "%sExecuting function: %s (%s) (0x%" PRIx64 ") via 0x%" PRIx64 " (%s)\n", prefix.c_str(),
-                                             e.function_name.c_str(), e.execution.rip_module.c_str(), e.execution.rip,
-                                             e.execution.previous_ip.value_or(0), e.execution.previous_ip_module.value_or("<N/A>").c_str());
+                            this->log_.print(line_color, "%s%s\n", prefix.c_str(), text.c_str());
                             for (const auto& detail : e.details)
                             {
                                 if (detail.label.empty())
@@ -321,10 +385,15 @@ namespace sogen
                             {
                                 return;
                             }
-                            this->log_.print(e.interesting ? color::yellow : color::dark_gray,
-                                             "Transition to foreign code: %s+0x%" PRIx64 " (%s) (0x%" PRIx64 ") via 0x%" PRIx64 " (%s)\n",
-                                             e.function_name.c_str(), e.function_offset, e.execution.rip_module.c_str(), e.execution.rip,
-                                             e.execution.previous_ip.value_or(0), e.execution.previous_ip_module.value_or("<N/A>").c_str());
+                            const auto line_color = e.interesting ? color::yellow : color::dark_gray;
+                            auto text = format_text("Transition to foreign code: %s+0x%" PRIx64 " (%s) (0x%" PRIx64 ") via 0x%" PRIx64 " (%s)",
+                                                    e.function_name.c_str(), e.function_offset, e.execution.rip_module.c_str(), e.execution.rip,
+                                                    e.execution.previous_ip.value_or(0), e.execution.previous_ip_module.value_or("<N/A>").c_str());
+                            if (this->absorb_repeat(e.execution.thread_id, "ft|" + text, 0, line_color, text))
+                            {
+                                return;
+                            }
+                            this->log_.print(line_color, "%s\n", text.c_str());
                         },
                         [&](const section_first_execute_event& e) {
                             this->log_.print(
@@ -353,32 +422,37 @@ namespace sogen
                                              e.execution.rip, e.execution.rip_module.c_str());
                         },
                         [&](const syscall_event& e) {
-                            const auto prefix = this->make_call_prefix(e.call_count);
+                            std::string text;
+                            auto line_color = color::blue;
                             switch (e.classification)
                             {
                             case syscall_classification::inline_syscall:
-                                this->log_.print(color::blue, "%sExecuting inline syscall: %s (0x%X) at 0x%" PRIx64 " (%s)\n",
-                                                 prefix.c_str(), e.syscall_name.c_str(), e.syscall_id, e.execution.rip,
-                                                 e.execution.rip_module.c_str());
+                                text = format_text("Executing inline syscall: %s (0x%X) at 0x%" PRIx64 " (%s)", e.syscall_name.c_str(),
+                                                   e.syscall_id, e.execution.rip, e.execution.rip_module.c_str());
                                 break;
                             case syscall_classification::crafted_out_of_line:
-                                this->log_.print(
-                                    color::blue, "%sCrafted out-of-line syscall: %s (0x%X) at 0x%" PRIx64 " (%s) via 0x%" PRIx64 " (%s)\n",
-                                    prefix.c_str(), e.syscall_name.c_str(), e.syscall_id, e.execution.rip, e.execution.rip_module.c_str(),
-                                    e.execution.previous_ip.value_or(0), e.execution.previous_ip_module.value_or("<N/A>").c_str());
+                                text = format_text("Crafted out-of-line syscall: %s (0x%X) at 0x%" PRIx64 " (%s) via 0x%" PRIx64 " (%s)",
+                                                   e.syscall_name.c_str(), e.syscall_id, e.execution.rip, e.execution.rip_module.c_str(),
+                                                   e.execution.previous_ip.value_or(0), e.execution.previous_ip_module.value_or("<N/A>").c_str());
                                 break;
                             case syscall_classification::regular:
                             default:
                                 if (this->settings_.interesting_only)
                                 {
-                                    break;
+                                    return;
                                 }
-                                this->log_.print(color::dark_gray,
-                                                 "%sExecuting syscall: %s (0x%X) at 0x%" PRIx64 " via 0x%" PRIx64 " (%s)\n", prefix.c_str(),
-                                                 e.syscall_name.c_str(), e.syscall_id, e.execution.rip, e.caller_rip.value_or(0),
-                                                 e.caller_module.value_or("<N/A>").c_str());
+                                line_color = color::dark_gray;
+                                text = format_text("Executing syscall: %s (0x%X) at 0x%" PRIx64 " via 0x%" PRIx64 " (%s)", e.syscall_name.c_str(),
+                                                   e.syscall_id, e.execution.rip, e.caller_rip.value_or(0),
+                                                   e.caller_module.value_or("<N/A>").c_str());
                                 break;
                             }
+                            if (this->absorb_repeat(e.execution.thread_id, "sc|" + text, e.call_count, line_color, text))
+                            {
+                                return;
+                            }
+                            const auto prefix = this->make_call_prefix(e.call_count);
+                            this->log_.print(line_color, "%s%s\n", prefix.c_str(), text.c_str());
                         },
                         [&](const foreign_module_read_event& e) {
                             this->log_.print(color::pink, "Reading %zd bytes from module %s at 0x%" PRIx64 " (%s) via 0x%" PRIx64 " (%s)\n",
@@ -404,8 +478,95 @@ namespace sogen
             }
 
           private:
+            // Console-only repeat coalescing, one state per guest thread. The structured reporters
+            // still receive every event; only the human console folds consecutive identical lines.
+            struct repeat_state
+            {
+                std::string key{};
+                std::string text{};
+                color line_color{color::gray};
+                uint64_t repeats{};            // identical events absorbed after the printed line
+                uint64_t reported{};           // repeats already covered by a summary line
+                uint64_t pending_first_call{}; // traced-call count of the first unreported repeat
+                uint64_t last_call{};
+                std::chrono::steady_clock::time_point last_summary{};
+            };
+
+            // Returns true when the event repeats the previous line of the same thread and was folded
+            // into its repeat run. Otherwise the pending run is summarized and the caller prints the line.
+            bool absorb_repeat(const uint32_t tid, std::string key, const uint64_t call_count, const color line_color,
+                               const std::string& text)
+            {
+                if (!this->settings_.coalesce_repeats)
+                {
+                    return false;
+                }
+
+                const std::scoped_lock lock(this->repeat_mutex_);
+                auto& state = this->repeats_[tid];
+                const auto now = std::chrono::steady_clock::now();
+                if (!state.key.empty() && state.key == key)
+                {
+                    ++state.repeats;
+                    state.last_call = call_count;
+                    if (state.repeats - state.reported == 1)
+                    {
+                        state.pending_first_call = call_count;
+                    }
+                    const auto pending = state.repeats - state.reported;
+                    if ((this->settings_.repeat_summary_every && pending >= this->settings_.repeat_summary_every) ||
+                        now - state.last_summary >= this->settings_.repeat_summary_interval)
+                    {
+                        this->print_repeat_summary(tid, state);
+                        state.last_summary = now;
+                    }
+                    return true;
+                }
+
+                this->flush_repeat(tid, state);
+                state.key = std::move(key);
+                state.text = text;
+                state.line_color = line_color;
+                state.repeats = 0;
+                state.reported = 0;
+                state.pending_first_call = call_count;
+                state.last_call = call_count;
+                state.last_summary = now;
+                return false;
+            }
+
+            void print_repeat_summary(const uint32_t tid, repeat_state& state)
+            {
+                const auto pending = state.repeats - state.reported;
+                if (pending == 0)
+                {
+                    return;
+                }
+                if (state.last_call != 0)
+                {
+                    this->log_.print(state.line_color, "~ tid %" PRIu32 " repeated %" PRIu64 " more times [calls %" PRIu64 "..%" PRIu64 "]: %s\n",
+                                     tid, pending, state.pending_first_call, state.last_call, state.text.c_str());
+                }
+                else
+                {
+                    this->log_.print(state.line_color, "~ tid %" PRIu32 " repeated %" PRIu64 " more times: %s\n", tid, pending,
+                                     state.text.c_str());
+                }
+                state.reported = state.repeats;
+            }
+
+            void flush_repeat(const uint32_t tid, repeat_state& state)
+            {
+                this->print_repeat_summary(tid, state);
+                state.key.clear();
+                state.repeats = 0;
+                state.reported = 0;
+            }
+
             logger& log_;
             console_reporter_settings settings_{};
+            std::mutex repeat_mutex_{};
+            std::unordered_map<uint32_t, repeat_state> repeats_{};
         };
     }
 

@@ -49,6 +49,12 @@ namespace sogen
 #endif
         }
 
+        // Process exit codes. The controller classifies a run without parsing the report, which can be
+        // the failing component (a report file on an exhausted volume).
+        constexpr int exit_code_success = 0;       // guest exited with STATUS_SUCCESS or a checkpoint was saved
+        constexpr int exit_code_guest_failure = 1; // guest exited with another status
+        constexpr int exit_code_host_failure = 2;  // host-side emulation/reporting failure (run_failed event)
+
         struct analysis_options : analysis_settings
         {
             bool use_gdb{false};
@@ -60,6 +66,8 @@ namespace sogen
             bool tenet_trace{false};
             bool prepend_call_count{false};
             bool console_interesting_only{false};
+            bool console_coalesce_repeats{false};
+            std::string report_mode{"full"};
 #if defined(OS_EMSCRIPTEN) && !defined(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS)
             bool pause_before_start{false};
 #endif
@@ -370,7 +378,7 @@ namespace sogen
             }
         }
 
-        bool run_emulation(const analysis_context& c, const analysis_options& options)
+        int run_emulation(const analysis_context& c, const analysis_options& options)
         {
             auto& win_emu = *c.win_emu;
 
@@ -420,14 +428,29 @@ namespace sogen
                 {
                     message += " (snapshot failed: "s + e.what() + ")";
                 }
-                do_post_emulation_work(c);
-                c.emit_summary<run_failed_event>([&](auto& event) {
-                    event.rip = win_emu.emu().read_instruction_pointer();
-                    event.message = std::move(message);
-                    event.phase = phase;
-                });
-                flush_reporters(c);
-                return false;
+                const auto rip = win_emu.emu().read_instruction_pointer();
+                try
+                {
+                    do_post_emulation_work(c);
+                    c.emit_summary<run_failed_event>([&](auto& event) {
+                        event.rip = rip;
+                        event.message = message;
+                        event.phase = phase;
+                    });
+                    flush_reporters(c);
+                }
+                catch (const std::exception& e)
+                {
+                    // A reporter can itself be the failing component (for example the report file on
+                    // an exhausted volume). The failure packet must still leave the process, so fall
+                    // back to stderr instead of letting a second exception unwind through the emulator
+                    // teardown, which terminates the process without any record.
+                    (void)fprintf(stderr,
+                                  "\033[91mEmulation failed at: 0x%llx - %s\nReporting the failure also failed: %s\033[0m\n",
+                                  static_cast<unsigned long long>(rip), message.c_str(), e.what());
+                    (void)fflush(stderr);
+                }
+                return exit_code_host_failure;
             };
 
             try
@@ -484,7 +507,7 @@ namespace sogen
                         event.exit_status = std::nullopt;
                     });
                     flush_reporters(c);
-                    return true;
+                    return exit_code_success;
                 }
                 else
                 {
@@ -539,7 +562,7 @@ namespace sogen
                         event.rip = win_emu.emu().read_instruction_pointer();
                     });
                     flush_reporters(c);
-                    return true;
+                    return exit_code_success;
                 }
                 return emit_failure(win_emu.last_stop_reason() == stop_reason::backend_error ? win_emu.last_stop_detail()
                                                                                              : "Emulation terminated without status");
@@ -553,7 +576,7 @@ namespace sogen
                 event.exit_status = static_cast<uint32_t>(*exit_status);
             });
             flush_reporters(c);
-            return success;
+            return success ? exit_code_success : exit_code_guest_failure;
         }
 
         std::vector<std::u16string> parse_arguments(const std::span<const std::string_view> args)
@@ -684,7 +707,7 @@ namespace sogen
             return "?";
         }
 
-        bool run(const analysis_options& options, const std::span<const std::string_view> args)
+        int run(const analysis_options& options, const std::span<const std::string_view> args)
         {
             analysis_context context{
                 .settings = &options,
@@ -702,6 +725,7 @@ namespace sogen
                                                                              .buffer_stdout = options.buffer_stdout,
                                                                              .interesting_only = options.console_interesting_only,
                                                                              .prepend_call_count = options.prepend_call_count,
+                                                                             .coalesce_repeats = options.console_coalesce_repeats,
                                                                          }));
 
             if (!options.report_path.empty())
@@ -711,7 +735,11 @@ namespace sogen
                     throw std::runtime_error("Unsupported report format: " + options.report_format);
                 }
 
-                reporters.emplace_back(create_jsonl_reporter(options.report_path));
+                jsonl_report_settings report_settings{};
+                report_settings.mode = options.report_mode == "audit" ? jsonl_report_mode::audit : jsonl_report_mode::full;
+                // Live counters and the last guest location for panels/MCP readers, next to the report.
+                report_settings.status_path = options.report_path.parent_path() / "report-status.json";
+                reporters.emplace_back(create_jsonl_reporter(options.report_path, report_settings));
             }
 
             if (!options.stdout_path.empty())
@@ -961,6 +989,8 @@ namespace sogen
             app.add_flag("-b,--buffer", options.buffer_stdout, "Buffer stdout");
             app.add_flag("--console-interesting-only", options.console_interesting_only,
                          "Print notable events to the console while retaining every event in the report");
+            app.add_flag("--console-coalesce-repeats", options.console_coalesce_repeats,
+                         "Fold consecutive identical console events per thread into bounded repeat summaries");
             app.add_flag("-f,--foreign", options.log_foreign_module_access, "Log read access to foreign modules");
             app.add_flag("-c,--concise", options.concise_logging, "Concise logging");
             app.add_flag_callback(
@@ -991,6 +1021,10 @@ namespace sogen
             app.add_option("--minidump", options.minidump_path, "Load minidump from path");
             app.add_option("--report", options.report_path, "Write machine-readable analysis events to a file");
             app.add_option("--report-format", options.report_format, "Report format (supported: jsonl)")->capture_default_str();
+            app.add_option("--report-mode", options.report_mode,
+                           "Report detail: full writes every event; audit keeps diagnostics and counts routine events")
+                ->capture_default_str()
+                ->check(CLI::IsMember({"full", "audit"}));
             app.add_option("--stdout", options.stdout_path, "Write guest console output to a file");
             app.add_option("--whp-exec-hook", options.whp_execution_hook_mode, "WHP memory execution hook mode")
                 ->capture_default_str()
@@ -1067,7 +1101,7 @@ namespace sogen
                 const auto application = app.remaining();
                 const std::vector<std::string_view> args{application.begin(), application.end()};
 
-                return run(options, args) ? 0 : 1;
+                return run(options, args);
             }
             catch (std::exception& e)
             {
@@ -1078,7 +1112,7 @@ namespace sogen
                 puts("An unknown exception occured");
             }
 
-            return 1;
+            return exit_code_host_failure;
         }
     }
 
