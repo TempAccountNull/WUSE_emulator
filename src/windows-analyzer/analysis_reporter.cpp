@@ -517,9 +517,10 @@ namespace sogen
                 {
                     top.emplace_back(name, value);
                 }
-                std::partial_sort(top.begin(), top.begin() + std::min<size_t>(top.size(), 24), top.end(),
+                const auto shown = std::min<size_t>(top.size(), std::max<uint32_t>(1, this->settings_.aggregate_top));
+                std::partial_sort(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(shown), top.end(),
                                   [](const auto& a, const auto& b) { return a.second > b.second; });
-                top.resize(std::min<size_t>(top.size(), 24));
+                top.resize(shown);
 
                 std::string line;
                 line.reserve(4096);

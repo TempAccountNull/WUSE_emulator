@@ -68,6 +68,8 @@ namespace sogen
             bool console_interesting_only{false};
             bool console_coalesce_repeats{false};
             bool report_dedupe{false};
+            bool console_dedupe{false};
+            uint32_t aggregate_top{24};
             std::vector<std::string> hide_modules{};
             std::vector<std::string> hide_events{};
             std::string report_mode{"full"};
@@ -743,7 +745,7 @@ namespace sogen
                                                                              .interesting_only = options.console_interesting_only,
                                                                              .prepend_call_count = options.prepend_call_count,
                                                                              .coalesce_repeats = options.console_coalesce_repeats,
-                                                                             .dedupe = options.report_dedupe,
+                                                                             .dedupe = options.console_dedupe,
                                                                              .hidden_modules = hidden_modules,
                                                                              .hidden_event_types = hidden_event_types,
                                                                          }));
@@ -758,6 +760,7 @@ namespace sogen
                 jsonl_report_settings report_settings{};
                 report_settings.mode = options.report_mode == "audit" ? jsonl_report_mode::audit : jsonl_report_mode::full;
                 report_settings.dedupe = options.report_dedupe;
+                report_settings.aggregate_top = options.aggregate_top;
                 report_settings.hidden_modules = hidden_modules;
                 report_settings.hidden_event_types = hidden_event_types;
                 // Live counters and the last guest location for panels/MCP readers, next to the report.
@@ -1021,8 +1024,13 @@ namespace sogen
                 "--hide-event", options.hide_events,
                 "Drop every event of this report type, e.g. object_access (repeatable; failure packets and run events are kept)");
             app.add_flag("--report-dedupe", options.report_dedupe,
-                         "Keep a report record and print a console line only when its data differs from one already kept "
-                         "(counters such as ic and callCount excluded); duplicates are counted");
+                         "Write a report record only when its data differs from one already written (counters such as ic and "
+                         "callCount excluded); duplicates are counted");
+            app.add_flag("--console-dedupe", options.console_dedupe,
+                         "Print a console line only when its data differs from one already printed; duplicates are counted");
+            app.add_option("--aggregate-top", options.aggregate_top, "Entries per routine-event window in audit report mode")
+                ->capture_default_str()
+                ->check(CLI::Range(1, 4096));
             app.add_flag("-f,--foreign", options.log_foreign_module_access, "Log read access to foreign modules");
             app.add_flag("-c,--concise", options.concise_logging, "Concise logging");
             app.add_flag_callback(

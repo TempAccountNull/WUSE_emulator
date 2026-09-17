@@ -465,6 +465,28 @@ namespace sogen
         EXPECT_NE(console.text.find("violation"), std::string::npos) << console.text;
     }
 
+    TEST(AuditReport, AggregateTopIsConfigurable)
+    {
+        const auto path = unique_path("sogen-audit-top", ".jsonl");
+        const auto cleanup = utils::finally([&] {
+            std::error_code error;
+            std::filesystem::remove(path, error);
+        });
+        jsonl_report_settings settings{};
+        settings.mode = jsonl_report_mode::audit;
+        settings.aggregate_top = 2;
+        settings.aggregate_interval_events = 1000000;
+        settings.aggregate_interval = std::chrono::hours(1);
+        auto jsonl = create_jsonl_reporter(path, settings);
+        for (const char* name : {"RtlAllocateHeap", "RtlFreeHeap", "memcpy", "memset"})
+        {
+            jsonl->report(function_call(8, 1, name, false));
+        }
+        jsonl->flush();
+        const auto text = read_text(path);
+        EXPECT_EQ(count_lines(text, "\"key\":"), 2U) << text;
+    }
+
     TEST(HiddenEventTypes, EventsOfHiddenTypesAreDroppedButFailuresKept)
     {
         const auto path = unique_path("sogen-hidden-types", ".jsonl");

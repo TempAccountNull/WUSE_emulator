@@ -27,6 +27,7 @@ namespace sogen
     {
         jsonl_report_mode mode{jsonl_report_mode::full};
         uint32_t retained_per_key{3};
+        uint32_t aggregate_top{24};
         uint64_t aggregate_interval_events{100000};
         std::chrono::milliseconds aggregate_interval{5000};
         std::chrono::milliseconds status_interval{1000};

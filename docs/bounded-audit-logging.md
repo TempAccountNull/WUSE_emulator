@@ -82,10 +82,12 @@ Panels and MCP readers use this file instead of reading the report.
 
 `windows-emulator-test.exe --gtest_filter=ConsoleCoalescing.*:AuditReport.*:LoggerResilience.*:IcicleHookExceptions.*`
 
-## Duplicate suppression (`--report-dedupe`)
+## Duplicate suppression (`--report-dedupe`, `--console-dedupe`)
 
-Identical observations are only worth recording once. With `--report-dedupe` the analyzer keeps a
-report record, and prints a console line, only when its *data* differs from one already kept.
+Identical observations are only worth recording once. With `--report-dedupe` the analyzer writes a
+report record only when its *data* differs from one already written; `--console-dedupe` applies the
+same rule to console lines (kept separate so the console can stay a full trace while the report is
+bounded).
 Data means every field except the values that change on every occurrence (`ic`, `callCount`,
 `call_id`, the stack pointer and the guest pointers of printed-call arguments); the console
 compares the same text it would print. Suppressed duplicates are counted:
@@ -111,3 +113,8 @@ can ask the runner to pass them as `--hide-module` for the next launch.
 `type` field of the JSONL report (`function_execution`, `object_access`, `syscall`, ...), at both the
 console and the report; they count as `hidden_events`. Failure packets and run start/end are
 always kept. The panel's Launch tab writes the list for the next launch.
+
+## Routine window size (`--aggregate-top N`)
+
+Each `event_aggregate` record lists the busiest keys of its window; `--aggregate-top` (default 24,
+up to 4096) sets how many. Larger values make each window record proportionally larger.
