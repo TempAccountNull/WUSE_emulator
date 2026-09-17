@@ -272,17 +272,29 @@ namespace sogen
                                              e.execution.rip_module.c_str());
                         },
                         [&](const object_access_event& e) {
+                            if (this->settings_.interesting_only && !e.main_access)
+                            {
+                                return;
+                            }
                             this->log_.print(e.main_access ? color::green : color::dark_gray,
                                              "Object access: %s - 0x%" PRIx64 " 0x%" PRIx64 " (%s) at 0x%" PRIx64 " (%s)\n",
                                              e.type_name.c_str(), e.offset, e.size, e.member_name.value_or("<N/A>").c_str(),
                                              e.execution.rip, e.execution.rip_module.c_str());
                         },
                         [&](const environment_access_event& e) {
+                            if (this->settings_.interesting_only && !e.main_access)
+                            {
+                                return;
+                            }
                             this->log_.print(e.main_access ? color::green : color::dark_gray,
                                              "Environment access: 0x%" PRIx64 " (0x%zX) at 0x%" PRIx64 " (%s)\n", e.offset,
                                              static_cast<size_t>(e.size), e.execution.rip, e.execution.rip_module.c_str());
                         },
                         [&](const function_execution_event& e) {
+                            if (this->settings_.interesting_only && !e.interesting)
+                            {
+                                return;
+                            }
                             const auto prefix = this->make_call_prefix(e.call_count);
                             this->log_.print(e.interesting ? color::yellow : color::dark_gray,
                                              "%sExecuting function: %s (%s) (0x%" PRIx64 ") via 0x%" PRIx64 " (%s)\n", prefix.c_str(),
@@ -305,6 +317,10 @@ namespace sogen
                                              e.execution.rip_module.c_str(), e.execution.rip);
                         },
                         [&](const foreign_code_transition_event& e) {
+                            if (this->settings_.interesting_only && !e.interesting)
+                            {
+                                return;
+                            }
                             this->log_.print(e.interesting ? color::yellow : color::dark_gray,
                                              "Transition to foreign code: %s+0x%" PRIx64 " (%s) (0x%" PRIx64 ") via 0x%" PRIx64 " (%s)\n",
                                              e.function_name.c_str(), e.function_offset, e.execution.rip_module.c_str(), e.execution.rip,
@@ -353,6 +369,10 @@ namespace sogen
                                 break;
                             case syscall_classification::regular:
                             default:
+                                if (this->settings_.interesting_only)
+                                {
+                                    break;
+                                }
                                 this->log_.print(color::dark_gray,
                                                  "%sExecuting syscall: %s (0x%X) at 0x%" PRIx64 " via 0x%" PRIx64 " (%s)\n", prefix.c_str(),
                                                  e.syscall_name.c_str(), e.syscall_id, e.execution.rip, e.caller_rip.value_or(0),

@@ -59,6 +59,7 @@ namespace sogen
             bool log_foreign_module_access{false};
             bool tenet_trace{false};
             bool prepend_call_count{false};
+            bool console_interesting_only{false};
 #if defined(OS_EMSCRIPTEN) && !defined(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS)
             bool pause_before_start{false};
 #endif
@@ -699,6 +700,7 @@ namespace sogen
             reporters.emplace_back(create_console_reporter(win_emu->log, console_reporter_settings{
                                                                              .silent = options.silent,
                                                                              .buffer_stdout = options.buffer_stdout,
+                                                                             .interesting_only = options.console_interesting_only,
                                                                              .prepend_call_count = options.prepend_call_count,
                                                                          }));
 
@@ -957,6 +959,8 @@ namespace sogen
             app.add_flag("-s,--silent", options.silent, "Silent mode");
             app.add_flag("-v,--verbose", options.verbose_logging, "Verbose logging");
             app.add_flag("-b,--buffer", options.buffer_stdout, "Buffer stdout");
+            app.add_flag("--console-interesting-only", options.console_interesting_only,
+                         "Print notable events to the console while retaining every event in the report");
             app.add_flag("-f,--foreign", options.log_foreign_module_access, "Log read access to foreign modules");
             app.add_flag("-c,--concise", options.concise_logging, "Concise logging");
             app.add_flag_callback(

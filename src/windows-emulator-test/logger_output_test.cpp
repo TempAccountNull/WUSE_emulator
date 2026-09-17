@@ -1,4 +1,5 @@
 #include "std_include.hpp"
+#include "../windows-analyzer/analysis_reporter.hpp"
 
 #include <gtest/gtest.h>
 #include <logger.hpp>
@@ -49,6 +50,49 @@ namespace sogen
         }
         EXPECT_TRUE(testing::internal::GetCapturedStdout().empty());
         EXPECT_EQ(observed, "ordinary\nforced\n");
+    }
+
+    TEST(ConsoleReporter, InterestingModeFiltersOnlyRoutineCopies)
+    {
+        std::string text;
+        logger log;
+        log.set_silent(true);
+        log.set_sink([&](const color, const std::string_view line) { text += line; });
+        auto console = create_console_reporter(log, {.interesting_only = true});
+
+        function_execution_event routine_function{};
+        routine_function.function_name = "RoutineFunction";
+        console->report(routine_function);
+
+        function_execution_event interesting_function{};
+        interesting_function.function_name = "InterestingFunction";
+        interesting_function.interesting = true;
+        console->report(interesting_function);
+
+        object_access_event routine_object{};
+        routine_object.type_name = "RoutineObject";
+        console->report(routine_object);
+
+        object_access_event main_object{};
+        main_object.type_name = "MainObject";
+        main_object.main_access = true;
+        console->report(main_object);
+
+        syscall_event routine_syscall{};
+        routine_syscall.syscall_name = "RoutineSyscall";
+        console->report(routine_syscall);
+
+        syscall_event inline_syscall{};
+        inline_syscall.syscall_name = "InlineSyscall";
+        inline_syscall.classification = syscall_classification::inline_syscall;
+        console->report(inline_syscall);
+
+        EXPECT_EQ(text.find("RoutineFunction"), std::string::npos);
+        EXPECT_EQ(text.find("RoutineObject"), std::string::npos);
+        EXPECT_EQ(text.find("RoutineSyscall"), std::string::npos);
+        EXPECT_NE(text.find("InterestingFunction"), std::string::npos);
+        EXPECT_NE(text.find("MainObject"), std::string::npos);
+        EXPECT_NE(text.find("InlineSyscall"), std::string::npos);
     }
 }
 #endif
