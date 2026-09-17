@@ -67,6 +67,7 @@ namespace sogen
             bool prepend_call_count{false};
             bool console_interesting_only{false};
             bool console_coalesce_repeats{false};
+            bool report_dedupe{false};
             std::string report_mode{"full"};
 #if defined(OS_EMSCRIPTEN) && !defined(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS)
             bool pause_before_start{false};
@@ -726,6 +727,7 @@ namespace sogen
                                                                              .interesting_only = options.console_interesting_only,
                                                                              .prepend_call_count = options.prepend_call_count,
                                                                              .coalesce_repeats = options.console_coalesce_repeats,
+                                                                             .dedupe = options.report_dedupe,
                                                                          }));
 
             if (!options.report_path.empty())
@@ -737,6 +739,7 @@ namespace sogen
 
                 jsonl_report_settings report_settings{};
                 report_settings.mode = options.report_mode == "audit" ? jsonl_report_mode::audit : jsonl_report_mode::full;
+                report_settings.dedupe = options.report_dedupe;
                 // Live counters and the last guest location for panels/MCP readers, next to the report.
                 report_settings.status_path = options.report_path.parent_path() / "report-status.json";
                 reporters.emplace_back(create_jsonl_reporter(options.report_path, report_settings));
@@ -991,6 +994,9 @@ namespace sogen
                          "Print notable events to the console while retaining every event in the report");
             app.add_flag("--console-coalesce-repeats", options.console_coalesce_repeats,
                          "Fold consecutive identical console events per thread into bounded repeat summaries");
+            app.add_flag("--report-dedupe", options.report_dedupe,
+                         "Keep a report record and print a console line only when its data differs from one already kept "
+                         "(counters such as ic and callCount excluded); duplicates are counted");
             app.add_flag("-f,--foreign", options.log_foreign_module_access, "Log read access to foreign modules");
             app.add_flag("-c,--concise", options.concise_logging, "Concise logging");
             app.add_flag_callback(

@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -248,6 +249,21 @@ namespace sogen
                     std::visit(make_overloaded([&](const auto& e) { write_record(object, e); }), event);
                 }
 
+                if (this->settings_.dedupe && event_is_deduplicable(event))
+                {
+                    const auto hash = record_content_hash(line);
+                    if (this->seen_content_.contains(hash))
+                    {
+                        ++this->deduplicated_events_;
+                        this->maybe_publish_status(false);
+                        return;
+                    }
+                    if (this->seen_content_.size() < max_dedupe_entries)
+                    {
+                        this->seen_content_.insert(hash);
+                    }
+                }
+
                 line.push_back('\n');
                 this->file_.write(line);
                 ++this->retained_events_;
@@ -261,15 +277,30 @@ namespace sogen
                 this->maybe_publish_status(true);
             }
 
+            // Hash of the event's serialized record with the counters skipped (see record_content_hash).
+            static uint64_t content_hash(const analysis_event& event)
+            {
+                thread_local std::string record;
+                record.clear();
+                {
+                    json_object_builder object{record};
+                    std::visit(make_overloaded([&](const auto& e) { write_record(object, e); }), event);
+                }
+                return record_content_hash(record);
+            }
+
           private:
             static constexpr size_t max_window_keys = 4096;
             static constexpr size_t max_retained_keys = 65536;
+            static constexpr size_t max_dedupe_entries = size_t{1} << 20;
 
             utils::async_file_writer file_;
             jsonl_report_settings settings_{};
             std::chrono::steady_clock::time_point last_aggregate_{};
             std::chrono::steady_clock::time_point last_status_{};
             uint64_t retained_events_{};
+            uint64_t deduplicated_events_{};
+            std::unordered_set<uint64_t> seen_content_{}; // content hashes of written records (dedupe)
             uint64_t summarized_events_{};
             uint64_t window_events_{};
             uint64_t clock_check_counter_{};
@@ -539,6 +570,9 @@ namespace sogen
                         object.field("retained_events", this->retained_events_);
                         object.field("summarized_events", this->summarized_events_);
                         object.field("aggregates_written", this->aggregates_written_);
+                        object.field("dedupe", this->settings_.dedupe);
+                        object.field("deduplicated_events", this->deduplicated_events_);
+                        object.field("dedupe_keys", static_cast<uint64_t>(this->seen_content_.size()));
                         object.field("last_event_type", this->last_event_type_);
                         object.field("updated_unix_ms",
                                      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1096,4 +1130,69 @@ namespace sogen
         return std::make_unique<jsonl_analysis_reporter>(path, std::move(settings));
     }
 
+    bool event_is_deduplicable(const analysis_event& event)
+    {
+        return std::visit(make_overloaded([](const run_started_event&) { return false; },
+                                          [](const run_finished_event&) { return false; },
+                                          [](const run_failed_event&) { return false; },
+                                          [](const stdout_chunk_event&) { return false; },
+                                          [](const buffered_stdout_event&) { return false; },
+                                          [](const instruction_summary_event&) { return false; },
+                                          [](const execution_progress_event&) { return false; },
+                                          [](const thread_switch_event&) { return false; },
+                                          [](const memory_violation_event&) { return false; },
+                                          [](const fast_fail_event&) { return false; },
+                                          [](const entry_point_execution_event&) { return false; },
+                                          [](const auto&) { return true; }),
+                          event);
+    }
+
+    uint64_t record_content_hash(const std::string_view record)
+    {
+        // FNV-1a over the record with the values of the counter fields skipped: "key":"digits"
+        // (uint64), "key":digits (uint32) or "key":"0x..." (guest pointers of printed-call arguments
+        // and the stack pointer, which change per call while the printed data does not).
+        static constexpr std::array<std::string_view, 6> volatile_keys{"\"ic\":",           "\"callCount\":", "\"call_id\":",
+                                                                       "\"stack_pointer\":", "\"raw\":",       "\"data_address\":"};
+        uint64_t hash = 14695981039346656037ULL;
+        size_t index = 0;
+        while (index < record.size())
+        {
+            bool skipped = false;
+            for (const auto key : volatile_keys)
+            {
+                if (record.compare(index, key.size(), key) != 0)
+                {
+                    continue;
+                }
+                index += key.size();
+                if (index < record.size() && record[index] == '"')
+                {
+                    const auto end = record.find('"', index + 1);
+                    index = end == std::string_view::npos ? record.size() : end + 1;
+                }
+                else
+                {
+                    while (index < record.size() && record[index] >= '0' && record[index] <= '9')
+                    {
+                        ++index;
+                    }
+                }
+                skipped = true;
+                break;
+            }
+            if (skipped)
+            {
+                continue;
+            }
+            hash ^= static_cast<unsigned char>(record[index++]);
+            hash *= 1099511628211ULL;
+        }
+        return hash;
+    }
+
+    uint64_t event_content_hash(const analysis_event& event)
+    {
+        return jsonl_analysis_reporter::content_hash(event);
+    }
 } // namespace sogen

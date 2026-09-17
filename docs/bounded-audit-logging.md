@@ -81,3 +81,17 @@ Panels and MCP readers use this file instead of reading the report.
 ## Validation
 
 `windows-emulator-test.exe --gtest_filter=ConsoleCoalescing.*:AuditReport.*:LoggerResilience.*:IcicleHookExceptions.*`
+
+## Duplicate suppression (`--report-dedupe`)
+
+Identical observations are only worth recording once. With `--report-dedupe` the analyzer keeps a
+report record, and prints a console line, only when its *data* differs from one already kept.
+Data means every field except the values that change on every occurrence (`ic`, `callCount`,
+`call_id`, the stack pointer and the guest pointers of printed-call arguments); the console
+compares the same text it would print. Suppressed duplicates are counted:
+`report-status.json` carries `dedupe`, `deduplicated_events` and `dedupe_keys`, and the console
+prints `~ suppressed N duplicate lines` at most once per summary interval and at flush.
+
+Failure packets (memory violations, fast fails, the run footer), guest stdout and progress
+heartbeats are never deduplicated. The first 2^20 distinct records are tracked; beyond that, new
+distinct records are still written but no longer remembered.

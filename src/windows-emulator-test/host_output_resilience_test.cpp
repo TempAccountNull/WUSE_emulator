@@ -333,6 +333,95 @@ namespace sogen
         EXPECT_EQ(count_prefixed(read_text(full_path), "{\"type\":\"function_execution\""), 25U);
     }
 
+    // ------------------------------------------------------------------ duplicate suppression
+
+    TEST(Dedupe, JsonlWritesARecordOnlyWhenItsDataDiffers)
+    {
+        const auto path = unique_path("sogen-dedupe", ".jsonl");
+        const auto status = unique_path("sogen-dedupe-status", ".json");
+        const auto cleanup = utils::finally([&] {
+            std::error_code error;
+            std::filesystem::remove(path, error);
+            std::filesystem::remove(status, error);
+        });
+        jsonl_report_settings settings{};
+        settings.dedupe = true;
+        settings.status_path = status;
+        auto jsonl = create_jsonl_reporter(path, settings);
+
+        suspicious_activity_event suspicious{};
+        suspicious.execution.thread_id = 76;
+        suspicious.execution.rip = 0x18009d972;
+        suspicious.execution.rip_module = "ntdll.dll";
+        suspicious.details = "Anti-debug check with ProcessDebugObjectHandle";
+        for (uint64_t i = 0; i < 5; ++i)
+        {
+            suspicious.header.instruction_count = 1000 + i; // counters differ, the data does not
+            jsonl->report(suspicious);
+        }
+        suspicious.details = "Illegal instruction";
+        jsonl->report(suspicious);
+        for (uint64_t i = 1; i <= 3; ++i)
+        {
+            jsonl->report(function_call(8, i, "memcpy")); // only callCount differs
+        }
+        memory_violation_event violation{};
+        violation.execution.thread_id = 76;
+        jsonl->report(violation);
+        jsonl->report(violation); // failure packets are never suppressed
+        jsonl->flush();
+
+        const auto text = read_text(path);
+        EXPECT_EQ(count_prefixed(text, "{\"type\":\"suspicious_activity\""), 2U) << text;
+        EXPECT_EQ(count_prefixed(text, "{\"type\":\"function_execution\""), 1U) << text;
+        EXPECT_EQ(count_prefixed(text, "{\"type\":\"memory_violation\""), 2U) << text;
+        const auto status_text = read_text(status);
+        EXPECT_NE(status_text.find("\"dedupe\":true"), std::string::npos) << status_text;
+        EXPECT_NE(status_text.find("\"deduplicated_events\":\"6\""), std::string::npos) << status_text;
+    }
+
+    TEST(Dedupe, RecordHashIgnoresCountersOnly)
+    {
+        EXPECT_EQ(record_content_hash("{\"type\":\"x\",\"ic\":\"1\",\"tid\":76,\"callCount\":\"9\",\"call_id\":\"3\"}"),
+                  record_content_hash("{\"type\":\"x\",\"ic\":\"22\",\"tid\":76,\"callCount\":\"10\",\"call_id\":\"4\"}"));
+        EXPECT_NE(record_content_hash("{\"type\":\"x\",\"ic\":\"1\",\"tid\":76}"),
+                  record_content_hash("{\"type\":\"x\",\"ic\":\"1\",\"tid\":77}"));
+    }
+
+    TEST(Dedupe, ConsolePrintsALineOnlyWhenItsDataDiffers)
+    {
+        captured_console console{
+            {.interesting_only = true, .coalesce_repeats = true, .dedupe = true, .repeat_summary_interval = std::chrono::hours(1)}};
+        suspicious_activity_event suspicious{};
+        suspicious.execution.thread_id = 76;
+        suspicious.execution.rip = 0x147e8a8bf;
+        suspicious.execution.rip_module = "destiny2.exe";
+        suspicious.details = "Illegal instruction";
+        for (uint64_t i = 0; i < 4; ++i)
+        {
+            suspicious.header.instruction_count = i;
+            console.console->report(suspicious);
+            // Two threads alternate, so per-thread coalescing alone would print the line twice.
+            console.console->report(function_call(8 + (i % 2), i + 1, "memcpy"));
+        }
+        console.console->flush();
+        EXPECT_EQ(count_prefixed(console.text, "Suspicious: Illegal instruction"), 1U) << console.text;
+        EXPECT_EQ(count_prefixed(console.text, "Executing function: memcpy"), 1U) << console.text;
+        EXPECT_NE(console.text.find("~ suppressed"), std::string::npos) << console.text;
+    }
+
+    TEST(Dedupe, ConsoleWithoutCoalescingStillSuppressesShownLines)
+    {
+        captured_console console{{.dedupe = true}};
+        for (uint64_t i = 1; i <= 3; ++i)
+        {
+            console.console->report(function_call(8, i, "memcpy"));
+        }
+        console.console->flush();
+        EXPECT_EQ(count_prefixed(console.text, "Executing function: memcpy"), 1U) << console.text;
+        EXPECT_NE(console.text.find("~ suppressed 2 duplicate lines"), std::string::npos) << console.text;
+    }
+
     // ------------------------------------------------------------------ logger never throws
 
 #ifdef _WIN32

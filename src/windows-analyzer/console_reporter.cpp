@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <logger.hpp>
 
 namespace sogen
@@ -73,21 +74,39 @@ namespace sogen
                 if (this->settings_.silent)
                 {
                     report_silent(event);
+                    return;
                 }
-                else
+                if (this->settings_.dedupe && event_is_deduplicable(event) && !uses_repeat_key(event) &&
+                    this->already_shown(event_content_hash(event)))
                 {
-                    report_regular(event);
+                    return;
                 }
+                report_regular(event);
             }
 
             // Print the pending repeat summaries of every guest thread (run end, failure packets).
             void flush() override
             {
-                const std::scoped_lock lock(this->repeat_mutex_);
-                for (auto& [tid, state] : this->repeats_)
                 {
-                    this->flush_repeat(tid, state);
+                    const std::scoped_lock lock(this->repeat_mutex_);
+                    for (auto& [tid, state] : this->repeats_)
+                    {
+                        this->flush_repeat(tid, state);
+                    }
                 }
+                const std::scoped_lock lock(this->dedupe_mutex_);
+                this->print_suppressed_summary();
+            }
+
+            // Routine classes build their console text anyway and pass it through absorb_repeat, which
+            // applies the duplicate check to that text; hashing their records as well would cost a
+            // serialization per event at the highest event rates.
+            static bool uses_repeat_key(const analysis_event& event)
+            {
+                return std::holds_alternative<function_execution_event>(event) || std::holds_alternative<syscall_event>(event) ||
+                       std::holds_alternative<object_access_event>(event) || std::holds_alternative<environment_access_event>(event) ||
+                       std::holds_alternative<generic_access_event>(event) || std::holds_alternative<io_control_event>(event) ||
+                       std::holds_alternative<foreign_code_transition_event>(event);
             }
 
             static void report_silent(const analysis_event& event)
@@ -499,7 +518,7 @@ namespace sogen
             {
                 if (!this->settings_.coalesce_repeats)
                 {
-                    return false;
+                    return this->settings_.dedupe && this->already_shown(record_content_hash(key));
                 }
 
                 const std::scoped_lock lock(this->repeat_mutex_);
@@ -520,6 +539,12 @@ namespace sogen
                         this->print_repeat_summary(tid, state);
                         state.last_summary = now;
                     }
+                    return true;
+                }
+
+                // A new line for this thread that any thread already printed is a duplicate, not a run.
+                if (this->settings_.dedupe && this->already_shown(record_content_hash(key)))
+                {
                     return true;
                 }
 
@@ -563,10 +588,53 @@ namespace sogen
                 state.reported = 0;
             }
 
+            // Returns true when a line with this data was already printed; duplicates are counted and
+            // summarized at most once per repeat_summary_interval and at flush.
+            bool already_shown(const uint64_t hash)
+            {
+                const std::scoped_lock lock(this->dedupe_mutex_);
+                if (this->shown_.contains(hash))
+                {
+                    ++this->suppressed_;
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - this->last_suppressed_summary_ >= this->settings_.repeat_summary_interval)
+                    {
+                        this->print_suppressed_summary();
+                        this->last_suppressed_summary_ = now;
+                    }
+                    return true;
+                }
+                if (this->shown_.size() < max_dedupe_entries)
+                {
+                    this->shown_.insert(hash);
+                }
+                return false;
+            }
+
+            void print_suppressed_summary()
+            {
+                const auto pending = this->suppressed_ - this->suppressed_reported_;
+                if (pending == 0)
+                {
+                    return;
+                }
+                this->log_.print(color::dark_gray,
+                                 "~ suppressed %" PRIu64 " duplicate lines (identical data already shown; %" PRIu64 " so far)\n", pending,
+                                 this->suppressed_);
+                this->suppressed_reported_ = this->suppressed_;
+            }
+
+            static constexpr size_t max_dedupe_entries = size_t{1} << 20;
+
             logger& log_;
             console_reporter_settings settings_{};
             std::mutex repeat_mutex_{};
             std::unordered_map<uint32_t, repeat_state> repeats_{};
+            std::mutex dedupe_mutex_{};
+            std::unordered_set<uint64_t> shown_{};
+            uint64_t suppressed_{};
+            uint64_t suppressed_reported_{};
+            std::chrono::steady_clock::time_point last_suppressed_summary_{std::chrono::steady_clock::now()};
         };
     }
 
