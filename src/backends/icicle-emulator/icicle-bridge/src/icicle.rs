@@ -2074,6 +2074,68 @@ mod shared_memory_smp {
         assert!(a.read_memory(addr + 8, &mut buf2));
         assert_eq!(u32::from_le_bytes(buf2), 0x55667788, "SMP write via B must be visible via A");
     }
+
+    /// The multi-core payoff: N per-vCPU VMs execute concurrently on ONE shared page (each writing
+    /// its own 8-byte slot), correct and near-linear. Gated on SOGEN_BENCH_OUT.
+    #[test]
+    fn smp_concurrent_scaling() {
+        use icicle_vm::cpu::mem::perm;
+        use std::sync::Arc;
+        use std::time::Instant;
+        let out = match std::env::var("SOGEN_BENCH_OUT") { Ok(p) => p, Err(_) => return };
+        let icount: u64 = std::env::var("SOGEN_BENCH_ICOUNT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(300_000_000);
+        const CODE: u64 = 0x10000;
+        const DATA: u64 = 0x50000;
+        let mut lines = vec![format!(
+            "SMP concurrent execution: N per-vCPU VMs share ONE page, each stores to its slot | icount/vcpu={}",
+            icount)];
+        let mut baseline = 0.0f64;
+        for &n in &[1usize, 2, 4, 8] {
+            // One shared page, created on a seed VM then handed to every vCPU.
+            let shared: Arc<_> = {
+                let mut seed = IcicleEmulator::new();
+                assert!(seed.vm.cpu.mem.map_smp_shared_fresh(DATA, perm::READ | perm::WRITE));
+                seed.vm.cpu.mem.share_page(DATA).expect("shared arc")
+            };
+            let wall = Instant::now();
+            let handles: Vec<_> = (0..n).map(|i| {
+                let page = Arc::clone(&shared);
+                std::thread::spawn(move || {
+                    let mut emu = IcicleEmulator::new();
+                    assert!(emu.map_memory(CODE, 0x1000, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+                    // mov [rax],ecx; inc ecx; jmp $-6  (store counter to this vCPU's slot each iter)
+                    assert!(emu.write_memory(CODE, &[0x89, 0x08, 0xFF, 0xC1, 0xEB, 0xFA]));
+                    assert!(emu.vm.cpu.mem.map_smp_shared(DATA, page));
+                    // 256-byte spacing so each vCPU's slot is on its own cache line (no false sharing).
+                    emu.write_register(registers::X86Register::Rax, &(DATA + (i as u64) * 256).to_le_bytes());
+                    emu.vm.cpu.write_pc(CODE);
+                    let before = emu.vm.cpu.icount;
+                    emu.start(icount);
+                    emu.vm.cpu.icount - before
+                })
+            }).collect();
+            let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+            let wall = wall.elapsed().as_secs_f64();
+            // Correctness: every vCPU wrote its own slot on the shared page (no corruption).
+            for i in 0..n {
+                let off = i * 256;
+                let v = u32::from_le_bytes(shared.data[off..off + 4].try_into().unwrap());
+                assert!(v > 0, "vCPU {i} did not write its shared slot (got {v})");
+            }
+            let agg = total as f64 / wall / 1e6;
+            let pt = agg / n as f64;
+            if n == 1 { baseline = pt; }
+            let eff = if baseline > 0.0 { pt / baseline } else { 1.0 };
+            lines.push(format!(
+                "vcpus={:>2}  wall={:>7.3}s  aggregate={:>8.1} MIPS  per_vcpu={:>7.1} MIPS  eff={:.2}x",
+                n, wall, agg, pt, eff));
+        }
+        let report = lines.join("\n") + "\n";
+        print!("\n{}", report);
+        if let Some(parent) = std::path::Path::new(&out).parent() { let _ = std::fs::create_dir_all(parent); }
+        std::fs::write(&out, &report).expect("write bench results");
+    }
 }
 
 #[cfg(test)]
