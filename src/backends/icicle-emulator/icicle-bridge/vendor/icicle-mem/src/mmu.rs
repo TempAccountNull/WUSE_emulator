@@ -518,6 +518,43 @@ impl Mmu {
         true
     }
 
+    /// Map a single guest page backed by an existing shared `Arc<PageData>` for SMP (multi-vCPU
+    /// shared RAM). Unlike `map_host_memory` (external, uncachable, ~305x slower), the shared page's
+    /// inline bytes are marked `smp_shared`: cachable in the direct-access TLB, writes go through to
+    /// the shared bytes, so N per-vCPU MMUs mapping the same `Arc` share one coherent, full-speed
+    /// guest page (coherency is the host CPU's). Per-byte permissions come from the shared PageData;
+    /// the mapping's `shared_perm` is 0. False on a misaligned address or an overlap.
+    pub fn map_smp_shared(&mut self, address: u64, data: std::sync::Arc<PageData>) -> bool {
+        let page_size = self.page_size();
+        if address % page_size != 0 {
+            return false;
+        }
+        let Some(last) = address.checked_add(page_size - 1) else { return false; };
+        if self.mapping.get_range(address..=last).is_some() {
+            return false;
+        }
+        let Some(index) = self.physical.alloc_shared(data) else { return false; };
+        let mapping = PhysicalMapping { addr: address, index, shared_perm: 0 };
+        assert!(self.map_memory_len(address, page_size, MemoryMapping::Physical(mapping)));
+        self.clear_tlb();
+        true
+    }
+
+    /// Create and map a fresh shared page (SMP) with the given internal permission bits. Other vCPUs
+    /// map the same page via `share_page` + `map_smp_shared`.
+    pub fn map_smp_shared_fresh(&mut self, address: u64, permissions: u8) -> bool {
+        let mut page_data = PageData::default();
+        page_data.perm.fill(permissions | perm::MAP | perm::INIT);
+        self.map_smp_shared(address, std::sync::Arc::new(page_data))
+    }
+
+    /// Clone the shared `Arc<PageData>` backing the page at `address`, so another MMU can map the
+    /// same physical page via `map_smp_shared` (SMP). None if the address is not mapped.
+    pub fn share_page(&self, address: u64) -> Option<std::sync::Arc<PageData>> {
+        let index = self.get_physical_index(address)?;
+        Some(self.physical.share_page_data(index))
+    }
+
     pub fn has_host_mappings(&self) -> bool {
         self.mapping.iter().any(|(_, _, mapping)| match mapping {
             MemoryMapping::Physical(page) => self.physical.get(page.index).data().data.is_external(),
@@ -1244,6 +1281,26 @@ impl Mmu {
         };
         if shared_perm != 0 { perm::check(shared_perm, perm)?; }
         let mut page = self.physical.get_mut(index);
+        if page.smp_shared {
+            // SMP shared page: write straight through to the shared Arc<PageData> (no copy-on-write)
+            // so every vCPU sharing this page sees it. The shared byte pointer is stable (never
+            // make_mut'd), so it stays cachable in the direct-access TLB — full JIT speed, unlike the
+            // shared_perm/external path. Cross-vCPU coherency is the host CPU's (MESI).
+            if page.executed && self.detect_self_modifying_code {
+                check_self_modifying_write(page.data(), addr, &value)?;
+            }
+            self.tlb.remove_read(page_start);
+            if !page.modified {
+                self.modified.insert(page_start);
+                page.modified = true;
+            }
+            // Safety: shared bytes; concurrent access across vCPUs is coordinated by host coherency.
+            unsafe { page.data_mut_shared() }.write(addr, value, perm)?;
+            if !self.write_hooks.contains_address(addr, page_size) {
+                self.tlb.insert_write(page_start, unsafe { page.shared_write_ptr() });
+            }
+            return Ok(());
+        }
         if page.executed && self.detect_self_modifying_code {
             check_self_modifying_write(page.data(), addr, &value)?;
         }

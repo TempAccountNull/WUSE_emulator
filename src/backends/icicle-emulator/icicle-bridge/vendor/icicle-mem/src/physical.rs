@@ -156,6 +156,20 @@ impl PhysicalMemory {
         Some(new_index)
     }
 
+    /// Clone the shared `Arc<PageData>` backing of a page so another MMU can map the same physical
+    /// page for SMP (multi-vCPU shared RAM).
+    pub fn share_page_data(&self, index: Index) -> Arc<PageData> {
+        self.get(index).shared_data()
+    }
+
+    /// Allocate a page slot backed by an existing shared `Arc<PageData>` (SMP). The slot is marked
+    /// `smp_shared` so writes go straight through to the shared bytes (no copy-on-write).
+    pub fn alloc_shared(&mut self, data: Arc<PageData>) -> Option<Index> {
+        let index = self.alloc()?;
+        self.allocated[index.0 as usize] = Page::from_shared(data);
+        Some(index)
+    }
+
     /// Return mutable references to two distict pages
     pub fn get_pair_mut(&mut self, a: Index, b: Index) -> (&mut Page, &mut Page) {
         let end = self.allocated.len() as u32;
@@ -199,6 +213,11 @@ pub struct Page {
 
     /// Keeps track of whether code within this page has been lifted.
     pub executed: bool,
+
+    /// SMP-shared: the `Arc<PageData>` backing is deliberately shared across per-vCPU MMUs and
+    /// writes go straight through to it (no copy-on-write), so all vCPUs observe one coherent page.
+    /// Coherency of the shared bytes is the host CPU's (MESI), as on real hardware.
+    pub smp_shared: bool,
 }
 
 impl Clone for Page {
@@ -209,6 +228,7 @@ impl Clone for Page {
             copy_on_write: self.copy_on_write,
             modified: self.modified,
             executed: self.executed,
+            smp_shared: false, // a clone is an independent copy, not part of the shared set
         }
     }
 }
@@ -220,7 +240,46 @@ impl Page {
             modified: false,
             copy_on_write: false,
             executed: false,
+            smp_shared: false,
         }
+    }
+
+    /// A page that shares an existing `Arc<PageData>` backing with other MMUs (SMP). Writes go
+    /// through to the shared bytes; see `Mmu::map_smp_shared`.
+    pub(crate) fn from_shared(data: Arc<PageData>) -> Self {
+        Self {
+            data: UnsafeCell::new(data),
+            modified: false,
+            copy_on_write: false,
+            executed: false,
+            smp_shared: true,
+        }
+    }
+
+    /// Clone the shared backing so another MMU can map the same physical page (SMP).
+    pub fn shared_data(&self) -> Arc<PageData> {
+        unsafe { Arc::clone(self.data.get().as_ref().unwrap()) }
+    }
+
+    /// A pointer to the SHARED page bytes for read/write without copy-on-write. Stable because an
+    /// SMP-shared page is never make_mut'd/cloned, so the direct-access TLB may cache it.
+    ///
+    /// # Safety
+    /// Only valid for `smp_shared` pages; concurrent access across vCPUs relies on host coherency.
+    #[inline(always)]
+    pub unsafe fn shared_write_ptr(&self) -> PageRef {
+        PageRef::new(NonNull::new(Arc::as_ptr(&*self.data.get()) as *mut _).unwrap())
+    }
+
+    /// Mutable access to the SHARED page data WITHOUT copy-on-write (no `Arc::make_mut`), for SMP
+    /// write-through.
+    ///
+    /// # Safety
+    /// Only for `smp_shared` pages. The returned reference aliases data other vCPUs may concurrently
+    /// read/write, so correctness relies on host CPU cache coherency, not Rust-level exclusivity.
+    #[inline(always)]
+    pub unsafe fn data_mut_shared(&self) -> &mut PageData {
+        &mut *(Arc::as_ptr(&*self.data.get()) as *mut PageData)
     }
 
     fn zero_page(perm: u8, copy_on_write: bool) -> Self {
@@ -239,6 +298,7 @@ impl Page {
         self.modified = false;
         self.copy_on_write = false;
         self.executed = false;
+        self.smp_shared = false;
     }
 
     #[inline(always)]

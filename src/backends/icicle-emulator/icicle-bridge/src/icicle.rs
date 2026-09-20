@@ -2052,6 +2052,28 @@ mod shared_memory_smp {
         } // VMs dropped here, before the backing is freed
         unsafe { dealloc(host, layout) };
     }
+
+    #[test]
+    fn two_vms_share_fast_smp_page() {
+        use icicle_vm::cpu::mem::perm;
+        let mut a = IcicleEmulator::new();
+        let mut b = IcicleEmulator::new();
+        let addr = 0x40000u64;
+        // A creates a fresh shared page (cachable, write-through); B maps the same Arc backing.
+        assert!(a.vm.cpu.mem.map_smp_shared_fresh(addr, perm::READ | perm::WRITE));
+        let shared = a.vm.cpu.mem.share_page(addr).expect("shared arc");
+        assert!(b.vm.cpu.mem.map_smp_shared(addr, shared));
+        // Write via A -> visible via B (shared bytes, no copy-on-write).
+        assert!(a.write_memory(addr, &0xa1b2c3d4u32.to_le_bytes()));
+        let mut buf = [0u8; 4];
+        assert!(b.read_memory(addr, &mut buf));
+        assert_eq!(u32::from_le_bytes(buf), 0xa1b2c3d4, "SMP write via A must be visible via B");
+        // Write via B -> visible via A.
+        assert!(b.write_memory(addr + 8, &0x55667788u32.to_le_bytes()));
+        let mut buf2 = [0u8; 4];
+        assert!(a.read_memory(addr + 8, &mut buf2));
+        assert_eq!(u32::from_le_bytes(buf2), 0x55667788, "SMP write via B must be visible via A");
+    }
 }
 
 #[cfg(test)]
@@ -2113,19 +2135,28 @@ mod parallel_scaling_bench {
     /// Store-loop (`mov [rax],ecx; inc ecx; jmp`) writing to a data page each iteration. When
     /// `host_mapped`, the data page is a borrowed host buffer (external, bypasses the JIT direct
     /// TLB) as SMP shared RAM would be; otherwise a normal page. Ratio = the external-memory tax.
-    fn run_store_loop(host_mapped: bool, icount: u64) -> (u64, f64) {
+    // mode: 0 = normal page, 1 = host-mapped (external), 2 = SMP-shared (cachable write-through)
+    fn run_store_loop(mode: u8, icount: u64) -> (u64, f64) {
         let mut emu = IcicleEmulator::new();
         assert!(emu.map_memory(0x10000, 0x1000, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
         assert!(emu.write_memory(0x10000, &[0x89, 0x08, 0xFF, 0xC1, 0xEB, 0xFA]));
-        let host = if host_mapped {
-            let layout = std::alloc::Layout::from_size_align(0x1000, 0x1000).unwrap();
-            let p = unsafe { std::alloc::alloc_zeroed(layout) };
-            assert!(!p.is_null());
-            unsafe { assert!(emu.map_host_memory(0x30000, p, 0x1000, FOREIGN_READ | FOREIGN_WRITE)) };
-            Some((p, layout))
-        } else {
-            assert!(emu.map_memory(0x30000, 0x1000, FOREIGN_READ | FOREIGN_WRITE));
-            None
+        let host = match mode {
+            1 => {
+                let layout = std::alloc::Layout::from_size_align(0x1000, 0x1000).unwrap();
+                let p = unsafe { std::alloc::alloc_zeroed(layout) };
+                assert!(!p.is_null());
+                unsafe { assert!(emu.map_host_memory(0x30000, p, 0x1000, FOREIGN_READ | FOREIGN_WRITE)) };
+                Some((p, layout))
+            }
+            2 => {
+                use icicle_vm::cpu::mem::perm;
+                assert!(emu.vm.cpu.mem.map_smp_shared_fresh(0x30000, perm::READ | perm::WRITE));
+                None
+            }
+            _ => {
+                assert!(emu.map_memory(0x30000, 0x1000, FOREIGN_READ | FOREIGN_WRITE));
+                None
+            }
         };
         emu.write_register(registers::X86Register::Rax, &0x30000u64.to_le_bytes());
         emu.vm.cpu.write_pc(0x10000);
@@ -2143,12 +2174,13 @@ mod parallel_scaling_bench {
         let out = match std::env::var("SOGEN_BENCH_OUT") { Ok(p) => p, Err(_) => return };
         let icount: u64 = std::env::var("SOGEN_BENCH_ICOUNT")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(300_000_000);
-        let (_, tn) = run_store_loop(false, icount);
-        let (_, th) = run_store_loop(true, icount);
+        let (_, tn) = run_store_loop(0, icount);
+        let (_, th) = run_store_loop(1, icount);
+        let (_, ts) = run_store_loop(2, icount);
         let mips = |t: f64| icount as f64 / t / 1e6;
         let report = format!(
-            "external-page store tax | icount={}\nnormal-page  store-loop: {:8.1} MIPS ({:.3}s)\nhost-mapped store-loop: {:8.1} MIPS ({:.3}s)\nexternal tax: {:.2}x slower\n",
-            icount, mips(tn), tn, mips(th), th, th / tn);
+            "store-loop by page type | icount={}\nnormal page:      {:8.1} MIPS ({:.3}s)\nhost-mapped:      {:8.1} MIPS ({:.3}s)  [{:.0}x slower than normal]\nSMP-shared:       {:8.1} MIPS ({:.3}s)  [{:.2}x vs normal]\n",
+            icount, mips(tn), tn, mips(th), th, th / tn, mips(ts), ts, tn / ts);
         print!("\n{}", report);
         if let Some(parent) = std::path::Path::new(&out).parent() { let _ = std::fs::create_dir_all(parent); }
         std::fs::write(&out, &report).expect("write bench results");
