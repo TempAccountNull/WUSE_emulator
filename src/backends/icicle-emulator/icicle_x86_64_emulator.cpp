@@ -159,49 +159,30 @@ namespace sogen::icicle
         };
     }
 
-    class icicle_x86_64_emulator : public x86_64_emulator, public detail::hook_exception_sink
+    class icicle_x86_64_emulator;
+
+    // One vCPU: register + run state on its own icicle VM handle; memory delegates to the shared
+    // machine. Mirrors whp_vcpu so windows-emulator's N-vCPU scheduler can drive N icicle VMs (SMP).
+    // The machine (icicle_x86_64_emulator) delegates its own CPU-0 role to vcpus_[0] (see get_cpu).
+    class icicle_vcpu final : public x86_64_cpu
     {
       public:
-        icicle_x86_64_emulator()
-            : emu_(icicle_create_emulator(configured_memory_limit_mib()))
+        icicle_vcpu(icicle_emulator* emu, icicle_x86_64_emulator& machine, const uint32_t index)
+            : emu_(emu),
+              machine_(machine),
+              index_(index)
         {
-            if (!this->emu_)
-            {
-                throw std::runtime_error("Failed to create icicle emulator instance");
-            }
         }
 
-        ~icicle_x86_64_emulator() override
+        size_t index() const override
         {
-            reset_object_with_delayed_destruction(this->hooks_);
-            reset_object_with_delayed_destruction(this->storage_);
-            utils::reset_object_with_delayed_destruction(this->hooks_to_install_);
-
-            if (this->emu_)
-            {
-                icicle_destroy_emulator(this->emu_);
-                this->emu_ = nullptr;
-            }
+            return this->index_;
         }
 
-        void start(const size_t count) override
-        {
-            icicle_start(this->emu_, count);
-            this->rethrow_deferred_hook_exception();
-            this->throw_if_unhandled_stop();
-            this->perform_pending_actions();
-        }
+        memory_interface& memory() override;
+        const memory_interface& memory() const override;
 
-        // See detail::hook_exception_sink. Only the first exception of a run is kept; it stops
-        // icicle immediately and surfaces from start() on the C++ side of the boundary.
-        void defer_hook_exception(std::exception_ptr exception) noexcept override
-        {
-            if (!this->pending_hook_exception_)
-            {
-                this->pending_hook_exception_ = std::move(exception);
-            }
-            icicle_stop(this->emu_);
-        }
+        void start(size_t count) override;
 
         void stop() override
         {
@@ -289,6 +270,142 @@ namespace sogen::icicle
             table.base = entry.address;
             table.limit = entry.limit;
             return true;
+        }
+
+        std::vector<std::byte> save_registers() const override
+        {
+            std::vector<std::byte> data{};
+            auto* accessor = +[](void* user, const void* data, const size_t length) {
+                auto& vec = *static_cast<std::vector<std::byte>*>(user);
+                vec.resize(length);
+                memcpy(vec.data(), data, length);
+            };
+
+            icicle_save_registers(this->emu_, accessor, &data);
+
+            return data;
+        }
+
+        void restore_registers(const std::vector<std::byte>& register_data) override
+        {
+            icicle_restore_registers(this->emu_, register_data.data(), register_data.size());
+        }
+
+        bool has_violation() const override
+        {
+            return false;
+        }
+
+        bool supports_instruction_counting() const override
+        {
+            return true;
+        }
+
+        bool is_stop_thread_safe() const override
+        {
+            return true;
+        }
+
+        icicle_emulator* handle() const
+        {
+            return this->emu_;
+        }
+
+      private:
+        void throw_if_unhandled_stop();
+
+        icicle_emulator* emu_{};
+        icicle_x86_64_emulator& machine_;
+        uint32_t index_{0};
+    };
+
+    class icicle_x86_64_emulator : public x86_64_emulator, public detail::hook_exception_sink
+    {
+      public:
+        icicle_x86_64_emulator()
+            : emu_(icicle_create_emulator(configured_memory_limit_mib()))
+        {
+            if (!this->emu_)
+            {
+                throw std::runtime_error("Failed to create icicle emulator instance");
+            }
+            this->vcpus_.push_back(std::make_unique<icicle_vcpu>(this->emu_, *this, 0));
+        }
+
+        ~icicle_x86_64_emulator() override
+        {
+            reset_object_with_delayed_destruction(this->hooks_);
+            reset_object_with_delayed_destruction(this->storage_);
+            utils::reset_object_with_delayed_destruction(this->hooks_to_install_);
+
+            if (this->emu_)
+            {
+                icicle_destroy_emulator(this->emu_);
+                this->emu_ = nullptr;
+            }
+        }
+
+        // The machine delegates its own CPU-0 role to vcpus_[0] (mirrors whp_x86_64_emulator); the
+        // N-vCPU scheduler drives get_cpu(i) directly.
+        void start(const size_t count) override
+        {
+            this->vcpus_[0]->start(count);
+        }
+
+        // See detail::hook_exception_sink. Only the first exception of a run is kept; it stops
+        // icicle immediately and surfaces from start() on the C++ side of the boundary.
+        void defer_hook_exception(std::exception_ptr exception) noexcept override
+        {
+            if (!this->pending_hook_exception_)
+            {
+                this->pending_hook_exception_ = std::move(exception);
+            }
+            icicle_stop(this->emu_);
+        }
+
+        void stop() override
+        {
+            this->vcpus_[0]->stop();
+        }
+
+        size_t vcpu_count() const override
+        {
+            return this->vcpus_.size();
+        }
+
+        x86_64_cpu& get_cpu(const size_t index) override
+        {
+            return *this->vcpus_.at(index);
+        }
+
+        void load_gdt(const pointer_type address, const uint32_t limit) override
+        {
+            this->vcpus_[0]->load_gdt(address, limit);
+        }
+
+        void set_segment_base(const x86_register base, const pointer_type value) override
+        {
+            this->vcpus_[0]->set_segment_base(base, value);
+        }
+
+        pointer_type get_segment_base(const x86_register base) override
+        {
+            return this->vcpus_[0]->get_segment_base(base);
+        }
+
+        size_t write_raw_register(const int reg, const void* value, const size_t size) override
+        {
+            return this->vcpus_[0]->write_raw_register(reg, value, size);
+        }
+
+        size_t read_raw_register(const int reg, void* value, const size_t size) override
+        {
+            return this->vcpus_[0]->read_raw_register(reg, value, size);
+        }
+
+        bool read_descriptor_table(const int reg, descriptor_table_register& table) override
+        {
+            return this->vcpus_[0]->read_descriptor_table(reg, table);
         }
 
         void map_mmio(const uint64_t address, const size_t size, mmio_read_callback read_cb, mmio_write_callback write_cb) override
@@ -386,7 +503,7 @@ namespace sogen::icicle
             return [this, c = std::move(callback)](Args... args) -> Ret {
                 try
                 {
-                    return c(*this, std::forward<Args>(args)...);
+                    return c(*this->vcpus_[0], std::forward<Args>(args)...);
                 }
                 catch (...)
                 {
@@ -631,26 +748,17 @@ namespace sogen::icicle
 
         std::vector<std::byte> save_registers() const override
         {
-            std::vector<std::byte> data{};
-            auto* accessor = +[](void* user, const void* data, const size_t length) {
-                auto& vec = *static_cast<std::vector<std::byte>*>(user);
-                vec.resize(length);
-                memcpy(vec.data(), data, length);
-            };
-
-            icicle_save_registers(this->emu_, accessor, &data);
-
-            return data;
+            return this->vcpus_[0]->save_registers();
         }
 
         void restore_registers(const std::vector<std::byte>& register_data) override
         {
-            icicle_restore_registers(this->emu_, register_data.data(), register_data.size());
+            this->vcpus_[0]->restore_registers(register_data);
         }
 
         bool has_violation() const override
         {
-            return false;
+            return this->vcpus_[0]->has_violation();
         }
 
         bool supports_instruction_counting() const override
@@ -680,7 +788,12 @@ namespace sogen::icicle
         std::unordered_map<uint32_t, std::unique_ptr<utils::object>> hooks_{};
         std::unordered_map<emulator_hook*, std::optional<uint32_t>> id_mapping_{};
         icicle_emulator* emu_{};
+        std::vector<std::unique_ptr<icicle_vcpu>> vcpus_{};
         uint32_t index_{0};
+
+        // icicle_vcpu::start() surfaces deferred hook exceptions and runs pending hook installs/deletes
+        // through the machine (hook machinery is machine-scoped).
+        friend class icicle_vcpu;
 
         std::unordered_set<emulator_hook*> hooks_to_delete_{};
         std::unordered_map<emulator_hook*, memory_access_hook> hooks_to_install_{};
@@ -900,6 +1013,68 @@ namespace sogen::icicle
             icicle_run_on_next_instruction(this->emu_, callback, heap_func);
         }
     };
+
+    // icicle_vcpu methods that need the complete machine type (memory surface + hook machinery).
+    inline memory_interface& icicle_vcpu::memory()
+    {
+        return this->machine_;
+    }
+
+    inline const memory_interface& icicle_vcpu::memory() const
+    {
+        return this->machine_;
+    }
+
+    inline void icicle_vcpu::start(const size_t count)
+    {
+        icicle_start(this->emu_, count);
+        this->machine_.rethrow_deferred_hook_exception();
+        this->throw_if_unhandled_stop();
+        this->machine_.perform_pending_actions();
+    }
+
+    inline void icicle_vcpu::throw_if_unhandled_stop()
+    {
+        icicle_stop_info info{};
+        ice(icicle_get_stop_info(this->emu_, &info) != 0, "Failed to read icicle stop info");
+
+        const auto kind = static_cast<icicle_stop_kind>(info.kind);
+        if (kind == icicle_stop_kind::none || kind == icicle_stop_kind::instruction_limit)
+        {
+            return;
+        }
+
+        std::array<char, 320> message{};
+        if (kind == icicle_stop_kind::unhandled_exception)
+        {
+            std::string name{};
+            icicle_get_exception_name(
+                info.code,
+                [](void* data, const void* text, const size_t length) {
+                    static_cast<std::string*>(data)->assign(static_cast<const char*>(text), length);
+                },
+                &name);
+            std::snprintf(message.data(), message.size(),
+                          "Icicle stopped on unhandled exception: code=0x%X (%s) value=0x%llX rip=0x%llX", info.code, name.c_str(),
+                          static_cast<unsigned long long>(info.value),
+                          static_cast<unsigned long long>(this->read_instruction_pointer()));
+        }
+        else
+        {
+            std::string description{};
+            icicle_get_vm_exit_description(
+                this->emu_,
+                [](void* data, const void* text, const size_t length) {
+                    static_cast<std::string*>(data)->assign(static_cast<const char*>(text), length);
+                },
+                &description);
+            std::snprintf(message.data(), message.size(), "Icicle stopped on unhandled VM exit: %s code=0x%X value=0x%llX rip=0x%llX",
+                          description.c_str(), info.code, static_cast<unsigned long long>(info.value),
+                          static_cast<unsigned long long>(this->read_instruction_pointer()));
+        }
+
+        throw std::runtime_error(message.data());
+    }
 
     std::unique_ptr<x86_64_emulator> create_x86_64_emulator()
     {
