@@ -356,6 +356,32 @@ namespace sogen::gdb_stub
             send_xfer_data(c.connection, std::string(data), xml);
         }
 
+        void handle_memory_diagnostics(const debugging_context& c, const std::string_view payload)
+        {
+            const auto [command, args] = split_string(payload, ':');
+            const auto [annex, data] = split_string(args, ':');
+            if (command != "read" || !annex.empty() || !c.handler.supports_memory_diagnostics())
+            {
+                c.connection.send_reply({});
+                return;
+            }
+            if (c.async.is_running())
+            {
+                c.connection.send_reply("E16");
+                return;
+            }
+            std::string xml = "<sogen-memory version=\"1\">\n";
+            for (const auto& region : c.handler.get_memory_regions())
+            {
+                xml += "<region base=\"0x" + utils::string::to_hex_number(region.base) + "\" size=\"0x" +
+                       utils::string::to_hex_number(region.size) + "\" permissions=\"" + escape_xml(region.permissions) +
+                       "\" state=\"" + escape_xml(region.state) + "\" kind=\"" + escape_xml(region.kind) + "\" module=\"" +
+                       escape_xml(region.module) + "\"/>\n";
+            }
+            xml += "</sogen-memory>";
+            send_xfer_data(c.connection, std::string(data), xml);
+        }
+
         void handle_watchpoint_diagnostics(const debugging_context& c, const std::string_view payload)
         {
             const auto [command, args] = split_string(payload, ':');
@@ -401,6 +427,10 @@ namespace sogen::gdb_stub
             {
                 handle_thread_diagnostics(c, args);
             }
+            else if (name == "sogen-memory")
+            {
+                handle_memory_diagnostics(c, args);
+            }
             else
             {
                 c.connection.send_reply({});
@@ -428,6 +458,10 @@ namespace sogen::gdb_stub
                 if (c.handler.supports_thread_diagnostics())
                 {
                     reply.append(";qXfer:sogen-threads:read+");
+                }
+                if (c.handler.supports_memory_diagnostics())
+                {
+                    reply.append(";qXfer:sogen-memory:read+");
                 }
                 c.connection.send_reply(reply);
             }

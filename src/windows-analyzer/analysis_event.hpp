@@ -337,6 +337,7 @@ namespace sogen
         uint64_t elapsed_milliseconds{};
         uint64_t instructions_per_second{};
         std::optional<uint64_t> module_rva{};
+        std::optional<double> percent{};  // 0..100 high-water mark through the main image (.text coverage proxy)
     };
 
     struct rdtsc_event : observation_event

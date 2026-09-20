@@ -426,8 +426,16 @@ namespace sogen
                                 e.module_name.c_str(), e.section_name.c_str(), e.execution.rip, e.file_address, e.execution.thread_id);
                         },
                         [&](const execution_progress_event& e) {
-                            this->log_.print(color::green, "Progress: tid %" PRIu32 " | RIP 0x%" PRIx64 " (%s", e.execution.thread_id,
-                                             e.execution.rip, e.execution.rip_module.c_str());
+                            if (e.percent)
+                            {
+                                this->log_.print(color::green, "Progress: %.2f%% | tid %" PRIu32 " | RIP 0x%" PRIx64 " (%s",
+                                                 *e.percent, e.execution.thread_id, e.execution.rip, e.execution.rip_module.c_str());
+                            }
+                            else
+                            {
+                                this->log_.print(color::green, "Progress: tid %" PRIu32 " | RIP 0x%" PRIx64 " (%s",
+                                                 e.execution.thread_id, e.execution.rip, e.execution.rip_module.c_str());
+                            }
                             if (e.module_rva)
                             {
                                 this->log_.print(color::green, "+0x%" PRIx64, *e.module_rva);

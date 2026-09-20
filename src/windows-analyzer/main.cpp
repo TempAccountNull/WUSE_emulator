@@ -26,6 +26,10 @@
 
 #ifndef _WIN32
 #include <csignal>
+#include <atomic>
+#include <thread>
+#include <fstream>
+#include <chrono>
 #endif
 
 namespace sogen
@@ -62,6 +66,7 @@ namespace sogen
             uint16_t gdb_port{28960};
             std::string gdb_architecture{"64bits"};
             bool log_executable_access{false};
+            std::string executable_access{}; // overrides -x: off|read|write|both
             bool log_foreign_module_access{false};
             bool tenet_trace{false};
             bool prepend_call_count{false};
@@ -79,6 +84,7 @@ namespace sogen
             std::optional<uint64_t> break_call{};
             std::filesystem::path dump{};
             std::filesystem::path snapshot_output{};
+            std::filesystem::path checkpoint_request{};  // poll-file: write a snapshot to the path inside it, then keep running
             std::filesystem::path minidump_path{};
             std::filesystem::path report_path{};
             std::filesystem::path stdout_path{};
@@ -402,6 +408,42 @@ namespace sogen
                 win_emu.stop();
             }};
 
+            // Live checkpoint: a background thread watches a request file. When it appears, it asks the
+            // emulator for a clean (resumable) stop; the main loop then snapshots to the path inside the
+            // file and resumes execution, so a checkpoint can be taken without ending the run.
+            std::atomic_bool checkpoint_watcher_stop{false};
+            std::atomic_bool checkpoint_pending{false};
+            std::thread checkpoint_watcher;
+            if (!options.checkpoint_request.empty())
+            {
+                checkpoint_watcher = std::thread([&] {
+                    bool armed = true;
+                    while (!checkpoint_watcher_stop.load())
+                    {
+                        std::error_code ec;
+                        const bool present = std::filesystem::exists(options.checkpoint_request, ec);
+                        if (present && armed)
+                        {
+                            checkpoint_pending.store(true);
+                            armed = false;
+                            win_emu.stop();
+                        }
+                        else if (!present)
+                        {
+                            armed = true;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    }
+                });
+            }
+            const auto _checkpoint_watch = utils::finally([&] {
+                checkpoint_watcher_stop.store(true);
+                if (checkpoint_watcher.joinable())
+                {
+                    checkpoint_watcher.join();
+                }
+            });
+
             std::optional<NTSTATUS> exit_status{};
 #if defined(OS_EMSCRIPTEN) && !defined(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS)
             const auto _1 = utils::finally([&] {
@@ -521,7 +563,46 @@ namespace sogen
                         debugger::enter_breakpoint(win_emu, win_emu.mod_manager.executable->entry_point);
                     }
 #endif
-                    win_emu.start();
+                    while (true)
+                    {
+                        win_emu.start();
+                        if (!checkpoint_pending.exchange(false) || win_emu.process.exit_status.has_value())
+                        {
+                            break;  // stopped by a signal, a fault, or a clean guest exit - not a live checkpoint
+                        }
+                        std::filesystem::path checkpoint_path;
+                        {
+                            std::ifstream request_stream(options.checkpoint_request);
+                            std::string path_line;
+                            std::getline(request_stream, path_line);
+                            checkpoint_path = path_line;
+                        }
+                        std::error_code ec;
+                        if (checkpoint_path.empty() || signals_received > 0 ||
+                            !snapshot::is_resumable_checkpoint_stop(win_emu.last_stop_reason()))
+                        {
+                            std::filesystem::remove(options.checkpoint_request, ec);  // consume the request without snapshotting
+                            break;
+                        }
+                        snapshot_saving = true;
+                        try
+                        {
+                            snapshot::write_emulator_snapshot(win_emu, checkpoint_path);
+                            win_emu.log.force_print(color::pink, "Live checkpoint saved to %s; resuming guest.\n",
+                                                    checkpoint_path.string().c_str());
+                        }
+                        catch (const std::exception& e)
+                        {
+                            // A live checkpoint must never end the run. The common decline is an open SogenGpu
+                            // (Vulkan) device, which cannot be serialized - checkpoints are only valid before the
+                            // guest opens its GPU device. Log it and keep executing.
+                            win_emu.log.force_print(color::pink, "Live checkpoint declined (%s); resuming guest.\n", e.what());
+                        }
+                        snapshot_saving = false;
+                        // Remove the request only after the attempt, so the runner can treat "request file gone" as
+                        // "attempt finished" (snapshot present = saved, absent = declined) and the watcher re-arms.
+                        std::filesystem::remove(options.checkpoint_request, ec);
+                    }
                 }
 
                 save_requested_snapshot();
@@ -912,7 +993,12 @@ namespace sogen
                                                 });
             }
 
-            if (options.log_executable_access)
+            const auto exec_mode = !options.executable_access.empty()
+                                       ? options.executable_access
+                                       : (options.log_executable_access ? std::string("both") : std::string("off"));
+            const bool exec_read = exec_mode == "read" || exec_mode == "both";
+            const bool exec_write = exec_mode == "write" || exec_mode == "both";
+            if (exec_read || exec_write)
             {
                 for (const auto& section : exe.sections)
                 {
@@ -971,8 +1057,10 @@ namespace sogen
                         });
                     };
 
-                    win_emu->emu().hook_memory_read(section.region.start, section.region.length, std::move(read_handler));
-                    win_emu->emu().hook_memory_write(section.region.start, section.region.length, std::move(write_handler));
+                    if (exec_read)
+                        win_emu->emu().hook_memory_read(section.region.start, section.region.length, std::move(read_handler));
+                    if (exec_write)
+                        win_emu->emu().hook_memory_write(section.region.start, section.region.length, std::move(write_handler));
                 }
             }
 
@@ -1042,6 +1130,9 @@ namespace sogen
                 },
                 "Very concise logging");
             app.add_flag("-x,--exec", options.log_executable_access, "Log r/w access to executable memory");
+            app.add_option("--exec-access", options.executable_access,
+                           "Executable-memory access to log: off, read, write, both. One direction only is much faster (overrides -x)")
+                ->check(CLI::IsMember({"off", "read", "write", "both"}));
             app.add_flag("-t,--tenet-trace", options.tenet_trace, "Enable Tenet tracer");
             app.add_flag("--first-exec", options.log_first_section_execution, "Print first executions of sections");
             app.add_flag("--inst-summary", options.instruction_summary, "Print a summary of executed instructions of the analyzed modules");
@@ -1058,6 +1149,8 @@ namespace sogen
             app.add_option("-a,--snapshot", options.dump, "Load snapshot dump from path");
             app.add_option("--snapshot-out", options.snapshot_output,
                            "Save resumable state to path when emulation stops or the debugger disconnects");
+            app.add_option("--checkpoint-request", options.checkpoint_request,
+                           "Poll this file while running; when it appears, snapshot to the path it contains and keep executing");
             app.add_option("--minidump", options.minidump_path, "Load minidump from path");
             app.add_option("--report", options.report_path, "Write machine-readable analysis events to a file");
             app.add_option("--report-format", options.report_format, "Report format (supported: jsonl)")->capture_default_str();

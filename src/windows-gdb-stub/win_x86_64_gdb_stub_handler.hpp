@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <windows_emulator.hpp>
+#include <memory_utils.hpp>
 #include <utils/function.hpp>
 #include <utils/finally.hpp>
 #include <utils/string.hpp>
@@ -249,6 +250,56 @@ namespace sogen
             }
 
             return thread_list;
+        }
+
+        static const char* region_kind_name(const sogen::memory_region_kind kind)
+        {
+            switch (kind)
+            {
+            case sogen::memory_region_kind::free:
+                return "free";
+            case sogen::memory_region_kind::private_allocation:
+                return "private";
+            case sogen::memory_region_kind::file_section_view:
+                return "file";
+            case sogen::memory_region_kind::pagefile_section_view:
+                return "pagefile";
+            case sogen::memory_region_kind::section_image:
+                return "image";
+            case sogen::memory_region_kind::mmio:
+                return "mmio";
+            default:
+                return "unknown";
+            }
+        }
+
+        bool supports_memory_diagnostics() const override
+        {
+            return true;
+        }
+
+        std::vector<gdb_stub::memory_region_diagnostic> get_memory_regions() const override
+        {
+            std::vector<gdb_stub::memory_region_diagnostic> result;
+            auto& memory = this->win_emu_->memory;
+            for (const auto& [base, region] : memory.get_reserved_regions())
+            {
+                const auto* module_name = this->win_emu_->mod_manager.find_name(base);
+                const std::string module =
+                    (!module_name || std::string_view(module_name) == "<N/A>") ? std::string{} : std::string(module_name);
+                const auto* kind = region_kind_name(region.kind);
+                result.push_back({base, region.length, sogen::get_permission_string(region.initial_permission), "reserve", kind, module});
+                for (const auto& [committed_base, committed] : region.committed_regions)
+                {
+                    auto protection = sogen::get_permission_string(committed.permissions.common);
+                    if (committed.permissions.is_guarded())
+                    {
+                        protection += 'g';
+                    }
+                    result.push_back({committed_base, committed.length, protection, "commit", kind, module});
+                }
+            }
+            return result;
         }
 
         bool supports_thread_diagnostics() const override

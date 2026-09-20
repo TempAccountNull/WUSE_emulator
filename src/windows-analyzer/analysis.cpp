@@ -513,6 +513,12 @@ namespace sogen
                 {
                     event.module_rva = address - module->image_base;
                 }
+                if (!c.main_pages_seen.empty())
+                {
+                    // Fraction of the main image's pages that have executed - climbs 0->100 as the guest
+                    // decrypts and runs across its own .text (a meaningful anti-tamper progress indicator).
+                    event.percent = 100.0 * static_cast<double>(c.main_pages_covered) / static_cast<double>(c.main_pages_seen.size());
+                }
             });
             c.progress_last = now;
             c.progress_instructions = count;
@@ -586,6 +592,19 @@ namespace sogen
             const auto previous_ip = current_thread.previous_ip;
             const auto* main = win_emu.mod_manager.executable;
             const auto is_main_exe = main->contains(address);
+            if (is_main_exe && main->size_of_image)
+            {
+                if (c.main_pages_seen.empty())
+                {
+                    c.main_pages_seen.assign((static_cast<size_t>(main->size_of_image) >> 12) + 1, 0);
+                }
+                const auto page = static_cast<size_t>((address - main->image_base) >> 12);
+                if (page < c.main_pages_seen.size() && !c.main_pages_seen[page])
+                {
+                    c.main_pages_seen[page] = 1;
+                    ++c.main_pages_covered;
+                }
+            }
             const auto* binary = is_main_exe ? main : win_emu.mod_manager.find_by_address(address);
 
             if (c.settings->instruction_summary && (is_main_exe || !binary || c.settings->modules.contains(binary->name)))

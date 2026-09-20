@@ -89,6 +89,16 @@ namespace sogen::gdb_stub
         std::vector<std::pair<std::string, std::string>> fields;
     };
 
+    struct memory_region_diagnostic
+    {
+        uint64_t base;
+        uint64_t size;
+        std::string permissions;
+        std::string state;
+        std::string kind;
+        std::string module;
+    };
+
     class binding_error : public std::runtime_error
     {
       public:
@@ -189,6 +199,16 @@ namespace sogen::gdb_stub
         }
 
         virtual std::vector<thread_diagnostic> get_thread_diagnostics() const
+        {
+            return {};
+        }
+
+        virtual bool supports_memory_diagnostics() const
+        {
+            return false;
+        }
+
+        virtual std::vector<memory_region_diagnostic> get_memory_regions() const
         {
             return {};
         }
