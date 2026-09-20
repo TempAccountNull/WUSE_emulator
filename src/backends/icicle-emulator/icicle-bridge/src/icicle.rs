@@ -1999,3 +1999,68 @@ mod hook_hotpath_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod parallel_scaling_bench {
+    //! Does execution scale across OS threads? Each thread builds its OWN `IcicleEmulator`
+    //! (created in-thread, never moved, so the `Rc<RefCell>` interior stays single-threaded) and
+    //! runs a tight `inc rax; jmp` loop for a fixed instruction budget with no memory traffic.
+    //! Near-linear aggregate MIPS proves independent VMs execute concurrently -> the per-vCPU
+    //! *instance* multi-core design is viable and the remaining work is a shared, thread-safe
+    //! memory backing (icicle-mem). Sub-linear scaling would expose a process-global bottleneck
+    //! (allocator, JIT global state) that must be fixed first. Gated on SOGEN_BENCH_OUT so the
+    //! normal `cargo test` run stays fast; results are written there and also printed.
+    use super::*;
+    use std::time::Instant;
+
+    fn run_loop(icount: u64) -> (u64, f64) {
+        let mut emu = IcicleEmulator::new();
+        assert!(emu.map_memory(0x10000, 4096, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+        // inc rax (48 FF C0) ; jmp -5 (EB FB) => 2 instructions/iteration, no loads/stores.
+        assert!(emu.write_memory(0x10000, &[0x48, 0xFF, 0xC0, 0xEB, 0xFB]));
+        emu.vm.cpu.write_pc(0x10000);
+        let before = emu.vm.cpu.icount;
+        let start = Instant::now();
+        emu.start(icount);
+        (emu.vm.cpu.icount - before, start.elapsed().as_secs_f64())
+    }
+
+    #[test]
+    fn parallel_scaling() {
+        let out = match std::env::var("SOGEN_BENCH_OUT") {
+            Ok(path) => path,
+            Err(_) => return, // no-op unless explicitly enabled
+        };
+        let icount: u64 = std::env::var("SOGEN_BENCH_ICOUNT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(300_000_000);
+        let thread_counts: Vec<usize> = std::env::var("SOGEN_BENCH_THREADS")
+            .ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![1, 2, 4, 8]);
+
+        let mut lines = vec![format!(
+            "icicle parallel-scaling bench | icount/thread={} | loop=inc-rax+jmp (2 instr/iter, no mem)",
+            icount)];
+        let mut baseline = 0.0f64;
+        for &n in &thread_counts {
+            let wall = Instant::now();
+            let handles: Vec<_> =
+                (0..n).map(|_| std::thread::spawn(move || run_loop(icount))).collect();
+            let per: Vec<(u64, f64)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let wall = wall.elapsed().as_secs_f64();
+            let total: u64 = per.iter().map(|(c, _)| *c).sum();
+            let agg = total as f64 / wall / 1e6;
+            let per_thread = agg / n as f64;
+            if n == 1 { baseline = per_thread; }
+            let eff = if baseline > 0.0 { per_thread / baseline } else { 1.0 };
+            lines.push(format!(
+                "threads={:>2}  wall={:>7.3}s  aggregate={:>8.1} MIPS  per_thread={:>7.1} MIPS  eff={:.2}x",
+                n, wall, agg, per_thread, eff));
+        }
+        let report = lines.join("\n") + "\n";
+        print!("\n{}", report);
+        if let Some(parent) = std::path::Path::new(&out).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&out, &report).expect("write bench results");
+    }
+}
