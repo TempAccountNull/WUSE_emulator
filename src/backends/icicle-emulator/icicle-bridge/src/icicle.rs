@@ -2013,6 +2013,48 @@ mod hook_hotpath_tests {
 }
 
 #[cfg(test)]
+mod shared_memory_smp {
+    //! P1 foundation for multi-vCPU SMP: can N Icicle VMs share ONE guest address space coherently?
+    //! Maps the same host buffer into two VMs and checks a write through one is visible via the
+    //! other. Host-memory backing (host hardware keeps it coherent) is a candidate shared-RAM path
+    //! for per-vCPU VMs that avoids rewriting PhysicalMemory. Runs under plain `cargo test`.
+    use super::*;
+
+    #[test]
+    fn two_vms_share_one_host_backed_region() {
+        use std::alloc::{alloc_zeroed, dealloc, Layout};
+        // map_host_memory requires a PAGE-ALIGNED host pointer; a Vec<u8> is not aligned.
+        let layout = Layout::from_size_align(0x1000, 0x1000).unwrap();
+        let host = unsafe { alloc_zeroed(layout) };
+        assert!(!host.is_null());
+        {
+            let mut a = IcicleEmulator::new();
+            let mut b = IcicleEmulator::new();
+            unsafe {
+                assert!(a.map_host_memory(0x20000, host, 0x1000, FOREIGN_READ | FOREIGN_WRITE));
+                assert!(b.map_host_memory(0x20000, host, 0x1000, FOREIGN_READ | FOREIGN_WRITE));
+            }
+            // Write through A -> visible through B (same host bytes).
+            assert!(a.write_memory(0x20000, &0xdeadbeefu32.to_le_bytes()));
+            let mut buf = [0u8; 4];
+            assert!(b.read_memory(0x20000, &mut buf));
+            assert_eq!(u32::from_le_bytes(buf), 0xdeadbeef, "A's write must be visible via B");
+            // And the reverse.
+            assert!(b.write_memory(0x20004, &0x12345678u32.to_le_bytes()));
+            let mut buf2 = [0u8; 4];
+            assert!(a.read_memory(0x20004, &mut buf2));
+            assert_eq!(u32::from_le_bytes(buf2), 0x12345678, "B's write must be visible via A");
+            // Direct host mutation is seen by a VM (models a third writer / DMA).
+            unsafe { std::ptr::copy_nonoverlapping(0xcafef00du32.to_le_bytes().as_ptr(), host.add(8), 4) };
+            let mut buf3 = [0u8; 4];
+            assert!(a.read_memory(0x20008, &mut buf3));
+            assert_eq!(u32::from_le_bytes(buf3), 0xcafef00d, "host write must be visible via A");
+        } // VMs dropped here, before the backing is freed
+        unsafe { dealloc(host, layout) };
+    }
+}
+
+#[cfg(test)]
 mod parallel_scaling_bench {
     //! Does execution scale across OS threads? Each thread builds its OWN `IcicleEmulator`
     //! (created in-thread, never moved, so the `Rc<RefCell>` interior stays single-threaded) and
