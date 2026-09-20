@@ -646,25 +646,37 @@ impl IcicleEmulator {
             invalidate_code.clone(),
         )));
 
-        let inst_exec_hooks = Rc::clone(&exec_hooks);
+        // The per-instruction/per-block hooks drive all instrumentation (call-count, first-exec,
+        // execution-progress, coverage, import tracking) but the JIT compiles them as a call on
+        // every instruction, a ~5-7x throughput tax (measured; see cpu-test-impl). A lean "fast"
+        // run can skip them for pure-JIT speed; the analyzer keeps its syscall/rdtsc/cpuid and
+        // memory hooks either way, and correctness is unaffected (handle_instruction is pure
+        // observation). Default on; SOGEN_ICICLE_INSTRUCTION_HOOK=0 opts into the fast path
+        // (panel: "Instrumentation hooks" -> disabled). Skipping injection also disables
+        // per-instruction breakpoints, so the panel pairs this with the debugger being off.
+        let install_instruction_hooks =
+            std::env::var("SOGEN_ICICLE_INSTRUCTION_HOOK").map(|v| v != "0").unwrap_or(true);
+        if install_instruction_hooks {
+            let inst_exec_hooks = Rc::clone(&exec_hooks);
 
-        let inst_hook = icicle_cpu::InstHook::new(move |cpu: &mut icicle_cpu::Cpu, addr: u64| {
-            inst_exec_hooks.borrow_mut().execute(cpu, addr);
-        });
+            let inst_hook = icicle_cpu::InstHook::new(move |cpu: &mut icicle_cpu::Cpu, addr: u64| {
+                inst_exec_hooks.borrow_mut().execute(cpu, addr);
+            });
 
-        let block_exec_hooks = Rc::clone(&exec_hooks);
+            let block_exec_hooks = Rc::clone(&exec_hooks);
 
-        let block_hook = icicle_cpu::InstHook::new(move |cpu: &mut icicle_cpu::Cpu, addr: u64| {
-            let instructions = cpu.args[0] as u64;
-            block_exec_hooks.borrow_mut().on_block(addr, instructions);
-        });
+            let block_hook = icicle_cpu::InstHook::new(move |cpu: &mut icicle_cpu::Cpu, addr: u64| {
+                let instructions = cpu.args[0] as u64;
+                block_exec_hooks.borrow_mut().on_block(addr, instructions);
+            });
 
-        let inst_hook_id = virtual_machine.cpu.add_hook(inst_hook);
-        let block_hook_id = virtual_machine.cpu.add_hook(block_hook);
-        virtual_machine.add_injector(InstructionHookInjector {
-            inst_hook: inst_hook_id,
-            block_hook: block_hook_id,
-        });
+            let inst_hook_id = virtual_machine.cpu.add_hook(inst_hook);
+            let block_hook_id = virtual_machine.cpu.add_hook(block_hook);
+            virtual_machine.add_injector(InstructionHookInjector {
+                inst_hook: inst_hook_id,
+                block_hook: block_hook_id,
+            });
+        }
 
         Self {
             stop: stop_value,
