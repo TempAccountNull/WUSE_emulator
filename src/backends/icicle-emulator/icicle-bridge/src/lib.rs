@@ -154,6 +154,25 @@ pub fn icicle_map_shared_memory(ptr: *mut c_void, address: u64, source: u64, len
     }
 }
 
+// SMP (multi-vCPU) shared guest RAM: the master VM maps fresh shared pages; each other vCPU VM maps
+// the same Arc<PageData> backing so all N share one coherent, full-speed address space.
+#[unsafe(no_mangle)]
+pub fn icicle_map_smp_shared_fresh(ptr: *mut c_void, address: u64, length: u64, permissions: u8) -> i32 {
+    unsafe {
+        let emulator = &mut *(ptr as *mut IcicleEmulator);
+        to_cbool(emulator.map_smp_shared_fresh_range(address, length, permissions))
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn icicle_share_smp_pages(dst: *mut c_void, src: *mut c_void, address: u64, length: u64) -> i32 {
+    unsafe {
+        let dst_emulator = &mut *(dst as *mut IcicleEmulator);
+        let src_emulator = &*(src as *mut IcicleEmulator);
+        to_cbool(dst_emulator.share_smp_pages_from(src_emulator, address, length))
+    }
+}
+
 #[unsafe(no_mangle)]
 pub fn icicle_unmap_memory(ptr: *mut c_void, address: u64, length: u64) -> i32 {
     unsafe {

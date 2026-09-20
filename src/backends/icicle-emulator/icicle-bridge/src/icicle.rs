@@ -1137,6 +1137,46 @@ impl IcicleEmulator {
             .is_ok()
     }
 
+    /// Map a range of fresh SMP-shared pages on this VM (the master, vCPU 0). Each page can then be
+    /// shared into the other vCPUs' VMs via share_smp_pages_from, so all N observe one coherent page.
+    pub fn map_smp_shared_fresh_range(&mut self, address: u64, length: u64, permissions: u8) -> bool {
+        const PAGE: u64 = 0x1000;
+        if address % PAGE != 0 || length == 0 || length % PAGE != 0 {
+            return false;
+        }
+        let native = map_permissions(permissions);
+        let mut page = address;
+        let end = address + length;
+        while page < end {
+            if !self.vm.cpu.mem.map_smp_shared_fresh(page, native) {
+                return false;
+            }
+            page += PAGE;
+        }
+        true
+    }
+
+    /// Map the SAME Arc<PageData> backing as the source VM for each page in the range (SMP), so this
+    /// vCPU shares the master's guest RAM. Coherency of the shared bytes is the host CPU's (MESI).
+    pub fn share_smp_pages_from(&mut self, source: &IcicleEmulator, address: u64, length: u64) -> bool {
+        const PAGE: u64 = 0x1000;
+        if address % PAGE != 0 || length == 0 || length % PAGE != 0 {
+            return false;
+        }
+        let mut page = address;
+        let end = address + length;
+        while page < end {
+            let Some(data) = source.vm.cpu.mem.share_page(page) else {
+                return false;
+            };
+            if !self.vm.cpu.mem.map_smp_shared(page, data) {
+                return false;
+            }
+            page += PAGE;
+        }
+        true
+    }
+
     pub fn map_mmio(
         &mut self,
         address: u64,
