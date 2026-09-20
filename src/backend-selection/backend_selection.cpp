@@ -37,7 +37,7 @@ namespace sogen
                 // TODO: Add proper handling for WOW64 case (x64 -> x86 emulation is not supported yet).
                 // icicle does not support automatic cross-architecture conversion from x64 to x86.
                 // therefore WOW64 programs are naturally not supported to run.
-                return icicle::create_x86_64_emulator();
+                return icicle::create_x86_64_emulator(vcpu_count);
 #endif
 
 #if defined(_WIN64) && !defined(__MINGW64__)

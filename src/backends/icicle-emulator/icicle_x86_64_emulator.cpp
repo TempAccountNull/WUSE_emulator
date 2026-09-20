@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <utils/object.hpp>
@@ -42,6 +43,10 @@ extern "C"
     int32_t icicle_map_mmio(icicle_emulator*, uint64_t address, uint64_t length, icicle_mmio_read_func* read_callback, void* read_data,
                             icicle_mmio_write_func* write_callback, void* write_data);
     int32_t icicle_map_shared_memory(icicle_emulator*, uint64_t address, uint64_t source, uint64_t length, uint8_t permissions);
+    // SMP shared RAM (steps 1-2): map one shared page set on a master VM, then alias the same
+    // Arc<PageData> into every other vCPU VM so all N see one coherent, cachable, write-through address space.
+    int32_t icicle_map_smp_shared_fresh(icicle_emulator*, uint64_t address, uint64_t length, uint8_t permissions);
+    int32_t icicle_share_smp_pages(icicle_emulator* dst, icicle_emulator* src, uint64_t address, uint64_t length);
     int32_t icicle_unmap_memory(icicle_emulator*, uint64_t address, uint64_t length);
     int32_t icicle_read_memory(icicle_emulator*, uint64_t address, void* data, size_t length);
     int32_t icicle_write_memory(icicle_emulator*, uint64_t address, const void* data, size_t length);
@@ -119,17 +124,16 @@ namespace sogen::icicle
             return std::make_unique<function_object<T>>(std::move(func), &hook_state);
         }
 
-        // memory_access_hook_callback with the leading cpu_interface& stripped: bind_cpu binds icicle's
-        // single vCPU into the callback (icicle is single-vCPU), so the stored callback takes no cpu.
-        using bound_memory_access_hook_callback = std::function<void(uint64_t address, const void* data, size_t size)>;
-
+        // Stored UNBOUND (still takes cpu_interface&): with N vCPU VMs the hook is registered once per
+        // VM and bound to that VM's vCPU at install time (see hook_memory_access), so one hook fires with
+        // the correct acting vCPU on whichever VM executed the access.
         struct memory_access_hook
         {
             uint64_t address{};
             uint64_t size{};
-            bound_memory_access_hook_callback callback{};
+            memory_access_hook_callback callback{};
             bool is_read{};
-            std::function<void(uint64_t, const void*, size_t, uint64_t, int32_t)> observation{};
+            memory_write_observation_callback observation{};
         };
 
         uint64_t configured_memory_limit_mib()
@@ -164,7 +168,7 @@ namespace sogen::icicle
     // One vCPU: register + run state on its own icicle VM handle; memory delegates to the shared
     // machine. Mirrors whp_vcpu so windows-emulator's N-vCPU scheduler can drive N icicle VMs (SMP).
     // The machine (icicle_x86_64_emulator) delegates its own CPU-0 role to vcpus_[0] (see get_cpu).
-    class icicle_vcpu final : public x86_64_cpu
+    class icicle_vcpu final : public x86_64_cpu, public detail::hook_exception_sink
     {
       public:
         icicle_vcpu(icicle_emulator* emu, icicle_x86_64_emulator& machine, const uint32_t index)
@@ -311,38 +315,82 @@ namespace sogen::icicle
             return this->emu_;
         }
 
+        // A host exception raised in a hook bound to this vCPU stops THIS VM and is rethrown from this
+        // vCPU's start() once icicle has returned to C++ (see execution_hook / hook_exception_sink).
+        void defer_hook_exception(std::exception_ptr exception) noexcept override
+        {
+            if (!this->pending_hook_exception_)
+            {
+                this->pending_hook_exception_ = std::move(exception);
+            }
+            icicle_stop(this->emu_);
+        }
+
+        void rethrow_deferred_hook_exception()
+        {
+            if (this->pending_hook_exception_)
+            {
+                auto exception = std::exchange(this->pending_hook_exception_, std::exception_ptr{});
+                std::rethrow_exception(exception);
+            }
+        }
+
       private:
         void throw_if_unhandled_stop();
 
         icicle_emulator* emu_{};
         icicle_x86_64_emulator& machine_;
         uint32_t index_{0};
+        std::exception_ptr pending_hook_exception_{};
     };
 
     class icicle_x86_64_emulator : public x86_64_emulator, public detail::hook_exception_sink
     {
       public:
-        icicle_x86_64_emulator()
-            : emu_(icicle_create_emulator(configured_memory_limit_mib()))
+        explicit icicle_x86_64_emulator(size_t vcpu_count = 1)
         {
-            if (!this->emu_)
+            if (vcpu_count < 1)
             {
-                throw std::runtime_error("Failed to create icicle emulator instance");
+                vcpu_count = 1;
             }
-            this->vcpus_.push_back(std::make_unique<icicle_vcpu>(this->emu_, *this, 0));
+            // One icicle VM per vCPU (each keeps its single-threaded Rc<RefCell> core pinned to its own
+            // OS thread); guest RAM is shared across them via smp_shared pages in map_memory. VM 0 is the
+            // master the machine surface (memory read/write) delegates to.
+            //
+            // INVARIANT (N>1): the machine surface below mutates ALL N VMs (map/unmap/protect touch every
+            // handle; each hook_* registers on every handle). An icicle VM must only be touched by its own
+            // thread, so these machine-wide mutations are safe only while the VMs are quiesced -- during
+            // setup (before workers start) or a stop-the-world kernel section under Sogen's BEL. Coordinating
+            // cross-VM mutation that happens *while other vCPUs execute in parallel* is step 6 (see
+            // cpu-test-impl/SMP-PLAN.md): defer each VM's mutation to its own thread, or gate on the BEL.
+            this->vcpus_.reserve(vcpu_count);
+            for (size_t i = 0; i < vcpu_count; ++i)
+            {
+                auto* handle = icicle_create_emulator(configured_memory_limit_mib());
+                if (!handle)
+                {
+                    throw std::runtime_error("Failed to create icicle emulator instance");
+                }
+                this->vcpus_.push_back(std::make_unique<icicle_vcpu>(handle, *this, static_cast<uint32_t>(i)));
+            }
+            this->emu_ = this->vcpus_[0]->handle();
         }
 
         ~icicle_x86_64_emulator() override
         {
-            reset_object_with_delayed_destruction(this->hooks_);
+            // Free hook/storage objects first (nothing is running), then tear down every VM handle.
+            this->registrations_.clear();
             reset_object_with_delayed_destruction(this->storage_);
             utils::reset_object_with_delayed_destruction(this->hooks_to_install_);
 
-            if (this->emu_)
+            for (auto& vcpu : this->vcpus_)
             {
-                icicle_destroy_emulator(this->emu_);
-                this->emu_ = nullptr;
+                if (vcpu && vcpu->handle())
+                {
+                    icicle_destroy_emulator(vcpu->handle());
+                }
             }
+            this->emu_ = nullptr;
         }
 
         // The machine delegates its own CPU-0 role to vcpus_[0] (mirrors whp_x86_64_emulator); the
@@ -352,15 +400,11 @@ namespace sogen::icicle
             this->vcpus_[0]->start(count);
         }
 
-        // See detail::hook_exception_sink. Only the first exception of a run is kept; it stops
-        // icicle immediately and surfaces from start() on the C++ side of the boundary.
+        // See detail::hook_exception_sink. Machine-scoped deferrals (e.g. run_on_next_instruction, which
+        // runs on the master VM) are attributed to vCPU 0; per-vCPU hook wrappers defer to their own vCPU.
         void defer_hook_exception(std::exception_ptr exception) noexcept override
         {
-            if (!this->pending_hook_exception_)
-            {
-                this->pending_hook_exception_ = std::move(exception);
-            }
-            icicle_stop(this->emu_);
+            this->vcpus_[0]->defer_hook_exception(std::move(exception));
         }
 
         void stop() override
@@ -435,36 +479,67 @@ namespace sogen::icicle
                 w->write_cb(addr + w->base, data, length);
             };
 
-            icicle_map_mmio(this->emu_, address, size, read_wrapper, ptr, write_wrapper, ptr);
+            // Every vCPU VM needs the MMIO region; the callback context (ptr) is shared and coherent.
+            for (auto& vcpu : this->vcpus_)
+            {
+                icicle_map_mmio(vcpu->handle(), address, size, read_wrapper, ptr, write_wrapper, ptr);
+            }
         }
 
         void map_memory(const uint64_t address, const size_t size, memory_permission permissions) override
         {
-            const auto res = icicle_map_memory(this->emu_, address, size, static_cast<uint8_t>(permissions));
-            ice(res, "Failed to map memory");
+            const auto perm = static_cast<uint8_t>(permissions);
+            if (this->vcpus_.size() == 1)
+            {
+                // Normal path: keeps COW + snapshots for the single-vCPU case (byte-identical to before SMP).
+                ice(icicle_map_memory(this->emu_, address, size, perm), "Failed to map memory");
+                return;
+            }
+            // SMP: allocate the shared page set on the master, alias the same Arc<PageData> into the rest
+            // so all vCPUs share one coherent guest RAM (cachable, write-through, host-MESI coherency).
+            ice(icicle_map_smp_shared_fresh(this->emu_, address, size, perm), "Failed to map SMP memory");
+            for (size_t i = 1; i < this->vcpus_.size(); ++i)
+            {
+                ice(icicle_share_smp_pages(this->vcpus_[i]->handle(), this->emu_, address, size), "Failed to share SMP memory");
+            }
         }
 
         void map_host_memory(const uint64_t address, const size_t size, void* host_pointer, memory_permission permissions) override
         {
-            ice(icicle_map_host_memory(this->emu_, address, host_pointer, size, static_cast<uint8_t>(permissions)),
-                "Failed to map host memory");
+            const auto perm = static_cast<uint8_t>(permissions);
+            for (auto& vcpu : this->vcpus_)
+            {
+                // Same host pointer in every VM: coherent because they all alias the one host buffer.
+                ice(icicle_map_host_memory(vcpu->handle(), address, host_pointer, size, perm), "Failed to map host memory");
+            }
         }
 
         void flush_host_memory_cache(const void* host_pointer, const size_t size) override
         {
-            icicle_flush_host_memory_cache(this->emu_, host_pointer, size);
+            for (auto& vcpu : this->vcpus_)
+            {
+                icicle_flush_host_memory_cache(vcpu->handle(), host_pointer, size);
+            }
         }
 
         bool map_shared_memory(const uint64_t address, const uint64_t source, const size_t size,
                                const memory_permission permissions) override
         {
-            return icicle_map_shared_memory(this->emu_, address, source, size, static_cast<uint8_t>(permissions)) != 0;
+            const auto perm = static_cast<uint8_t>(permissions);
+            bool ok = true;
+            for (auto& vcpu : this->vcpus_)
+            {
+                ok = (icicle_map_shared_memory(vcpu->handle(), address, source, size, perm) != 0) && ok;
+            }
+            return ok;
         }
 
         void unmap_memory(const uint64_t address, const size_t size) override
         {
-            const auto res = icicle_unmap_memory(this->emu_, address, size);
-            ice(res, "Failed to unmap memory");
+            for (auto& vcpu : this->vcpus_)
+            {
+                ice(icicle_unmap_memory(vcpu->handle(), address, size), "Failed to unmap memory");
+            }
         }
 
         bool try_read_memory(const uint64_t address, void* data, const size_t size) const override
@@ -491,25 +566,45 @@ namespace sogen::icicle
 
         void apply_memory_protection(const uint64_t address, const size_t size, memory_permission permissions) override
         {
-            const auto res = icicle_protect_memory(this->emu_, address, size, static_cast<uint8_t>(permissions));
-            ice(res, "Failed to apply permissions");
+            const auto perm = static_cast<uint8_t>(permissions);
+            for (auto& vcpu : this->vcpus_)
+            {
+                ice(icicle_protect_memory(vcpu->handle(), address, size, perm), "Failed to apply permissions");
+            }
         }
 
-        // The raw icicle hook wrappers are captureless function pointers, so the
-        // triggering CPU is bound into the stored function up front.
-        template <typename Ret, typename... Args>
-        std::function<Ret(Args...)> bind_cpu(std::function<Ret(cpu_interface&, Args...)> callback)
+        // The cpu_interface a hook on VM `index` reports to its callback. VM 0 is the machine itself
+        // (emu.get()) -- the historical cpu-0 identity that hooks are expected to carry (mirrors the
+        // pre-SMP behavior and matches icicle_execution_hook_test); extra VMs report their own vCPU so a
+        // callback sees the acting vCPU under SMP.
+        cpu_interface& acting_cpu(const size_t index)
         {
-            return [this, c = std::move(callback)](Args... args) -> Ret {
+            return index == 0 ? static_cast<cpu_interface&>(*this) : static_cast<cpu_interface&>(*this->vcpus_[index]);
+        }
+
+        // The sink a hook on VM `index` defers exceptions to. VM 0 uses the machine (which forwards to
+        // vcpus_[0]); extra VMs use their own vCPU. Either way the exception surfaces from that VM's start().
+        detail::hook_exception_sink* acting_sink(const size_t index)
+        {
+            return index == 0 ? static_cast<detail::hook_exception_sink*>(this) : this->vcpus_[index].get();
+        }
+
+        // The raw icicle hook wrappers are captureless function pointers, so the triggering vCPU is bound
+        // into the stored function up front. With N VMs the same hook is registered on each and bound to
+        // that VM's acting cpu (see acting_cpu), so callbacks see the acting vCPU and defer exceptions to it.
+        template <typename Ret, typename... Args>
+        std::function<Ret(Args...)> bind_cpu(const size_t vcpu_index, std::function<Ret(cpu_interface&, Args...)> callback)
+        {
+            return [this, vcpu_index, c = std::move(callback)](Args... args) -> Ret {
                 try
                 {
-                    return c(*this->vcpus_[0], std::forward<Args>(args)...);
+                    return c(this->acting_cpu(vcpu_index), std::forward<Args>(args)...);
                 }
                 catch (...)
                 {
                     // Never let a host exception reach icicle's Rust frames (hook_exception_sink).
                     // The default result (stop / run_instruction / 0) is harmless: icicle stops now.
-                    this->defer_hook_exception(std::current_exception());
+                    this->acting_sink(vcpu_index)->defer_hook_exception(std::current_exception());
                     if constexpr (!std::is_void_v<Ret>)
                     {
                         return Ret{};
@@ -527,95 +622,122 @@ namespace sogen::icicle
                 return nullptr;
             }
 
-            auto obj = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
-            auto* ptr = obj.get();
+            auto* handle = this->fresh_hook_handle();
+            auto& reg = this->registrations_[handle];
+            for (size_t i = 0; i < this->vcpus_.size(); ++i)
+            {
+                auto obj = make_function_object(this->bind_cpu(i, callback), this->is_in_hook_);
+                auto* ptr = obj.get();
 
-            const auto invoker = +[](void* cb) {
-                const auto& func = *static_cast<decltype(ptr)>(cb);
-                (void)func(0); //
-            };
+                const auto invoker = +[](void* cb) {
+                    const auto& func = *static_cast<decltype(ptr)>(cb);
+                    (void)func(0); //
+                };
 
-            const auto timestamp_invoker = +[](void* cb) -> uint32_t {
-                const auto& func = *static_cast<decltype(ptr)>(cb);
-                return static_cast<uint32_t>(func(0));
-            };
-            const auto id = kind == x86_hookable_instructions::syscall
-                                ? icicle_add_syscall_hook(this->emu_, invoker, ptr)
-                                : icicle_add_timestamp_hook(this->emu_, kind == x86_hookable_instructions::rdtscp, timestamp_invoker, ptr);
-            this->hooks_[id] = std::move(obj);
+                const auto timestamp_invoker = +[](void* cb) -> uint32_t {
+                    const auto& func = *static_cast<decltype(ptr)>(cb);
+                    return static_cast<uint32_t>(func(0));
+                };
+                auto* const vm = this->vcpus_[i]->handle();
+                const auto id = kind == x86_hookable_instructions::syscall
+                                    ? icicle_add_syscall_hook(vm, invoker, ptr)
+                                    : icicle_add_timestamp_hook(vm, kind == x86_hookable_instructions::rdtscp, timestamp_invoker, ptr);
+                reg.entries.emplace_back(i, id, std::move(obj));
+            }
 
-            return wrap_hook(id);
+            return handle;
         }
 
         emulator_hook* hook_basic_block(basic_block_hook_callback callback) override
         {
-            auto object = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
-            auto* ptr = object.get();
-            auto* wrapper = +[](void* user, const uint64_t addr, const uint64_t instructions) {
-                basic_block block{};
-                block.address = addr;
-                block.instruction_count = static_cast<size_t>(instructions);
+            auto* handle = this->fresh_hook_handle();
+            auto& reg = this->registrations_[handle];
+            for (size_t i = 0; i < this->vcpus_.size(); ++i)
+            {
+                auto object = make_function_object(this->bind_cpu(i, callback), this->is_in_hook_);
+                auto* ptr = object.get();
+                auto* wrapper = +[](void* user, const uint64_t addr, const uint64_t instructions) {
+                    basic_block block{};
+                    block.address = addr;
+                    block.instruction_count = static_cast<size_t>(instructions);
 
-                const auto& func = *static_cast<decltype(ptr)>(user);
-                (func)(block);
-            };
+                    const auto& func = *static_cast<decltype(ptr)>(user);
+                    (func)(block);
+                };
 
-            const auto id = icicle_add_block_hook(this->emu_, wrapper, ptr);
-            this->hooks_[id] = std::move(object);
+                const auto id = icicle_add_block_hook(this->vcpus_[i]->handle(), wrapper, ptr);
+                reg.entries.emplace_back(i, id, std::move(object));
+            }
 
-            return wrap_hook(id);
+            return handle;
         }
 
         emulator_hook* hook_interrupt(interrupt_hook_callback callback) override
         {
-            auto obj = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
-            auto* ptr = obj.get();
-            auto* wrapper = +[](void* user, const int32_t code) {
-                const auto& func = *static_cast<decltype(ptr)>(user);
-                func(code);
-            };
+            auto* handle = this->fresh_hook_handle();
+            auto& reg = this->registrations_[handle];
+            for (size_t i = 0; i < this->vcpus_.size(); ++i)
+            {
+                auto obj = make_function_object(this->bind_cpu(i, callback), this->is_in_hook_);
+                auto* ptr = obj.get();
+                auto* wrapper = +[](void* user, const int32_t code) {
+                    const auto& func = *static_cast<decltype(ptr)>(user);
+                    func(code);
+                };
 
-            const auto id = icicle_add_interrupt_hook(this->emu_, wrapper, ptr);
-            this->hooks_[id] = std::move(obj);
+                const auto id = icicle_add_interrupt_hook(this->vcpus_[i]->handle(), wrapper, ptr);
+                reg.entries.emplace_back(i, id, std::move(obj));
+            }
 
-            return wrap_hook(id);
+            return handle;
         }
 
         emulator_hook* hook_memory_violation(memory_violation_hook_callback callback) override
         {
-            auto obj = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
-            auto* ptr = obj.get();
-            auto* wrapper = +[](void* user, const uint64_t address, const uint8_t operation, const int32_t unmapped) -> int32_t {
-                const auto violation_type = unmapped //
-                                                ? memory_violation_type::unmapped
-                                                : memory_violation_type::protection;
+            auto* handle = this->fresh_hook_handle();
+            auto& reg = this->registrations_[handle];
+            for (size_t i = 0; i < this->vcpus_.size(); ++i)
+            {
+                auto obj = make_function_object(this->bind_cpu(i, callback), this->is_in_hook_);
+                auto* ptr = obj.get();
+                auto* wrapper = +[](void* user, const uint64_t address, const uint8_t operation, const int32_t unmapped) -> int32_t {
+                    const auto violation_type = unmapped //
+                                                    ? memory_violation_type::unmapped
+                                                    : memory_violation_type::protection;
 
-                const auto& func = *static_cast<decltype(ptr)>(user);
-                const auto res = func(address, 1, static_cast<memory_operation>(operation), violation_type);
-                const auto restart = res == memory_violation_continuation::restart;
-                const auto resume = res == memory_violation_continuation::resume || restart;
-                return resume ? 1 : 0;
-            };
+                    const auto& func = *static_cast<decltype(ptr)>(user);
+                    const auto res = func(address, 1, static_cast<memory_operation>(operation), violation_type);
+                    const auto restart = res == memory_violation_continuation::restart;
+                    const auto resume = res == memory_violation_continuation::resume || restart;
+                    return resume ? 1 : 0;
+                };
 
-            const auto id = icicle_add_violation_hook(this->emu_, wrapper, ptr);
-            this->hooks_[id] = std::move(obj);
+                const auto id = icicle_add_violation_hook(this->vcpus_[i]->handle(), wrapper, ptr);
+                reg.entries.emplace_back(i, id, std::move(obj));
+            }
 
-            return wrap_hook(id);
+            return handle;
         }
 
         emulator_hook* hook_memory_execution(const uint64_t address, memory_execution_hook_callback callback) override
         {
-            auto object = std::make_unique<detail::execution_hook>(*this, std::move(callback), this->is_in_hook_, this);
-            auto* ptr = object.get();
-            auto* wrapper = +[](void* user, const uint64_t addr) {
-                const auto& func = *static_cast<decltype(ptr)>(user);
-                (func)(addr);
-            };
+            auto* handle = this->fresh_hook_handle();
+            auto& reg = this->registrations_[handle];
+            for (size_t i = 0; i < this->vcpus_.size(); ++i)
+            {
+                auto object = std::make_unique<detail::execution_hook>(this->acting_cpu(i), callback, this->is_in_hook_,
+                                                                       this->acting_sink(i));
+                auto* ptr = object.get();
+                auto* wrapper = +[](void* user, const uint64_t addr) {
+                    const auto& func = *static_cast<decltype(ptr)>(user);
+                    (func)(addr);
+                };
 
-            const auto id = icicle_add_execution_hook(this->emu_, address, wrapper, ptr);
-            this->hooks_[id] = std::move(object);
+                const auto id = icicle_add_execution_hook(this->vcpus_[i]->handle(), address, wrapper, ptr);
+                reg.entries.emplace_back(i, id, std::move(object));
+            }
 
-            return wrap_hook(id);
+            return handle;
         }
 
         emulator_hook* hook_memory_range_execution(const uint64_t address, const uint64_t size,
@@ -626,32 +748,44 @@ namespace sogen::icicle
                 return this->hook_memory_execution(address, std::move(callback));
             }
 
-            auto object = std::make_unique<detail::execution_hook>(*this, std::move(callback), this->is_in_hook_, this);
-            auto* ptr = object.get();
-            auto* wrapper = +[](void* user, const uint64_t addr) {
-                const auto& func = *static_cast<decltype(ptr)>(user);
-                (func)(addr);
-            };
+            auto* handle = this->fresh_hook_handle();
+            auto& reg = this->registrations_[handle];
+            for (size_t i = 0; i < this->vcpus_.size(); ++i)
+            {
+                auto object = std::make_unique<detail::execution_hook>(this->acting_cpu(i), callback, this->is_in_hook_,
+                                                                       this->acting_sink(i));
+                auto* ptr = object.get();
+                auto* wrapper = +[](void* user, const uint64_t addr) {
+                    const auto& func = *static_cast<decltype(ptr)>(user);
+                    (func)(addr);
+                };
 
-            const auto id = icicle_add_ranged_execution_hook(this->emu_, address, size, wrapper, ptr);
-            this->hooks_[id] = std::move(object);
+                const auto id = icicle_add_ranged_execution_hook(this->vcpus_[i]->handle(), address, size, wrapper, ptr);
+                reg.entries.emplace_back(i, id, std::move(object));
+            }
 
-            return wrap_hook(id);
+            return handle;
         }
 
         emulator_hook* hook_memory_execution(memory_execution_hook_callback callback) override
         {
-            auto object = std::make_unique<detail::execution_hook>(*this, std::move(callback), this->is_in_hook_, this);
-            auto* ptr = object.get();
-            auto* wrapper = +[](void* user, const uint64_t addr) {
-                const auto& func = *static_cast<decltype(ptr)>(user);
-                (func)(addr);
-            };
+            auto* handle = this->fresh_hook_handle();
+            auto& reg = this->registrations_[handle];
+            for (size_t i = 0; i < this->vcpus_.size(); ++i)
+            {
+                auto object = std::make_unique<detail::execution_hook>(this->acting_cpu(i), callback, this->is_in_hook_,
+                                                                       this->acting_sink(i));
+                auto* ptr = object.get();
+                auto* wrapper = +[](void* user, const uint64_t addr) {
+                    const auto& func = *static_cast<decltype(ptr)>(user);
+                    (func)(addr);
+                };
 
-            const auto id = icicle_add_generic_execution_hook(this->emu_, wrapper, ptr);
-            this->hooks_[id] = std::move(object);
+                const auto id = icicle_add_generic_execution_hook(this->vcpus_[i]->handle(), wrapper, ptr);
+                reg.entries.emplace_back(i, id, std::move(object));
+            }
 
-            return wrap_hook(id);
+            return handle;
         }
 
         emulator_hook* hook_memory_read(const uint64_t address, const uint64_t size, memory_access_hook_callback callback) override
@@ -659,7 +793,7 @@ namespace sogen::icicle
             return this->try_install_memory_access_hook(memory_access_hook{
                 .address = address,
                 .size = size,
-                .callback = this->bind_cpu(std::move(callback)),
+                .callback = std::move(callback),
                 .is_read = true,
             });
         }
@@ -669,7 +803,7 @@ namespace sogen::icicle
             return this->try_install_memory_access_hook(memory_access_hook{
                 .address = address,
                 .size = size,
-                .callback = this->bind_cpu(std::move(callback)),
+                .callback = std::move(callback),
                 .is_read = false,
             });
         }
@@ -680,21 +814,7 @@ namespace sogen::icicle
             return this->try_install_memory_access_hook(memory_access_hook{
                 .address = address,
                 .size = size,
-                .observation =
-                    [this, callback = std::move(callback)](uint64_t access, const void* data, size_t length, uint64_t error,
-                                                           int32_t host_write) {
-                        try
-                        {
-                            callback(*this, access, data, length,
-                                     {.outcome = error == 0 ? memory_access_outcome::completed : memory_access_outcome::failed,
-                                      .backend_error = error,
-                                      .origin = host_write != 0 ? memory_write_origin::host : memory_write_origin::guest});
-                        }
-                        catch (...)
-                        {
-                            this->defer_hook_exception(std::current_exception());
-                        }
-                    },
+                .observation = std::move(callback),
             });
         }
 
@@ -716,6 +836,10 @@ namespace sogen::icicle
             {
                 throw std::runtime_error("Cannot save or restore Icicle state while caller-owned host memory is mapped");
             }
+            if (is_snapshot && this->vcpus_.size() > 1)
+            {
+                throw std::runtime_error("Icicle snapshots are not supported with multiple vCPUs");
+            }
             if (is_snapshot)
             {
                 const auto snapshot = icicle_create_snapshot(this->emu_);
@@ -732,6 +856,10 @@ namespace sogen::icicle
             if (icicle_has_host_mappings(this->emu_))
             {
                 throw std::runtime_error("Cannot save or restore Icicle state while caller-owned host memory is mapped");
+            }
+            if (is_snapshot && this->vcpus_.size() > 1)
+            {
+                throw std::runtime_error("Icicle snapshots are not supported with multiple vCPUs");
             }
             if (is_snapshot)
             {
@@ -773,7 +901,7 @@ namespace sogen::icicle
 
         bool supports_multiple_vcpus() const override
         {
-            return false;
+            return this->vcpus_.size() > 1;
         }
 
         std::string get_name() const override
@@ -783,152 +911,118 @@ namespace sogen::icicle
 
       private:
         bool is_in_hook_{false};
-        std::exception_ptr pending_hook_exception_{};
         std::list<std::unique_ptr<utils::object>> storage_{};
-        std::unordered_map<uint32_t, std::unique_ptr<utils::object>> hooks_{};
-        std::unordered_map<emulator_hook*, std::optional<uint32_t>> id_mapping_{};
+
+        // One hook API handle maps to one icicle registration per vCPU VM: (vm index, icicle hook id, and
+        // the object kept alive for that VM's captureless wrapper). delete_hook removes every VM's
+        // registration; at N=1 this is exactly the old single (id, object) pair.
+        struct hook_registration
+        {
+            std::vector<std::tuple<size_t, uint32_t, std::unique_ptr<utils::object>>> entries{};
+            bool pending{false}; // reserved handle for a memory hook queued from inside a running hook
+        };
+        std::unordered_map<emulator_hook*, hook_registration> registrations_{};
+
         icicle_emulator* emu_{};
         std::vector<std::unique_ptr<icicle_vcpu>> vcpus_{};
         uint32_t index_{0};
 
-        // icicle_vcpu::start() surfaces deferred hook exceptions and runs pending hook installs/deletes
-        // through the machine (hook machinery is machine-scoped).
+        // icicle_vcpu::start() runs pending hook installs/deletes through the machine (hook machinery is
+        // machine-scoped); each vCPU surfaces its own deferred hook exceptions.
         friend class icicle_vcpu;
 
         std::unordered_set<emulator_hook*> hooks_to_delete_{};
         std::unordered_map<emulator_hook*, memory_access_hook> hooks_to_install_{};
 
-        emulator_hook* wrap_hook(const std::optional<uint32_t> icicle_id)
+        emulator_hook* fresh_hook_handle()
         {
             const auto id = ++this->index_;
-            auto* hook = reinterpret_cast<emulator_hook*>(static_cast<size_t>(id));
-
-            this->id_mapping_[hook] = icicle_id;
-
-            return hook;
-        }
-
-        void rethrow_deferred_hook_exception()
-        {
-            if (this->pending_hook_exception_)
-            {
-                auto exception = std::exchange(this->pending_hook_exception_, std::exception_ptr{});
-                std::rethrow_exception(exception);
-            }
-        }
-
-        void throw_if_unhandled_stop()
-        {
-            icicle_stop_info info{};
-            ice(icicle_get_stop_info(this->emu_, &info) != 0, "Failed to read icicle stop info");
-
-            const auto kind = static_cast<icicle_stop_kind>(info.kind);
-            if (kind == icicle_stop_kind::none || kind == icicle_stop_kind::instruction_limit)
-            {
-                return;
-            }
-
-            std::array<char, 320> message{};
-            if (kind == icicle_stop_kind::unhandled_exception)
-            {
-                std::string name{};
-                icicle_get_exception_name(
-                    info.code,
-                    [](void* data, const void* text, const size_t length) {
-                        static_cast<std::string*>(data)->assign(static_cast<const char*>(text), length);
-                    },
-                    &name);
-                std::snprintf(message.data(), message.size(),
-                              "Icicle stopped on unhandled exception: code=0x%X (%s) value=0x%llX rip=0x%llX", info.code, name.c_str(),
-                              static_cast<unsigned long long>(info.value),
-                              static_cast<unsigned long long>(this->read_instruction_pointer()));
-            }
-            else
-            {
-                std::string description{};
-                icicle_get_vm_exit_description(
-                    this->emu_,
-                    [](void* data, const void* text, const size_t length) {
-                        static_cast<std::string*>(data)->assign(static_cast<const char*>(text), length);
-                    },
-                    &description);
-                std::snprintf(message.data(), message.size(), "Icicle stopped on unhandled VM exit: %s code=0x%X value=0x%llX rip=0x%llX",
-                              description.c_str(), info.code, static_cast<unsigned long long>(info.value),
-                              static_cast<unsigned long long>(this->read_instruction_pointer()));
-            }
-
-            throw std::runtime_error(message.data());
+            return reinterpret_cast<emulator_hook*>(static_cast<size_t>(id));
         }
 
         emulator_hook* hook_memory_access(memory_access_hook hook, emulator_hook* hook_id)
         {
-            std::unique_ptr<utils::object> object;
-            uint32_t id{};
-            if (hook.observation)
-            {
-                auto obj = make_function_object(std::move(hook.observation), this->is_in_hook_);
-                auto* ptr = obj.get();
-                auto* wrapper = +[](void* user, uint64_t address, const void* data, size_t length, uint64_t error, int32_t host_write) {
-                    (*static_cast<decltype(ptr)>(user))(address, data, length, error, host_write);
-                };
-                id = icicle_add_write_observation_hook(this->emu_, hook.address, hook.address + hook.size, wrapper, ptr);
-                object = std::move(obj);
-            }
-            else
-            {
-                auto obj = make_function_object(std::move(hook.callback), this->is_in_hook_);
-                auto* ptr = obj.get();
-                auto* wrapper = +[](void* user, const uint64_t address, const void* data, size_t length) {
-                    const auto& func = *static_cast<decltype(ptr)>(user);
-                    func(address, data, length);
-                };
+            auto* handle = hook_id ? hook_id : this->fresh_hook_handle();
+            auto& reg = this->registrations_[handle];
+            reg.entries.clear();
 
-                auto* installer = hook.is_read ? &icicle_add_read_hook : &icicle_add_write_hook;
-                id = installer(this->emu_, hook.address, hook.address + hook.size, wrapper, ptr);
-                object = std::move(obj);
-            }
-            if (id == 0)
+            for (size_t i = 0; i < this->vcpus_.size(); ++i)
             {
-                throw std::runtime_error("Icicle memory hook registration failed");
-            }
-            this->hooks_[id] = std::move(object);
+                auto* const vm = this->vcpus_[i]->handle();
+                std::unique_ptr<utils::object> object;
+                uint32_t id{};
+                if (hook.observation)
+                {
+                    // Shape + bind the observation to vCPU i (outcome + host/guest origin), deferring to it.
+                    auto shaped = [this, i, cb = hook.observation](uint64_t access, const void* data, size_t length,
+                                                                   uint64_t error, int32_t host_write) {
+                        try
+                        {
+                            cb(this->acting_cpu(i), access, data, length,
+                               {.outcome = error == 0 ? memory_access_outcome::completed : memory_access_outcome::failed,
+                                .backend_error = error,
+                                .origin = host_write != 0 ? memory_write_origin::host : memory_write_origin::guest});
+                        }
+                        catch (...)
+                        {
+                            this->acting_sink(i)->defer_hook_exception(std::current_exception());
+                        }
+                    };
+                    auto obj = make_function_object(
+                        std::function<void(uint64_t, const void*, size_t, uint64_t, int32_t)>(std::move(shaped)), this->is_in_hook_);
+                    auto* ptr = obj.get();
+                    auto* wrapper = +[](void* user, uint64_t address, const void* data, size_t length, uint64_t error, int32_t host_write) {
+                        (*static_cast<decltype(ptr)>(user))(address, data, length, error, host_write);
+                    };
+                    id = icicle_add_write_observation_hook(vm, hook.address, hook.address + hook.size, wrapper, ptr);
+                    object = std::move(obj);
+                }
+                else
+                {
+                    auto obj = make_function_object(this->bind_cpu(i, hook.callback), this->is_in_hook_);
+                    auto* ptr = obj.get();
+                    auto* wrapper = +[](void* user, const uint64_t address, const void* data, size_t length) {
+                        const auto& func = *static_cast<decltype(ptr)>(user);
+                        func(address, data, length);
+                    };
 
-            if (hook_id)
-            {
-                this->id_mapping_[hook_id] = id;
-                return hook_id;
+                    auto* installer = hook.is_read ? &icicle_add_read_hook : &icicle_add_write_hook;
+                    id = installer(vm, hook.address, hook.address + hook.size, wrapper, ptr);
+                    object = std::move(obj);
+                }
+                if (id == 0)
+                {
+                    throw std::runtime_error("Icicle memory hook registration failed");
+                }
+                reg.entries.emplace_back(i, id, std::move(object));
             }
+            reg.pending = false;
 
-            return wrap_hook(id);
+            return handle;
         }
 
         void delete_hook_internal(emulator_hook* hook)
         {
-            auto hook_id = this->id_mapping_.find(hook);
-            if (hook_id == this->id_mapping_.end())
+            auto it = this->registrations_.find(hook);
+            if (it == this->registrations_.end())
             {
                 return;
             }
 
-            if (!hook_id->second.has_value())
+            if (it->second.pending)
             {
-                this->hooks_to_delete_.insert(hook);
+                // Reserved but not yet installed (queued from inside a running hook): cancel the install.
+                this->hooks_to_install_.erase(hook);
+                this->registrations_.erase(it);
                 return;
             }
 
-            const auto id = *hook_id->second;
-            this->id_mapping_.erase(hook_id);
-
-            const auto entry = this->hooks_.find(id);
-            if (entry == this->hooks_.end())
+            for (auto& [vm_index, id, object] : it->second.entries)
             {
-                return;
+                icicle_remove_hook(this->vcpus_[vm_index]->handle(), id);
+                (void)object;
             }
-
-            icicle_remove_hook(this->emu_, id);
-            const auto obj = std::move(entry->second);
-            this->hooks_.erase(entry);
-            (void)obj;
+            this->registrations_.erase(it);
         }
 
         void perform_pending_actions()
@@ -966,7 +1060,8 @@ namespace sogen::icicle
                 return this->hook_memory_access(std::move(hook), nullptr);
             }
 
-            auto* hook_id = wrap_hook(std::nullopt);
+            auto* hook_id = this->fresh_hook_handle();
+            this->registrations_[hook_id].pending = true;
             this->hooks_to_install_[hook_id] = std::move(hook);
 
             this->schedule_action_execution();
@@ -1028,7 +1123,7 @@ namespace sogen::icicle
     inline void icicle_vcpu::start(const size_t count)
     {
         icicle_start(this->emu_, count);
-        this->machine_.rethrow_deferred_hook_exception();
+        this->rethrow_deferred_hook_exception();
         this->throw_if_unhandled_stop();
         this->machine_.perform_pending_actions();
     }
@@ -1076,8 +1171,8 @@ namespace sogen::icicle
         throw std::runtime_error(message.data());
     }
 
-    std::unique_ptr<x86_64_emulator> create_x86_64_emulator()
+    std::unique_ptr<x86_64_emulator> create_x86_64_emulator(const size_t vcpu_count)
     {
-        return std::make_unique<icicle_x86_64_emulator>();
+        return std::make_unique<icicle_x86_64_emulator>(vcpu_count);
     }
 } // namespace sogen::icicle
