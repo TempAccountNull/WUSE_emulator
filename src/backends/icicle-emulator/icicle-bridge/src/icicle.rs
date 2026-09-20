@@ -2110,6 +2110,50 @@ mod parallel_scaling_bench {
     fn run_raw(code: &[u8], icount: u64) -> (u64, f64) { run_raw_jit(code, icount, true) }
     fn run_raw_nojit(code: &[u8], icount: u64) -> (u64, f64) { run_raw_jit(code, icount, false) }
 
+    /// Store-loop (`mov [rax],ecx; inc ecx; jmp`) writing to a data page each iteration. When
+    /// `host_mapped`, the data page is a borrowed host buffer (external, bypasses the JIT direct
+    /// TLB) as SMP shared RAM would be; otherwise a normal page. Ratio = the external-memory tax.
+    fn run_store_loop(host_mapped: bool, icount: u64) -> (u64, f64) {
+        let mut emu = IcicleEmulator::new();
+        assert!(emu.map_memory(0x10000, 0x1000, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+        assert!(emu.write_memory(0x10000, &[0x89, 0x08, 0xFF, 0xC1, 0xEB, 0xFA]));
+        let host = if host_mapped {
+            let layout = std::alloc::Layout::from_size_align(0x1000, 0x1000).unwrap();
+            let p = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!p.is_null());
+            unsafe { assert!(emu.map_host_memory(0x30000, p, 0x1000, FOREIGN_READ | FOREIGN_WRITE)) };
+            Some((p, layout))
+        } else {
+            assert!(emu.map_memory(0x30000, 0x1000, FOREIGN_READ | FOREIGN_WRITE));
+            None
+        };
+        emu.write_register(registers::X86Register::Rax, &0x30000u64.to_le_bytes());
+        emu.vm.cpu.write_pc(0x10000);
+        let before = emu.vm.cpu.icount;
+        let start = Instant::now();
+        emu.start(icount);
+        let out = (emu.vm.cpu.icount - before, start.elapsed().as_secs_f64());
+        drop(emu);
+        if let Some((p, layout)) = host { unsafe { std::alloc::dealloc(p, layout) } }
+        out
+    }
+
+    #[test]
+    fn external_page_speed() {
+        let out = match std::env::var("SOGEN_BENCH_OUT") { Ok(p) => p, Err(_) => return };
+        let icount: u64 = std::env::var("SOGEN_BENCH_ICOUNT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(300_000_000);
+        let (_, tn) = run_store_loop(false, icount);
+        let (_, th) = run_store_loop(true, icount);
+        let mips = |t: f64| icount as f64 / t / 1e6;
+        let report = format!(
+            "external-page store tax | icount={}\nnormal-page  store-loop: {:8.1} MIPS ({:.3}s)\nhost-mapped store-loop: {:8.1} MIPS ({:.3}s)\nexternal tax: {:.2}x slower\n",
+            icount, mips(tn), tn, mips(th), th, th / tn);
+        print!("\n{}", report);
+        if let Some(parent) = std::path::Path::new(&out).parent() { let _ = std::fs::create_dir_all(parent); }
+        std::fs::write(&out, &report).expect("write bench results");
+    }
+
     fn scale(lines: &mut Vec<String>, tag: &str, runner: fn(&[u8], u64) -> (u64, f64),
              code: &[u8], icount: u64, counts: &[usize]) {
         lines.push(format!("--- {} ---", tag));
