@@ -2013,16 +2013,69 @@ mod parallel_scaling_bench {
     use super::*;
     use std::time::Instant;
 
-    fn run_loop(icount: u64) -> (u64, f64) {
+    fn run_loop(code: &[u8], icount: u64) -> (u64, f64) {
         let mut emu = IcicleEmulator::new();
         assert!(emu.map_memory(0x10000, 4096, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
-        // inc rax (48 FF C0) ; jmp -5 (EB FB) => 2 instructions/iteration, no loads/stores.
-        assert!(emu.write_memory(0x10000, &[0x48, 0xFF, 0xC0, 0xEB, 0xFB]));
+        assert!(emu.write_memory(0x10000, code));
         emu.vm.cpu.write_pc(0x10000);
         let before = emu.vm.cpu.icount;
         let start = Instant::now();
         emu.start(icount);
         (emu.vm.cpu.icount - before, start.elapsed().as_secs_f64())
+    }
+
+    /// tiny: inc rax; jmp $-5  => 2 instrs/block, one dispatch every 2 instrs (dispatch-bound).
+    fn tiny_loop() -> Vec<u8> { vec![0x48, 0xFF, 0xC0, 0xEB, 0xFB] }
+
+    /// big: 1000x inc rax; jmp rel32 back => 1001 instrs/block, one dispatch per 1001 instrs
+    /// (steady-state JIT throughput). rel32 = -(3000+5) = -3005 = 0xFFFFF443.
+    fn big_loop() -> Vec<u8> {
+        let mut code = [0x48u8, 0xFF, 0xC0].repeat(1000);
+        code.extend_from_slice(&[0xE9, 0x43, 0xF4, 0xFF, 0xFF]);
+        code
+    }
+
+    /// Same loop on a raw `create_x64_vm()` Vm with NO IcicleEmulator hooks installed: the JIT's
+    /// true throughput ceiling. Comparing this to run_loop isolates the always-on per-instruction
+    /// hook cost.
+    fn run_raw_jit(code: &[u8], icount: u64, jit: bool) -> (u64, f64) {
+        use icicle_vm::cpu::mem::{perm, Mapping};
+        let mut vm = create_x64_vm();
+        vm.enable_jit = jit;
+        vm.cpu.mem.set_capacity(8 * 2 * 50_000);
+        let p = map_permissions(FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC) | perm::MAP | perm::INIT;
+        assert!(vm.cpu.mem.map_memory_len(0x10000, 4096, Mapping { perm: p, value: 0 }));
+        vm.cpu.mem.write_bytes(0x10000, code, perm::NONE).unwrap();
+        vm.cpu.write_pc(0x10000);
+        let before = vm.cpu.icount;
+        vm.icount_limit = vm.cpu.icount.saturating_add(icount);
+        let start = Instant::now();
+        let _ = vm.run();
+        (vm.cpu.icount - before, start.elapsed().as_secs_f64())
+    }
+    fn run_raw(code: &[u8], icount: u64) -> (u64, f64) { run_raw_jit(code, icount, true) }
+    fn run_raw_nojit(code: &[u8], icount: u64) -> (u64, f64) { run_raw_jit(code, icount, false) }
+
+    fn scale(lines: &mut Vec<String>, tag: &str, runner: fn(&[u8], u64) -> (u64, f64),
+             code: &[u8], icount: u64, counts: &[usize]) {
+        lines.push(format!("--- {} ---", tag));
+        let mut baseline = 0.0f64;
+        for &n in counts {
+            let wall = Instant::now();
+            let handles: Vec<_> = (0..n)
+                .map(|_| { let c = code.to_vec(); std::thread::spawn(move || runner(&c, icount)) })
+                .collect();
+            let per: Vec<(u64, f64)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let wall = wall.elapsed().as_secs_f64();
+            let total: u64 = per.iter().map(|(c, _)| *c).sum();
+            let agg = total as f64 / wall / 1e6;
+            let pt = agg / n as f64;
+            if n == 1 { baseline = pt; }
+            let eff = if baseline > 0.0 { pt / baseline } else { 1.0 };
+            lines.push(format!(
+                "threads={:>2}  wall={:>7.3}s  aggregate={:>8.1} MIPS  per_thread={:>7.1} MIPS  eff={:.2}x",
+                n, wall, agg, pt, eff));
+        }
     }
 
     #[test]
@@ -2033,29 +2086,21 @@ mod parallel_scaling_bench {
         };
         let icount: u64 = std::env::var("SOGEN_BENCH_ICOUNT")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(300_000_000);
-        let thread_counts: Vec<usize> = std::env::var("SOGEN_BENCH_THREADS")
+        let counts: Vec<usize> = std::env::var("SOGEN_BENCH_THREADS")
             .ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
             .unwrap_or_else(|| vec![1, 2, 4, 8]);
 
+        let (tiny, big) = (tiny_loop(), big_loop());
         let mut lines = vec![format!(
-            "icicle parallel-scaling bench | icount/thread={} | loop=inc-rax+jmp (2 instr/iter, no mem)",
+            "icicle bench | icount/thread={} | host=20 logical cores | HOOKED=IcicleEmulator (analyzer path), RAW=no per-instruction hook",
             icount)];
-        let mut baseline = 0.0f64;
-        for &n in &thread_counts {
-            let wall = Instant::now();
-            let handles: Vec<_> =
-                (0..n).map(|_| std::thread::spawn(move || run_loop(icount))).collect();
-            let per: Vec<(u64, f64)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-            let wall = wall.elapsed().as_secs_f64();
-            let total: u64 = per.iter().map(|(c, _)| *c).sum();
-            let agg = total as f64 / wall / 1e6;
-            let per_thread = agg / n as f64;
-            if n == 1 { baseline = per_thread; }
-            let eff = if baseline > 0.0 { per_thread / baseline } else { 1.0 };
-            lines.push(format!(
-                "threads={:>2}  wall={:>7.3}s  aggregate={:>8.1} MIPS  per_thread={:>7.1} MIPS  eff={:.2}x",
-                n, wall, agg, per_thread, eff));
-        }
+        scale(&mut lines, "HOOKED tiny(2/blk)", run_loop, &tiny, icount, &counts);
+        scale(&mut lines, "HOOKED big(1001/blk)", run_loop, &big, icount, &counts);
+        scale(&mut lines, "RAW/no-hook tiny(2/blk)", run_raw, &tiny, icount, &[1, 4]);
+        scale(&mut lines, "RAW/no-hook big(1001/blk)", run_raw, &big, icount, &[1, 4]);
+        scale(&mut lines, "RAW NOJIT/interpreter tiny(2/blk)", run_raw_nojit, &tiny, icount, &[1]);
+        scale(&mut lines, "RAW NOJIT/interpreter big(1001/blk)", run_raw_nojit, &big, icount, &[1]);
+
         let report = lines.join("\n") + "\n";
         print!("\n{}", report);
         if let Some(parent) = std::path::Path::new(&out).parent() {
