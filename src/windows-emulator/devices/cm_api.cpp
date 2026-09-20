@@ -2,6 +2,8 @@
 #include "../std_include.hpp"
 #include "../windows_emulator.hpp"
 
+#include <cstdlib> // std::getenv for the SOGEN_LOG_CMAPI_INTERFACE_LIST gate
+
 namespace sogen {
 namespace {
 struct registry_request {
@@ -1343,10 +1345,20 @@ struct cm_api : stateless_device {
       c.io_status_block.access(
           [&](auto &block) { block.Information = 20u + copied; });
     }
-    win_emu.log.info("CMApi interface list %s (%s): %u bytes, status 0x%08X\n",
-                     u16_to_u8(guid_name(request.interface_class)).c_str(),
-                     request.flags == 0 ? "all registered" : "active", required,
-                     static_cast<uint32_t>(status));
+    // The interface-list query fires thousands of times during device enumeration (each guest
+    // re-scan walks every class), so this per-query line floods the console and costs log I/O on
+    // the hot path. Suppress it by default; opt back in with SOGEN_LOG_CMAPI_INTERFACE_LIST=1
+    // (the panel's "Log CMApi interface list" checkbox). Every other CMApi log is unaffected.
+    static const bool log_interface_list = [] {
+      const char *value = std::getenv("SOGEN_LOG_CMAPI_INTERFACE_LIST");
+      return value && *value && *value != '0';
+    }();
+    if (log_interface_list) {
+      win_emu.log.info("CMApi interface list %s (%s): %u bytes, status 0x%08X\n",
+                       u16_to_u8(guid_name(request.interface_class)).c_str(),
+                       request.flags == 0 ? "all registered" : "active", required,
+                       static_cast<uint32_t>(status));
+    }
     return STATUS_SUCCESS;
   }
 
