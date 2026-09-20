@@ -1,4 +1,4 @@
-use std::{cell::UnsafeCell, ptr::NonNull, rc::Rc};
+use std::{cell::UnsafeCell, ptr::NonNull, sync::Arc};
 
 use crate::{MemError, MemResult, perm};
 
@@ -187,7 +187,7 @@ impl PhysicalMemory {
 // @todo: make: copy_on_write, modified, and executed bitflags
 pub struct Page {
     /// The content of the page.
-    data: UnsafeCell<Rc<PageData>>,
+    data: UnsafeCell<Arc<PageData>>,
 
     /// Keeps track of whether this page implements 'copy-on-write' semantics. (i.e. if true, then
     /// modifications to this page are should not be visible to other virtual address spaces
@@ -205,7 +205,7 @@ impl Clone for Page {
     fn clone(&self) -> Self {
         Self {
             // Safety: this method invalidates any active `PageRef` used for writing.
-            data: Rc::clone(unsafe { self.data.get().as_ref().unwrap() }).into(),
+            data: Arc::clone(unsafe { self.data.get().as_ref().unwrap() }).into(),
             copy_on_write: self.copy_on_write,
             modified: self.modified,
             executed: self.executed,
@@ -216,7 +216,7 @@ impl Clone for Page {
 impl Page {
     fn new() -> Self {
         Self {
-            data: UnsafeCell::new(Rc::default()),
+            data: UnsafeCell::new(Arc::default()),
             modified: false,
             copy_on_write: false,
             executed: false,
@@ -252,7 +252,7 @@ impl Page {
 
     #[inline(always)]
     pub fn data_mut(&mut self) -> &mut PageData {
-        Rc::make_mut(self.data.get_mut())
+        Arc::make_mut(self.data.get_mut())
     }
 
     /// Returns a pointer that can be used for reading/writing.
@@ -274,7 +274,7 @@ impl Page {
     /// after a call to [Drop::drop]).
     #[inline(always)]
     pub unsafe fn read_ptr(&mut self) -> PageRef {
-        PageRef::new(NonNull::new(Rc::as_ptr(self.data.get_mut()) as *mut _).unwrap())
+        PageRef::new(NonNull::new(Arc::as_ptr(self.data.get_mut()) as *mut _).unwrap())
     }
 }
 
@@ -306,6 +306,14 @@ impl PageBytes {
         self.external.is_some()
     }
 }
+
+// SAFETY: `external` is a raw pointer to caller-owned memory whose validity is guaranteed by the
+// `borrowed` contract. For multi-vCPU SMP the guest RAM backing is a stable allocation shared across
+// per-vCPU VMs on different OS threads; concurrent access is coordinated by the host CPU's own cache
+// coherency (like real hardware). Inline pages are plain bytes. So sharing PageBytes across threads
+// is sound; enabling it lets `Arc<PageData>` back a shared guest address space.
+unsafe impl Send for PageBytes {}
+unsafe impl Sync for PageBytes {}
 
 impl std::ops::Deref for PageBytes {
     type Target = [u8; PAGE_SIZE];
