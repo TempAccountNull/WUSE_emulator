@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <shared_mutex>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -820,6 +821,7 @@ namespace sogen::icicle
 
         void delete_hook(emulator_hook* hook) override
         {
+            std::unique_lock lock(this->partition_mutex_);
             if (this->is_in_hook_)
             {
                 this->hooks_to_delete_.insert(hook);
@@ -934,6 +936,13 @@ namespace sogen::icicle
         std::unordered_set<emulator_hook*> hooks_to_delete_{};
         std::unordered_map<emulator_hook*, memory_access_hook> hooks_to_install_{};
 
+        // Step 6.1 (mirrors WHP whp_x86_64_emulator::partition_mutex_): guards the machine's shared hook
+        // tables (registrations_/hooks_to_install_/hooks_to_delete_/index_) so the N vCPU worker threads
+        // can mutate/consult them without racing. unique_lock to mutate, shared_lock to read (reads added
+        // with the memory-routing work in 6.4). Lock order matches WHP: BEL -> partition_mutex, never the
+        // reverse. Held only for C++ table work — never while invoking a guest/user callback.
+        mutable std::shared_mutex partition_mutex_{};
+
         emulator_hook* fresh_hook_handle()
         {
             const auto id = ++this->index_;
@@ -1027,6 +1036,8 @@ namespace sogen::icicle
 
         void perform_pending_actions()
         {
+            // Runs at the end of every vCPU's start() on its worker thread → concurrent across vCPUs.
+            std::unique_lock lock(this->partition_mutex_);
             const auto hooks_to_delete = std::move(this->hooks_to_delete_);
 
             this->hooks_to_delete_ = {};
@@ -1055,6 +1066,7 @@ namespace sogen::icicle
             {
                 throw std::invalid_argument("Invalid Icicle memory hook range");
             }
+            std::unique_lock lock(this->partition_mutex_);
             if (!this->is_in_hook_)
             {
                 return this->hook_memory_access(std::move(hook), nullptr);

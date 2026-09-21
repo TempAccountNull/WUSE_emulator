@@ -2,6 +2,7 @@
 #include "../backends/icicle-emulator/icicle_x86_64_emulator.hpp"
 #include <memory_manager.hpp>
 #include <array>
+#include <thread>
 
 namespace sogen::test
 {
@@ -48,5 +49,45 @@ namespace sogen::test
         auto emu = icicle::create_x86_64_emulator(1);
         EXPECT_EQ(emu->vcpu_count(), 1U);
         EXPECT_FALSE(emu->supports_multiple_vcpus());
+    }
+
+    // Step 6.1 verification: two vCPUs execute a bounded countdown loop over the SAME shared code page
+    // SIMULTANEOUSLY on their own threads. Each vCPU's start() ends by calling the machine's
+    // perform_pending_actions on its worker thread, so this races that path — partition_mutex_ must make it
+    // safe. Each vCPU has its own RCX; both must reach 0. (No runtime hooks/mutation here — that is 6.3/6.4.)
+    TEST(IcicleSmp, TwoVcpusExecuteConcurrentlyOverSharedCode)
+    {
+        auto emu = icicle::create_x86_64_emulator(2);
+        ASSERT_EQ(emu->vcpu_count(), 2U);
+
+        memory_manager memory(*emu);
+        const auto code = memory.allocate_memory(0x1000, memory_permission::all);
+        ASSERT_NE(code, 0U);
+
+        // dec rcx (48 FF C9); jnz -5 back to dec (75 FB); then a NOP sled to land in after the loop.
+        std::array<uint8_t, 32> prog{};
+        prog.fill(0x90);
+        prog[0] = 0x48;
+        prog[1] = 0xFF;
+        prog[2] = 0xC9;
+        prog[3] = 0x75;
+        prog[4] = 0xFB;
+        emu->write_memory(code, prog.data(), prog.size());
+
+        constexpr uint64_t iters = 100000;
+        const auto run = [&](const size_t i) {
+            auto& cpu = emu->get_cpu(i);
+            cpu.reg(x86_register::rcx, iters);
+            cpu.reg(x86_register::rip, code);
+            cpu.start(2 * iters + 16); // N dec + N jnz + a few trailing NOPs
+        };
+
+        std::thread t0(run, 0);
+        std::thread t1(run, 1);
+        t0.join();
+        t1.join();
+
+        EXPECT_EQ(emu->get_cpu(0).reg(x86_register::rcx), 0U) << "vCPU 0 loop did not complete";
+        EXPECT_EQ(emu->get_cpu(1).reg(x86_register::rcx), 0U) << "vCPU 1 loop did not complete";
     }
 }
