@@ -431,6 +431,7 @@ namespace sogen::icicle
             this->emu_ = this->vcpus_[0]->handle();
             this->quiesce_cancel_.assign(vcpu_count, 0);
             this->quantum_kick_.assign(vcpu_count, 0);
+            this->issuer_seq_.assign(vcpu_count, 0);
             this->pending_ops_.resize(vcpu_count);
         }
 
@@ -572,16 +573,14 @@ namespace sogen::icicle
             void* const raw = icicle_smp_capture(source, address, size);
             ice(raw != nullptr, "Failed to capture SMP pages");
             const std::shared_ptr<void> captured(raw, icicle_smp_release_capture);
+            const uint64_t seq = this->issuer_next(self->index());
+            for (auto& v : this->vcpus_)
             {
-                std::lock_guard<std::mutex> lock(this->pending_mutex_);
-                for (auto& v : this->vcpus_)
+                if (v.get() != self)
                 {
-                    if (v.get() != self)
-                    {
-                        this->pending_ops_[v->index()].push_back([captured, address](icicle_emulator* h) {
-                            ice(icicle_smp_map_captured(h, captured.get(), address), "Failed to map captured SMP pages");
-                        });
-                    }
+                    this->queue_op(v->index(), seq, [captured, address](icicle_emulator* h) {
+                        ice(icicle_smp_map_captured(h, captured.get(), address), "Failed to map captured SMP pages");
+                    });
                 }
             }
             // A peer can observe pointers into this new region as soon as this syscall's guest-visible
@@ -622,15 +621,13 @@ namespace sogen::icicle
             }
             // vCPU mutator: apply to own VM now (its result represents the coherent shared space), queue peers.
             const bool ok = icicle_map_shared_memory(self->handle(), address, source, size, perm) != 0;
+            const uint64_t seq = this->issuer_next(self->index());
+            for (auto& v : this->vcpus_)
             {
-                std::lock_guard<std::mutex> lock(this->pending_mutex_);
-                for (auto& v : this->vcpus_)
+                if (v.get() != self)
                 {
-                    if (v.get() != self)
-                    {
-                        this->pending_ops_[v->index()].push_back(
-                            [address, source, size, perm](icicle_emulator* h) { icicle_map_shared_memory(h, address, source, size, perm); });
-                    }
+                    this->queue_op(v->index(), seq,
+                                   [address, source, size, perm](icicle_emulator* h) { icicle_map_shared_memory(h, address, source, size, perm); });
                 }
             }
             this->kick_peers(self->index());
@@ -679,6 +676,12 @@ namespace sogen::icicle
             // quantum write race remains open: needs op-application via the icicle C ABI that
             // never re-enters C++ write paths, or a scheduler-level drain before worker writes.
 
+            // NOTE (5th attempt, reverted): pre-write op application destabilizes IcicleSmp
+            // (6-7/8) even over per-issuer-ordered queues - the disturbance is not ordering but
+            // timing/state (eager application changes when peers observe ops). The between-quantum
+            // Unmapped race needs the windows_emulator to stop issuing such writes outside a
+            // quantum (or provide an explicit pre-write hook) - backend-only fixes are exhausted.
+
             // SMP 6.6: if the written range is translated on ANY VM (detected via the shared PageData
             // IN_CODE_CACHE perms — visible from any single view), every OTHER VM's translation of it
             // must be dropped too, or a peer keeps executing stale code after this write.
@@ -703,14 +706,13 @@ namespace sogen::icicle
                 const bool ok = icicle_write_memory(this->emu_, address, data, size);
                 if (cached)
                 {
+                    // External writer: its own issuer slot (index == vcpus_.size(), beyond any vCPU).
+                    const uint64_t eseq = this->issuer_next(this->vcpus_.size());
+                    for (auto& v : this->vcpus_)
                     {
-                        std::lock_guard<std::mutex> lock(this->pending_mutex_);
-                        for (auto& v : this->vcpus_)
-                        {
-                            this->pending_ops_[v->index()].push_back([address, size](icicle_emulator* h) {
-                                (void)icicle_invalidate_code_range(h, address, size);
-                            });
-                        }
+                        this->queue_op(v->index(), eseq, [address, size](icicle_emulator* h) {
+                            (void)icicle_invalidate_code_range(h, address, size);
+                        });
                     }
                     this->kick_peers(std::numeric_limits<size_t>::max()); // external: no own vCPU to skip
                 }
@@ -721,18 +723,16 @@ namespace sogen::icicle
             const bool ok = icicle_write_memory(self->handle(), address, data, size);
             if (cached)
             {
+                const uint64_t iseq = this->issuer_next(own);
+                for (auto& v : this->vcpus_)
                 {
-                    std::lock_guard<std::mutex> lock(this->pending_mutex_);
-                    for (auto& v : this->vcpus_)
+                    if (v->index() == own)
                     {
-                        if (v->index() == own)
-                        {
-                            continue;
-                        }
-                        this->pending_ops_[v->index()].push_back([address, size](icicle_emulator* h) {
-                            (void)icicle_invalidate_code_range(h, address, size);
-                        });
+                        continue;
                     }
+                    this->queue_op(v->index(), iseq, [address, size](icicle_emulator* h) {
+                        (void)icicle_invalidate_code_range(h, address, size);
+                    });
                 }
                 this->kick_peers(own);
             }
@@ -805,19 +805,22 @@ namespace sogen::icicle
             const auto own = self->index();
             const uint64_t epoch = icicle_perm_epoch_of_range(self->handle(), address, size);
             ice(icicle_protect_memory(self->handle(), address, size, perm), "Failed to apply permissions");
+            const uint64_t pseq = this->issuer_next(own);
+            for (auto& v : this->vcpus_)
             {
-                std::lock_guard<std::mutex> lock(this->pending_mutex_);
-                for (auto& v : this->vcpus_)
+                if (v->index() != own)
                 {
-                    if (v->index() != own)
-                    {
-                        this->pending_ops_[v->index()].push_back([=](icicle_emulator* h) {
-                            if (icicle_perm_epoch_of_range(h, address, size) == epoch)
-                            {
-                                ice(icicle_protect_memory(h, address, size, perm), "Failed to apply permissions");
-                            }
-                        });
-                    }
+                    this->queue_op(v->index(), pseq, [this, address, size, perm, epoch, own, pseq](icicle_emulator* h) {
+                        // Same-issuer sequences (this issuer's earlier map) always apply in order;
+                        // the perm_epoch stale-skip applies only CROSS-issuer (the recording vCPU's
+                        // own next seq > pseq means this protect was superseded by its own later op).
+                        const uint64_t now_seq = this->issuer_seq_.size() > own ? this->issuer_seq_[own] : pseq + 1;
+                        const bool superseded_by_same_issuer = now_seq > pseq + 1;
+                        if (!superseded_by_same_issuer && icicle_perm_epoch_of_range(h, address, size) == epoch)
+                        {
+                            ice(icicle_protect_memory(h, address, size, perm), "Failed to apply permissions");
+                        }
+                    });
                 }
             }
             this->kick_peers(own);
@@ -1301,7 +1304,40 @@ namespace sogen::icicle
         // N>1 sample probe). Instead it applies to its OWN VM now and queues the op per-peer; each peer
         // drains its queue on its own thread at begin_run_quantum, before it next executes.
         std::mutex pending_mutex_{};
-        std::vector<std::vector<std::function<void(icicle_emulator*)>>> pending_ops_{}; // [vm index] -> ops(handle)
+        // 6.6c'' per-issuer op queues: every queued op carries (issuer, seq). Same-issuer
+        // sequences (the loader's map->protect) ALWAYS apply in order; the perm_epoch stale-skip
+        // only applies to CROSS-issuer ops (a stale protect from another thread over a range this
+        // issuer remapped). This reconciles eager application with the epoch guard.
+        struct pending_op
+        {
+            uint64_t seq{}; // issuer-local sequence number
+            std::function<void(icicle_emulator*)> apply{};
+        };
+        std::vector<std::vector<pending_op>> pending_ops_{}; // [vm index] -> ops(handle)
+        // Next sequence number per issuer vCPU index (monotonic).
+        std::vector<uint64_t> issuer_seq_{};
+
+        // Queue `op` for peer vCPU `target`, stamped with the ISSUING vCPU's sequence. External
+        // (setup) callers issue as vCPU 0 semantics with their own counter — use size_t max issuer?
+        // Simpler: external callers pass issuer = their own index sentinel via issuer_next().
+        uint64_t issuer_next(const size_t issuer)
+        {
+            if (issuer >= this->issuer_seq_.size())
+            {
+                this->issuer_seq_.resize(issuer + 1, 0);
+            }
+            return this->issuer_seq_[issuer]++;
+        }
+
+        void queue_op(const size_t target, const uint64_t seq, std::function<void(icicle_emulator*)> op)
+        {
+            std::lock_guard<std::mutex> lock(this->pending_mutex_);
+            if (target >= this->pending_ops_.size())
+            {
+                return;
+            }
+            this->pending_ops_[target].push_back(pending_op{seq, std::move(op)});
+        }
 
         emulator_hook* fresh_hook_handle()
         {
@@ -1354,15 +1390,13 @@ namespace sogen::icicle
             }
             per_vm_op(self->index());
             const auto own = self->index();
+            const uint64_t rseq = this->issuer_next(own);
+            for (auto& v : this->vcpus_)
             {
-                std::lock_guard<std::mutex> lock(this->pending_mutex_);
-                for (auto& v : this->vcpus_)
+                if (v->index() != own)
                 {
-                    if (v->index() != own)
-                    {
-                        const auto i = v->index();
-                        this->pending_ops_[i].push_back([this, i, per_vm_op](icicle_emulator*) { per_vm_op(i); });
-                    }
+                    const auto i = v->index();
+                    this->queue_op(i, rseq, [this, i, per_vm_op](icicle_emulator*) { per_vm_op(i); });
                 }
             }
             // Bounded application latency: a peer mid-quantum must not keep executing (potentially
@@ -1679,7 +1713,7 @@ namespace sogen::icicle
         // 6.5 — run the ops queued for this vCPU on its own thread (safe), before it next executes.
         void drain_pending_ops(icicle_vcpu& v)
         {
-            std::vector<std::function<void(icicle_emulator*)>> ops;
+            std::vector<pending_op> ops;
             {
                 std::lock_guard<std::mutex> lock(this->pending_mutex_);
                 ops.swap(this->pending_ops_[v.index_]);
@@ -1699,8 +1733,27 @@ namespace sogen::icicle
             const auto clear = utils::finally([] { t_draining_own_queue = false; });
             for (auto& op : ops)
             {
-                op(v.handle());
+                op.apply(v.handle());
             }
+        }
+
+        // 6.6c'': apply ONE queued op (pure C-ABI; issuer ordering already encoded in the
+        // queue's FIFO). Returns false when empty.
+        bool apply_one_pending_op(icicle_vcpu& v)
+        {
+            pending_op op;
+            {
+                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                auto& queue = this->pending_ops_[v.index_];
+                if (queue.empty())
+                {
+                    return false;
+                }
+                op = std::move(queue.front());
+                queue.erase(queue.begin());
+            }
+            op.apply(v.handle());
+            return true;
         }
 
         // 6.5 — apply a SELF-CONTAINED `op(handle)` (touches only the given handle, never reads another VM)
