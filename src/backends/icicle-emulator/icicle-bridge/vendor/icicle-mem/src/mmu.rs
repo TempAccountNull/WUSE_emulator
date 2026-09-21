@@ -525,6 +525,9 @@ impl Mmu {
     /// guest page (coherency is the host CPU's). Per-byte permissions come from the shared PageData;
     /// the mapping's `shared_perm` is 0. False on a misaligned address or an overlap.
     pub fn map_smp_shared(&mut self, address: u64, data: std::sync::Arc<PageData>) -> bool {
+        // SMP 6.6c'': a (re)map re-establishes this page's perms - bump so stale deferred
+        // protects queued against the PREVIOUS mapping skip (see PageData::perm_epoch).
+        data.bump_perm_epoch();
         let page_size = self.page_size();
         if address % page_size != 0 {
             return false;
@@ -809,7 +812,9 @@ impl Mmu {
                         // traces to this). Protection is a property of the shared page: apply the
                         // perm bytes in place so every sharing VM sees the same protection.
                         // Safety: smp_shared pages are never cloned; see Page::data_mut_shared.
-                        unsafe { page.data_mut_shared() }.perm[offset..offset + len].fill(perm);
+                        let data = unsafe { page.data_mut_shared() };
+                        data.perm[offset..offset + len].fill(perm);
+                        data.bump_perm_epoch();
                     } else {
                         page.data_mut().perm[offset..offset + len].fill(perm);
                     }

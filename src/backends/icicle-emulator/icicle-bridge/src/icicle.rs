@@ -871,6 +871,35 @@ impl IcicleEmulator {
     /// SMP 6.6: read-only query — does [address, address+length) overlap an EXECUTED (translated)
     /// page in this VM? Lets the C++ backend decide whether a host write needs peer fan-out,
     /// without mutating anything.
+    /// SMP 6.6c'': the SMALLEST perm epoch over the range's pages (0 if unmapped). The backend
+    /// captures this when QUEUEING a deferred protect and skips applying if it changed (the
+    /// page was re-mapped/re-protected since - a stale protect must not land over newer perms).
+    pub fn perm_epoch_of_range(&self, address: u64, length: u64) -> u64 {
+        if length == 0 {
+            return 0;
+        }
+        let last = address.saturating_add(length - 1);
+        let mem = &self.vm.cpu.mem;
+        let page_size = mem.page_size();
+        let mut page_address = mem.page_aligned(address);
+        let mut min_epoch = u64::MAX;
+        loop {
+            if let Some(index) = mem.get_physical_index(page_address) {
+                let page = mem.get_physical(index);
+                if page.smp_shared {
+                    min_epoch = min_epoch.min(page.data().perm_epoch());
+                } else {
+                    return 0; // non-shared page: no cross-VM ordering concern
+                }
+            }
+            if last - page_address < page_size {
+                break;
+            }
+            page_address += page_size;
+        }
+        if min_epoch == u64::MAX { 0 } else { min_epoch }
+    }
+
     pub fn code_range_is_cached(&self, address: u64, length: u64) -> bool {
         use icicle_vm::cpu::mem::perm;
         if length == 0 {

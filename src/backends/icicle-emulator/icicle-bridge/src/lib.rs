@@ -69,6 +69,14 @@ pub fn icicle_invalidate_code_range(ptr: *mut c_void, address: u64, length: u64)
 }
 
 #[unsafe(no_mangle)]
+pub fn icicle_perm_epoch_of_range(ptr: *mut c_void, address: u64, length: u64) -> u64 {
+    unsafe {
+        let emulator = &*(ptr as *mut IcicleEmulator);
+        return emulator.perm_epoch_of_range(address, length);
+    }
+}
+
+#[unsafe(no_mangle)]
 pub fn icicle_code_range_is_cached(ptr: *mut c_void, address: u64, length: u64) -> i32 {
     unsafe {
         let emulator = &*(ptr as *mut IcicleEmulator);

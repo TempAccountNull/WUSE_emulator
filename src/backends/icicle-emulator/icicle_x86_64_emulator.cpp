@@ -93,6 +93,8 @@ extern "C"
     // read-only query for whether ANY sharing VM translated the range (shared IN_CODE_CACHE perms).
     int32_t icicle_invalidate_code_range(icicle_emulator*, uint64_t address, uint64_t length);
     int32_t icicle_code_range_is_cached(icicle_emulator*, uint64_t address, uint64_t length);
+    // SMP 6.6c'': smallest perm epoch over a range (0 = not shared/unmapped) for stale-op detection.
+    uint64_t icicle_perm_epoch_of_range(icicle_emulator*, uint64_t address, uint64_t length);
     void icicle_get_exception_name(uint32_t code, data_accessor_func* callback, void* data);
     void icicle_get_vm_exit_description(icicle_emulator*, data_accessor_func* callback, void* data);
     void icicle_stop(icicle_emulator*);
@@ -736,6 +738,9 @@ namespace sogen::icicle
             // ("vCPU 0 worker terminated: Failed to write memory", 0/5 probe batch). Setup-time
             // (non-vCPU) callers keep the hard throw: those failures are real host bugs.
             auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
+            // NOTE: dispatching from BETWEEN-quantum writes (t_running_vcpu null) was tried and
+            // SEGFAULTS - the guest dispatcher needs a real vCPU context. Those writers keep the
+            // throw until the scheduler gives the backend a safe between-quantum dispatch point.
             if (self && &self->machine_ == this && this->violation_callback_)
             {
                 try
@@ -760,12 +765,36 @@ namespace sogen::icicle
         void apply_memory_protection(const uint64_t address, const size_t size, memory_permission permissions) override
         {
             const auto perm = static_cast<uint8_t>(permissions);
-            // SMP: routed (own-VM apply + queued peer apply + kick). A bounded wait for peers to
-            // drain was tried and REVERTED: a peer blocked acquiring the BEL (run_active_, parked in
-            // a hook) can never drain while we hold the BEL, so every protect paid the full timeout
-            // and the sample starved (0/8 vs 1/7 without the wait). Closing this window needs
-            // scheduler-level synchronous TLB flush (QEMU-style exclusive section), not a sleep.
-            this->apply_to_all_vms([=](icicle_emulator* h) { ice(icicle_protect_memory(h, address, size, perm), "Failed to apply permissions"); });
+            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
+            const bool caller_is_vcpu = self && &self->machine_ == this;
+            if (this->vcpus_.size() == 1 || !caller_is_vcpu)
+            {
+                this->apply_to_all_vms([=](icicle_emulator* h) { ice(icicle_protect_memory(h, address, size, perm), "Failed to apply permissions"); });
+                return;
+            }
+            // SMP 6.6c'': STALE-OP GUARD. A deferred protect queued now can land on a peer AFTER
+            // the range was freed and RE-MAPPED (the probe's 'Failed to write memory': a stale
+            // protect over the loader's fresh module). Capture the range's perm epoch at queue
+            // time; the peer's apply skips if the epoch changed (a newer map/protect won).
+            const auto own = self->index();
+            const uint64_t epoch = icicle_perm_epoch_of_range(self->handle(), address, size);
+            ice(icicle_protect_memory(self->handle(), address, size, perm), "Failed to apply permissions");
+            {
+                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                for (auto& v : this->vcpus_)
+                {
+                    if (v->index() != own)
+                    {
+                        this->pending_ops_[v->index()].push_back([=](icicle_emulator* h) {
+                            if (icicle_perm_epoch_of_range(h, address, size) == epoch)
+                            {
+                                ice(icicle_protect_memory(h, address, size, perm), "Failed to apply permissions");
+                            }
+                        });
+                    }
+                }
+            }
+            this->kick_peers(own);
         }
 
         // The cpu_interface a hook on VM `index` reports to its callback. VM 0 is the machine itself
@@ -1228,6 +1257,7 @@ namespace sogen::icicle
 
         // SMP 6.6c': the windows_emulator's violation callback (guest AV dispatch) for host-write perm races.
         memory_violation_hook_callback violation_callback_{};
+        std::atomic_bool ever_ran_{false};
 
         // Step 6.2/6.3 — stop-the-world quiesce (mirrors WHP's cancel-without-stop_requested_ resume): an
         // icicle VM can only be touched by its own thread, so before a cross-VM MMU mutation we pause every
@@ -1571,6 +1601,7 @@ namespace sogen::icicle
         // parked->executing race with run_with_vcpus_paused. N=1: no peers, so no gate.
         void begin_run_quantum(icicle_vcpu& v)
         {
+            this->ever_ran_.store(true);
             if (this->vcpus_.size() == 1)
             {
                 v.run_active_ = true;

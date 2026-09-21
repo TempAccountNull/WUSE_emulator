@@ -420,11 +420,17 @@ pub struct PageData {
     /// host-side fan-out) still invalidates the stale translation. Atomic: shared via the Arc across
     /// vCPU threads; cloned pages snapshot the current value.
     pub code_epoch: AtomicU64,
+
+    /// SMP 6.6c'': bumped whenever this page's perms are re-established (map / update_perm).
+    /// A DEFERRED cross-VM protect captures the epoch at queue time and skips applying if the
+    /// page was re-perm'd since (a stale protect over a freed-and-remapped range must not land
+    /// over the newer mapping's perms - the probe's 'Failed to write memory').
+    pub perm_epoch: AtomicU64,
 }
 
 impl Default for PageData {
     fn default() -> Self {
-        Self { data: PageBytes::default(), perm: [0; PAGE_SIZE], code_epoch: AtomicU64::new(0) }
+        Self { data: PageBytes::default(), perm: [0; PAGE_SIZE], code_epoch: AtomicU64::new(0), perm_epoch: AtomicU64::new(0) }
     }
 }
 
@@ -434,6 +440,7 @@ impl Clone for PageData {
             data: self.data.clone(),
             perm: self.perm,
             code_epoch: AtomicU64::new(self.code_epoch.load(Ordering::Relaxed)),
+            perm_epoch: AtomicU64::new(self.perm_epoch.load(Ordering::Relaxed)),
         }
     }
 }
@@ -447,6 +454,15 @@ impl PageData {
     /// SMP 6.6a: read the cross-VM code epoch for this page.
     pub fn code_epoch(&self) -> u64 {
         self.code_epoch.load(Ordering::Acquire)
+    }
+
+    /// SMP 6.6c'': bump/read the perm epoch (see field doc).
+    pub fn bump_perm_epoch(&self) {
+        self.perm_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn perm_epoch(&self) -> u64 {
+        self.perm_epoch.load(Ordering::Acquire)
     }
 }
 
