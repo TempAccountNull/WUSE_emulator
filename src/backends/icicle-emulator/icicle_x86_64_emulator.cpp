@@ -177,6 +177,9 @@ namespace sogen::icicle
     // thread - t_running_vcpu is null but the thread still belongs to this vCPU, so host-write
     // perm failures can be attributed and DEFERRED to this vCPU's next quantum (6.6c'').
     thread_local void* t_worker_vcpu = nullptr;
+    // True while THIS thread is inside drain_pending_ops: a drained op (e.g. a map) can re-enter
+    // try_write_memory, which would otherwise drain again (re-entrancy broke CrossVmMap/RangedExec).
+    thread_local bool t_draining_own_queue = false;
 
         uint64_t configured_memory_limit_mib()
         {
@@ -670,9 +673,11 @@ namespace sogen::icicle
             {
                 return icicle_write_memory(this->acting_handle(), address, data, size);
             }
-            // NOTE: draining this thread's own queue HERE was tried and REVERTED - the drained ops
-            // re-enter try_write_memory (re-entrancy), breaking CrossVmMap/RangedExecHook (7/8).
-            // The "Unmapped" between-quantum write race needs a reentrancy-guarded drain instead.
+            // NOTE: even REENTRANCY-GUARDED, a pre-write own-queue drain here SEGV'd
+            // TwoVcpusExecuteConcurrentlyOverSharedCode (host AV in test body) - reverted again.
+            // The guard itself stays in drain_pending_ops (hardening). The "Unmapped" between-
+            // quantum write race remains open: needs op-application via the icicle C ABI that
+            // never re-enters C++ write paths, or a scheduler-level drain before worker writes.
 
             // SMP 6.6: if the written range is translated on ANY VM (detected via the shared PageData
             // IN_CODE_CACHE perms — visible from any single view), every OTHER VM's translation of it
@@ -1679,6 +1684,19 @@ namespace sogen::icicle
                 std::lock_guard<std::mutex> lock(this->pending_mutex_);
                 ops.swap(this->pending_ops_[v.index_]);
             }
+            // 6.6c'': reentrancy guard - drained ops (maps/protects) can re-enter host write paths;
+            // a nested drain must not run (double-apply/ordering corruption + the CrossVmMap/
+            // RangedExecHook regressions). Ops queued WHILE draining simply wait for the next drain.
+            if (t_draining_own_queue)
+            {
+                // Put them back in order (front = oldest) so nothing is lost.
+                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                auto& queue = this->pending_ops_[v.index_];
+                queue.insert(queue.begin(), std::make_move_iterator(ops.begin()), std::make_move_iterator(ops.end()));
+                return;
+            }
+            t_draining_own_queue = true;
+            const auto clear = utils::finally([] { t_draining_own_queue = false; });
             for (auto& op : ops)
             {
                 op(v.handle());
