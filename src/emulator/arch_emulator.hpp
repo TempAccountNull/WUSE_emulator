@@ -77,6 +77,14 @@ namespace sogen
             return 1;
         }
 
+        // SMP scheduler integration point: called by the emulator's worker loop between guest
+        // execution quanta (under the kernel lock, OUTSIDE any icicle run / write path) so a
+        // backend with cross-VM op queues can apply everything queued for the vCPU this thread
+        // owns BEFORE the scheduler's own host writes (thread-context save/restore) touch guest
+        // memory. Default: nothing (single-VM backends; mirrors WHP's no-op semantics).
+        virtual void sync_worker_context() {}
+
+
         virtual x86_cpu<Traits>& get_cpu(const size_t index)
         {
             if (index >= this->vcpu_count())

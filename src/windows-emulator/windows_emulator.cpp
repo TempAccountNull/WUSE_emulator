@@ -934,6 +934,11 @@ namespace sogen
             this->start_cpu(vcpu);
             lock.lock();
 
+            // SMP: between quanta (kernel lock held, outside any write path) apply every cross-VM
+            // op queued for this vCPU, so the scheduler's own host writes below (thread-context
+            // save/restore) see freshly queued maps instead of racing them ('Unmapped').
+            this->emu().sync_worker_context();
+
             if (!vcpu.switch_thread && !vcpu.cpu.has_violation())
             {
                 break;

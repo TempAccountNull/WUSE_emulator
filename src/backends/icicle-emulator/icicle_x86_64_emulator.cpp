@@ -771,8 +771,9 @@ namespace sogen::icicle
             }
             if (smp_trace_enabled())
             {
-                std::fprintf(stderr, "[SMPTRC] write-FAIL ice-throw addr=%#llx size=%zu self=%p cb=%d\n",
-                             (unsigned long long)address, size, (void*)self, (int)(bool)this->violation_callback_);
+                std::fprintf(stderr, "[SMPTRC] write-FAIL ice-throw addr=%#llx size=%zu self=%p worker=%p tid=%u cb=%d\n",
+                             (unsigned long long)address, size, (void*)self, (void*)t_worker_vcpu,
+                             (unsigned)(GetCurrentThreadId()), (int)(bool)this->violation_callback_);
             }
                         // 6.6c'': a BETWEEN-quantum worker write (t_running_vcpu null, but this thread owns a
             // vCPU via t_worker_vcpu): DEFER the fault to that vCPU's next begin_run_quantum - a
@@ -1233,6 +1234,20 @@ namespace sogen::icicle
         std::string get_name() const override
         {
             return "icicle-emu";
+        }
+
+        // SMP scheduler integration: apply everything queued for the vCPU this OS thread owns.
+        // Called from the windows_emulator worker between quanta (kernel lock held, outside any
+        // icicle run and outside any write path) - the safe point five write-path attempts could
+        // not synthesize. Fixes the between-quantum 'Unmapped' race (the recurring 1232-byte
+        // CONTEXT write during thread switches hitting a map queued but not yet applied).
+        void sync_worker_context() override
+        {
+            auto* worker = static_cast<icicle_vcpu*>(t_worker_vcpu);
+            if (worker && &worker->machine_ == this)
+            {
+                this->drain_pending_ops(*worker);
+            }
         }
 
       private:
