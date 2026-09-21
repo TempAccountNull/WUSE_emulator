@@ -1295,7 +1295,18 @@ impl Mmu {
                 page.modified = true;
             }
             // Safety: shared bytes; concurrent access across vCPUs is coordinated by host coherency.
-            unsafe { page.data_mut_shared() }.write(addr, value, perm)?;
+            let shared = unsafe { page.data_mut_shared() };
+            // SMP 6.6a: if the written bytes were translated (IN_CODE_CACHE in the SHARED perms — set
+            // by ANY VM's lifter), bump the page's cross-VM code epoch. Peers validate the epoch per
+            // block execution and flush their stale translation. This is the path GUEST stores take
+            // (including cached TLB write pointers on re-entry), which host-side fan-out cannot see.
+            let was_cached = shared.perm[PageData::offset(addr)..PageData::offset(addr) + N]
+                .iter()
+                .any(|p| p & perm::IN_CODE_CACHE != 0);
+            shared.write(addr, value, perm)?;
+            if was_cached {
+                shared.bump_code_epoch();
+            }
             if !self.write_hooks.contains_address(addr, page_size) {
                 self.tlb.insert_write(page_start, unsafe { page.shared_write_ptr() });
             }

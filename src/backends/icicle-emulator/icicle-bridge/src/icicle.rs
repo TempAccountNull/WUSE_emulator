@@ -353,6 +353,8 @@ impl icicle_vm::CodeInjector for InstructionHookInjector {
 
 struct ExecutionHooks {
     stop: Rc<RefCell<bool>>,
+    /// SMP 6.6a: page address -> code_epoch this VM last executed that shared page at.
+    shared_code_epochs: std::collections::HashMap<u64, u64>,
     invalidate_code: Rc<Cell<bool>>,
     generic_hooks: HookContainer<dyn Fn(u64)>,
     ranged_hooks: HookContainer<dyn Fn(u64)>,
@@ -367,6 +369,7 @@ impl ExecutionHooks {
     pub fn new(stop_value: Rc<RefCell<bool>>, invalidate_code: Rc<Cell<bool>>) -> Self {
         Self {
             stop: stop_value,
+            shared_code_epochs: std::collections::HashMap::new(),
             invalidate_code,
             generic_hooks: HookContainer::new(),
             ranged_hooks: HookContainer::new(),
@@ -444,6 +447,41 @@ impl ExecutionHooks {
             cpu.exception =
                 icicle_cpu::Exception::new(ExceptionCode::Environment, CACHE_INVALIDATED);
             return;
+        }
+        // SMP 6.6a: cross-VM self-modifying code. GUEST stores through a peer's TLB write pointer
+        // land in the shared bytes without any host-side fan-out; each sharing page's PageData
+        // carries a cross-VM `code_epoch` bumped on writes to translated bytes. This VM records the
+        // epoch it first executed each SHARED page at and re-checks it per block execution: a bump
+        // means someone (peer or self) rewrote translated code -> raise CACHE_INVALIDATED, which
+        // icicle handles by flushing this VM's code cache and retranslating (fresh bytes).
+        {
+            let mem = &cpu.mem;
+            let page_start = mem.page_aligned(address);
+            if let Some(index) = mem.get_physical_index(page_start) {
+                let page = mem.get_physical(index);
+                // WIP (6.6a): the epoch CHECK is env-gated OFF by default - raising
+                // CACHE_INVALIDATED here currently gets mangled into a ReadUnmapped fetch fault
+                // (gate test: rip=P, value=0). Enable with SOGEN_SMP_EPOCH=1 to work on it.
+                static EPOCH_CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if page.smp_shared
+                    && *EPOCH_CHECK.get_or_init(|| {
+                        std::env::var("SOGEN_SMP_EPOCH").map(|v| v == "1").unwrap_or(false)
+                    })
+                {
+                    let current = page.data().code_epoch();
+                    let seen = self
+                        .shared_code_epochs
+                        .entry(page_start)
+                        .or_insert(current);
+                    if *seen != current {
+                        *seen = current;
+                        self.invalidate_code.set(true);
+                        cpu.exception =
+                            icicle_cpu::Exception::new(ExceptionCode::Environment, CACHE_INVALIDATED);
+                        return;
+                    }
+                }
+            }
         }
         self.run_hooks(address);
 

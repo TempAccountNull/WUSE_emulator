@@ -291,6 +291,79 @@ namespace sogen::test
         EXPECT_EQ(eax(), 0x2222u) << "vCPU 0 executed its stale translation after the peer write";
     }
 
+        // Step 6.6a: GUEST-write SMC — the writer is GUEST CODE (stores through the TLB write
+    // pointer), so no host-write fan-out runs. vCPU 0 loops on code page P (v1); vCPU 1 executes
+    // guest stores (from a separate page Q) that overwrite P with v2; vCPU 0 must then execute
+    // the NEW code. Values printed per step.
+    // DISABLED = open 6.6a target: the epoch mechanism (PageData.code_epoch + write bump +
+    // per-block check, SOGEN_SMP_EPOCH=1) DETECTS the stale translation correctly, but raising
+    // CACHE_INVALIDATED from the bridge's execute() hook currently gets mangled into a
+    // ReadUnmapped fetch fault (rip=P, value=0). Fix the flush/handling path, then enable.
+    TEST(IcicleSmp, DISABLED_GuestSelfModifyingCodeSeenByOtherVcpu)
+    {
+        auto emu = icicle::create_x86_64_emulator(2);
+        ASSERT_EQ(emu->vcpu_count(), 2U);
+
+        memory_manager memory(*emu);
+        const auto page_p = memory.allocate_memory(0x1000, memory_permission::all);
+        const auto page_q = memory.allocate_memory(0x1000, memory_permission::all);
+        ASSERT_NE(page_p, 0U);
+        ASSERT_NE(page_q, 0U);
+
+        // P: v1 = mov eax,0x1111; jmp $-5.  v2 = mov eax,0x2222; jmp $-5.
+        const std::array<uint8_t, 7> v1{0xB8, 0x11, 0x11, 0x00, 0x00, 0xEB, 0xF9};
+        const std::array<uint8_t, 7> v2{0xB8, 0x22, 0x22, 0x00, 0x00, 0xEB, 0xF9};
+        emu->write_memory(page_p, v1.data(), v1.size());
+
+        // Q (guest writer): movabs rax, P; movabs rcx, 7; mov qword [rax], 0x2222_B8 (v2 head);
+        // simpler: write the two dwords of v2 via two mov [rax],ecx steps, then spin.
+        // Encoded: 48 B8 <P>            movabs rax, P
+        //          B9 22 22 00 00       mov ecx, 0x2222
+        //          48 89 08             mov [rax], rcx
+        //          48 83 C0 04          add rax, 4
+        //          B9 00 00 00 00       mov ecx, 0
+        //          89 08                mov [rax], ecx   (imm32 high = 0)
+        //          EB FE                jmp $
+        std::array<uint8_t, 64> q{};
+        size_t n = 0;
+        const auto emit = [&](const std::initializer_list<uint8_t> bytes) {
+            for (const auto b : bytes) { q[n++] = b; }
+        };
+        emit({0x48, 0xB8});
+        const uint64_t p64 = page_p;
+        for (size_t i = 0; i < 8; ++i) { q[n++] = static_cast<uint8_t>(p64 >> (i * 8)); }
+        emit({0xB9, 0x22, 0x22, 0x00, 0x00});
+        emit({0x48, 0x89, 0x08});
+        emit({0x48, 0x83, 0xC0, 0x04});
+        emit({0xB9, 0x00, 0x00, 0x00, 0x00});
+        emit({0x89, 0x08});
+        emit({0xEB, 0xFE});
+        emu->write_memory(page_q, q.data(), q.size());
+
+        auto& cpu0 = emu->get_cpu(0);
+        auto& cpu1 = emu->get_cpu(1);
+        const auto eax0 = [&] { return cpu0.reg(x86_register::rax); };
+
+        std::fprintf(stderr, "[GSMC] STEP1 vCPU0 executes v1 on P\n");
+        cpu0.reg(x86_register::rip, page_p);
+        cpu0.start(10);
+        std::fprintf(stderr, "[GSMC] STEP2 rax=%#llx (expect 0x1111)\n", (unsigned long long)eax0());
+        ASSERT_EQ(eax0(), 0x1111u);
+
+        std::fprintf(stderr, "[GSMC] STEP3 vCPU1 guest-stores v2 over P\n");
+        cpu1.reg(x86_register::rip, page_q);
+        cpu1.start(20);
+        uint64_t check{};
+        emu->read_memory(page_p, &check, 8);
+        std::fprintf(stderr, "[GSMC] STEP4 P head=%#llx (expect 0x00002222_0000b8 or similar v2 bytes)\n", (unsigned long long)check);
+
+        std::fprintf(stderr, "[GSMC] STEP5 vCPU0 re-executes P\n");
+        cpu0.reg(x86_register::rip, page_p);
+        cpu0.start(10);
+        std::fprintf(stderr, "[GSMC] STEP6 rax=%#llx (expect 0x2222, stale=0x1111)\n", (unsigned long long)eax0());
+        EXPECT_EQ(eax0(), 0x2222u) << "vCPU 0 executed stale code after vCPU 1's GUEST stores";
+    }
+
         // Step 6.5 verification — Arc-capture async mapping from an in-hook context reaches peers and they
     // EXECUTE from the region. vCPU A maps a fresh region from inside its own read hook (async path:
     // map+capture on A's VM, queued alias-from-capture + kick for B), writes code + a pointer into shared

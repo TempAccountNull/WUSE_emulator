@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{cell::UnsafeCell, ptr::NonNull, sync::Arc};
 
 use crate::{MemError, MemResult, perm};
@@ -405,7 +406,6 @@ impl std::ops::DerefMut for PageBytes {
     }
 }
 
-#[derive(Clone)]
 #[repr(C)]
 pub struct PageData {
     /// The actual data stored in this page.
@@ -413,11 +413,40 @@ pub struct PageData {
 
     /// The permissions associated with each byte in the page
     pub perm: [u8; PAGE_SIZE],
+
+    /// SMP 6.6a: bumped whenever bytes marked IN_CODE_CACHE in `perm` are written (by ANY sharing
+    /// VM). Each VM's executor records the epoch it translated a page at and re-checks it per block
+    /// execution, so a GUEST store through another VM's TLB write pointer (which bypasses all
+    /// host-side fan-out) still invalidates the stale translation. Atomic: shared via the Arc across
+    /// vCPU threads; cloned pages snapshot the current value.
+    pub code_epoch: AtomicU64,
 }
 
 impl Default for PageData {
     fn default() -> Self {
-        Self { data: PageBytes::default(), perm: [0; PAGE_SIZE] }
+        Self { data: PageBytes::default(), perm: [0; PAGE_SIZE], code_epoch: AtomicU64::new(0) }
+    }
+}
+
+impl Clone for PageData {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            perm: self.perm,
+            code_epoch: AtomicU64::new(self.code_epoch.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl PageData {
+    /// SMP 6.6a: bump the cross-VM code epoch for this page.
+    pub fn bump_code_epoch(&self) {
+        self.code_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// SMP 6.6a: read the cross-VM code epoch for this page.
+    pub fn code_epoch(&self) -> u64 {
+        self.code_epoch.load(Ordering::Acquire)
     }
 }
 
@@ -425,7 +454,7 @@ impl PageData {
     #[allow(unused)]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         assert_eq!(bytes.len(), 2 * PAGE_SIZE);
-        let mut data = Self { data: PageBytes::default(), perm: [0; PAGE_SIZE] };
+        let mut data = Self::default();
         data.data.copy_from_slice(&bytes[..PAGE_SIZE]);
         data.perm[..PAGE_SIZE].copy_from_slice(&bytes[PAGE_SIZE..]);
         data
