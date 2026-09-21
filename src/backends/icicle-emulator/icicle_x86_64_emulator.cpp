@@ -3,6 +3,7 @@
 #include "execution_hook.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <charconv>
@@ -108,6 +109,17 @@ namespace sogen::icicle
             {
                 throw std::runtime_error(std::string(error));
             }
+        }
+
+        // SMP deadlock tracing (SOGEN_SMP_TRACE=1): prints every cross-VM coordination event with
+        // values so a hung run's stderr tail shows exactly which wait is stuck and on which vCPU.
+        bool smp_trace_enabled()
+        {
+            static const bool enabled = [] {
+                const char* v = std::getenv("SOGEN_SMP_TRACE");
+                return v && *v && *v != '0';
+            }();
+            return enabled;
         }
 
         using detail::hook_scope;
@@ -655,18 +667,35 @@ namespace sogen::icicle
             auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
             const bool caller_is_vcpu = self && &self->machine_ == this;
             const bool cached = icicle_code_range_is_cached(this->acting_handle(), address, size);
+            if (smp_trace_enabled() && (cached || !caller_is_vcpu))
+            {
+                std::fprintf(stderr, "[SMPTRC] write addr=%#llx size=%zu cached=%d caller=%s\n",
+                             (unsigned long long)address, size, (int)cached, caller_is_vcpu ? "vcpu" : "external");
+            }
 
             if (!caller_is_vcpu)
             {
-                // External/setup caller: peers are paused — invalidate every VM directly.
-                bool ok = false;
-                this->pause_peers_and([&] {
-                    ok = icicle_write_memory(this->emu_, address, data, size);
-                    for (auto& v : this->vcpus_)
+                // External caller: do NOT pause. A write through the master's view IS the coherent
+                // shared state for SMP-shared guest RAM, so no peer handle needs touching for the
+                // write itself. Pausing here DEADLOCKED: an external loader write waits for a peer's
+                // run_active_ to clear, but the peer can be parked in a hook that cannot progress
+                // (trace: "pause still waiting (44s) for: vcpu0" after write 0x101cd39fb20/1232).
+                // If the range was translated, queue invalidate ops for every VM instead (peers
+                // drain at their next quantum; the kick bounds the latency).
+                const bool ok = icicle_write_memory(this->emu_, address, data, size);
+                if (cached)
+                {
                     {
-                        (void)icicle_invalidate_code_range(v->handle(), address, size);
+                        std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                        for (auto& v : this->vcpus_)
+                        {
+                            this->pending_ops_[v->index()].push_back([address, size](icicle_emulator* h) {
+                                (void)icicle_invalidate_code_range(h, address, size);
+                            });
+                        }
                     }
-                });
+                    this->kick_peers(std::numeric_limits<size_t>::max()); // external: no own vCPU to skip
+                }
                 return ok;
             }
 
@@ -1636,16 +1665,47 @@ namespace sogen::icicle
                     icicle_stop(vcpu->handle());
                 }
             }
-            this->quiesce_cv_.wait(lock, [this] {
-                for (auto& vcpu : this->vcpus_)
-                {
-                    if (vcpu.get() != t_running_vcpu && vcpu->run_active_)
+            // Heartbeat wait (SOGEN_SMP_TRACE): a stuck pause prints which vCPU never cleared
+            // run_active_, so a hung run's stderr tail names the deadlock participant directly.
+            for (int waited_s = 0;; ++waited_s)
+            {
+                const bool ready = [this] {
+                    for (auto& vcpu : this->vcpus_)
                     {
-                        return false;
+                        if (vcpu.get() != t_running_vcpu && vcpu->run_active_)
+                        {
+                            return false;
+                        }
                     }
+                    return true;
+                }();
+                if (ready)
+                {
+                    break;
                 }
-                return true;
-            });
+                if (smp_trace_enabled() && waited_s > 0 && waited_s % 2 == 0)
+                {
+                    std::fprintf(stderr, "[SMPTRC] pause still waiting (%ds) for: ", waited_s);
+                    for (auto& vcpu : this->vcpus_)
+                    {
+                        if (vcpu.get() != t_running_vcpu && vcpu->run_active_)
+                        {
+                            std::fprintf(stderr, "vcpu%u ", vcpu->index_);
+                        }
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+                this->quiesce_cv_.wait_for(lock, std::chrono::seconds(1), [this] {
+                    for (auto& vcpu : this->vcpus_)
+                    {
+                        if (vcpu.get() != t_running_vcpu && vcpu->run_active_)
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                });
+            }
             // Every peer is now outside icicle run(): safe to touch their VMs from this thread.
             fn();
         }

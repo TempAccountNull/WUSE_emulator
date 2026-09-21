@@ -427,6 +427,12 @@ namespace sogen::test
     // ACCESS_VIOLATION (0xC0000005) instead of a host exception/hang — i.e. the host SMP machinery
     // now holds; the remaining failure is guest-visible correctness (cross-vCPU TLB/SMC invalidation
     // = 6.6, LOCK-op atomics on shared bytes = 6.7). Re-enable when those land.
+    // DISABLED: the HOST deadlock is fixed (external writes no longer pause), and the sample now
+    // completes without hanging — but the run is RACY because the guest still hits an AV mid-run
+    // (SMPDIAG: read of ntdll+0x75D68 .text at rip ntdll+0xA0342, tid=12/vCPU1). When the guest's
+    // own handler chain re-raises with code 0 the test passes; when the first 0xC0000005 stands it
+    // fails. Re-enable only when that guest-visible fault is fixed (6.6 TLB-coherency window /
+    // 6.7 atomics). Run with SOGEN_SMP_TRACE=1 to trace cross-VM coordination events.
     TEST(IcicleSmp, DISABLED_MultiThreadedSampleRunsOnTwoVcpus)
     {
         emulator_settings settings{};
