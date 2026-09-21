@@ -12,6 +12,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -170,6 +171,12 @@ namespace sogen::icicle
         // The icicle_vcpu running on the current OS thread (nullptr on non-vCPU threads). Lets a
         // stop-the-world initiated from inside a vCPU's own hook skip pausing/awaiting itself (6.3/6.5).
         thread_local void* t_running_vcpu = nullptr;
+
+    // The vCPU this OS thread OWNS (set at start entry, never cleared). Between quanta -
+    // after start() returns, while the windows_emulator worker still runs host code on this
+    // thread - t_running_vcpu is null but the thread still belongs to this vCPU, so host-write
+    // perm failures can be attributed and DEFERRED to this vCPU's next quantum (6.6c'').
+    thread_local void* t_worker_vcpu = nullptr;
 
         uint64_t configured_memory_limit_mib()
         {
@@ -663,6 +670,9 @@ namespace sogen::icicle
             {
                 return icicle_write_memory(this->acting_handle(), address, data, size);
             }
+            // NOTE: draining this thread's own queue HERE was tried and REVERTED - the drained ops
+            // re-enter try_write_memory (re-entrancy), breaking CrossVmMap/RangedExecHook (7/8).
+            // The "Unmapped" between-quantum write race needs a reentrancy-guarded drain instead.
 
             // SMP 6.6: if the written range is translated on ANY VM (detected via the shared PageData
             // IN_CODE_CACHE perms — visible from any single view), every OTHER VM's translation of it
@@ -758,6 +768,17 @@ namespace sogen::icicle
             {
                 std::fprintf(stderr, "[SMPTRC] write-FAIL ice-throw addr=%#llx size=%zu self=%p cb=%d\n",
                              (unsigned long long)address, size, (void*)self, (int)(bool)this->violation_callback_);
+            }
+                        // 6.6c'': a BETWEEN-quantum worker write (t_running_vcpu null, but this thread owns a
+            // vCPU via t_worker_vcpu): DEFER the fault to that vCPU's next begin_run_quantum - a
+            // REAL vCPU context outside any syscall handler - instead of ice()-throwing out of the
+            // worker. (Dispatching immediately from here SEGFAULTS - tried, reverted.)
+            auto* worker = static_cast<icicle_vcpu*>(t_worker_vcpu);
+            if (worker && &worker->machine_ == this && this->violation_callback_)
+            {
+                std::lock_guard<std::mutex> lock(this->write_faults_mutex_);
+                this->pending_write_faults_[worker->index()].emplace_back(address, size);
+                return;
             }
             ice(false, "Failed to write memory");
         }
@@ -1258,6 +1279,8 @@ namespace sogen::icicle
         // SMP 6.6c': the windows_emulator's violation callback (guest AV dispatch) for host-write perm races.
         memory_violation_hook_callback violation_callback_{};
         std::atomic_bool ever_ran_{false};
+        std::mutex write_faults_mutex_{};
+        std::map<size_t, std::vector<std::pair<uint64_t, size_t>>> pending_write_faults_{};
 
         // Step 6.2/6.3 — stop-the-world quiesce (mirrors WHP's cancel-without-stop_requested_ resume): an
         // icicle VM can only be touched by its own thread, so before a cross-VM MMU mutation we pause every
@@ -1618,6 +1641,34 @@ namespace sogen::icicle
             // queued ops to it (the old drain-before-mark order left that cross-thread window open).
             this->drain_pending_ops(v);
             this->drain_exec_hook_installs(); // outside run(): execution_hooks is not borrowed here
+            this->dispatch_deferred_write_faults(v);
+        }
+
+        // 6.6c'': surface between-quantum host-write perm failures as guest AVs at a REAL vCPU
+        // context (own thread, outside any syscall handler) - the safe dispatch point.
+        void dispatch_deferred_write_faults(icicle_vcpu& v)
+        {
+            if (!this->violation_callback_)
+            {
+                return;
+            }
+            std::vector<std::pair<uint64_t, size_t>> faults;
+            {
+                std::lock_guard<std::mutex> lock(this->write_faults_mutex_);
+                faults.swap(this->pending_write_faults_[v.index()]);
+            }
+            for (auto& fault : faults)
+            {
+                try
+                {
+                    (void)this->violation_callback_(this->acting_cpu(v.index()), fault.first, fault.second,
+                                                    memory_operation::write, memory_violation_type::protection);
+                }
+                catch (...)
+                {
+                    this->acting_sink(v.index())->defer_hook_exception(std::current_exception());
+                }
+            }
         }
 
         // 6.5 — run the ops queued for this vCPU on its own thread (safe), before it next executes.
@@ -1809,6 +1860,7 @@ namespace sogen::icicle
     inline void icicle_vcpu::start(const size_t count)
     {
         this->stop_requested_ = false;
+        t_worker_vcpu = this;
         t_running_vcpu = this;
         const auto clear_current = utils::finally([] { t_running_vcpu = nullptr; });
         // start(count) must run at most `count` instructions in TOTAL. A kick-ended quantum resumes
