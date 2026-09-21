@@ -1177,6 +1177,40 @@ impl IcicleEmulator {
         true
     }
 
+    /// SMP async (step 6.5): capture the shared `Arc<PageData>` for each page of a range on THIS VM's own
+    /// thread (safe), so a peer can later alias them WITHOUT reading this (the source) VM cross-thread while
+    /// it executes. The returned Arcs are `Send`+`Sync` and carried to peers as an opaque handle.
+    pub fn capture_smp_range(&self, address: u64, length: u64) -> Option<Vec<std::sync::Arc<icicle_cpu::mem::physical::PageData>>> {
+        const PAGE: u64 = 0x1000;
+        if address % PAGE != 0 || length == 0 || length % PAGE != 0 {
+            return None;
+        }
+        let mut pages = Vec::with_capacity((length / PAGE) as usize);
+        let mut page = address;
+        let end = address + length;
+        while page < end {
+            pages.push(self.vm.cpu.mem.share_page(page)?);
+            page += PAGE;
+        }
+        Some(pages)
+    }
+
+    /// Alias a previously captured range into THIS VM (the peer), on its own thread. No source VM is read.
+    pub fn map_captured_smp_range(&mut self, captured: &[std::sync::Arc<icicle_cpu::mem::physical::PageData>], address: u64) -> bool {
+        const PAGE: u64 = 0x1000;
+        if address % PAGE != 0 {
+            return false;
+        }
+        let mut page = address;
+        for data in captured {
+            if !self.vm.cpu.mem.map_smp_shared(page, data.clone()) {
+                return false;
+            }
+            page += PAGE;
+        }
+        true
+    }
+
     pub fn map_mmio(
         &mut self,
         address: u64,

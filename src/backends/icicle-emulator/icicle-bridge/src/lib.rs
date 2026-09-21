@@ -173,6 +173,42 @@ pub fn icicle_share_smp_pages(dst: *mut c_void, src: *mut c_void, address: u64, 
     }
 }
 
+// SMP async (step 6.5): capture the shared pages of a range from the SOURCE VM on its own thread, so a peer
+// can alias them later without a cross-thread read of the source. The opaque handle owns the captured Arcs.
+type SmpCapture = Vec<std::sync::Arc<icicle_cpu::mem::physical::PageData>>;
+
+#[unsafe(no_mangle)]
+pub fn icicle_smp_capture(ptr: *mut c_void, address: u64, length: u64) -> *mut c_void {
+    unsafe {
+        let emulator = &*(ptr as *mut IcicleEmulator);
+        match emulator.capture_smp_range(address, length) {
+            Some(pages) => Box::into_raw(Box::new(pages)) as *mut c_void,
+            None => std::ptr::null_mut(),
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn icicle_smp_map_captured(ptr: *mut c_void, captured: *mut c_void, address: u64) -> i32 {
+    unsafe {
+        if captured.is_null() {
+            return 0;
+        }
+        let emulator = &mut *(ptr as *mut IcicleEmulator);
+        let pages = &*(captured as *const SmpCapture);
+        to_cbool(emulator.map_captured_smp_range(pages, address))
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn icicle_smp_release_capture(captured: *mut c_void) {
+    if !captured.is_null() {
+        unsafe {
+            drop(Box::from_raw(captured as *mut SmpCapture));
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub fn icicle_unmap_memory(ptr: *mut c_void, address: u64, length: u64) -> i32 {
     unsafe {
