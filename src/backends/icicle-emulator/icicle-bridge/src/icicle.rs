@@ -476,9 +476,9 @@ impl ExecutionHooks {
                     if *seen != current {
                         *seen = current;
                         self.invalidate_code.set(true);
-                        cpu.exception =
-                            icicle_cpu::Exception::new(ExceptionCode::Environment, CACHE_INVALIDATED);
-                        return;
+                        // Fall through to run_hooks + the TAIL raise below — the exact shape of the
+                        // working mid-run invalidate_code path (raising EARLY here, before run_hooks,
+                        // got mangled into ReadUnmapped(value=0) in the re-fetch after the flush).
                     }
                 }
             }

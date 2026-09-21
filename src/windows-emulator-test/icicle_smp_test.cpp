@@ -359,7 +359,19 @@ namespace sogen::test
 
         std::fprintf(stderr, "[GSMC] STEP5 vCPU0 re-executes P\n");
         cpu0.reg(x86_register::rip, page_p);
-        cpu0.start(10);
+        try
+        {
+            cpu0.start(10);
+        }
+        catch (const std::exception& e)
+        {
+            uint64_t head{};
+            emu->read_memory(page_p, &head, 8);
+            std::fprintf(stderr,
+                         "[GSMC] STEP5-FAULT %s | master P head=%#llx | vcpu0 rip=%#llx rax=%#llx\n", e.what(),
+                         (unsigned long long)head, (unsigned long long)cpu0.reg(x86_register::rip),
+                         (unsigned long long)cpu0.reg(x86_register::rax));
+        }
         std::fprintf(stderr, "[GSMC] STEP6 rax=%#llx (expect 0x2222, stale=0x1111)\n", (unsigned long long)eax0());
         EXPECT_EQ(eax0(), 0x2222u) << "vCPU 0 executed stale code after vCPU 1's GUEST stores";
     }
