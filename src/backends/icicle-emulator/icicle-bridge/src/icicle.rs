@@ -819,8 +819,19 @@ impl IcicleEmulator {
                 let page = self.vm.cpu.mem.get_physical_mut(index);
                 if page.executed {
                     page.executed = false;
-                    for permission in &mut page.data_mut().perm {
-                        *permission &= !icicle_cpu::mem::perm::IN_CODE_CACHE;
+                    if page.smp_shared {
+                        // SMP: never `make_mut` a shared page — the clone would privatize this VM's
+                        // view and silently diverge the vCPUs (write_memory invalidates before
+                        // writing, so every host write to executed shared memory hits this).
+                        // Safety: smp_shared pages are never cloned; see Page::data_mut_shared.
+                        let data = unsafe { page.data_mut_shared() };
+                        for permission in &mut data.perm {
+                            *permission &= !icicle_cpu::mem::perm::IN_CODE_CACHE;
+                        }
+                    } else {
+                        for permission in &mut page.data_mut().perm {
+                            *permission &= !icicle_cpu::mem::perm::IN_CODE_CACHE;
+                        }
                     }
                     changed = true;
                 }
@@ -959,6 +970,10 @@ impl IcicleEmulator {
 
         self.vm.cpu.write_pc(self.vm.cpu.read_pc() + 2);
         return true;
+    }
+
+    pub fn icount(&self) -> u64 {
+        return self.vm.cpu.icount;
     }
 
     pub fn stop(&mut self) {

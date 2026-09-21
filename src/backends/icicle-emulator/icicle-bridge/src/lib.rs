@@ -53,6 +53,14 @@ pub fn icicle_get_stop_info(ptr: *mut c_void, out: *mut IcicleStopInfo) -> i32 {
 }
 
 #[unsafe(no_mangle)]
+pub fn icicle_get_icount(ptr: *mut c_void) -> u64 {
+    unsafe {
+        let emulator = &*(ptr as *mut IcicleEmulator);
+        return emulator.icount();
+    }
+}
+
+#[unsafe(no_mangle)]
 pub fn icicle_get_vm_exit_description(ptr: *mut c_void, callback: DataFunction, data: *mut c_void) {
     let emulator = unsafe { &*(ptr as *mut IcicleEmulator) };
     let description = emulator.vm_exit_description();

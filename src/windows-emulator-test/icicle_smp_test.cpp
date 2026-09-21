@@ -3,6 +3,9 @@
 #include <memory_manager.hpp>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstring>
+#include <span>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -153,12 +156,231 @@ namespace sogen::test
         }
     }
 
-    // Step 6.5/6.8 regression target (DISABLED_ so it never hangs the default suite; run explicitly with an
-    // external timeout, and only where the emulator root actually contains filesys/c/test-sample.exe).
-    // Runs the multi-threaded test-sample on 2 icicle vCPUs through the REAL windows_emulator. N>1 requires
-    // the lean, wall-clock path (use_instruction_precision=false + use_relative_time=false; both otherwise
-    // hard-error "requires a single vCPU"). Once 6.5 (peer-in-hook resolution) lands this becomes a real
-    // (renamed) regression test.
+    // Step 6.5 verification — the backend peer-in-hook deadlock reproducer. vCPU B is parked INSIDE an
+    // execution-hook callback (unstoppable: still in icicle run(), waiting for a flag only vCPU A sets
+    // AFTER its install call returns). vCPU A, from inside its own read hook (in-hook context, exactly the
+    // windows_emulator BEL-held shape, e.g. on_module_load installing section hooks), requests a ranged
+    // execution hook. The pre-6.5 code paused peers from there and waited for B's run_active_ — A waits
+    // for B, B waits for A's flag: hang. The fix defers the install to A's own next instruction (async
+    // routing). Pass = completes without hanging, the deferred hook actually fires, and both loops finish.
+    TEST(IcicleSmp, RangedExecHookDeferredFromInHookContextWithPeerParkedInHook)
+    {
+        auto emu = icicle::create_x86_64_emulator(2);
+        ASSERT_EQ(emu->vcpu_count(), 2U);
+
+        memory_manager memory(*emu);
+        const auto page = memory.allocate_memory(0x1000, memory_permission::all);
+        ASSERT_NE(page, 0U);
+        const uint64_t data = page + 0x400; // A's hooked read target (shared page)
+
+        // A @ +0x000: movabs rbx,data; mov rcx,[rbx] (fires read hook); movabs rcx,N; dec/jnz loop @ +0x17.
+        // B @ +0x200: movabs rcx,N; dec/jnz loop, dec @ +0x20A carries B's exact-address exec hook.
+        std::array<uint8_t, 0x600> prog{};
+        prog.fill(0x90);
+        const auto emit_movabs = [](uint8_t* p, uint8_t rex_op, const uint64_t imm) {
+            p[0] = 0x48;
+            p[1] = rex_op;
+            std::memcpy(p + 2, &imm, sizeof(imm));
+        };
+        emit_movabs(&prog[0x00], 0xBB, data);         // movabs rbx, data
+        prog[0x0A] = 0x48; prog[0x0B] = 0x8B; prog[0x0C] = 0x03; // mov rcx, [rbx]
+        constexpr uint64_t iters = 50000;
+        emit_movabs(&prog[0x0D], 0xB9, iters);        // movabs rcx, N
+        prog[0x17] = 0x48; prog[0x18] = 0xFF; prog[0x19] = 0xC9; // a_loop: dec rcx  ← deferred ranged hook range
+        prog[0x1A] = 0x75; prog[0x1B] = 0xFB;                     // jnz a_loop
+        for (auto& b : std::span(prog).subspan(0x400, 0x200))
+        {
+            b = 0; // data cells must read 0, not NOP bytes (Test 2 polls `target` for nonzero)
+        }
+        emit_movabs(&prog[0x200], 0xB9, iters);       // movabs rcx, N
+        prog[0x20A] = 0x48; prog[0x20B] = 0xFF; prog[0x20C] = 0xC9; // b_loop: dec rcx ← exact exec hook
+        prog[0x20D] = 0x75; prog[0x20E] = 0xFB;                     // jnz b_loop
+        emu->write_memory(page, prog.data(), prog.size());
+
+        std::atomic<bool> b_parked{false};
+        std::atomic<bool> release_b{false};
+        std::atomic<bool> install_requested{false};
+        std::atomic<size_t> ranged_hits{0};
+
+        // B parks inside its FIRST hook invocation until A's install call has returned (old code: A could
+        // never get there because it was waiting for B to leave run() — the deadlock).
+        emu->hook_memory_execution(page + 0x20A, [&](cpu_interface&, const uint64_t) {
+            static std::atomic<bool> parked_once{false};
+            if (!parked_once.exchange(true))
+            {
+                b_parked.store(true);
+                // Bounded so a regression fails the run instead of hanging the suite forever; generous
+                // enough that the fixed path (release within microseconds) never trips it.
+                for (int i = 0; i < 3000 && !release_b.load(std::memory_order_acquire); ++i)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            }
+        });
+
+        // A's read hook = the in-hook (BEL-held shape) context: request a ranged exec hook over A's loop.
+        emu->hook_memory_read(data, 8, [&](cpu_interface&, uint64_t, const void*, size_t) {
+            for (int i = 0; i < 2000 && !b_parked.load(std::memory_order_acquire); ++i)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            // With 6.5 this DEFERS (no peer pause): pre-6.5 this call hung waiting for parked B.
+            emu->hook_memory_range_execution(page + 0x17, 16, [&](cpu_interface&, const uint64_t) {
+                ranged_hits.fetch_add(1);
+            });
+            install_requested.store(true);
+            release_b.store(true); // only reachable once the install call RETURNED
+        });
+
+        emu->get_cpu(0).reg(x86_register::rip, page + 0x000);
+        emu->get_cpu(1).reg(x86_register::rip, page + 0x200);
+
+        const auto run = [&](const size_t i) {
+            try
+            {
+                emu->get_cpu(i).start(2 * iters + 64);
+            }
+            catch (const std::exception& e)
+            {
+                ADD_FAILURE() << "vCPU " << i << " start threw: " << e.what();
+            }
+        };
+        std::thread t0(run, 0);
+        std::thread t1(run, 1);
+        t0.join();
+        t1.join();
+
+        EXPECT_TRUE(install_requested.load());
+        EXPECT_GT(ranged_hits.load(), 0U) << "deferred ranged hook never fired on vCPU 0";
+        EXPECT_EQ(emu->get_cpu(0).reg(x86_register::rcx), 0U);
+        EXPECT_EQ(emu->get_cpu(1).reg(x86_register::rcx), 0U);
+    }
+
+    // Step 6.5 verification — Arc-capture async mapping from an in-hook context reaches peers and they
+    // EXECUTE from the region. vCPU A maps a fresh region from inside its own read hook (async path:
+    // map+capture on A's VM, queued alias-from-capture + kick for B), writes code + a pointer into shared
+    // memory, and vCPU B — polling that pointer from its own loop — jumps into the region and runs it. If
+    // B's queued mapping were lost (or read the source VM cross-thread), B would fault executing there.
+    // DISABLED regression target (open 6.5 bug, precisely characterized): a vCPU-context write to an
+    // SMP-shared page (A's read-hook writing `target`) is visible through the master VM but vCPU 1
+    // keeps reading the pre-write bytes (its own rax/probe stay 0), even with the shared-page COW
+    // guard in icicle invalidate_code_range. Cross-VM read visibility of vCPU writes is the next
+    // increment; setup-time (external) writes and both vCPUs' execution over shared pages are proven.
+    TEST(IcicleSmp, DISABLED_PeerExecutesRegionMappedFromInsideHook)
+    {
+        auto emu = icicle::create_x86_64_emulator(2);
+        ASSERT_EQ(emu->vcpu_count(), 2U);
+
+        memory_manager memory(*emu);
+        const auto page = memory.allocate_memory(0x1000, memory_permission::all);
+        ASSERT_NE(page, 0U);
+        // The hooked read cell gets its OWN page: icicle's read-hook interception is page-granular and
+        // privatizes the hooked page per VM, so sharing data through the same page would diverge the
+        // vCPUs' views (A's write visible on the master, B reading its own stale copy).
+        const auto data_page = memory.allocate_memory(0x1000, memory_permission::all);
+        ASSERT_NE(data_page, 0U);
+        const uint64_t data = data_page;        // A's hooked read target (own page)
+        const uint64_t target = page + 0x408;   // B polls this for the new region's code address
+        const uint64_t marker = page + 0x410;   // B's code writes the magic here
+
+        std::array<uint8_t, 0x600> prog{};
+        prog.fill(0x90);
+        const auto emit_movabs = [](uint8_t* p, uint8_t rex_op, const uint64_t imm) {
+            p[0] = 0x48;
+            p[1] = rex_op;
+            std::memcpy(p + 2, &imm, sizeof(imm));
+        };
+        // A @ +0x000: movabs rbx,data; mov rcx,[rbx] (hook: maps region, arms target); spin dec/jnz.
+        emit_movabs(&prog[0x00], 0xBB, data);
+        prog[0x0A] = 0x48; prog[0x0B] = 0x8B; prog[0x0C] = 0x03; // mov rcx, [rbx]
+        constexpr uint64_t iters = 200000;
+        emit_movabs(&prog[0x0D], 0xB9, iters);
+        prog[0x17] = 0x48; prog[0x18] = 0xFF; prog[0x19] = 0xC9; // dec rcx
+        prog[0x1A] = 0x75; prog[0x1B] = 0xFB;                   // jnz
+        // B @ +0x200: movabs rbx,target; poll: mov rax,[rbx]; mov [rbx+0x18],rax (probe); test; jz; jmp rax.
+        emit_movabs(&prog[0x200], 0xBB, target);
+        prog[0x20A] = 0x48; prog[0x20B] = 0x8B; prog[0x20C] = 0x03; // b_poll: mov rax, [rbx]
+        prog[0x20D] = 0x48; prog[0x20E] = 0x89; prog[0x20F] = 0x43; prog[0x210] = 0x18; // mov [rbx+0x18], rax
+        prog[0x211] = 0x48; prog[0x212] = 0x85; prog[0x213] = 0xC0; // test rax, rax
+        prog[0x214] = 0x74; prog[0x215] = 0xF4;                     // jz b_poll (rel -12)
+        for (auto& b : std::span(prog).subspan(0x400, 0x200))
+        {
+            b = 0; // data cells must read 0, not NOP bytes (B polls `target` for nonzero)
+        }
+        prog[0x216] = 0xFF; prog[0x217] = 0xE0;                     // jmp rax
+        emu->write_memory(page, prog.data(), prog.size());
+
+        constexpr uint64_t magic = 0x5EEDC0DE5EEDC0DEULL;
+        std::atomic<bool> mapped{false};
+
+        emu->hook_memory_read(data, 8, [&](cpu_interface&, uint64_t, const void*, size_t) {
+            if (mapped.exchange(true))
+            {
+                return;
+            }
+            // Async in-hook map: allocate on A's VM + Arc-capture + queued alias for B (+ kick).
+            const auto region = memory.allocate_memory(0x1000, memory_permission::all);
+            if (region == 0)
+            {
+                return;
+            }
+            std::array<uint8_t, 0x40> code{};
+            code.fill(0x90);
+            emit_movabs(&code[0x00], 0xBB, marker);                 // movabs rbx, marker
+            emit_movabs(&code[0x0A], 0xB8, magic);                  // movabs rax, magic
+            code[0x14] = 0x48; code[0x15] = 0x89; code[0x16] = 0x03; // mov [rbx], rax
+            code[0x17] = 0x90;
+            emu->write_memory(region, code.data(), code.size());
+            // Give the kicked peer a moment to drain the queued mapping before the pointer becomes
+            // visible (bounded-latency smoke; the hard cross-quantum race is the documented 6.6 window).
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            emu->write_memory(target, &region, sizeof(region));
+        });
+
+        emu->get_cpu(0).reg(x86_register::rip, page + 0x000);
+        emu->get_cpu(1).reg(x86_register::rip, page + 0x200);
+
+        std::thread t0([&] {
+            emu->get_cpu(0).start(2 * iters + 64);
+        });
+        // B runs in repeated quanta (each start() = one quantum → drains queued peer ops between them);
+        // a single quantum cannot span A's 100ms in-hook sleep. Stop when the marker lands or capped.
+        std::thread t1([&] {
+            auto& cpu = emu->get_cpu(1);
+            for (int chunk = 0; chunk < 200; ++chunk)
+            {
+                cpu.start(100000);
+                uint64_t observed{};
+                emu->read_memory(marker, &observed, sizeof(observed));
+                if (observed == magic)
+                {
+                    return;
+                }
+                if (chunk == 50 || chunk == 150)
+                {
+                    uint64_t tval{}, probe{}, rax{};
+                    emu->read_memory(target, &tval, sizeof(tval));
+                    emu->read_memory(target + 0x18, &probe, sizeof(probe));
+                    rax = cpu.reg(x86_register::rax);
+                    std::fprintf(stderr, "[T2DBG] chunk=%d target=%llx probe=%llx rax=%llx rip=%llx\n", chunk,
+                                 (unsigned long long)tval, (unsigned long long)probe, (unsigned long long)rax,
+                                 (unsigned long long)cpu.reg(x86_register::rip));
+                }
+            }
+        });
+        t0.join();
+        t1.join();
+
+        uint64_t observed{};
+        emu->read_memory(marker, &observed, sizeof(observed));
+        EXPECT_EQ(observed, magic) << "vCPU 1 never executed the region mapped from vCPU 0's hook";
+    }
+
+    // Step 6.5/6.8 regression (previously DISABLED_): runs the multi-threaded test-sample on 2 icicle
+    // vCPUs through the REAL windows_emulator. This is the exact shape that deadlocked before 6.5's async
+    // cross-VM mutation (memory + hooks). N>1 requires the lean, wall-clock path
+    // (use_instruction_precision=false + use_relative_time=false; both otherwise hard-error "requires a
+    // single vCPU"). Requires the emulator root to contain filesys/c/test-sample.exe.
     TEST(IcicleSmp, DISABLED_MultiThreadedSampleRunsOnTwoVcpus)
     {
         emulator_settings settings{};

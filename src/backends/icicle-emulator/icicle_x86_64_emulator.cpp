@@ -8,7 +8,9 @@
 #include <charconv>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <tuple>
@@ -51,6 +53,11 @@ extern "C"
     // Arc<PageData> into every other vCPU VM so all N see one coherent, cachable, write-through address space.
     int32_t icicle_map_smp_shared_fresh(icicle_emulator*, uint64_t address, uint64_t length, uint8_t permissions);
     int32_t icicle_share_smp_pages(icicle_emulator* dst, icicle_emulator* src, uint64_t address, uint64_t length);
+    // SMP async (step 6.5): capture a range's shared pages from a VM on its own thread; a peer maps them
+    // later (icicle_smp_map_captured) with NO cross-thread read of the (possibly executing) source VM.
+    void* icicle_smp_capture(icicle_emulator*, uint64_t address, uint64_t length);
+    int32_t icicle_smp_map_captured(icicle_emulator*, void* captured, uint64_t address);
+    void icicle_smp_release_capture(void* captured);
     int32_t icicle_unmap_memory(icicle_emulator*, uint64_t address, uint64_t length);
     int32_t icicle_read_memory(icicle_emulator*, uint64_t address, void* data, size_t length);
     int32_t icicle_write_memory(icicle_emulator*, uint64_t address, const void* data, size_t length);
@@ -78,6 +85,8 @@ extern "C"
     size_t icicle_write_register(icicle_emulator*, int reg, const void* data, size_t length);
     void icicle_start(icicle_emulator*, size_t count);
     int32_t icicle_get_stop_info(icicle_emulator*, icicle_stop_info* info);
+    // Retired-instruction counter: used to honor start(count) across kick-resumed quanta.
+    uint64_t icicle_get_icount(icicle_emulator*);
     void icicle_get_exception_name(uint32_t code, data_accessor_func* callback, void* data);
     void icicle_get_vm_exit_description(icicle_emulator*, data_accessor_func* callback, void* data);
     void icicle_stop(icicle_emulator*);
@@ -102,19 +111,18 @@ namespace sogen::icicle
         template <typename T>
         struct function_object : utils::object
         {
-            bool* hook_state{};
             std::function<T> func{};
 
-            function_object(std::function<T> f = {}, bool* state = nullptr)
-                : hook_state(state),
-                  func(std::move(f))
+            explicit function_object(std::function<T> f = {})
+                : func(std::move(f))
             {
             }
 
             template <typename... Args>
             auto operator()(Args&&... args) const
             {
-                const hook_scope scope(this->hook_state);
+                // Scope the INVOKING thread's in-hook flag (thread-local under SMP).
+                const hook_scope scope;
 
                 return this->func.operator()(std::forward<Args>(args)...);
             }
@@ -123,9 +131,9 @@ namespace sogen::icicle
         };
 
         template <typename T>
-        std::unique_ptr<function_object<T>> make_function_object(std::function<T> func, bool& hook_state)
+        std::unique_ptr<function_object<T>> make_function_object(std::function<T> func)
         {
-            return std::make_unique<function_object<T>>(std::move(func), &hook_state);
+            return std::make_unique<function_object<T>>(std::move(func));
         }
 
         // Stored UNBOUND (still takes cpu_interface&): with N vCPU VMs the hook is registered once per
@@ -393,6 +401,8 @@ namespace sogen::icicle
             }
             this->emu_ = this->vcpus_[0]->handle();
             this->quiesce_cancel_.assign(vcpu_count, 0);
+            this->quantum_kick_.assign(vcpu_count, 0);
+            this->pending_ops_.resize(vcpu_count);
         }
 
         ~icicle_x86_64_emulator() override
@@ -499,79 +509,108 @@ namespace sogen::icicle
             };
 
             // Every vCPU VM needs the MMIO region; the callback context (ptr) is shared and coherent.
-            // Peers paused so their VMs are safe to touch from this thread (6.3/6.4).
-            this->run_with_vcpus_paused([&] {
-                for (auto& vcpu : this->vcpus_)
-                {
-                    icicle_map_mmio(vcpu->handle(), address, size, read_wrapper, ptr, write_wrapper, ptr);
-                }
-            });
+            this->apply_to_all_vms([=](icicle_emulator* h) { icicle_map_mmio(h, address, size, read_wrapper, ptr, write_wrapper, ptr); });
         }
 
         void map_memory(const uint64_t address, const size_t size, memory_permission permissions) override
         {
             const auto perm = static_cast<uint8_t>(permissions);
-            this->run_with_vcpus_paused([&] {
-                if (this->vcpus_.size() == 1)
+            if (this->vcpus_.size() == 1)
+            {
+                // Normal path: keeps COW + snapshots for the single-vCPU case (byte-identical to before SMP).
+                ice(icicle_map_memory(this->emu_, address, size, perm), "Failed to map memory");
+                return;
+            }
+            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
+            const bool caller_is_vcpu = self && &self->machine_ == this;
+            if (!caller_is_vcpu)
+            {
+                // External/setup mutator: pause peers, allocate on the master, share into the rest directly.
+                this->pause_peers_and([&] {
+                    ice(icicle_map_smp_shared_fresh(this->emu_, address, size, perm), "Failed to map SMP memory");
+                    for (size_t i = 1; i < this->vcpus_.size(); ++i)
+                    {
+                        ice(icicle_share_smp_pages(this->vcpus_[i]->handle(), this->emu_, address, size), "Failed to share SMP memory");
+                    }
+                });
+                return;
+            }
+            // vCPU mutator (inside its own hook, may hold the BEL): allocate on its OWN VM now, capture the
+            // shared Arcs on this thread (source-safe), and queue an alias-from-capture for each peer — the
+            // peer maps the captured Arcs on its own thread with NO cross-thread read of the source (6.5).
+            icicle_emulator* const source = self->handle();
+            ice(icicle_map_smp_shared_fresh(source, address, size, perm), "Failed to map SMP memory");
+            void* const raw = icicle_smp_capture(source, address, size);
+            ice(raw != nullptr, "Failed to capture SMP pages");
+            const std::shared_ptr<void> captured(raw, icicle_smp_release_capture);
+            {
+                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                for (auto& v : this->vcpus_)
                 {
-                    // Normal path: keeps COW + snapshots for the single-vCPU case (byte-identical to before SMP).
-                    ice(icicle_map_memory(this->emu_, address, size, perm), "Failed to map memory");
-                    return;
+                    if (v.get() != self)
+                    {
+                        this->pending_ops_[v->index()].push_back([captured, address](icicle_emulator* h) {
+                            ice(icicle_smp_map_captured(h, captured.get(), address), "Failed to map captured SMP pages");
+                        });
+                    }
                 }
-                // SMP: allocate the shared page set on the master, alias the same Arc<PageData> into the rest
-                // so all vCPUs share one coherent guest RAM (cachable, write-through, host-MESI coherency).
-                ice(icicle_map_smp_shared_fresh(this->emu_, address, size, perm), "Failed to map SMP memory");
-                for (size_t i = 1; i < this->vcpus_.size(); ++i)
-                {
-                    ice(icicle_share_smp_pages(this->vcpus_[i]->handle(), this->emu_, address, size), "Failed to share SMP memory");
-                }
-            });
+            }
+            // A peer can observe pointers into this new region as soon as this syscall's guest-visible
+            // effects land, so make the queued mapping apply at the peer's NEXT quantum, not after its
+            // whole current one (kick_peers).
+            this->kick_peers(self->index());
         }
 
         void map_host_memory(const uint64_t address, const size_t size, void* host_pointer, memory_permission permissions) override
         {
             const auto perm = static_cast<uint8_t>(permissions);
-            this->run_with_vcpus_paused([&] {
-                for (auto& vcpu : this->vcpus_)
-                {
-                    // Same host pointer in every VM: coherent because they all alias the one host buffer.
-                    ice(icicle_map_host_memory(vcpu->handle(), address, host_pointer, size, perm), "Failed to map host memory");
-                }
-            });
+            // Same host pointer in every VM: coherent because they all alias the one host buffer.
+            this->apply_to_all_vms(
+                [=](icicle_emulator* h) { ice(icicle_map_host_memory(h, address, host_pointer, size, perm), "Failed to map host memory"); });
         }
 
         void flush_host_memory_cache(const void* host_pointer, const size_t size) override
         {
-            this->run_with_vcpus_paused([&] {
-                for (auto& vcpu : this->vcpus_)
-                {
-                    icicle_flush_host_memory_cache(vcpu->handle(), host_pointer, size);
-                }
-            });
+            this->apply_to_all_vms([=](icicle_emulator* h) { icicle_flush_host_memory_cache(h, host_pointer, size); });
         }
 
         bool map_shared_memory(const uint64_t address, const uint64_t source, const size_t size,
                                const memory_permission permissions) override
         {
             const auto perm = static_cast<uint8_t>(permissions);
-            bool ok = true;
-            this->run_with_vcpus_paused([&] {
-                for (auto& vcpu : this->vcpus_)
+            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
+            const bool caller_is_vcpu = self && &self->machine_ == this;
+            if (this->vcpus_.size() == 1 || !caller_is_vcpu)
+            {
+                bool ok = true;
+                this->pause_peers_and([&] {
+                    for (auto& vcpu : this->vcpus_)
+                    {
+                        ok = (icicle_map_shared_memory(vcpu->handle(), address, source, size, perm) != 0) && ok;
+                    }
+                });
+                return ok;
+            }
+            // vCPU mutator: apply to own VM now (its result represents the coherent shared space), queue peers.
+            const bool ok = icicle_map_shared_memory(self->handle(), address, source, size, perm) != 0;
+            {
+                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                for (auto& v : this->vcpus_)
                 {
-                    ok = (icicle_map_shared_memory(vcpu->handle(), address, source, size, perm) != 0) && ok;
+                    if (v.get() != self)
+                    {
+                        this->pending_ops_[v->index()].push_back(
+                            [address, source, size, perm](icicle_emulator* h) { icicle_map_shared_memory(h, address, source, size, perm); });
+                    }
                 }
-            });
+            }
+            this->kick_peers(self->index());
             return ok;
         }
 
         void unmap_memory(const uint64_t address, const size_t size) override
         {
-            this->run_with_vcpus_paused([&] {
-                for (auto& vcpu : this->vcpus_)
-                {
-                    ice(icicle_unmap_memory(vcpu->handle(), address, size), "Failed to unmap memory");
-                }
-            });
+            this->apply_to_all_vms([=](icicle_emulator* h) { ice(icicle_unmap_memory(h, address, size), "Failed to unmap memory"); });
         }
 
         // 6.4 — the icicle handle to read/write guest memory through. During a syscall/hook the acting
@@ -613,12 +652,7 @@ namespace sogen::icicle
         void apply_memory_protection(const uint64_t address, const size_t size, memory_permission permissions) override
         {
             const auto perm = static_cast<uint8_t>(permissions);
-            this->run_with_vcpus_paused([&] {
-                for (auto& vcpu : this->vcpus_)
-                {
-                    ice(icicle_protect_memory(vcpu->handle(), address, size, perm), "Failed to apply permissions");
-                }
-            });
+            this->apply_to_all_vms([=](icicle_emulator* h) { ice(icicle_protect_memory(h, address, size, perm), "Failed to apply permissions"); });
         }
 
         // The cpu_interface a hook on VM `index` reports to its callback. VM 0 is the machine itself
@@ -671,10 +705,10 @@ namespace sogen::icicle
             }
 
             auto* handle = this->fresh_hook_handle();
-            auto& reg = this->registrations_[handle];
+            auto reg = std::make_shared<hook_registration>();
             for (size_t i = 0; i < this->vcpus_.size(); ++i)
             {
-                auto obj = make_function_object(this->bind_cpu(i, callback), this->is_in_hook_);
+                auto obj = make_function_object(this->bind_cpu(i, callback));
                 auto* ptr = obj.get();
 
                 const auto invoker = +[](void* cb) {
@@ -690,21 +724,24 @@ namespace sogen::icicle
                 const auto id = kind == x86_hookable_instructions::syscall
                                     ? icicle_add_syscall_hook(vm, invoker, ptr)
                                     : icicle_add_timestamp_hook(vm, kind == x86_hookable_instructions::rdtscp, timestamp_invoker, ptr);
-                reg.entries.emplace_back(i, id, std::move(obj));
+                reg->entries.emplace_back(i, id, std::move(obj));
             }
 
+            std::unique_lock lock(this->partition_mutex_);
+            this->registrations_[handle] = std::move(reg);
             return handle;
         }
 
         emulator_hook* hook_basic_block(basic_block_hook_callback callback) override
         {
             auto* handle = this->fresh_hook_handle();
-            auto& reg = this->registrations_[handle];
+            auto reg = std::make_shared<hook_registration>();
             for (size_t i = 0; i < this->vcpus_.size(); ++i)
             {
-                auto object = make_function_object(this->bind_cpu(i, callback), this->is_in_hook_);
+                auto object = make_function_object(this->bind_cpu(i, callback));
                 auto* ptr = object.get();
                 auto* wrapper = +[](void* user, const uint64_t addr, const uint64_t instructions) {
+                    const hook_scope exec_scope(&detail::in_execution_hook_flag()); // fires under execution_hooks
                     basic_block block{};
                     block.address = addr;
                     block.instruction_count = static_cast<size_t>(instructions);
@@ -714,19 +751,21 @@ namespace sogen::icicle
                 };
 
                 const auto id = icicle_add_block_hook(this->vcpus_[i]->handle(), wrapper, ptr);
-                reg.entries.emplace_back(i, id, std::move(object));
+                reg->entries.emplace_back(i, id, std::move(object));
             }
 
+            std::unique_lock lock(this->partition_mutex_);
+            this->registrations_[handle] = std::move(reg);
             return handle;
         }
 
         emulator_hook* hook_interrupt(interrupt_hook_callback callback) override
         {
             auto* handle = this->fresh_hook_handle();
-            auto& reg = this->registrations_[handle];
+            auto reg = std::make_shared<hook_registration>();
             for (size_t i = 0; i < this->vcpus_.size(); ++i)
             {
-                auto obj = make_function_object(this->bind_cpu(i, callback), this->is_in_hook_);
+                auto obj = make_function_object(this->bind_cpu(i, callback));
                 auto* ptr = obj.get();
                 auto* wrapper = +[](void* user, const int32_t code) {
                     const auto& func = *static_cast<decltype(ptr)>(user);
@@ -734,19 +773,21 @@ namespace sogen::icicle
                 };
 
                 const auto id = icicle_add_interrupt_hook(this->vcpus_[i]->handle(), wrapper, ptr);
-                reg.entries.emplace_back(i, id, std::move(obj));
+                reg->entries.emplace_back(i, id, std::move(obj));
             }
 
+            std::unique_lock lock(this->partition_mutex_);
+            this->registrations_[handle] = std::move(reg);
             return handle;
         }
 
         emulator_hook* hook_memory_violation(memory_violation_hook_callback callback) override
         {
             auto* handle = this->fresh_hook_handle();
-            auto& reg = this->registrations_[handle];
+            auto reg = std::make_shared<hook_registration>();
             for (size_t i = 0; i < this->vcpus_.size(); ++i)
             {
-                auto obj = make_function_object(this->bind_cpu(i, callback), this->is_in_hook_);
+                auto obj = make_function_object(this->bind_cpu(i, callback));
                 auto* ptr = obj.get();
                 auto* wrapper = +[](void* user, const uint64_t address, const uint8_t operation, const int32_t unmapped) -> int32_t {
                     const auto violation_type = unmapped //
@@ -761,33 +802,27 @@ namespace sogen::icicle
                 };
 
                 const auto id = icicle_add_violation_hook(this->vcpus_[i]->handle(), wrapper, ptr);
-                reg.entries.emplace_back(i, id, std::move(obj));
+                reg->entries.emplace_back(i, id, std::move(obj));
             }
 
+            std::unique_lock lock(this->partition_mutex_);
+            this->registrations_[handle] = std::move(reg);
             return handle;
         }
 
         emulator_hook* hook_memory_execution(const uint64_t address, memory_execution_hook_callback callback) override
         {
-            std::unique_lock lock(this->partition_mutex_);
-            auto* handle = this->fresh_hook_handle();
-            auto& reg = this->registrations_[handle];
-            this->run_with_vcpus_paused([&] {
-            for (size_t i = 0; i < this->vcpus_.size(); ++i)
+            if (detail::in_hook_flag() && detail::in_execution_hook_flag())
             {
-                auto object = std::make_unique<detail::execution_hook>(this->acting_cpu(i), callback, this->is_in_hook_,
-                                                                       this->acting_sink(i));
-                auto* ptr = object.get();
-                auto* wrapper = +[](void* user, const uint64_t addr) {
-                    const auto& func = *static_cast<decltype(ptr)>(user);
-                    (func)(addr);
-                };
-
-                const auto id = icicle_add_execution_hook(this->vcpus_[i]->handle(), address, wrapper, ptr);
-                reg.entries.emplace_back(i, id, std::move(object));
+                // 6.5: requested from INSIDE an execution-family hook — installing one right there panics
+                // icicle's execution_hooks RefCell, and windows_emulator may hold the BEL here. Defer to
+                // this vCPU's next quantum boundary (kick_self), draining outside run().
+                return this->defer_exec_hook_install(address, 1, std::move(callback));
             }
-            });
-
+            // From a syscall/read/write hook or external context: execution_hooks is free — install now
+            // via the routing (a vCPU caller registers its own VM immediately; no peer pause).
+            auto* handle = this->fresh_hook_handle();
+            this->install_exec_hook(address, 1, callback, handle);
             return handle;
         }
 
@@ -796,43 +831,86 @@ namespace sogen::icicle
         {
             if (size == 1)
             {
-                // Delegates to the exact-address hook (which takes partition_mutex_ + pauses); do that
-                // BEFORE locking here to avoid a self-deadlock on the non-recursive mutex.
+                // Delegates to the exact-address hook; do that BEFORE any locking here.
                 return this->hook_memory_execution(address, std::move(callback));
             }
 
-            std::unique_lock lock(this->partition_mutex_);
-            auto* handle = this->fresh_hook_handle();
-            auto& reg = this->registrations_[handle];
-            this->run_with_vcpus_paused([&] {
-            for (size_t i = 0; i < this->vcpus_.size(); ++i)
+            if (detail::in_hook_flag() && detail::in_execution_hook_flag())
             {
-                auto object = std::make_unique<detail::execution_hook>(this->acting_cpu(i), callback, this->is_in_hook_,
-                                                                       this->acting_sink(i));
+                return this->defer_exec_hook_install(address, size, std::move(callback));
+            }
+            auto* handle = this->fresh_hook_handle();
+            this->install_exec_hook(address, size, callback, handle);
+            return handle;
+        }
+
+        // Installs an exact/ranged execution hook on every VM via the 6.5 routing rule: a vCPU caller
+        // registers on its own VM now and queues peers; an external caller pauses peers. Either way each
+        // VM is only ever touched from a context where that is safe.
+        void install_exec_hook(const uint64_t address, const uint64_t size, const memory_execution_hook_callback& callback,
+                               emulator_hook* handle)
+        {
+            auto reg = std::make_shared<hook_registration>();
+            {
+                std::unique_lock lock(this->partition_mutex_);
+                this->registrations_[handle] = reg;
+            }
+
+            this->route_to_all_vms([this, address, size, callback, reg](const size_t i) {
+                if (reg->deleted)
+                {
+                    return; // deleted before this VM's install drained
+                }
+                auto object = std::make_unique<detail::execution_hook>(this->acting_cpu(i), callback, this->acting_sink(i));
                 auto* ptr = object.get();
                 auto* wrapper = +[](void* user, const uint64_t addr) {
                     const auto& func = *static_cast<decltype(ptr)>(user);
                     (func)(addr);
                 };
 
-                const auto id = icicle_add_ranged_execution_hook(this->vcpus_[i]->handle(), address, size, wrapper, ptr);
-                reg.entries.emplace_back(i, id, std::move(object));
-            }
+                const auto id = size == 1
+                                    ? icicle_add_execution_hook(this->vcpus_[i]->handle(), address, wrapper, ptr)
+                                    : icicle_add_ranged_execution_hook(this->vcpus_[i]->handle(), address, size, wrapper, ptr);
+                std::unique_lock lock(this->partition_mutex_);
+                reg->entries.emplace_back(i, id, std::move(object));
             });
+        }
 
-            return handle;
+        // 6.5: reserve the handle and install the execution hook when this vCPU's CURRENT QUANTUM ends
+        // (self-kick: icicle exits at the next block boundary), draining in begin_run_quantum — OUTSIDE
+        // icicle run(), where execution_hooks is not borrowed. (The run_on_next_instruction one-shot
+        // itself lives in execution_hooks, so installing an execution hook from inside it panics with
+        // "RefCell already borrowed" — caught by RangedExecHookDeferredFromInHookContextWithPeerParkedInHook.)
+        // Read/write hooks are separate RefCells and keep using the one-shot (try_install_memory_access_hook).
+        emulator_hook* defer_exec_hook_install(const uint64_t address, const uint64_t size,
+                                               memory_execution_hook_callback callback)
+        {
+            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
+            auto* hook_id = this->fresh_hook_handle();
+            {
+                std::unique_lock lock(this->partition_mutex_);
+                auto reg = std::make_shared<hook_registration>();
+                reg->pending = true;
+                this->registrations_[hook_id] = std::move(reg);
+                this->exec_hooks_to_install_[hook_id] = {.address = address, .size = size, .callback = std::move(callback)};
+            }
+
+            if (self && &self->machine_ == this)
+            {
+                this->kick_self(self->index_);
+            }
+            return hook_id;
         }
 
         emulator_hook* hook_memory_execution(memory_execution_hook_callback callback) override
         {
-            std::unique_lock lock(this->partition_mutex_);
+            // Generic (every-instruction) execution hook: only installed at setup (instruction precision /
+            // preemption), where all VMs are idle — direct registration on every handle is safe.
             auto* handle = this->fresh_hook_handle();
-            auto& reg = this->registrations_[handle];
-            this->run_with_vcpus_paused([&] {
+            auto reg = std::make_shared<hook_registration>();
             for (size_t i = 0; i < this->vcpus_.size(); ++i)
             {
-                auto object = std::make_unique<detail::execution_hook>(this->acting_cpu(i), callback, this->is_in_hook_,
-                                                                       this->acting_sink(i));
+                auto object = std::make_unique<detail::execution_hook>(this->acting_cpu(i), callback, this->acting_sink(i));
                 auto* ptr = object.get();
                 auto* wrapper = +[](void* user, const uint64_t addr) {
                     const auto& func = *static_cast<decltype(ptr)>(user);
@@ -840,9 +918,10 @@ namespace sogen::icicle
                 };
 
                 const auto id = icicle_add_generic_execution_hook(this->vcpus_[i]->handle(), wrapper, ptr);
-                reg.entries.emplace_back(i, id, std::move(object));
+                reg->entries.emplace_back(i, id, std::move(object));
             }
-            });
+            std::unique_lock lock(this->partition_mutex_);
+            this->registrations_[handle] = std::move(reg);
 
             return handle;
         }
@@ -879,15 +958,16 @@ namespace sogen::icicle
 
         void delete_hook(emulator_hook* hook) override
         {
-            std::unique_lock lock(this->partition_mutex_);
-            if (this->is_in_hook_)
+            if (detail::in_hook_flag())
             {
+                // Inside a running hook: icicle is iterating its hook tables on this thread, and the
+                // windows_emulator may hold the BEL — defer to quantum end, where the 6.5 routing applies
+                // the removals without pausing anyone.
+                std::unique_lock lock(this->partition_mutex_);
                 this->hooks_to_delete_.insert(hook);
+                return;
             }
-            else
-            {
-                this->delete_hook_internal(hook);
-            }
+            this->delete_hook_internal(hook);
         }
 
         void serialize_state(utils::buffer_serializer& buffer, const bool is_snapshot) const override
@@ -970,18 +1050,22 @@ namespace sogen::icicle
         }
 
       private:
-        bool is_in_hook_{false};
         std::list<std::unique_ptr<utils::object>> storage_{};
 
         // One hook API handle maps to one icicle registration per vCPU VM: (vm index, icicle hook id, and
         // the object kept alive for that VM's captureless wrapper). delete_hook removes every VM's
         // registration; at N=1 this is exactly the old single (id, object) pair.
+        // Shared ownership (6.5): peer-queued async ops hold the registration while it drains, so a map
+        // erase can't dangle it; `deleted` makes a late-draining install a no-op instead of resurrecting a
+        // hook the API user already deleted. entries is mutated from several vCPU threads → always under
+        // partition_mutex_.
         struct hook_registration
         {
             std::vector<std::tuple<size_t, uint32_t, std::unique_ptr<utils::object>>> entries{};
-            bool pending{false}; // reserved handle for a memory hook queued from inside a running hook
+            bool pending{false};  // reserved handle for a hook queued from inside a running hook
+            bool deleted{false};  // delete_hook seen; queued installs must not apply
         };
-        std::unordered_map<emulator_hook*, hook_registration> registrations_{};
+        std::unordered_map<emulator_hook*, std::shared_ptr<hook_registration>> registrations_{};
 
         icicle_emulator* emu_{};
         std::vector<std::unique_ptr<icicle_vcpu>> vcpus_{};
@@ -993,6 +1077,14 @@ namespace sogen::icicle
 
         std::unordered_set<emulator_hook*> hooks_to_delete_{};
         std::unordered_map<emulator_hook*, memory_access_hook> hooks_to_install_{};
+        // 6.5: exact/ranged execution hooks deferred from inside a running hook (defer_exec_hook_install).
+        struct pending_exec_hook
+        {
+            uint64_t address{};
+            uint64_t size{};
+            memory_execution_hook_callback callback{};
+        };
+        std::unordered_map<emulator_hook*, pending_exec_hook> exec_hooks_to_install_{};
 
         // Step 6.1 (mirrors WHP whp_x86_64_emulator::partition_mutex_): guards the machine's shared hook
         // tables (registrations_/hooks_to_install_/hooks_to_delete_/index_) so the N vCPU worker threads
@@ -1001,6 +1093,11 @@ namespace sogen::icicle
         // reverse. Held only for C++ table work — never while invoking a guest/user callback.
         mutable std::shared_mutex partition_mutex_{};
 
+        // Serializes stop-the-world pauses (see pause_peers_and); separate from partition_mutex_ so the
+        // lock order is always pause_mutex_ -> partition_mutex_ and vCPU threads (which never pause)
+        // can't participate in a pause-related cycle.
+        std::mutex pause_mutex_{};
+
         // Step 6.2/6.3 — stop-the-world quiesce (mirrors WHP's cancel-without-stop_requested_ resume): an
         // icicle VM can only be touched by its own thread, so before a cross-VM MMU mutation we pause every
         // OTHER vCPU (icicle_stop, marking it to resume not to stop) and wait for its run_active_ to clear.
@@ -1008,26 +1105,99 @@ namespace sogen::icicle
         std::condition_variable quiesce_cv_{};
         bool quiescing_{false};
         std::vector<uint8_t> quiesce_cancel_{}; // per-vCPU: was cancelled for a mutation (resume, don't stop)
+        std::vector<uint8_t> quantum_kick_{};   // per-vCPU: peer queued ops for it; end quantum early to drain
+
+        // Step 6.5 — async cross-VM mutation. A vCPU mutating guest RAM from inside its own hook holds the
+        // BEL, so it cannot pause a peer parked in a hook blocked on that BEL (deadlock, confirmed by the
+        // N>1 sample probe). Instead it applies to its OWN VM now and queues the op per-peer; each peer
+        // drains its queue on its own thread at begin_run_quantum, before it next executes.
+        std::mutex pending_mutex_{};
+        std::vector<std::vector<std::function<void(icicle_emulator*)>>> pending_ops_{}; // [vm index] -> ops(handle)
 
         emulator_hook* fresh_hook_handle()
         {
+            std::unique_lock lock(this->partition_mutex_);
             const auto id = ++this->index_;
             return reinterpret_cast<emulator_hook*>(static_cast<size_t>(id));
+        }
+
+        // Serializes stop-the-world operations (guards the quiesce handshake's single quiescing_ flag).
+        // Deliberately separate from partition_mutex_ so hook-table work can lock partition_mutex_ inside a
+        // paused section without recursive locking. Lock order: pause_mutex_ -> partition_mutex_, never the
+        // reverse, and vCPU threads never pause at all (route_to_all_vms).
+        template <typename Fn>
+        void pause_peers_and(Fn&& fn)
+        {
+            if (this->vcpus_.size() == 1)
+            {
+                fn();
+                return;
+            }
+            std::lock_guard<std::mutex> plock(this->pause_mutex_);
+            this->run_with_vcpus_paused(std::forward<Fn>(fn));
+        }
+
+        // 6.5 routing rule: a mutation requested BY a vCPU of this machine (from its own hook, the
+        // deferred-action one-shot, or its quantum-end drain — contexts that may hold the BEL) applies to
+        // its OWN VM now and queues the op for each peer, drained on the peer's thread at
+        // begin_run_quantum. An external/setup caller pauses peers instead — it holds no BEL, so a peer
+        // parked in a hook can always acquire the BEL, finish, exit run(), and become stoppable. Because
+        // vCPU threads never pause, the A-B/B-A hazard between partition_mutex_ and the quiesce wait
+        // cannot form.
+        void route_to_all_vms(const std::function<void(size_t)>& per_vm_op)
+        {
+            if (this->vcpus_.size() == 1)
+            {
+                per_vm_op(0);
+                return;
+            }
+            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
+            const bool caller_is_vcpu = self && &self->machine_ == this;
+            if (!caller_is_vcpu)
+            {
+                this->pause_peers_and([&] {
+                    for (size_t i = 0; i < this->vcpus_.size(); ++i)
+                    {
+                        per_vm_op(i);
+                    }
+                });
+                return;
+            }
+            per_vm_op(self->index());
+            const auto own = self->index();
+            {
+                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                for (auto& v : this->vcpus_)
+                {
+                    if (v->index() != own)
+                    {
+                        const auto i = v->index();
+                        this->pending_ops_[i].push_back([this, i, per_vm_op](icicle_emulator*) { per_vm_op(i); });
+                    }
+                }
+            }
+            // Bounded application latency: a peer mid-quantum must not keep executing (potentially
+            // faulting on just-changed mappings) for its whole quantum before the op drains.
+            this->kick_peers(own);
         }
 
         emulator_hook* hook_memory_access(memory_access_hook hook, emulator_hook* hook_id)
         {
             auto* handle = hook_id ? hook_id : this->fresh_hook_handle();
-            auto& reg = this->registrations_[handle];
-            reg.entries.clear();
-
-            // Registering on every VM's handle touches peer VMs, so pause them first (6.4).
-            this->run_with_vcpus_paused([&] {
-            for (size_t i = 0; i < this->vcpus_.size(); ++i)
+            auto reg = std::make_shared<hook_registration>();
             {
+                std::unique_lock lock(this->partition_mutex_);
+                this->registrations_[handle] = reg;
+            }
+
+            this->route_to_all_vms([this, hook, reg](const size_t i) {
+                if (reg->deleted)
+                {
+                    return; // deleted before this VM's install drained
+                }
                 auto* const vm = this->vcpus_[i]->handle();
-                std::unique_ptr<utils::object> object;
                 uint32_t id{};
+                std::unique_ptr<utils::object> object;
                 if (hook.observation)
                 {
                     // Shape + bind the observation to vCPU i (outcome + host/guest origin), deferring to it.
@@ -1046,7 +1216,7 @@ namespace sogen::icicle
                         }
                     };
                     auto obj = make_function_object(
-                        std::function<void(uint64_t, const void*, size_t, uint64_t, int32_t)>(std::move(shaped)), this->is_in_hook_);
+                        std::function<void(uint64_t, const void*, size_t, uint64_t, int32_t)>(std::move(shaped)));
                     auto* ptr = obj.get();
                     auto* wrapper = +[](void* user, uint64_t address, const void* data, size_t length, uint64_t error, int32_t host_write) {
                         (*static_cast<decltype(ptr)>(user))(address, data, length, error, host_write);
@@ -1056,7 +1226,7 @@ namespace sogen::icicle
                 }
                 else
                 {
-                    auto obj = make_function_object(this->bind_cpu(i, hook.callback), this->is_in_hook_);
+                    auto obj = make_function_object(this->bind_cpu(i, hook.callback));
                     auto* ptr = obj.get();
                     auto* wrapper = +[](void* user, const uint64_t address, const void* data, size_t length) {
                         const auto& func = *static_cast<decltype(ptr)>(user);
@@ -1071,65 +1241,129 @@ namespace sogen::icicle
                 {
                     throw std::runtime_error("Icicle memory hook registration failed");
                 }
-                reg.entries.emplace_back(i, id, std::move(object));
-            }
+                std::unique_lock lock(this->partition_mutex_);
+                reg->entries.emplace_back(i, id, std::move(object));
             });
-            reg.pending = false;
 
             return handle;
         }
 
         void delete_hook_internal(emulator_hook* hook)
         {
-            auto it = this->registrations_.find(hook);
-            if (it == this->registrations_.end())
+            std::shared_ptr<hook_registration> reg;
             {
-                return;
-            }
-
-            if (it->second.pending)
-            {
-                // Reserved but not yet installed (queued from inside a running hook): cancel the install.
-                this->hooks_to_install_.erase(hook);
-                this->registrations_.erase(it);
-                return;
-            }
-
-            // Removing a hook from each VM's handle touches peer VMs, so pause them first (6.4).
-            this->run_with_vcpus_paused([&] {
-                for (auto& [vm_index, id, object] : it->second.entries)
+                std::unique_lock lock(this->partition_mutex_);
+                auto it = this->registrations_.find(hook);
+                if (it == this->registrations_.end())
                 {
-                    icicle_remove_hook(this->vcpus_[vm_index]->handle(), id);
-                    (void)object;
+                    return;
+                }
+                reg = it->second;
+                if (reg->pending)
+                {
+                    // Reserved but not yet installed (queued from inside a running hook): cancel the install.
+                    this->hooks_to_install_.erase(hook);
+                    this->exec_hooks_to_install_.erase(hook);
+                    this->registrations_.erase(it);
+                    return;
+                }
+                reg->deleted = true; // in-flight peer installs must not resurrect this hook
+                this->registrations_.erase(it);
+            }
+
+            this->route_to_all_vms([this, reg](const size_t i) {
+                std::vector<uint32_t> ids;
+                {
+                    std::unique_lock lock(this->partition_mutex_);
+                    for (auto it = reg->entries.begin(); it != reg->entries.end();)
+                    {
+                        if (std::get<0>(*it) == i)
+                        {
+                            ids.push_back(std::get<1>(*it));
+                            it = reg->entries.erase(it);
+                        }
+                        else
+                        {
+                            ++it;
+                        }
+                    }
+                }
+                // Runs on VM i's own thread (async drain) or under the pause (external caller): touching
+                // this VM's handle is safe in both.
+                for (const auto id : ids)
+                {
+                    icicle_remove_hook(this->vcpus_[i]->handle(), id);
                 }
             });
-            this->registrations_.erase(it);
         }
 
-        void perform_pending_actions()
+        // Drains deferred memory-hook installs (read/write/observation). Safe from the
+        // run_on_next_instruction one-shot: read/write hooks live in separate RefCells from the
+        // execution_hooks the one-shot fires under.
+        void drain_memory_hook_installs()
         {
-            // Runs at the end of every vCPU's start() on its worker thread → concurrent across vCPUs.
-            std::unique_lock lock(this->partition_mutex_);
-            const auto hooks_to_delete = std::move(this->hooks_to_delete_);
+            std::vector<std::pair<emulator_hook*, memory_access_hook>> installs;
+            {
+                std::unique_lock lock(this->partition_mutex_);
+                for (auto& [k, v] : this->hooks_to_install_)
+                {
+                    installs.emplace_back(k, std::move(v));
+                }
+                this->hooks_to_install_.clear();
+            }
+            for (auto& [handle, hook] : installs)
+            {
+                this->hook_memory_access(std::move(hook), handle);
+            }
+        }
 
-            this->hooks_to_delete_ = {};
-            this->perform_pending_hook_installs();
+        // Drains deferred execution-hook installs. Must run OUTSIDE icicle run() (execution_hooks is
+        // borrowed while execution hooks fire): begin_run_quantum or quantum end — never the one-shot.
+        void drain_exec_hook_installs()
+        {
+            std::vector<std::pair<emulator_hook*, pending_exec_hook>> installs;
+            {
+                std::unique_lock lock(this->partition_mutex_);
+                for (auto& [k, v] : this->exec_hooks_to_install_)
+                {
+                    installs.emplace_back(k, std::move(v));
+                }
+                this->exec_hooks_to_install_.clear();
+            }
+            for (auto& [handle, pending] : installs)
+            {
+                this->install_exec_hook(pending.address, pending.size, pending.callback, handle);
+            }
+        }
 
-            for (auto* hook : hooks_to_delete)
+        void drain_deferred_deletes()
+        {
+            std::vector<emulator_hook*> deletes;
+            {
+                std::unique_lock lock(this->partition_mutex_);
+                deletes.assign(this->hooks_to_delete_.begin(), this->hooks_to_delete_.end());
+                this->hooks_to_delete_.clear();
+            }
+            for (auto* hook : deletes)
             {
                 this->delete_hook_internal(hook);
             }
         }
 
+        // Full drain at the end of start() (outside run() — safe for every hook type).
+        void perform_pending_actions()
+        {
+            // Runs at the end of every vCPU's start() on its worker thread → concurrent across vCPUs.
+            this->drain_memory_hook_installs();
+            this->drain_exec_hook_installs();
+            this->drain_deferred_deletes();
+        }
+
+        // Entry point for the deferred-action one-shot (run_on_next_instruction): MEMORY hooks only —
+        // execution hooks must not be installed from inside the one-shot (execution_hooks RefCell).
         void perform_pending_hook_installs()
         {
-            auto hooks_to_install = std::move(this->hooks_to_install_);
-            this->hooks_to_install_ = {};
-
-            for (auto& hook : hooks_to_install)
-            {
-                this->hook_memory_access(std::move(hook.second), hook.first);
-            }
+            this->drain_memory_hook_installs();
         }
 
         emulator_hook* try_install_memory_access_hook(memory_access_hook hook)
@@ -1138,15 +1372,19 @@ namespace sogen::icicle
             {
                 throw std::invalid_argument("Invalid Icicle memory hook range");
             }
-            std::unique_lock lock(this->partition_mutex_);
-            if (!this->is_in_hook_)
+            if (!detail::in_hook_flag())
             {
                 return this->hook_memory_access(std::move(hook), nullptr);
             }
 
             auto* hook_id = this->fresh_hook_handle();
-            this->registrations_[hook_id].pending = true;
-            this->hooks_to_install_[hook_id] = std::move(hook);
+            {
+                std::unique_lock lock(this->partition_mutex_);
+                auto reg = std::make_shared<hook_registration>();
+                reg->pending = true;
+                this->registrations_[hook_id] = std::move(reg);
+                this->hooks_to_install_[hook_id] = std::move(hook);
+            }
 
             this->schedule_action_execution();
 
@@ -1177,6 +1415,7 @@ namespace sogen::icicle
             auto* callback = +[](void* data) {
                 auto* cb = static_cast<std::function<void()>*>(data);
 
+                const hook_scope exec_scope(&detail::in_execution_hook_flag()); // scheduled into execution_hooks
                 try
                 {
                     (*cb)();
@@ -1189,7 +1428,10 @@ namespace sogen::icicle
                 delete cb;
             };
 
-            icicle_run_on_next_instruction(this->emu_, callback, heap_func);
+            // 6.5: target the ACTING vCPU's VM — the deferral came from that vCPU's hook, so its next
+            // instruction is imminent (the originating syscall has not even returned yet). Falls back to
+            // the master VM for external callers and at N=1.
+            icicle_run_on_next_instruction(this->acting_handle(), callback, heap_func);
         }
 
         // 6.2 exec_start gate: a vCPU marks itself running here. It must not enter icicle run() while a
@@ -1201,22 +1443,72 @@ namespace sogen::icicle
             if (this->vcpus_.size() == 1)
             {
                 v.run_active_ = true;
+                this->drain_exec_hook_installs(); // self-kicked deferred installs drain outside run()
                 return;
             }
-            std::unique_lock lock(this->quiesce_mutex_);
-            this->quiesce_cv_.wait(lock, [this] { return !this->quiescing_; });
-            v.run_active_ = true;
+            {
+                std::unique_lock lock(this->quiesce_mutex_);
+                this->quiesce_cv_.wait(lock, [this] { return !this->quiescing_; });
+                v.run_active_ = true;
+            }
+            // 6.5: drain AFTER run_active_ is set. An external stop-the-world now observes this vCPU as
+            // running and stops/waits for it, so a pauser can never touch our VM while we are applying
+            // queued ops to it (the old drain-before-mark order left that cross-thread window open).
+            this->drain_pending_ops(v);
+            this->drain_exec_hook_installs(); // outside run(): execution_hooks is not borrowed here
+        }
+
+        // 6.5 — run the ops queued for this vCPU on its own thread (safe), before it next executes.
+        void drain_pending_ops(icicle_vcpu& v)
+        {
+            std::vector<std::function<void(icicle_emulator*)>> ops;
+            {
+                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                ops.swap(this->pending_ops_[v.index_]);
+            }
+            for (auto& op : ops)
+            {
+                op(v.handle());
+            }
+        }
+
+        // 6.5 — apply a SELF-CONTAINED `op(handle)` (touches only the given handle, never reads another VM)
+        // to every vCPU VM safely, via the 6.5 routing rule (see route_to_all_vms): a vCPU caller applies
+        // to its own VM now, queues peers, and kicks them for bounded drain latency; an external/setup
+        // caller (or N=1) pauses peers and applies to all directly.
+        void apply_to_all_vms(const std::function<void(icicle_emulator*)>& op)
+        {
+            this->route_to_all_vms([this, &op](const size_t i) { op(this->vcpus_[i]->handle()); });
         }
 
         // 6.2 — a vCPU calls this right after icicle run() returns: clears run_active_, wakes any
         // stop-the-world waiter, and (if this vCPU was cancelled for a peer's cross-VM mutation, not a real
         // stop or a hook exception) waits for that mutation to finish and reports that the quantum should
         // resume (mirrors WHP's "cancel without stop_requested_ -> continue").
+        // 6.5: end THIS vCPU's quantum at the next block boundary so begin_run_quantum can drain deferred
+        // work outside icicle run() (same-thread stop: just sets the stop flag + zeroes the icount limit).
+        void kick_self(const size_t index)
+        {
+            {
+                std::lock_guard<std::mutex> lock(this->quiesce_mutex_);
+                this->quantum_kick_[index] = 1;
+            }
+            icicle_stop(this->vcpus_[index]->handle());
+        }
+
         bool complete_run_quantum(icicle_vcpu& v)
         {
             v.run_active_ = false;
             if (this->vcpus_.size() == 1)
             {
+                // N=1: honor a self-kick (deferred execution-hook install) by resuming the quantum —
+                // begin_run_quantum drains it outside icicle run().
+                std::lock_guard<std::mutex> lock(this->quiesce_mutex_);
+                if (this->quantum_kick_[v.index_])
+                {
+                    this->quantum_kick_[v.index_] = 0;
+                    return true;
+                }
                 return false;
             }
             std::unique_lock lock(this->quiesce_mutex_);
@@ -1231,7 +1523,34 @@ namespace sogen::icicle
                 this->quiesce_cv_.wait(lock, [this] { return !this->quiescing_; });
                 return true;
             }
+            if (this->quantum_kick_[v.index_])
+            {
+                // A peer queued a cross-VM op for this vCPU and kicked us (kick_peers): end this quantum
+                // early so begin_run_quantum drains the queue before any further guest execution. Same
+                // resume mechanics as a quiesce cancel, minus the wait (no stop-the-world holds us).
+                this->quantum_kick_[v.index_] = 0;
+                return true;
+            }
             return false;
+        }
+
+        // 6.5: after a vCPU queues cross-VM ops for peers (async map/protect/unmap), kick each RUNNING
+        // peer so its current quantum ends promptly (icicle checks the stop flag at block boundaries) and
+        // begin_run_quantum drains the queue. Without the kick a spinning peer could run its whole quantum
+        // — faulting on a mapping whose pointer it can already observe — before draining. Residual race
+        // (peer's last few blocks before the kick lands) is the documented 6.6 TLB-coherency window.
+        void kick_peers(const size_t own_index)
+        {
+            std::lock_guard<std::mutex> lock(this->quiesce_mutex_);
+            for (auto& v : this->vcpus_)
+            {
+                if (v->index_ == own_index || !v->run_active_.load())
+                {
+                    continue;
+                }
+                this->quantum_kick_[v->index_] = 1;
+                icicle_stop(v->handle());
+            }
         }
 
         // 6.3 — run `fn` with every OTHER vCPU guaranteed to be outside icicle run() (so touching its VM
@@ -1295,10 +1614,27 @@ namespace sogen::icicle
         this->stop_requested_ = false;
         t_running_vcpu = this;
         const auto clear_current = utils::finally([] { t_running_vcpu = nullptr; });
+        // start(count) must run at most `count` instructions in TOTAL. A kick-ended quantum resumes
+        // here, and re-issuing the full count would extend the budget past the caller's contract
+        // (caught by RangedExecHook...: the resumed vCPU ran off the end of its code). Track the
+        // remainder via the VM's retired-instruction counter. count==0 means unlimited (icicle contract).
+        const uint64_t base_icount = icicle_get_icount(this->emu_);
         for (;;)
         {
+            // Budget check BEFORE begin_run_quantum: breaking after it would leak run_active_ = true
+            // (set by begin), deadlocking the next external stop-the-world waiting on this vCPU.
+            uint64_t remaining = count;
+            if (count != 0)
+            {
+                const uint64_t executed = icicle_get_icount(this->emu_) - base_icount;
+                if (executed >= count)
+                {
+                    break; // budget fully consumed by the interrupted quantum
+                }
+                remaining = count - executed;
+            }
             this->machine_.begin_run_quantum(*this);
-            icicle_start(this->emu_, count);
+            icicle_start(this->emu_, remaining);
             if (this->machine_.complete_run_quantum(*this))
             {
                 continue; // paused for a peer's cross-VM mutation — resume this quantum
