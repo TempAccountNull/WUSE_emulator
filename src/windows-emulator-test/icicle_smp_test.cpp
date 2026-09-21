@@ -3,6 +3,9 @@
 #include <memory_manager.hpp>
 #include <array>
 #include <atomic>
+#include <filesystem>
+#include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -148,5 +151,37 @@ namespace sogen::test
             emu->read_memory(addr, &readback, sizeof(readback));
             EXPECT_EQ(readback, value) << "mapped region " << k << " not coherent";
         }
+    }
+
+    // Step 6.5/6.8 regression target (DISABLED_ so it never hangs the default suite; run explicitly with an
+    // external timeout, and only where the emulator root actually contains filesys/c/test-sample.exe).
+    // Runs the multi-threaded test-sample on 2 icicle vCPUs through the REAL windows_emulator. N>1 requires
+    // the lean, wall-clock path (use_instruction_precision=false + use_relative_time=false; both otherwise
+    // hard-error "requires a single vCPU"). Once 6.5 (peer-in-hook resolution) lands this becomes a real
+    // (renamed) regression test.
+    TEST(IcicleSmp, DISABLED_MultiThreadedSampleRunsOnTwoVcpus)
+    {
+        emulator_settings settings{};
+        settings.use_relative_time = false;         // N>1 requires wall-clock time
+        settings.use_instruction_precision = false; // N>1 requires the lean (no per-instruction precision) path
+        settings.emulation_root = get_emulator_root();
+        settings.path_mappings["C:\\a.txt"] =
+            std::filesystem::temp_directory_path() / ("emu-smp-test-" + std::to_string(getpid()) + ".txt");
+
+        emulator_interfaces interfaces{};
+        interfaces.socket_factory = network::create_static_socket_factory();
+        interfaces.dns_lookup = create_sample_dns_lookup();
+        interfaces.ui = std::make_unique<null_ui_backend>();
+
+        windows_emulator emu{
+            create_x86_64_emulator(backend_type::icicle, 2),
+            get_sample_app_settings({}),
+            settings,
+            {},
+            std::move(interfaces),
+        };
+
+        emu.start();
+        ASSERT_TERMINATED_SUCCESSFULLY(emu);
     }
 }
