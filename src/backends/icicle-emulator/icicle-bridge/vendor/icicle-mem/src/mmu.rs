@@ -676,7 +676,11 @@ impl Mmu {
                         // SMP: in-place perm clear on the shared page (a clone would privatize this
                         // VM's view of a page the guest is unmapping — peers must see the same state).
                         // Safety: smp_shared pages are never cloned; see Page::data_mut_shared.
-                        unsafe { page.data_mut_shared() }.perm[offset..offset + len as usize].fill(perm::NONE);
+                        // SMP: do NOT touch shared byte-perms on unmap (never clone either -
+                        // that privatizes this VM's view). Unmap is PER-VM intent: the mapping-tree
+                        // removal below already blocks THIS VM; clearing SHARED perms would break
+                        // peers still mapping the page (probe's loader write failed exactly so:
+                        // peer unmap -> shared perms NONE -> master module write ice-throw).
                     } else {
                         page.data_mut().perm[offset..offset + len as usize].fill(perm::NONE);
                     }

@@ -725,7 +725,36 @@ namespace sogen::icicle
         void write_memory(const uint64_t address, const void* data, const size_t size) override
         {
             const auto res = try_write_memory(address, data, size);
-            ice(res, "Failed to write memory");
+            if (res)
+            {
+                return;
+            }
+            // SMP 6.6c': a host write inside a syscall hook can fail the guest-perm check when a
+            // PEER's write-protect landed in the shared perm array mid-race (instant since 6.6b).
+            // On real Windows this guest race takes a HANDLED access violation - dispatch it on the
+            // acting vCPU instead of ice()-throwing out of the hook and killing the worker
+            // ("vCPU 0 worker terminated: Failed to write memory", 0/5 probe batch). Setup-time
+            // (non-vCPU) callers keep the hard throw: those failures are real host bugs.
+            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
+            if (self && &self->machine_ == this && this->violation_callback_)
+            {
+                try
+                {
+                    (void)this->violation_callback_(this->acting_cpu(self->index()), address, size,
+                                                    memory_operation::write, memory_violation_type::protection);
+                }
+                catch (...)
+                {
+                    this->acting_sink(self->index())->defer_hook_exception(std::current_exception());
+                }
+                return;
+            }
+            if (smp_trace_enabled())
+            {
+                std::fprintf(stderr, "[SMPTRC] write-FAIL ice-throw addr=%#llx size=%zu self=%p cb=%d\n",
+                             (unsigned long long)address, size, (void*)self, (int)(bool)this->violation_callback_);
+            }
+            ice(false, "Failed to write memory");
         }
 
         void apply_memory_protection(const uint64_t address, const size_t size, memory_permission permissions) override
@@ -879,6 +908,9 @@ namespace sogen::icicle
 
         emulator_hook* hook_memory_violation(memory_violation_hook_callback callback) override
         {
+            // SMP 6.6c': kept so a racing HOST write that fails the guest-perm check can dispatch
+            // the guest AV path on the acting vCPU instead of hard-throwing out of the syscall hook.
+            this->violation_callback_ = callback;
             auto* handle = this->fresh_hook_handle();
             auto reg = std::make_shared<hook_registration>();
             for (size_t i = 0; i < this->vcpus_.size(); ++i)
@@ -1193,6 +1225,9 @@ namespace sogen::icicle
         // lock order is always pause_mutex_ -> partition_mutex_ and vCPU threads (which never pause)
         // can't participate in a pause-related cycle.
         std::mutex pause_mutex_{};
+
+        // SMP 6.6c': the windows_emulator's violation callback (guest AV dispatch) for host-write perm races.
+        memory_violation_hook_callback violation_callback_{};
 
         // Step 6.2/6.3 — stop-the-world quiesce (mirrors WHP's cancel-without-stop_requested_ resume): an
         // icicle VM can only be touched by its own thread, so before a cross-VM MMU mutation we pause every
