@@ -1478,7 +1478,11 @@ namespace sogen::icicle
         // caller (or N=1) pauses peers and applies to all directly.
         void apply_to_all_vms(const std::function<void(icicle_emulator*)>& op)
         {
-            this->route_to_all_vms([this, &op](const size_t i) { op(this->vcpus_[i]->handle()); });
+            // `op` MUST be captured by value: the lambda is QUEUED for peers and invoked on their
+            // threads at begin_run_quantum — long after this call returned. A reference capture dangles
+            // and the peer's drain invokes a destroyed std::function (std::bad_function_call — caught by
+            // the N>1 sample probe under cdb: drain_pending_ops -> queued route op).
+            this->route_to_all_vms([this, op](const size_t i) { op(this->vcpus_[i]->handle()); });
         }
 
         // 6.2 — a vCPU calls this right after icicle run() returns: clears run_active_, wakes any

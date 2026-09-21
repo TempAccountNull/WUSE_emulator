@@ -266,7 +266,7 @@ namespace sogen::test
     // keeps reading the pre-write bytes (its own rax/probe stay 0), even with the shared-page COW
     // guard in icicle invalidate_code_range. Cross-VM read visibility of vCPU writes is the next
     // increment; setup-time (external) writes and both vCPUs' execution over shared pages are proven.
-    TEST(IcicleSmp, DISABLED_PeerExecutesRegionMappedFromInsideHook)
+    TEST(IcicleSmp, PeerExecutesRegionMappedFromInsideHook)
     {
         auto emu = icicle::create_x86_64_emulator(2);
         ASSERT_EQ(emu->vcpu_count(), 2U);
@@ -330,6 +330,7 @@ namespace sogen::test
             emit_movabs(&code[0x0A], 0xB8, magic);                  // movabs rax, magic
             code[0x14] = 0x48; code[0x15] = 0x89; code[0x16] = 0x03; // mov [rbx], rax
             code[0x17] = 0x90;
+            code[0x18] = 0xEB; code[0x19] = 0xFE; // jmp $ — stay in the region until the quantum ends
             emu->write_memory(region, code.data(), code.size());
             // Give the kicked peer a moment to drain the queued mapping before the pointer becomes
             // visible (bounded-latency smoke; the hard cross-quantum race is the documented 6.6 window).
@@ -341,7 +342,14 @@ namespace sogen::test
         emu->get_cpu(1).reg(x86_register::rip, page + 0x200);
 
         std::thread t0([&] {
-            emu->get_cpu(0).start(2 * iters + 64);
+            try
+            {
+                emu->get_cpu(0).start(2 * iters + 64);
+            }
+            catch (const std::exception& e)
+            {
+                ADD_FAILURE() << "vCPU 0 start threw: " << e.what();
+            }
         });
         // B runs in repeated quanta (each start() = one quantum → drains queued peer ops between them);
         // a single quantum cannot span A's 100ms in-hook sleep. Stop when the marker lands or capped.
@@ -349,22 +357,20 @@ namespace sogen::test
             auto& cpu = emu->get_cpu(1);
             for (int chunk = 0; chunk < 200; ++chunk)
             {
-                cpu.start(100000);
+                try
+                {
+                    cpu.start(100000);
+                }
+                catch (const std::exception& e)
+                {
+                    ADD_FAILURE() << "vCPU 1 start threw at chunk " << chunk << ": " << e.what();
+                    return;
+                }
                 uint64_t observed{};
                 emu->read_memory(marker, &observed, sizeof(observed));
                 if (observed == magic)
                 {
                     return;
-                }
-                if (chunk == 50 || chunk == 150)
-                {
-                    uint64_t tval{}, probe{}, rax{};
-                    emu->read_memory(target, &tval, sizeof(tval));
-                    emu->read_memory(target + 0x18, &probe, sizeof(probe));
-                    rax = cpu.reg(x86_register::rax);
-                    std::fprintf(stderr, "[T2DBG] chunk=%d target=%llx probe=%llx rax=%llx rip=%llx\n", chunk,
-                                 (unsigned long long)tval, (unsigned long long)probe, (unsigned long long)rax,
-                                 (unsigned long long)cpu.reg(x86_register::rip));
                 }
             }
         });
@@ -381,6 +387,11 @@ namespace sogen::test
     // cross-VM mutation (memory + hooks). N>1 requires the lean, wall-clock path
     // (use_instruction_precision=false + use_relative_time=false; both otherwise hard-error "requires a
     // single vCPU"). Requires the emulator root to contain filesys/c/test-sample.exe.
+    // DISABLED again at a LATER stage (progress): after the write_ptr shared-page clone fix and the
+    // dangling-capture fix, the sample runs guest code on both vCPUs and terminates with a GUEST
+    // ACCESS_VIOLATION (0xC0000005) instead of a host exception/hang — i.e. the host SMP machinery
+    // now holds; the remaining failure is guest-visible correctness (cross-vCPU TLB/SMC invalidation
+    // = 6.6, LOCK-op atomics on shared bytes = 6.7). Re-enable when those land.
     TEST(IcicleSmp, DISABLED_MultiThreadedSampleRunsOnTwoVcpus)
     {
         emulator_settings settings{};

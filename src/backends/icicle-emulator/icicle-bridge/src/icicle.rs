@@ -2191,6 +2191,73 @@ mod shared_memory_smp {
         assert_eq!(read_rax(&mut b), 0xfeedfacefeedface, "B's guest load must see A's write");
     }
 
+    /// Concurrency stage of the C++ `PeerExecutesRegionMappedFromInsideHook` reduction: B's JITTED
+    /// poll loop runs on its own thread over the shared page while A host-writes the cell mid-flight.
+    /// (The sequential variant passes; if this passes too, the trigger is the hook context or the
+    /// kick/drain path, not raw concurrency.)
+    #[test]
+    fn concurrent_guest_read_sees_peer_host_write() {
+        use icicle_vm::cpu::mem::perm;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        const PAGE: u64 = 0x40000;
+        const TARGET: u64 = PAGE + 0x100; // A host-writes this
+        const PROBE: u64 = PAGE + 0x108;  // B stores its loaded rax here each poll
+
+        let shared: Arc<_> = {
+            let mut seed = IcicleEmulator::new();
+            assert!(seed.vm.cpu.mem.map_smp_shared_fresh(PAGE, perm::READ | perm::WRITE | perm::EXEC));
+            // B's poll loop ON THE SHARED PAGE:
+            //   0x00 mov rax,[TARGET] (48 A1 moffs64) | 0x0A mov [PROBE],rax (48 A3 moffs64)
+            //   0x14 test rax,rax      (48 85 C0)    | 0x17 jz 0x00 (74 E7) | 0x19 jmp $ (EB FE)
+            let mut code = Vec::new();
+            code.extend_from_slice(&[0x48, 0xA1]);
+            code.extend_from_slice(&TARGET.to_le_bytes());
+            code.extend_from_slice(&[0x48, 0xA3]);
+            code.extend_from_slice(&PROBE.to_le_bytes());
+            code.extend_from_slice(&[0x48, 0x85, 0xC0]);
+            code.extend_from_slice(&[0x74, 0xE7]);
+            code.extend_from_slice(&[0xEB, 0xFE]);
+            assert!(seed.write_memory(PAGE, &code));
+            seed.vm.cpu.mem.share_page(PAGE).expect("shared arc")
+        };
+
+        let w_page = Arc::clone(&shared);
+        let writer = std::thread::spawn(move || {
+            let mut a = IcicleEmulator::new();
+            assert!(a.vm.cpu.mem.map_smp_shared(PAGE, w_page));
+            std::thread::sleep(Duration::from_millis(100)); // let B's loop get hot (jitted)
+            assert!(a.write_memory(TARGET, &0xfeedfacefeedfaceu64.to_le_bytes()));
+        });
+
+        let r_page = Arc::clone(&shared);
+        let reader = std::thread::spawn(move || {
+            let mut b = IcicleEmulator::new();
+            assert!(b.vm.cpu.mem.map_smp_shared(PAGE, Arc::clone(&r_page)));
+            let ptr_eq = |b: &mut IcicleEmulator| -> bool {
+                b.vm.cpu.mem.share_page(PAGE).map(|p| Arc::ptr_eq(&p, &r_page)).unwrap_or(false)
+            };
+            b.vm.cpu.write_pc(PAGE);
+            b.start(1);
+            for _ in 0..2000 {
+                b.start(100_000);
+                let mut buf = [0u8; 8];
+                assert!(b.read_memory(PROBE, &mut buf));
+                if u64::from_le_bytes(buf) != 0 {
+                    return true;
+                }
+            }
+            false
+        });
+
+        writer.join().unwrap();
+        assert!(
+            reader.join().unwrap(),
+            "B's jitted poll loop never observed A's concurrent write (PROBE stayed 0)"
+        );
+    }
+
     #[test]
     fn two_vms_share_fast_smp_page() {
         use icicle_vm::cpu::mem::perm;

@@ -323,6 +323,16 @@ impl Page {
     /// not be used after a call to [Page::clone] or [Drop::drop]).
     #[inline(always)]
     pub unsafe fn write_ptr(&mut self) -> PageRef {
+        if self.smp_shared {
+            // SMP: a shared page must never be make_mut'd/cloned — the clone would privatize this
+            // VM's view (ensure_executable takes write_ptr when the lifter translates a block, so
+            // simply EXECUTING shared code would otherwise fork the page: caught by
+            // concurrent_guest_read_sees_peer_host_write). Use the stable shared pointer; perm
+            // changes (IN_CODE_CACHE/SMC tracking) apply in place to the shared data — visible to
+            // all sharing VMs, which is the conservative/correct direction for cross-vCPU
+            // self-modifying-code detection.
+            return self.shared_write_ptr();
+        }
         PageRef::new(self.data_mut().into())
     }
 
