@@ -2,7 +2,9 @@
 #include "../backends/icicle-emulator/icicle_x86_64_emulator.hpp"
 #include <memory_manager.hpp>
 #include <array>
+#include <atomic>
 #include <thread>
+#include <vector>
 
 namespace sogen::test
 {
@@ -89,5 +91,62 @@ namespace sogen::test
 
         EXPECT_EQ(emu->get_cpu(0).reg(x86_register::rcx), 0U) << "vCPU 0 loop did not complete";
         EXPECT_EQ(emu->get_cpu(1).reg(x86_register::rcx), 0U) << "vCPU 1 loop did not complete";
+    }
+
+    // Step 6.3/6.4 verification: while both vCPUs SPIN on their own threads, a third thread performs many
+    // cross-VM map_memory calls. Each map must pause both vCPUs (run_with_vcpus_paused) so it can touch
+    // their single-threaded MMUs safely — the whole point of step 6. Success = no crash/hang/UB and every
+    // mapped region is coherent afterwards. (Guarded by an external timeout when run, in case of a deadlock.)
+    TEST(IcicleSmp, CrossVmMapDuringConcurrentExecutionIsSafe)
+    {
+        auto emu = icicle::create_x86_64_emulator(2);
+        ASSERT_EQ(emu->vcpu_count(), 2U);
+
+        memory_manager memory(*emu);
+        const auto code = memory.allocate_memory(0x1000, memory_permission::all);
+        ASSERT_NE(code, 0U);
+        const std::array<uint8_t, 2> spin{0xEB, 0xFE}; // jmp $ (spin forever until stopped)
+        emu->write_memory(code, spin.data(), spin.size());
+
+        std::atomic<bool> stop_flag{false};
+        const auto spin_vcpu = [&](const size_t i) {
+            auto& cpu = emu->get_cpu(i);
+            cpu.reg(x86_register::rip, code);
+            while (!stop_flag.load())
+            {
+                cpu.start(1000000); // returns on quiesce-resume/exhaust or when stopped
+            }
+        };
+
+        std::thread t0(spin_vcpu, 0);
+        std::thread t1(spin_vcpu, 1);
+
+        // Mutator: allocate_memory drives the (now paused-routed) map_memory on all N VMs. Runs while the
+        // two vCPUs spin, so each allocation pauses them mid-execution.
+        constexpr size_t map_count = 400;
+        std::vector<uint64_t> mapped;
+        mapped.reserve(map_count);
+        for (size_t k = 0; k < map_count; ++k)
+        {
+            mapped.push_back(memory.allocate_memory(0x1000, memory_permission::all));
+        }
+
+        stop_flag.store(true);
+        emu->get_cpu(0).stop();
+        emu->get_cpu(1).stop();
+        t0.join();
+        t1.join();
+
+        // Each region mapped during concurrent execution is coherent + usable (checked single-threaded now).
+        for (size_t k = 0; k < mapped.size(); ++k)
+        {
+            const auto addr = mapped[k];
+            ASSERT_NE(addr, 0U);
+            const uint64_t value = 0xA5A5A5A500000000ULL | k;
+            emu->write_memory(addr, &value, sizeof(value));
+            uint64_t readback{};
+            emu->read_memory(addr, &readback, sizeof(readback));
+            EXPECT_EQ(readback, value) << "mapped region " << k << " not coherent";
+        }
     }
 }

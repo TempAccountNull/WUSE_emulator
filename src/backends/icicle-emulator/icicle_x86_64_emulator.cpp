@@ -2,11 +2,14 @@
 #include "icicle_x86_64_emulator.hpp"
 #include "execution_hook.hpp"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <charconv>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <shared_mutex>
 #include <tuple>
 #include <unordered_set>
@@ -137,6 +140,10 @@ namespace sogen::icicle
             memory_write_observation_callback observation{};
         };
 
+        // The icicle_vcpu running on the current OS thread (nullptr on non-vCPU threads). Lets a
+        // stop-the-world initiated from inside a vCPU's own hook skip pausing/awaiting itself (6.3/6.5).
+        thread_local void* t_running_vcpu = nullptr;
+
         uint64_t configured_memory_limit_mib()
         {
             const auto* text = std::getenv("SOGEN_ICICLE_MEMORY_MB");
@@ -191,6 +198,7 @@ namespace sogen::icicle
 
         void stop() override
         {
+            this->stop_requested_ = true;
             icicle_stop(this->emu_);
         }
 
@@ -337,12 +345,21 @@ namespace sogen::icicle
         }
 
       private:
+        friend class icicle_x86_64_emulator; // reads run_active_/stop_requested_/pending_hook_exception_/index_
+
         void throw_if_unhandled_stop();
 
         icicle_emulator* emu_{};
         icicle_x86_64_emulator& machine_;
         uint32_t index_{0};
         std::exception_ptr pending_hook_exception_{};
+
+        // Step 6.2 (mirrors WHP whp_vcpu::run_active_/stop_requested_): run_active_ is true only while this
+        // vCPU is inside icicle run() (a peer's stop-the-world waits for every peer's run_active_ to clear
+        // before touching its VM). stop_requested_ distinguishes a REAL stop (thread-switch/external) from a
+        // quiesce cancel (a peer's cross-VM mutation), so start() knows whether to return or re-enter.
+        std::atomic_bool run_active_{false};
+        std::atomic_bool stop_requested_{false};
     };
 
     class icicle_x86_64_emulator : public x86_64_emulator, public detail::hook_exception_sink
@@ -375,6 +392,7 @@ namespace sogen::icicle
                 this->vcpus_.push_back(std::make_unique<icicle_vcpu>(handle, *this, static_cast<uint32_t>(i)));
             }
             this->emu_ = this->vcpus_[0]->handle();
+            this->quiesce_cancel_.assign(vcpu_count, 0);
         }
 
         ~icicle_x86_64_emulator() override
@@ -481,46 +499,55 @@ namespace sogen::icicle
             };
 
             // Every vCPU VM needs the MMIO region; the callback context (ptr) is shared and coherent.
-            for (auto& vcpu : this->vcpus_)
-            {
-                icicle_map_mmio(vcpu->handle(), address, size, read_wrapper, ptr, write_wrapper, ptr);
-            }
+            // Peers paused so their VMs are safe to touch from this thread (6.3/6.4).
+            this->run_with_vcpus_paused([&] {
+                for (auto& vcpu : this->vcpus_)
+                {
+                    icicle_map_mmio(vcpu->handle(), address, size, read_wrapper, ptr, write_wrapper, ptr);
+                }
+            });
         }
 
         void map_memory(const uint64_t address, const size_t size, memory_permission permissions) override
         {
             const auto perm = static_cast<uint8_t>(permissions);
-            if (this->vcpus_.size() == 1)
-            {
-                // Normal path: keeps COW + snapshots for the single-vCPU case (byte-identical to before SMP).
-                ice(icicle_map_memory(this->emu_, address, size, perm), "Failed to map memory");
-                return;
-            }
-            // SMP: allocate the shared page set on the master, alias the same Arc<PageData> into the rest
-            // so all vCPUs share one coherent guest RAM (cachable, write-through, host-MESI coherency).
-            ice(icicle_map_smp_shared_fresh(this->emu_, address, size, perm), "Failed to map SMP memory");
-            for (size_t i = 1; i < this->vcpus_.size(); ++i)
-            {
-                ice(icicle_share_smp_pages(this->vcpus_[i]->handle(), this->emu_, address, size), "Failed to share SMP memory");
-            }
+            this->run_with_vcpus_paused([&] {
+                if (this->vcpus_.size() == 1)
+                {
+                    // Normal path: keeps COW + snapshots for the single-vCPU case (byte-identical to before SMP).
+                    ice(icicle_map_memory(this->emu_, address, size, perm), "Failed to map memory");
+                    return;
+                }
+                // SMP: allocate the shared page set on the master, alias the same Arc<PageData> into the rest
+                // so all vCPUs share one coherent guest RAM (cachable, write-through, host-MESI coherency).
+                ice(icicle_map_smp_shared_fresh(this->emu_, address, size, perm), "Failed to map SMP memory");
+                for (size_t i = 1; i < this->vcpus_.size(); ++i)
+                {
+                    ice(icicle_share_smp_pages(this->vcpus_[i]->handle(), this->emu_, address, size), "Failed to share SMP memory");
+                }
+            });
         }
 
         void map_host_memory(const uint64_t address, const size_t size, void* host_pointer, memory_permission permissions) override
         {
             const auto perm = static_cast<uint8_t>(permissions);
-            for (auto& vcpu : this->vcpus_)
-            {
-                // Same host pointer in every VM: coherent because they all alias the one host buffer.
-                ice(icicle_map_host_memory(vcpu->handle(), address, host_pointer, size, perm), "Failed to map host memory");
-            }
+            this->run_with_vcpus_paused([&] {
+                for (auto& vcpu : this->vcpus_)
+                {
+                    // Same host pointer in every VM: coherent because they all alias the one host buffer.
+                    ice(icicle_map_host_memory(vcpu->handle(), address, host_pointer, size, perm), "Failed to map host memory");
+                }
+            });
         }
 
         void flush_host_memory_cache(const void* host_pointer, const size_t size) override
         {
-            for (auto& vcpu : this->vcpus_)
-            {
-                icicle_flush_host_memory_cache(vcpu->handle(), host_pointer, size);
-            }
+            this->run_with_vcpus_paused([&] {
+                for (auto& vcpu : this->vcpus_)
+                {
+                    icicle_flush_host_memory_cache(vcpu->handle(), host_pointer, size);
+                }
+            });
         }
 
         bool map_shared_memory(const uint64_t address, const uint64_t source, const size_t size,
@@ -528,19 +555,23 @@ namespace sogen::icicle
         {
             const auto perm = static_cast<uint8_t>(permissions);
             bool ok = true;
-            for (auto& vcpu : this->vcpus_)
-            {
-                ok = (icicle_map_shared_memory(vcpu->handle(), address, source, size, perm) != 0) && ok;
-            }
+            this->run_with_vcpus_paused([&] {
+                for (auto& vcpu : this->vcpus_)
+                {
+                    ok = (icicle_map_shared_memory(vcpu->handle(), address, source, size, perm) != 0) && ok;
+                }
+            });
             return ok;
         }
 
         void unmap_memory(const uint64_t address, const size_t size) override
         {
-            for (auto& vcpu : this->vcpus_)
-            {
-                ice(icicle_unmap_memory(vcpu->handle(), address, size), "Failed to unmap memory");
-            }
+            this->run_with_vcpus_paused([&] {
+                for (auto& vcpu : this->vcpus_)
+                {
+                    ice(icicle_unmap_memory(vcpu->handle(), address, size), "Failed to unmap memory");
+                }
+            });
         }
 
         bool try_read_memory(const uint64_t address, void* data, const size_t size) const override
@@ -568,10 +599,12 @@ namespace sogen::icicle
         void apply_memory_protection(const uint64_t address, const size_t size, memory_permission permissions) override
         {
             const auto perm = static_cast<uint8_t>(permissions);
-            for (auto& vcpu : this->vcpus_)
-            {
-                ice(icicle_protect_memory(vcpu->handle(), address, size, perm), "Failed to apply permissions");
-            }
+            this->run_with_vcpus_paused([&] {
+                for (auto& vcpu : this->vcpus_)
+                {
+                    ice(icicle_protect_memory(vcpu->handle(), address, size, perm), "Failed to apply permissions");
+                }
+            });
         }
 
         // The cpu_interface a hook on VM `index` reports to its callback. VM 0 is the machine itself
@@ -943,6 +976,14 @@ namespace sogen::icicle
         // reverse. Held only for C++ table work — never while invoking a guest/user callback.
         mutable std::shared_mutex partition_mutex_{};
 
+        // Step 6.2/6.3 — stop-the-world quiesce (mirrors WHP's cancel-without-stop_requested_ resume): an
+        // icicle VM can only be touched by its own thread, so before a cross-VM MMU mutation we pause every
+        // OTHER vCPU (icicle_stop, marking it to resume not to stop) and wait for its run_active_ to clear.
+        std::mutex quiesce_mutex_{};
+        std::condition_variable quiesce_cv_{};
+        bool quiescing_{false};
+        std::vector<uint8_t> quiesce_cancel_{}; // per-vCPU: was cancelled for a mutation (resume, don't stop)
+
         emulator_hook* fresh_hook_handle()
         {
             const auto id = ++this->index_;
@@ -1119,6 +1160,92 @@ namespace sogen::icicle
 
             icicle_run_on_next_instruction(this->emu_, callback, heap_func);
         }
+
+        // 6.2 exec_start gate: a vCPU marks itself running here. It must not enter icicle run() while a
+        // stop-the-world is in progress (else its VM would be touched cross-thread), so it waits for
+        // quiescing_ to clear; setting run_active_ under the same lock that guards quiescing_ closes the
+        // parked->executing race with run_with_vcpus_paused. N=1: no peers, so no gate.
+        void begin_run_quantum(icicle_vcpu& v)
+        {
+            if (this->vcpus_.size() == 1)
+            {
+                v.run_active_ = true;
+                return;
+            }
+            std::unique_lock lock(this->quiesce_mutex_);
+            this->quiesce_cv_.wait(lock, [this] { return !this->quiescing_; });
+            v.run_active_ = true;
+        }
+
+        // 6.2 — a vCPU calls this right after icicle run() returns: clears run_active_, wakes any
+        // stop-the-world waiter, and (if this vCPU was cancelled for a peer's cross-VM mutation, not a real
+        // stop or a hook exception) waits for that mutation to finish and reports that the quantum should
+        // resume (mirrors WHP's "cancel without stop_requested_ -> continue").
+        bool complete_run_quantum(icicle_vcpu& v)
+        {
+            v.run_active_ = false;
+            if (this->vcpus_.size() == 1)
+            {
+                return false;
+            }
+            std::unique_lock lock(this->quiesce_mutex_);
+            this->quiesce_cv_.notify_all();
+            if (v.stop_requested_ || v.pending_hook_exception_)
+            {
+                return false;
+            }
+            if (this->quiesce_cancel_[v.index_])
+            {
+                this->quiesce_cancel_[v.index_] = 0;
+                this->quiesce_cv_.wait(lock, [this] { return !this->quiescing_; });
+                return true;
+            }
+            return false;
+        }
+
+        // 6.3 — run `fn` with every OTHER vCPU guaranteed to be outside icicle run() (so touching its VM
+        // from this thread is safe). Pauses running peers via icicle_stop (marking them to RESUME, not
+        // stop), waits for each run_active_ to clear, runs fn, then releases them. The caller's own vCPU (if
+        // any, on this thread) is excluded — its VM is safe to touch same-thread. N=1: no peers.
+        template <typename Fn>
+        void run_with_vcpus_paused(Fn&& fn)
+        {
+            if (this->vcpus_.size() == 1)
+            {
+                fn();
+                return;
+            }
+            std::unique_lock lock(this->quiesce_mutex_);
+            this->quiescing_ = true;
+            const auto resume = utils::finally([this] {
+                this->quiescing_ = false;
+                this->quiesce_cv_.notify_all();
+            });
+            for (auto& vcpu : this->vcpus_)
+            {
+                if (vcpu.get() == t_running_vcpu)
+                {
+                    continue;
+                }
+                if (vcpu->run_active_)
+                {
+                    this->quiesce_cancel_[vcpu->index()] = 1;
+                    icicle_stop(vcpu->handle());
+                }
+            }
+            this->quiesce_cv_.wait(lock, [this] {
+                for (auto& vcpu : this->vcpus_)
+                {
+                    if (vcpu.get() != t_running_vcpu && vcpu->run_active_)
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            });
+            // Every peer is now outside icicle run(): safe to touch their VMs from this thread.
+            fn();
+        }
     };
 
     // icicle_vcpu methods that need the complete machine type (memory surface + hook machinery).
@@ -1134,7 +1261,19 @@ namespace sogen::icicle
 
     inline void icicle_vcpu::start(const size_t count)
     {
-        icicle_start(this->emu_, count);
+        this->stop_requested_ = false;
+        t_running_vcpu = this;
+        const auto clear_current = utils::finally([] { t_running_vcpu = nullptr; });
+        for (;;)
+        {
+            this->machine_.begin_run_quantum(*this);
+            icicle_start(this->emu_, count);
+            if (this->machine_.complete_run_quantum(*this))
+            {
+                continue; // paused for a peer's cross-VM mutation — resume this quantum
+            }
+            break;
+        }
         this->rethrow_deferred_hook_exception();
         this->throw_if_unhandled_stop();
         this->machine_.perform_pending_actions();
