@@ -2142,6 +2142,55 @@ mod shared_memory_smp {
         unsafe { dealloc(host, layout) };
     }
 
+    /// The C++ `PeerExecutesRegionMappedFromInsideHook` failure reduced to Rust: after a peer VM has
+    /// EXECUTED code from an SMP-shared page (page is executed / JIT-translated), a HOST write via the
+    /// other VM (bridge write_memory: invalidate_code_range + write_bytes) must be visible to the
+    /// first VM's GUEST reads (executed loads), not only to its host reads.
+    #[test]
+    fn guest_read_sees_peer_host_write_to_executed_shared_page() {
+        use icicle_vm::cpu::mem::perm;
+        let mut a = IcicleEmulator::new();
+        let mut b = IcicleEmulator::new();
+        let addr = 0x40000u64;
+        assert!(a.vm.cpu.mem.map_smp_shared_fresh(addr, perm::READ | perm::WRITE | perm::EXEC));
+        let shared = a.vm.cpu.mem.share_page(addr).expect("shared arc");
+        assert!(b.vm.cpu.mem.map_smp_shared(addr, shared));
+
+        // Guest code ON THE SHARED PAGE at +0x00: mov rax, [TARGET]; then a jmp-self pad is not needed
+        // (icount-limited). TARGET at +0x100.
+        // 48 B8 is mov rax, imm64 -- we need a LOAD: mov rax, [abs] = REX.W A1 imm64 (moffs).
+        let code: [u8; 10] = [0x48, 0xA1, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]; // mov rax,[0x40000+0x100]
+        assert!(a.write_memory(addr, &code));
+        b.vm.cpu.write_pc(addr);
+
+        let read_rax = |emu: &mut IcicleEmulator| -> u64 {
+            let mut buf = [0u8; 8];
+            emu.read_register(registers::X86Register::Rax, &mut buf);
+            u64::from_le_bytes(buf)
+        };
+
+        // 1) B executes the load once with TARGET = 0 (page becomes executed / translated).
+        unsafe { b.vm.cpu.regs.write_at(0, 0u64.to_le_bytes()) }; // zero rax (Rax is regs slot 0)
+        b.start(1);
+        assert_eq!(read_rax(&mut b), 0, "initial load must read 0");
+
+        // 2) A host-writes TARGET (the failing path: invalidate_code_range + write_bytes on VM A).
+        assert!(a.write_memory(addr + 0x100, &0xfeedfacefeedfaceu64.to_le_bytes()));
+
+        // 3) Host-read sanity through BOTH VMs.
+        let mut buf = [0u8; 8];
+        assert!(a.read_memory(addr + 0x100, &mut buf));
+        assert_eq!(u64::from_le_bytes(buf), 0xfeedfacefeedface, "A host-read");
+        assert!(b.read_memory(addr + 0x100, &mut buf));
+        assert_eq!(u64::from_le_bytes(buf), 0xfeedfacefeedface, "B host-read (shared bytes)");
+
+        // 4) THE assertion that failed in C++: B's GUEST load must observe the peer's write.
+        //    (Re-point PC at the load: start(1) advanced PC past it — the C++ test polls in a loop.)
+        b.vm.cpu.write_pc(addr);
+        b.start(1);
+        assert_eq!(read_rax(&mut b), 0xfeedfacefeedface, "B's guest load must see A's write");
+    }
+
     #[test]
     fn two_vms_share_fast_smp_page() {
         use icicle_vm::cpu::mem::perm;
