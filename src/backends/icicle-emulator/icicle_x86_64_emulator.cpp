@@ -764,7 +764,14 @@ namespace sogen::icicle
             return [this, vcpu_index, c = std::move(callback)](Args... args) -> Ret {
                 try
                 {
-                    return c(this->acting_cpu(vcpu_index), std::forward<Args>(args)...);
+                    if constexpr (std::is_void_v<Ret>)
+                    {
+                        c(this->acting_cpu(vcpu_index), std::forward<Args>(args)...);
+                    }
+                    else
+                    {
+                        return c(this->acting_cpu(vcpu_index), std::forward<Args>(args)...);
+                    }
                 }
                 catch (...)
                 {
@@ -792,6 +799,11 @@ namespace sogen::icicle
             auto reg = std::make_shared<hook_registration>();
             for (size_t i = 0; i < this->vcpus_.size(); ++i)
             {
+                // 6.6c NOTE: a syscall-exit drain of this vCPU's pending queue was tried and
+                // REVERTED (probe 0/8): applying a peer's queued UNMAP mid-hook breaks the running
+                // syscall's own subsequent guest writes ("Failed to write memory"). Closing the
+                // deferred-protect DEP window needs an op-type-filtered drain (perm-only) at a
+                // post-block safe point - see SMP-PLAN 6.6c.
                 auto obj = make_function_object(this->bind_cpu(i, callback));
                 auto* ptr = obj.get();
 
