@@ -2,6 +2,7 @@
 #include "icicle_x86_64_emulator.hpp"
 #include "execution_hook.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -730,6 +731,11 @@ namespace sogen::icicle
         void apply_memory_protection(const uint64_t address, const size_t size, memory_permission permissions) override
         {
             const auto perm = static_cast<uint8_t>(permissions);
+            // SMP: routed (own-VM apply + queued peer apply + kick). A bounded wait for peers to
+            // drain was tried and REVERTED: a peer blocked acquiring the BEL (run_active_, parked in
+            // a hook) can never drain while we hold the BEL, so every protect paid the full timeout
+            // and the sample starved (0/8 vs 1/7 without the wait). Closing this window needs
+            // scheduler-level synchronous TLB flush (QEMU-style exclusive section), not a sleep.
             this->apply_to_all_vms([=](icicle_emulator* h) { ice(icicle_protect_memory(h, address, size, perm), "Failed to apply permissions"); });
         }
 

@@ -672,7 +672,14 @@ impl Mmu {
                     assert!(!page.executed, "Unmapped cached code page. Currently unsupported");
 
                     let offset = PageData::offset(start);
-                    page.data_mut().perm[offset..offset + len as usize].fill(perm::NONE);
+                    if page.smp_shared {
+                        // SMP: in-place perm clear on the shared page (a clone would privatize this
+                        // VM's view of a page the guest is unmapping — peers must see the same state).
+                        // Safety: smp_shared pages are never cloned; see Page::data_mut_shared.
+                        unsafe { page.data_mut_shared() }.perm[offset..offset + len as usize].fill(perm::NONE);
+                    } else {
+                        page.data_mut().perm[offset..offset + len as usize].fill(perm::NONE);
+                    }
                 }
                 Some(_) => {}
 
@@ -791,7 +798,17 @@ impl Mmu {
                     if page.executed {
                         tracing::error!("Changed perms of code page. JIT cache may now be invalid");
                     }
-                    page.data_mut().perm[offset..offset + len].fill(perm);
+                    if page.smp_shared {
+                        // SMP: never make_mut a shared page — the clone privatizes this VM's copy
+                        // (protect_does_not_privatize_shared_page: the protecting VM loses all
+                        // subsequent peer writes; the N>1 probe's WritePerm fault on ntdll .data
+                        // traces to this). Protection is a property of the shared page: apply the
+                        // perm bytes in place so every sharing VM sees the same protection.
+                        // Safety: smp_shared pages are never cloned; see Page::data_mut_shared.
+                        unsafe { page.data_mut_shared() }.perm[offset..offset + len].fill(perm);
+                    } else {
+                        page.data_mut().perm[offset..offset + len].fill(perm);
+                    }
                 }
                 MemoryMapping::Unallocated(entry) => entry.perm = perm,
                 MemoryMapping::Io(_) => {
@@ -1073,11 +1090,21 @@ impl Mmu {
                     if entry.shared_perm != 0 { continue; }
                     let (offset, len) = PageData::offset_and_len(start, end + 1);
                     let page = physical.get_mut(entry.index);
-                    page.data_mut().perm[offset..offset + len].iter_mut().for_each(|p| {
-                        if *p & perm::INIT == 0 {
-                            *p &= !perm::EXEC;
-                        }
-                    });
+                    if page.smp_shared {
+                        // SMP: in-place (a clone would privatize this VM's view of a shared page).
+                        // Safety: smp_shared pages are never cloned; see Page::data_mut_shared.
+                        unsafe { page.data_mut_shared() }.perm[offset..offset + len].iter_mut().for_each(|p| {
+                            if *p & perm::INIT == 0 {
+                                *p &= !perm::EXEC;
+                            }
+                        });
+                    } else {
+                        page.data_mut().perm[offset..offset + len].iter_mut().for_each(|p| {
+                            if *p & perm::INIT == 0 {
+                                *p &= !perm::EXEC;
+                            }
+                        });
+                    }
                 }
                 MemoryMapping::Unallocated(x) => x.perm &= !perm::EXEC,
                 MemoryMapping::Io(_) => {}
@@ -1275,9 +1302,9 @@ impl Mmu {
         // SMP 6.6a experiment (SOGEN_SMP_EPOCH=2): bump the epoch for PRIVATE (executed) pages too,
         // so the same raise/recovery can be A/B tested at N=1 on a private page.
         if std::env::var("SOGEN_SMP_EPOCH").map(|v| v == "2").unwrap_or(false) {
-            let page = self.physical.get_mut(index);
+            let page = self.physical.get(index);
             if page.executed {
-                page.data_mut().bump_code_epoch();
+                page.data().bump_code_epoch();
             }
         }
         let page_start = self.page_aligned(addr);

@@ -2339,6 +2339,39 @@ mod shared_memory_smp {
     /// poll loop runs on its own thread over the shared page while A host-writes the cell mid-flight.
     /// (The sequential variant passes; if this passes too, the trigger is the hook context or the
     /// kick/drain path, not raw concurrency.)
+    /// 6.6b: a PROTECT on an SMP-shared page must not privatize it. Mmu::protect used
+    /// Page::data_mut() (Arc::make_mut), which clones a shared page in the protecting VM — after
+    /// which that VM's writes/perm changes diverge from the rest (the probe's WritePerm fault on
+    /// ntdll .data at pc=0x180075d6a traces to this). Sharing must survive protects.
+    #[test]
+    fn protect_does_not_privatize_shared_page() {
+        use icicle_vm::cpu::mem::perm;
+        const PAGE: u64 = 0x40000;
+        let mut a = IcicleEmulator::new();
+        let mut b = IcicleEmulator::new();
+        assert!(a.vm.cpu.mem.map_smp_shared_fresh(PAGE, perm::READ | perm::WRITE));
+        let shared = a.vm.cpu.mem.share_page(PAGE).expect("arc");
+        assert!(b.vm.cpu.mem.map_smp_shared(PAGE, shared));
+
+        // B writes; A protects RW (the loader's everyday pattern); B writes again.
+        assert!(b.write_memory(PAGE, &1u64.to_le_bytes()));
+        assert!(a.vm.cpu.mem.update_perm(PAGE, 0x1000, perm::READ | perm::WRITE).is_ok());
+        assert!(b.write_memory(PAGE + 8, &2u64.to_le_bytes()));
+
+        // Both VMs must still see BOTH writes (one shared backing), and B's page must still be
+        // smp_shared (not a private clone).
+        let check = |emu: &mut IcicleEmulator, tag: &str| {
+            let mut buf = [0u8; 8];
+            assert!(emu.read_memory(PAGE, &mut buf), "{tag} read0");
+            eprintln!("{tag} [0]={}", u64::from_le_bytes(buf));
+            assert_eq!(u64::from_le_bytes(buf), 1, "{tag} lost pre-protect write (sharing broke)");
+            assert!(emu.read_memory(PAGE + 8, &mut buf), "{tag} read8");
+            assert_eq!(u64::from_le_bytes(buf), 2, "{tag} lost post-protect write (sharing broke)");
+        };
+        check(&mut a, "A");
+        check(&mut b, "B");
+    }
+
     #[test]
     fn concurrent_guest_read_sees_peer_host_write() {
         use icicle_vm::cpu::mem::perm;
