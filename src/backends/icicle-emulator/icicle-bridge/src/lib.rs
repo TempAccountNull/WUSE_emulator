@@ -61,6 +61,22 @@ pub fn icicle_get_icount(ptr: *mut c_void) -> u64 {
 }
 
 #[unsafe(no_mangle)]
+pub fn icicle_invalidate_code_range(ptr: *mut c_void, address: u64, length: u64) -> i32 {
+    unsafe {
+        let emulator = &mut *(ptr as *mut IcicleEmulator);
+        return if emulator.invalidate_code_range_public(address, length) { 1 } else { 0 };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn icicle_code_range_is_cached(ptr: *mut c_void, address: u64, length: u64) -> i32 {
+    unsafe {
+        let emulator = &*(ptr as *mut IcicleEmulator);
+        return if emulator.code_range_is_cached(address, length) { 1 } else { 0 };
+    }
+}
+
+#[unsafe(no_mangle)]
 pub fn icicle_get_vm_exit_description(ptr: *mut c_void, callback: DataFunction, data: *mut c_void) {
     let emulator = unsafe { &*(ptr as *mut IcicleEmulator) };
     let description = emulator.vm_exit_description();

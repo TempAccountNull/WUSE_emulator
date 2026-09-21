@@ -256,7 +256,42 @@ namespace sogen::test
         EXPECT_EQ(emu->get_cpu(1).reg(x86_register::rcx), 0U);
     }
 
-    // Step 6.5 verification — Arc-capture async mapping from an in-hook context reaches peers and they
+    // Step 6.6: cross-vCPU self-modifying code — a host write over a TRANSLATED shared page must
+    // invalidate every VM's translation (the peer would otherwise keep executing stale code; the
+    // minimal repro showed rax=0x1111 after the peer wrote 0x2222 code). Values printed per step.
+    TEST(IcicleSmp, CrossVcpuSelfModifyingCodeInvalidatesPeerTranslation)
+    {
+        auto emu = icicle::create_x86_64_emulator(2);
+        ASSERT_EQ(emu->vcpu_count(), 2U);
+
+        memory_manager memory(*emu);
+        const auto page = memory.allocate_memory(0x1000, memory_permission::all);
+        ASSERT_NE(page, 0U);
+
+        // v1: mov eax,0x1111 (B8 11 11 00 00); jmp $-5 (EB F9).  v2: same with 0x2222.
+        const std::array<uint8_t, 7> v1{0xB8, 0x11, 0x11, 0x00, 0x00, 0xEB, 0xF9};
+        const std::array<uint8_t, 7> v2{0xB8, 0x22, 0x22, 0x00, 0x00, 0xEB, 0xF9};
+
+        auto& cpu0 = emu->get_cpu(0);
+        const auto eax = [&] { return cpu0.reg(x86_register::rax); };
+
+        std::fprintf(stderr, "[SMC6] STEP1 write v1 + execute on vCPU 0\n");
+        emu->write_memory(page, v1.data(), v1.size());
+        cpu0.reg(x86_register::rip, page);
+        cpu0.start(10);
+        std::fprintf(stderr, "[SMC6] STEP2 rax=%#llx (expect 0x1111)\n", (unsigned long long)eax());
+        ASSERT_EQ(eax(), 0x1111u);
+
+        std::fprintf(stderr, "[SMC6] STEP3 host-write v2 over the translated page\n");
+        emu->write_memory(page, v2.data(), v2.size());
+
+        cpu0.reg(x86_register::rip, page);
+        cpu0.start(10);
+        std::fprintf(stderr, "[SMC6] STEP4 rax=%#llx (expect 0x2222, stale=0x1111)\n", (unsigned long long)eax());
+        EXPECT_EQ(eax(), 0x2222u) << "vCPU 0 executed its stale translation after the peer write";
+    }
+
+        // Step 6.5 verification — Arc-capture async mapping from an in-hook context reaches peers and they
     // EXECUTE from the region. vCPU A maps a fresh region from inside its own read hook (async path:
     // map+capture on A's VM, queued alias-from-capture + kick for B), writes code + a pointer into shared
     // memory, and vCPU B — polling that pointer from its own loop — jumps into the region and runs it. If

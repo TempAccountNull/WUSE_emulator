@@ -87,6 +87,10 @@ extern "C"
     int32_t icicle_get_stop_info(icicle_emulator*, icicle_stop_info* info);
     // Retired-instruction counter: used to honor start(count) across kick-resumed quanta.
     uint64_t icicle_get_icount(icicle_emulator*);
+    // SMP 6.6: drop this VM's translations for a range (returns 1 if anything was cached), and a
+    // read-only query for whether ANY sharing VM translated the range (shared IN_CODE_CACHE perms).
+    int32_t icicle_invalidate_code_range(icicle_emulator*, uint64_t address, uint64_t length);
+    int32_t icicle_code_range_is_cached(icicle_emulator*, uint64_t address, uint64_t length);
     void icicle_get_exception_name(uint32_t code, data_accessor_func* callback, void* data);
     void icicle_get_vm_exit_description(icicle_emulator*, data_accessor_func* callback, void* data);
     void icicle_stop(icicle_emulator*);
@@ -640,7 +644,52 @@ namespace sogen::icicle
 
         bool try_write_memory(const uint64_t address, const void* data, const size_t size) override
         {
-            return icicle_write_memory(this->acting_handle(), address, data, size);
+            if (this->vcpus_.size() == 1 || size == 0)
+            {
+                return icicle_write_memory(this->acting_handle(), address, data, size);
+            }
+
+            // SMP 6.6: if the written range is translated on ANY VM (detected via the shared PageData
+            // IN_CODE_CACHE perms — visible from any single view), every OTHER VM's translation of it
+            // must be dropped too, or a peer keeps executing stale code after this write.
+            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
+            const bool caller_is_vcpu = self && &self->machine_ == this;
+            const bool cached = icicle_code_range_is_cached(this->acting_handle(), address, size);
+
+            if (!caller_is_vcpu)
+            {
+                // External/setup caller: peers are paused — invalidate every VM directly.
+                bool ok = false;
+                this->pause_peers_and([&] {
+                    ok = icicle_write_memory(this->emu_, address, data, size);
+                    for (auto& v : this->vcpus_)
+                    {
+                        (void)icicle_invalidate_code_range(v->handle(), address, size);
+                    }
+                });
+                return ok;
+            }
+
+            const auto own = self->index();
+            const bool ok = icicle_write_memory(self->handle(), address, data, size);
+            if (cached)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                    for (auto& v : this->vcpus_)
+                    {
+                        if (v->index() == own)
+                        {
+                            continue;
+                        }
+                        this->pending_ops_[v->index()].push_back([address, size](icicle_emulator* h) {
+                            (void)icicle_invalidate_code_range(h, address, size);
+                        });
+                    }
+                }
+                this->kick_peers(own);
+            }
+            return ok;
         }
 
         void write_memory(const uint64_t address, const void* data, const size_t size) override

@@ -806,6 +806,56 @@ impl IcicleEmulator {
         return continue_execution;
     }
 
+    /// SMP 6.6: drop this VM's translations/TLB for [address, address+length). Returns whether
+    /// anything was actually invalidated (an executed page was touched). No-op for uncached ranges.
+    pub fn invalidate_code_range_public(&mut self, address: u64, length: u64) -> bool {
+        let changed = self.invalidate_code_range(address, length);
+        if changed {
+            // invalidate_code_range already cleared the TLB and set the flag; nothing extra needed.
+        }
+        return changed;
+    }
+
+    /// SMP 6.6: read-only query — does [address, address+length) overlap an EXECUTED (translated)
+    /// page in this VM? Lets the C++ backend decide whether a host write needs peer fan-out,
+    /// without mutating anything.
+    pub fn code_range_is_cached(&self, address: u64, length: u64) -> bool {
+        use icicle_vm::cpu::mem::perm;
+        if length == 0 {
+            return false;
+        }
+        let last = address.saturating_add(length - 1);
+        let mem = &self.vm.cpu.mem;
+        let page_size = mem.page_size();
+        let mut page_address = mem.page_aligned(address);
+        loop {
+            if let Some(index) = mem.get_physical_index(page_address) {
+                let page = mem.get_physical(index);
+                if page.executed {
+                    return true; // this VM translated the page
+                }
+                if page.smp_shared {
+                    // The shared PageData perms carry IN_CODE_CACHE set by ANY sharing VM's
+                    // translation (ensure_executable mutates them in place since the write_ptr
+                    // fix), so this is a cross-VM-visible "someone translated this" signal.
+                    let data = page.data();
+                    let start = ((page_address.max(address) - page_address) & (page_size - 1)) as usize;
+                    let end = (((last.min(page_address + page_size - 1)) - page_address) & (page_size - 1)) as usize;
+                    for p in &data.perm[start..=end.min(data.perm.len() - 1)] {
+                        if p & perm::IN_CODE_CACHE != 0 {
+                            return true;
+                        }
+                    }
+                }
+            }
+            if last - page_address < page_size {
+                break;
+            }
+            page_address += page_size;
+        }
+        return false;
+    }
+
     fn invalidate_code_range(&mut self, address: u64, length: u64) -> bool {
         if length == 0 {
             return false;
@@ -2268,6 +2318,9 @@ mod shared_memory_smp {
     // fix), but the peer's write only clears/invalidates ITS OWN VM's TLB + code cache. Fix
     // direction: fan the invalidation out to every VM sharing the page (queued peer op calling an
     // exposed invalidate-range on each handle, plus a generation/epoch check for guest-TLB writes).
+    // IGNORED: the bridge is a single-VM view — the cross-VM invalidation fan-out lives in the C++
+    // backend (it owns all N VMs + the peer queues), so this cannot pass at the Rust level.
+    // The real gate is IcicleSmp.CrossVcpuSelfModifyingCodeInvalidatesPeerTranslation.
     #[test]
     #[ignore]
     fn cross_vcpu_self_modifying_code_is_seen_by_executing_vm() {
