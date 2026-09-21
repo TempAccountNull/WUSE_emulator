@@ -295,11 +295,7 @@ namespace sogen::test
     // pointer), so no host-write fan-out runs. vCPU 0 loops on code page P (v1); vCPU 1 executes
     // guest stores (from a separate page Q) that overwrite P with v2; vCPU 0 must then execute
     // the NEW code. Values printed per step.
-    // DISABLED = open 6.6a target: the epoch mechanism (PageData.code_epoch + write bump +
-    // per-block check, SOGEN_SMP_EPOCH=1) DETECTS the stale translation correctly, but raising
-    // CACHE_INVALIDATED from the bridge's execute() hook currently gets mangled into a
-    // ReadUnmapped fetch fault (rip=P, value=0). Fix the flush/handling path, then enable.
-    TEST(IcicleSmp, DISABLED_GuestSelfModifyingCodeSeenByOtherVcpu)
+    TEST(IcicleSmp, GuestSelfModifyingCodeSeenByOtherVcpu)
     {
         auto emu = icicle::create_x86_64_emulator(2);
         ASSERT_EQ(emu->vcpu_count(), 2U);
@@ -315,15 +311,13 @@ namespace sogen::test
         const std::array<uint8_t, 7> v2{0xB8, 0x22, 0x22, 0x00, 0x00, 0xEB, 0xF9};
         emu->write_memory(page_p, v1.data(), v1.size());
 
-        // Q (guest writer): movabs rax, P; movabs rcx, 7; mov qword [rax], 0x2222_B8 (v2 head);
-        // simpler: write the two dwords of v2 via two mov [rax],ecx steps, then spin.
-        // Encoded: 48 B8 <P>            movabs rax, P
-        //          B9 22 22 00 00       mov ecx, 0x2222
-        //          48 89 08             mov [rax], rcx
-        //          48 83 C0 04          add rax, 4
-        //          B9 00 00 00 00       mov ecx, 0
-        //          89 08                mov [rax], ecx   (imm32 high = 0)
-        //          EB FE                jmp $
+        // v2 as one little-endian qword (B8 22 22 00 00 EB F9 padded with 90):
+        //   bytes B8 22 22 00 00 EB F9 90 -> u64 0x90F9EB00002222B8
+        // Q (guest writer): movabs rax, P; movabs rcx, <v2 qword>; mov [rax], rcx; jmp $
+        // Encoded: 48 B8 <P>                     movabs rax, P
+        //          48 B9 <v2qword>               movabs rcx, 0x90F9EB00002222B8
+        //          48 89 08                      mov [rax], rcx
+        //          EB FE                         jmp $
         std::array<uint8_t, 64> q{};
         size_t n = 0;
         const auto emit = [&](const std::initializer_list<uint8_t> bytes) {
@@ -332,11 +326,10 @@ namespace sogen::test
         emit({0x48, 0xB8});
         const uint64_t p64 = page_p;
         for (size_t i = 0; i < 8; ++i) { q[n++] = static_cast<uint8_t>(p64 >> (i * 8)); }
-        emit({0xB9, 0x22, 0x22, 0x00, 0x00});
+        emit({0x48, 0xB9});
+        const uint64_t v2q = 0x90F9EB00002222B8ULL; // B8 22 22 00 00 EB F9 90 little-endian
+        for (size_t i = 0; i < 8; ++i) { q[n++] = static_cast<uint8_t>(v2q >> (i * 8)); }
         emit({0x48, 0x89, 0x08});
-        emit({0x48, 0x83, 0xC0, 0x04});
-        emit({0xB9, 0x00, 0x00, 0x00, 0x00});
-        emit({0x89, 0x08});
         emit({0xEB, 0xFE});
         emu->write_memory(page_q, q.data(), q.size());
 

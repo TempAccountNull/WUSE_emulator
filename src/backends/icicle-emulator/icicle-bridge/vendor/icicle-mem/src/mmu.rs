@@ -1272,6 +1272,14 @@ impl Mmu {
         value: [u8; N],
         perm: u8,
     ) -> MemResult<()> {
+        // SMP 6.6a experiment (SOGEN_SMP_EPOCH=2): bump the epoch for PRIVATE (executed) pages too,
+        // so the same raise/recovery can be A/B tested at N=1 on a private page.
+        if std::env::var("SOGEN_SMP_EPOCH").map(|v| v == "2").unwrap_or(false) {
+            let page = self.physical.get_mut(index);
+            if page.executed {
+                page.data_mut().bump_code_epoch();
+            }
+        }
         let page_start = self.page_aligned(addr);
         let page_size = self.page_size();
 

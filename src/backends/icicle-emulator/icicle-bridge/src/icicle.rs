@@ -351,6 +351,25 @@ impl icicle_vm::CodeInjector for InstructionHookInjector {
     }
 }
 
+#[inline]
+fn smp_dbg(msg: &str) {
+    if smp_epoch_mode() != 0 {
+        eprintln!("[SMPDBG-R] {msg}");
+    }
+}
+
+/// SMP 6.6a epoch mode: 1 = smp_shared pages only (DEFAULT - production), 2 = all pages
+/// (A/B experiment), 0 = off. The earlier "recovery fault" was a bad TEST writing the VALUE 0x2222
+/// over the B8 opcode (re-lifted garbage read [0]); the mechanism itself is proven on private
+/// (epoch_recovery_private_page_ab) and shared (GuestSelfModifyingCodeSeenByOtherVcpu) pages.
+fn smp_epoch_mode() -> u8 {
+    use std::sync::OnceLock;
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::var("SOGEN_SMP_EPOCH").map(|v| v.parse().unwrap_or(1)).unwrap_or(1).min(2)
+    })
+}
+
 struct ExecutionHooks {
     stop: Rc<RefCell<bool>>,
     /// SMP 6.6a: page address -> code_epoch this VM last executed that shared page at.
@@ -459,21 +478,15 @@ impl ExecutionHooks {
             let page_start = mem.page_aligned(address);
             if let Some(index) = mem.get_physical_index(page_start) {
                 let page = mem.get_physical(index);
-                // WIP (6.6a): the epoch CHECK is env-gated OFF by default - raising
-                // CACHE_INVALIDATED here currently gets mangled into a ReadUnmapped fetch fault
-                // (gate test: rip=P, value=0). Enable with SOGEN_SMP_EPOCH=1 to work on it.
                 static EPOCH_CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                if page.smp_shared
-                    && *EPOCH_CHECK.get_or_init(|| {
-                        std::env::var("SOGEN_SMP_EPOCH").map(|v| v == "1").unwrap_or(false)
-                    })
-                {
+                if (page.smp_shared || smp_epoch_mode() == 2) && smp_epoch_mode() != 0 {
                     let current = page.data().code_epoch();
                     let seen = self
                         .shared_code_epochs
                         .entry(page_start)
                         .or_insert(current);
                     if *seen != current {
+                        smp_dbg(&format!("epoch mismatch page={page_start:#x} seen={seen} current={current} pc={address:#x}"));
                         *seen = current;
                         self.invalidate_code.set(true);
                         // Fall through to run_hooks + the TAIL raise below — the exact shape of the
@@ -826,6 +839,7 @@ impl IcicleEmulator {
     }
 
     fn handle_exception(&mut self, code: ExceptionCode, value: u64) -> bool {
+        smp_dbg(&format!("handle_exception code={code:?} value={value:#x} pc={:#x}", self.vm.cpu.read_pc()));
         let continue_execution = match code {
             ExceptionCode::Syscall => self.handle_syscall(value),
             ExceptionCode::ReadPerm => self.handle_violation(value, FOREIGN_READ, false),
@@ -938,6 +952,7 @@ impl IcicleEmulator {
 
     fn flush_pending_code(&mut self) {
         if self.invalidate_code.replace(false) {
+            smp_dbg("flush_pending_code: flushing code+vising jit");
             assert!(!self.vm_running);
             self.vm.code.flush_code();
             // Vm::run has returned, so no generated-code frame still references this module.
@@ -974,7 +989,9 @@ impl IcicleEmulator {
             return self.handle_interrupt((value & 0xff) as i32);
         }
         if value == CACHE_INVALIDATED {
+            smp_dbg("handle_environment CACHE_INVALIDATED -> flush");
             self.flush_pending_code();
+            smp_dbg("handle_environment flushed, continue");
             return true;
         }
         if value == crate::xstate::GENERAL_PROTECTION {
@@ -2234,6 +2251,45 @@ mod shared_memory_smp {
     /// EXECUTED code from an SMP-shared page (page is executed / JIT-translated), a HOST write via the
     /// other VM (bridge write_memory: invalidate_code_range + write_bytes) must be visible to the
     /// first VM's GUEST reads (executed loads), not only to its host reads.
+    /// 6.6a A/B experiment (run with SOGEN_SMP_EPOCH=2): the SAME epoch raise/recovery on a
+    /// PRIVATE page at N=1. If this recovers (rax=0x2222), the shared-page lift diverges; if it
+    /// faults with ReadUnmapped(0) too, the raise itself is malformed vs the working path.
+    #[test]
+    #[ignore]
+    fn epoch_recovery_private_page_ab() {
+        let mut a = IcicleEmulator::new();
+        assert!(a.map_memory(0x10000, 4096, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+        let v1: [u8; 7] = [0xB8, 0x11, 0x11, 0x00, 0x00, 0xEB, 0xF9];
+        let v2: [u8; 7] = [0xB8, 0x22, 0x22, 0x00, 0x00, 0xEB, 0xF9];
+        assert!(a.write_memory(0x10000, &v1));
+        a.vm.cpu.write_pc(0x10000);
+        a.start(10);
+        let mut buf = [0u8; 8];
+        a.read_register(registers::X86Register::Rax, &mut buf);
+        eprintln!("AB STEP1 rax={:#x} (expect 0x1111)", u64::from_le_bytes(buf));
+        assert_eq!(u64::from_le_bytes(buf), 0x1111);
+
+        eprintln!("AB STEP2 host-write v2");
+        assert!(a.write_memory(0x10000, &v2));
+        // Bump the epoch EXPLICITLY: the host write goes through the cached TLB write pointer, so
+        // write_physical (where the mode-2 bump lives) never runs. This forces the mismatch so the
+        // RAISE -> flush -> re-fetch path itself is what this A/B exercises.
+        {
+            let mem = &mut a.vm.cpu.mem;
+            let page_start = mem.page_aligned(0x10000);
+            let index = mem.get_physical_index(page_start).expect("page");
+            mem.get_physical_mut(index).data_mut().bump_code_epoch();
+            eprintln!("AB STEP2b epoch bumped manually");
+        }
+
+        a.vm.cpu.write_pc(0x10000);
+        a.start(10);
+        let mut buf2 = [0u8; 8];
+        a.read_register(registers::X86Register::Rax, &mut buf2);
+        eprintln!("AB STEP3 rax={:#x} (expect 0x2222)", u64::from_le_bytes(buf2));
+        assert_eq!(u64::from_le_bytes(buf2), 0x2222, "private-page epoch recovery failed");
+    }
+
     #[test]
     fn guest_read_sees_peer_host_write_to_executed_shared_page() {
         use icicle_vm::cpu::mem::perm;
