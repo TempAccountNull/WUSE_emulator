@@ -574,9 +574,23 @@ namespace sogen::icicle
             });
         }
 
+        // 6.4 — the icicle handle to read/write guest memory through. During a syscall/hook the acting
+        // vCPU (this thread's) handle is used: safe same-thread and coherent (all VMs share the smp pages),
+        // instead of always the master whose VM may be executing on another thread. External threads (and
+        // N=1, where the acting vCPU IS vcpus_[0]==emu_) fall back to the master.
+        icicle_emulator* acting_handle() const
+        {
+            auto* v = static_cast<icicle_vcpu*>(t_running_vcpu);
+            if (v && &v->machine_ == this)
+            {
+                return v->handle();
+            }
+            return this->emu_;
+        }
+
         bool try_read_memory(const uint64_t address, void* data, const size_t size) const override
         {
-            return icicle_read_memory(this->emu_, address, data, size);
+            return icicle_read_memory(this->acting_handle(), address, data, size);
         }
 
         void read_memory(const uint64_t address, void* data, const size_t size) const override
@@ -587,7 +601,7 @@ namespace sogen::icicle
 
         bool try_write_memory(const uint64_t address, const void* data, const size_t size) override
         {
-            return icicle_write_memory(this->emu_, address, data, size);
+            return icicle_write_memory(this->acting_handle(), address, data, size);
         }
 
         void write_memory(const uint64_t address, const void* data, const size_t size) override
@@ -755,8 +769,10 @@ namespace sogen::icicle
 
         emulator_hook* hook_memory_execution(const uint64_t address, memory_execution_hook_callback callback) override
         {
+            std::unique_lock lock(this->partition_mutex_);
             auto* handle = this->fresh_hook_handle();
             auto& reg = this->registrations_[handle];
+            this->run_with_vcpus_paused([&] {
             for (size_t i = 0; i < this->vcpus_.size(); ++i)
             {
                 auto object = std::make_unique<detail::execution_hook>(this->acting_cpu(i), callback, this->is_in_hook_,
@@ -770,6 +786,7 @@ namespace sogen::icicle
                 const auto id = icicle_add_execution_hook(this->vcpus_[i]->handle(), address, wrapper, ptr);
                 reg.entries.emplace_back(i, id, std::move(object));
             }
+            });
 
             return handle;
         }
@@ -779,11 +796,15 @@ namespace sogen::icicle
         {
             if (size == 1)
             {
+                // Delegates to the exact-address hook (which takes partition_mutex_ + pauses); do that
+                // BEFORE locking here to avoid a self-deadlock on the non-recursive mutex.
                 return this->hook_memory_execution(address, std::move(callback));
             }
 
+            std::unique_lock lock(this->partition_mutex_);
             auto* handle = this->fresh_hook_handle();
             auto& reg = this->registrations_[handle];
+            this->run_with_vcpus_paused([&] {
             for (size_t i = 0; i < this->vcpus_.size(); ++i)
             {
                 auto object = std::make_unique<detail::execution_hook>(this->acting_cpu(i), callback, this->is_in_hook_,
@@ -797,14 +818,17 @@ namespace sogen::icicle
                 const auto id = icicle_add_ranged_execution_hook(this->vcpus_[i]->handle(), address, size, wrapper, ptr);
                 reg.entries.emplace_back(i, id, std::move(object));
             }
+            });
 
             return handle;
         }
 
         emulator_hook* hook_memory_execution(memory_execution_hook_callback callback) override
         {
+            std::unique_lock lock(this->partition_mutex_);
             auto* handle = this->fresh_hook_handle();
             auto& reg = this->registrations_[handle];
+            this->run_with_vcpus_paused([&] {
             for (size_t i = 0; i < this->vcpus_.size(); ++i)
             {
                 auto object = std::make_unique<detail::execution_hook>(this->acting_cpu(i), callback, this->is_in_hook_,
@@ -818,6 +842,7 @@ namespace sogen::icicle
                 const auto id = icicle_add_generic_execution_hook(this->vcpus_[i]->handle(), wrapper, ptr);
                 reg.entries.emplace_back(i, id, std::move(object));
             }
+            });
 
             return handle;
         }
@@ -996,6 +1021,8 @@ namespace sogen::icicle
             auto& reg = this->registrations_[handle];
             reg.entries.clear();
 
+            // Registering on every VM's handle touches peer VMs, so pause them first (6.4).
+            this->run_with_vcpus_paused([&] {
             for (size_t i = 0; i < this->vcpus_.size(); ++i)
             {
                 auto* const vm = this->vcpus_[i]->handle();
@@ -1046,6 +1073,7 @@ namespace sogen::icicle
                 }
                 reg.entries.emplace_back(i, id, std::move(object));
             }
+            });
             reg.pending = false;
 
             return handle;
@@ -1067,11 +1095,14 @@ namespace sogen::icicle
                 return;
             }
 
-            for (auto& [vm_index, id, object] : it->second.entries)
-            {
-                icicle_remove_hook(this->vcpus_[vm_index]->handle(), id);
-                (void)object;
-            }
+            // Removing a hook from each VM's handle touches peer VMs, so pause them first (6.4).
+            this->run_with_vcpus_paused([&] {
+                for (auto& [vm_index, id, object] : it->second.entries)
+                {
+                    icicle_remove_hook(this->vcpus_[vm_index]->handle(), id);
+                    (void)object;
+                }
+            });
             this->registrations_.erase(it);
         }
 
