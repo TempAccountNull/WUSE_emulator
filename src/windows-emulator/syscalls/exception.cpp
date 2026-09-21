@@ -54,7 +54,19 @@ namespace sogen
                 return STATUS_NOT_SUPPORTED;
             }
 
-            c.proc.exit_status = exception_record.read().ExceptionCode;
+            // SMP-6.6 DIAGNOSTIC: print the full crash context for an unhandled guest exception so the
+            // N>1 probe's guest AV is traceable (code, faulting address, info words, TID, RIP).
+            const auto record = exception_record.read();
+            c.win_emu.log.error(
+                "SMPDIAG unhandled guest exception: code=0x%08X addr=0x%llX params=%u info=[%llu,%llu,%llu] tid=%u rip=0x%llX\n",
+                record.ExceptionCode, static_cast<unsigned long long>(record.ExceptionAddress),
+                record.NumberParameters,
+                record.NumberParameters > 0 ? static_cast<unsigned long long>(record.ExceptionInformation[0]) : 0ull,
+                record.NumberParameters > 1 ? static_cast<unsigned long long>(record.ExceptionInformation[1]) : 0ull,
+                record.NumberParameters > 2 ? static_cast<unsigned long long>(record.ExceptionInformation[2]) : 0ull,
+                c.vcpu.active_thread ? c.vcpu.active_thread->id : 0,
+                static_cast<unsigned long long>(c.emu.reg(x86_register::rip)));
+            c.proc.exit_status = record.ExceptionCode;
             c.win_emu.callbacks.on_exception();
             c.emu.stop();
 

@@ -2258,6 +2258,56 @@ mod shared_memory_smp {
         );
     }
 
+    /// 6.6 core question: cross-vCPU self-modifying code. VM A translates + executes code on a
+    /// SHARED page; VM B rewrites that code (legitimate SMC, e.g. a patching thread); VM A must then
+    /// execute the NEW bytes, not its stale translation.
+    // IGNORED = open 6.6 regression target: a peer VM's write to a TRANSLATED shared page must
+    // invalidate the executing VM's translation. Currently VM A keeps executing its stale block
+    // (rax=0x1111 after the peer wrote 0x2222 code). This is the cross-vCPU half of icicle's
+    // same-VM SMC detection: the shared PageData perm carries IN_CODE_CACHE in place (write_ptr
+    // fix), but the peer's write only clears/invalidates ITS OWN VM's TLB + code cache. Fix
+    // direction: fan the invalidation out to every VM sharing the page (queued peer op calling an
+    // exposed invalidate-range on each handle, plus a generation/epoch check for guest-TLB writes).
+    #[test]
+    #[ignore]
+    fn cross_vcpu_self_modifying_code_is_seen_by_executing_vm() {
+        use icicle_vm::cpu::mem::perm;
+        const PAGE: u64 = 0x40000;
+        let mut a = IcicleEmulator::new();
+        let mut b = IcicleEmulator::new();
+        assert!(a.vm.cpu.mem.map_smp_shared_fresh(PAGE, perm::READ | perm::WRITE | perm::EXEC));
+        let shared = a.vm.cpu.mem.share_page(PAGE).expect("shared arc");
+        assert!(b.vm.cpu.mem.map_smp_shared(PAGE, shared));
+
+        // v1: mov eax, 0x1111 (B8 11 11 00 00); jmp $-5 (EB F9)   -> rax accumulates 0x1111s
+        // v2: mov eax, 0x2222 (B8 22 22 00 00); jmp $-5
+        let v1: [u8; 7] = [0xB8, 0x11, 0x11, 0x00, 0x00, 0xEB, 0xF9];
+        let v2: [u8; 7] = [0xB8, 0x22, 0x22, 0x00, 0x00, 0xEB, 0xF9];
+
+        assert!(a.write_memory(PAGE, &v1));
+        a.vm.cpu.write_pc(PAGE);
+        a.start(10); // translate + execute v1
+        let read_rax = |emu: &mut IcicleEmulator| -> u64 {
+            let mut buf = [0u8; 8];
+            emu.read_register(registers::X86Register::Rax, &mut buf);
+            u64::from_le_bytes(buf)
+        };
+        let after_v1 = read_rax(&mut a);
+        println!("STEP6_1 after executing v1: rax={after_v1:#x} (expect 0x1111)");
+        assert_eq!(after_v1, 0x1111);
+
+        // VM B rewrites the shared page (SMC through the peer VM).
+        println!("STEP6_2 VM B writes v2 over the shared code page");
+        assert!(b.write_memory(PAGE, &v2));
+
+        // VM A keeps executing: it must pick up v2 (fresh translation), not its stale v1 block.
+        a.vm.cpu.write_pc(PAGE);
+        a.start(10);
+        let after_v2 = read_rax(&mut a);
+        println!("STEP6_3 after SMC + re-execute: rax={after_v2:#x} (expect 0x2222, stale=0x1111)");
+        assert_eq!(after_v2, 0x2222, "VM A executed its STALE translation after peer SMC");
+    }
+
     #[test]
     fn two_vms_share_fast_smp_page() {
         use icicle_vm::cpu::mem::perm;
