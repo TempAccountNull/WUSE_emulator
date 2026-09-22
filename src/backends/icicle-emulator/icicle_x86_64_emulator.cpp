@@ -1412,16 +1412,19 @@ namespace sogen::icicle
             return issued >= pending && (issued - pending) >= mark;
         }
 
-        void sync_worker_context() override
+        void sync_worker_context(const size_t vcpu_index) override
         {
-            auto* worker = static_cast<icicle_vcpu*>(t_worker_vcpu);
-            if (worker && &worker->machine_ == this)
+            // The scheduler passes the authoritative vCPU index: a worker that has not run its
+            // first quantum yet has no thread-local registration, and its idle loop must still
+            // drain its own queue (GATEDIAG livelock at N>=4: q_i stuck forever, all parked).
+            if (vcpu_index < this->vcpus_.size())
             {
-                this->drain_pending_ops(*worker);
-                // Progress-meter safe point: this thread owns `worker` and its VM is parked here,
-                // so both reads are race-free.
-                worker->published_instructions_.store(icicle_get_icount(worker->emu_), std::memory_order_relaxed);
-                worker->published_rip_.store(worker->read_instruction_pointer(), std::memory_order_relaxed);
+                auto& worker = *this->vcpus_[vcpu_index];
+                this->drain_pending_ops(worker);
+                // Progress-meter safe point: the caller owns this vCPU and its VM is parked
+                // here, so both reads are race-free.
+                worker.published_instructions_.store(icicle_get_icount(worker.emu_), std::memory_order_relaxed);
+                worker.published_rip_.store(worker.read_instruction_pointer(), std::memory_order_relaxed);
             }
         }
 
@@ -1435,6 +1438,29 @@ namespace sogen::icicle
                     .instructions = vcpu->published_instructions_.load(std::memory_order_relaxed),
                     .rip = vcpu->published_rip_.load(std::memory_order_relaxed),
                 });
+            }
+            return out;
+        }
+
+        std::string smp_gate_debug() const override
+        {
+            std::string out{};
+            char buf[48];
+            {
+                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                for (size_t i = 0; i < this->pending_ops_.size(); ++i)
+                {
+                    std::snprintf(buf, sizeof(buf), "q%zu=%zu ", i, this->pending_ops_[i].size());
+                    out += buf;
+                }
+            }
+            const auto issued = this->ops_issued_watermark_.load(std::memory_order_acquire);
+            std::snprintf(buf, sizeof(buf), "issued=%llu ", static_cast<unsigned long long>(issued));
+            out += buf;
+            for (const auto& vcpu : this->vcpus_)
+            {
+                std::snprintf(buf, sizeof(buf), "v%u=%s ", vcpu->index_, vcpu->run_active_.load() ? "RUN" : "park");
+                out += buf;
             }
             return out;
         }
@@ -1553,13 +1579,20 @@ namespace sogen::icicle
 
         void queue_op(const size_t target, const uint64_t seq, std::function<void(icicle_emulator*)> op)
         {
-            this->ops_issued_watermark_.fetch_add(1, std::memory_order_acq_rel);
-            std::lock_guard<std::mutex> lock(this->pending_mutex_);
-            if (target >= this->pending_ops_.size())
+            // Push under the mutex FIRST, bump the issued watermark AFTER: smp_op_applied() reads
+            // issued then sums the queues under the same mutex, so a watermark bumped before the
+            // push could make an un-queued op count as applied (the gate opens early - the 6.7
+            // transient first-read race). This order errs the safe way: pending may briefly
+            // exceed issued, which only holds the visibility gate one drain longer.
             {
-                return;
+                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                if (target >= this->pending_ops_.size())
+                {
+                    return;
+                }
+                this->pending_ops_[target].push_back(pending_op{seq, std::move(op)});
             }
-            this->pending_ops_[target].push_back(pending_op{seq, std::move(op)});
+            this->ops_issued_watermark_.fetch_add(1, std::memory_order_acq_rel);
         }
 
         emulator_hook* fresh_hook_handle()

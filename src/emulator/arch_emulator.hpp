@@ -25,6 +25,7 @@ real per-vCPU objects (docs/multi-vcpu-design.md).
 #include "x86_register.hpp"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include <stdexcept>
@@ -84,8 +85,11 @@ namespace sogen
         // execution quanta (under the kernel lock, OUTSIDE any icicle run / write path) so a
         // backend with cross-VM op queues can apply everything queued for the vCPU this thread
         // owns BEFORE the scheduler's own host writes (thread-context save/restore) touch guest
-        // memory. Default: nothing (single-VM backends; mirrors WHP's no-op semantics).
-        virtual void sync_worker_context() {}
+        // memory. The vCPU INDEX is authoritative: a worker that has not executed its first
+        // quantum yet has no registered thread-local, and its idle loop must still drain its own
+        // queue or a thread-visibility gate can never open (GATEDIAG livelock at N>=4).
+        // Default: nothing (single-VM backends; mirrors WHP's no-op semantics).
+        virtual void sync_worker_context(size_t /*vcpu_index*/) {}
 
         // SMP: watermark of cross-VM ops issued to peer queues, and whether every op issued up
         // to `mark` has been applied (per-target FIFO). Lets host code gate a transition on its
@@ -110,6 +114,13 @@ namespace sogen
         };
 
         virtual std::vector<vcpu_activity_snapshot> vcpu_activity() const
+        {
+            return {};
+        }
+
+        // SMP diagnostics: human-readable cross-VM queue/vCPU state for a stalled
+        // thread-visibility gate (printed by the scheduler's idle loop). Default: empty.
+        virtual std::string smp_gate_debug() const
         {
             return {};
         }

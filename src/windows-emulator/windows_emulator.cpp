@@ -884,7 +884,29 @@ namespace sogen
             // SMP 6.7 RC#2: draining OUR OWN queued cross-vm ops here is the missing drain
             // trigger - it lets a thread-visibility gate (is_thread_ready) make progress even
             // when no thread is runnable, instead of parking with an undrained queue forever.
-            this->emu().sync_worker_context();
+            // Index-keyed: a worker without its first quantum yet has no thread-local.
+            this->emu().sync_worker_context(vcpu.cpu.index());
+
+            // GATEDIAG (rate-limited): if a thread-visibility gate stays closed for seconds,
+            // dump its mark plus the backend's per-queue/vCPU state so the stuck queue is named.
+            {
+                static thread_local std::chrono::steady_clock::time_point last_gate_diag{};
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last_gate_diag > std::chrono::seconds(2))
+                {
+                    last_gate_diag = now;
+                    for (const auto& thread : this->process.threads | std::views::values)
+                    {
+                        if (thread.smp_visibility_mark != 0 && !this->emu().smp_op_applied(thread.smp_visibility_mark))
+                        {
+                            this->log.error("GATEDIAG tid=%u mark=%llu stuck: %s\n", thread.id,
+                                            static_cast<unsigned long long>(thread.smp_visibility_mark),
+                                            this->emu().smp_gate_debug().c_str());
+                            break;
+                        }
+                    }
+                }
+            }
             lock.unlock();
 
             if (this->vcpu_count_ == 1)
@@ -943,7 +965,7 @@ namespace sogen
             // SMP: between quanta (kernel lock held, outside any write path) apply every cross-VM
             // op queued for this vCPU, so the scheduler's own host writes below (thread-context
             // save/restore) see freshly queued maps instead of racing them ('Unmapped').
-            this->emu().sync_worker_context();
+            this->emu().sync_worker_context(vcpu.cpu.index());
 
             // Progress meter: publish the per-vCPU activity snapshot (rate-limited inside). The
             // kernel lock is held here, so concurrent workers cannot interleave file writes.
