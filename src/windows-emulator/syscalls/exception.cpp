@@ -37,6 +37,9 @@ namespace sogen
             }
 
             c.proc.exit_status = error_status;
+            c.win_emu.log.error("EXITDIAG NtRaiseHardError status=%#x tid=%u\n", (unsigned)error_status,
+                                (unsigned)GetCurrentThreadId());
+
             c.win_emu.callbacks.on_exception();
             c.emu.stop();
 
@@ -67,6 +70,9 @@ namespace sogen
                 c.vcpu.active_thread ? c.vcpu.active_thread->id : 0,
                 static_cast<unsigned long long>(c.emu.reg(x86_register::rip)));
             c.proc.exit_status = record.ExceptionCode;
+            c.win_emu.log.error("EXITDIAG NtRaiseException status=%#x tid=%u\n", (unsigned)record.ExceptionCode,
+                                (unsigned)GetCurrentThreadId());
+
             c.win_emu.callbacks.on_exception();
             c.emu.stop();
 

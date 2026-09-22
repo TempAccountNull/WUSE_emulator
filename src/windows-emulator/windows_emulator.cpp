@@ -1258,6 +1258,8 @@ namespace sogen
             case 41:
                 this->callbacks.on_fast_fail(acting.reg<uint32_t>(x86_register::ecx));
                 this->process.exit_status = STATUS_FAIL_FAST_EXCEPTION;
+                this->log.error("EXITDIAG FailFast tid=%u\n", (unsigned)GetCurrentThreadId());
+
                 this->stop();
                 return;
             case 45:

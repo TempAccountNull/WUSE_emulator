@@ -646,6 +646,9 @@ namespace sogen
             if (c.proc.is_current_process_handle(process_handle))
             {
                 c.proc.exit_status = exit_status;
+                c.win_emu.log.error("EXITDIAG NtTerminateProcess status=%#x tid=%u\n", (unsigned)exit_status,
+                                    (unsigned)GetCurrentThreadId());
+
                 c.win_emu.stop();
                 return STATUS_SUCCESS;
             }
