@@ -122,6 +122,27 @@ namespace sogen
                     (unsigned long long)c.emu.reg(x86_register::rax), (unsigned long long)c.emu.reg(x86_register::rcx),
                     (unsigned long long)c.emu.reg(x86_register::rdx), (unsigned long long)c.emu.reg(x86_register::rbx),
                     c.vcpu.cpu.index());
+                // SMP 6.7: walk the raiser's GUEST STACK (ntdll-base return addresses at rsp) to
+                // name the exact raising path. Raw RVAs vs ntdll base 0x180000000, decoded offline.
+                {
+                    const auto rsp = c.emu.reg(x86_register::rsp);
+                    std::array<uint64_t, 24> stack{};
+                    if (rsp && c.emu.try_read_memory(rsp, stack.data(), stack.size() * sizeof(uint64_t)))
+                    {
+                        std::string chain{};
+                        char buf[24];
+                        for (const auto q : stack)
+                        {
+                            if (q >= 0x180000000 && q < 0x180400000)
+                            {
+                                std::snprintf(buf, sizeof(buf), "ntdll+%llX ",
+                                              (unsigned long long)(q - 0x180000000));
+                                chain += buf;
+                            }
+                        }
+                        c.win_emu.log.error("RAISECTX stack-chain: %s\n", chain.c_str());
+                    }
+                }
             }
 
             c.win_emu.callbacks.on_exception();

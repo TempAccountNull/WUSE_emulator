@@ -1337,6 +1337,15 @@ namespace sogen
             // transition that reloads FS reads the correct base regardless of which vCPU runs the thread.
             setup_wow64_fs_segment(*this->memory_ptr, this->teb32->value(), gdt_base);
         }
+
+        // SMP: re-assert this thread's GS base on EVERY switch. GS is only set at thread creation,
+        // so a thread migrating between vCPUs inherited the previous thread's base and its
+        // gs:[0x60] (TEB->PEB) reads ran against the WRONG TEB - the probe's terminal 0x43 raise
+        // is exactly this: ntdll's `mov rcx, gs:[0x60]; cmp [rcx+2], 0` (BeingDebugged check,
+        // ntdll+0x1026F6) reading a stale/garbage PEB pointer and faulting at near-NULL. The lazy
+        // repair in the memory-violation hook only fires when the wrong read FAULTS; a wrong-but-
+        // mapped read silently corrupts. Cheap, and matches the GDTR re-assertion above.
+        emu.set_segment_base(x86_register::gs, this->gs_segment->get_base());
     }
 
     callback_frame::callback_frame() = default;
