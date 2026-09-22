@@ -728,6 +728,12 @@ namespace sogen::icicle
                     // worker branch doing exactly this; the external branch needed it too.
                     this->drain_own_queue_with_inflight_wait(*this->vcpus_[0]);
                     ok = icicle_write_memory(this->emu_, address, data, size);
+                    if (!ok && smp_trace_enabled())
+                    {
+                        std::fprintf(stderr, "[SMPTRC] write-RETRY-FAILED(external) addr=%#llx size=%zu inflight=%llu\n",
+                                     (unsigned long long)address, size,
+                                     (unsigned long long)this->ops_in_flight_.load(std::memory_order_acquire));
+                    }
                 }
                 if (cached)
                 {
@@ -754,6 +760,12 @@ namespace sogen::icicle
                 // violation wrapper already proves safe from inside a hook.
                 this->drain_own_queue_with_inflight_wait(*self);
                 ok = icicle_write_memory(self->handle(), address, data, size);
+                if (!ok && smp_trace_enabled())
+                {
+                    std::fprintf(stderr, "[SMPTRC] write-RETRY-FAILED(inquantum) addr=%#llx size=%zu vcpu=%zu inflight=%llu\n",
+                                 (unsigned long long)address, size, self->index(),
+                                 (unsigned long long)this->ops_in_flight_.load(std::memory_order_acquire));
+                }
             }
             if (cached)
             {
