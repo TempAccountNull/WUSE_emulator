@@ -100,6 +100,29 @@ namespace sogen
             c.proc.exit_status = record.ExceptionCode;
             c.win_emu.log.error("EXITDIAG NtRaiseException status=%#x tid=%u\n", (unsigned)record.ExceptionCode,
                                 (unsigned)GetCurrentThreadId());
+            // 6.6/6.7 DIAG: dump bytes at the ExceptionAddress + the raiser's registers, so the
+            // terminal 0x43@0x2000 raise is decodable (which structure, which vCPU, what code).
+            {
+                std::array<uint8_t, 32> target{};
+                if (c.emu.try_read_memory(record.ExceptionAddress, target.data(), target.size()))
+                {
+                    std::string hex{};
+                    for (const auto b : target)
+                    {
+                        char buf[4];
+                        std::snprintf(buf, sizeof(buf), "%02X ", b);
+                        hex += buf;
+                    }
+                    c.win_emu.log.error("RAISECTX target@0x%llX: %s\n",
+                                        (unsigned long long)record.ExceptionAddress, hex.c_str());
+                }
+                c.win_emu.log.error(
+                    "RAISECTX raiser rip=0x%llX rsp=0x%llX rax=0x%llX rcx=0x%llX rdx=0x%llX rbx=0x%llX vcpu=%zu\n",
+                    (unsigned long long)c.emu.reg(x86_register::rip), (unsigned long long)c.emu.reg(x86_register::rsp),
+                    (unsigned long long)c.emu.reg(x86_register::rax), (unsigned long long)c.emu.reg(x86_register::rcx),
+                    (unsigned long long)c.emu.reg(x86_register::rdx), (unsigned long long)c.emu.reg(x86_register::rbx),
+                    c.vcpu.cpu.index());
+            }
 
             c.win_emu.callbacks.on_exception();
             c.emu.stop();
