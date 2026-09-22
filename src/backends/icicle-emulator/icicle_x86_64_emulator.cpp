@@ -769,12 +769,6 @@ namespace sogen::icicle
                 }
                 return;
             }
-            if (smp_trace_enabled())
-            {
-                std::fprintf(stderr, "[SMPTRC] write-FAIL ice-throw addr=%#llx size=%zu self=%p worker=%p tid=%u cb=%d\n",
-                             (unsigned long long)address, size, (void*)self, (void*)t_worker_vcpu,
-                             (unsigned)(GetCurrentThreadId()), (int)(bool)this->violation_callback_);
-            }
                         // 6.6c'': a BETWEEN-quantum worker write (t_running_vcpu null, but this thread owns a
             // vCPU via t_worker_vcpu): DEFER the fault to that vCPU's next begin_run_quantum - a
             // REAL vCPU context outside any syscall handler - instead of ice()-throwing out of the
@@ -784,7 +778,18 @@ namespace sogen::icicle
             {
                 std::lock_guard<std::mutex> lock(this->write_faults_mutex_);
                 this->pending_write_faults_[worker->index()].emplace_back(address, size);
+                if (smp_trace_enabled())
+                {
+                    std::fprintf(stderr, "[SMPTRC] write-DEFERRED addr=%#llx size=%zu vcpu=%zu tid=%u\n",
+                                 (unsigned long long)address, size, worker->index(),
+                                 (unsigned)(GetCurrentThreadId()));
+                }
                 return;
+            }
+            if (smp_trace_enabled())
+            {
+                std::fprintf(stderr, "[SMPTRC] write-FAIL ice-throw addr=%#llx size=%zu tid=%u\n",
+                             (unsigned long long)address, size, (unsigned)(GetCurrentThreadId()));
             }
             ice(false, "Failed to write memory");
         }
