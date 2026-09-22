@@ -7,6 +7,37 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::registers;
 
+// SMP 6.7 LOCK-op atomicity: the x86 SLEIGH spec emits LOCK()/UNLOCK() pcode userops around
+// every lockable RMW; icicle executes the RMW as plain load/compare/store pcode, so a peer
+// vCPU's op on the same shared variable interleaves and tears the atomic (the probe's terminal
+// 0x43 garbage record traces to torn LOCK cmpxchg in ntdll thread startup). The hooks installed
+// below acquire/release a process-global RMW spinlock: LOCK-vs-LOCK mutual exclusion across all
+// vCPU VMs (the realistic corruption class - synchronization variables are always LOCK-accessed).
+mod smp_rmw_lock {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static RMW_LOCK: AtomicBool = AtomicBool::new(false);
+    thread_local! {
+        static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub fn acquire() {
+        if HELD.with(|h| h.get()) {
+            return; // reentrant (exception-path safety release may precede a nested acquire)
+        }
+        while RMW_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            std::hint::spin_loop();
+        }
+        HELD.with(|h| h.set(true));
+    }
+
+    pub fn release() {
+        if HELD.with(|h| h.replace(false)) {
+            RMW_LOCK.store(false, Ordering::Release);
+        }
+    }
+}
+
 fn create_x64_vm() -> icicle_vm::Vm {
     let mut cpu_config = icicle_vm::cpu::Config::from_target_triple("x86_64-none");
     cpu_config.enable_jit = std::env::var("SOGEN_ICICLE_JIT").as_deref() == Ok("1");
@@ -18,6 +49,39 @@ fn create_x64_vm() -> icicle_vm::Vm {
     cpu_config.optimize_block = false;
 
     let mut vm = icicle_vm::build(&cpu_config).unwrap();
+
+    // SMP 6.7: register LOCK()/UNLOCK() hooks (acquire/release the RMW spinlock) and op
+    // injectors that rewrite those pcode userops into the hooks. If the locked instruction
+    // faults between LOCK and UNLOCK, the exception path releases (see handle_exception).
+    {
+        use icicle_cpu::lifter::BlockState;
+        use icicle_cpu::{HookHandler, InstHook};
+        use icicle_cpu::{Arch, Cpu};
+
+        struct LockAcquire;
+        impl HookHandler for LockAcquire {
+            fn call(_: &mut Self, _: &mut Cpu, _: u64) {
+                smp_rmw_lock::acquire();
+            }
+        }
+        struct LockRelease;
+        impl HookHandler for LockRelease {
+            fn call(_: &mut Self, _: &mut Cpu, _: u64) {
+                smp_rmw_lock::release();
+            }
+        }
+
+        let acquire_id = vm.cpu.trace.add_hook(InstHook::new(LockAcquire));
+        let release_id = vm.cpu.trace.add_hook(InstHook::new(LockRelease));
+        let _ = vm.add_op_injector("LOCK", move |_: &Arch, _: pcode::PcodeOpId, _: pcode::Inputs, _: pcode::VarNode, state: &mut BlockState| {
+            state.pcode.push((pcode::Op::Hook(acquire_id), pcode::Inputs::none()));
+            false
+        });
+        let _ = vm.add_op_injector("UNLOCK", move |_: &Arch, _: pcode::PcodeOpId, _: pcode::Inputs, _: pcode::VarNode, state: &mut BlockState| {
+            state.pcode.push((pcode::Op::Hook(release_id), pcode::Inputs::none()));
+            false
+        });
+    }
     crate::aes::register(&mut vm.cpu);
     crate::packed_sad::register(&mut vm.cpu);
     crate::reciprocal_sqrt::register(&mut vm.cpu);
@@ -839,6 +903,7 @@ impl IcicleEmulator {
     }
 
     fn handle_exception(&mut self, code: ExceptionCode, value: u64) -> bool {
+        smp_rmw_lock::release(); // 6.7: faulted mid-locked-section - never leave the RMW spinlock held
         smp_dbg(&format!("handle_exception code={code:?} value={value:#x} pc={:#x}", self.vm.cpu.read_pc()));
         let continue_execution = match code {
             ExceptionCode::Syscall => self.handle_syscall(value),

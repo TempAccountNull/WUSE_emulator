@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <cstdlib>
 #include "std_include.hpp"
 #include "exception_dispatch.hpp"
@@ -134,9 +135,9 @@ namespace sogen
             if (const char* diag = std::getenv("SOGEN_SMP_TRACE"); diag && *diag == '1')
             {
                 const auto& wr = *reinterpret_cast<exception_record*>(pointers.ExceptionRecord);
-                win_emu.log.error("RECDIAG write record@0x%llX code=%#x addr=0x%llX new_sp=0x%llX\n",
-                                  (unsigned long long)exception_record_obj.value(), (unsigned)wr.ExceptionCode,
-                                  (unsigned long long)wr.ExceptionAddress, (unsigned long long)new_sp);
+                std::fprintf(stderr, "RECDIAG write record@0x%llX code=%#x addr=0x%llX new_sp=0x%llX\n",
+                             (unsigned long long)exception_record_obj.value(), (unsigned)wr.ExceptionCode,
+                             (unsigned long long)wr.ExceptionAddress, (unsigned long long)new_sp);
             }
 
 
