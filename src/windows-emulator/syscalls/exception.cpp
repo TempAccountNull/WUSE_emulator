@@ -1,3 +1,6 @@
+#include <array>
+#include <cstdio>
+#include <string>
 #include "../std_include.hpp"
 #include "../emulator_utils.hpp"
 #include "../syscall_utils.hpp"
@@ -68,7 +71,32 @@ namespace sogen
                 record.NumberParameters > 1 ? static_cast<unsigned long long>(record.ExceptionInformation[1]) : 0ull,
                 record.NumberParameters > 2 ? static_cast<unsigned long long>(record.ExceptionInformation[2]) : 0ull,
                 c.vcpu.active_thread ? c.vcpu.active_thread->id : 0,
-                static_cast<unsigned long long>(c.emu.reg(x86_register::rip)));
+                static_cast<unsigned long long>(c.emu.reg(x86_register::rip)),
+                c.vcpu.cpu.index());
+            // SMP-6.6 FINAL-ITEM DIAG: dump 32 bytes at the faulting target so the ntdll self-read
+            // AV is decodable offline, and whether the target is readable on the FAULTING vCPU.
+            if (record.NumberParameters > 1 && record.ExceptionInformation[1] != 0)
+            {
+                const auto fault_addr = record.ExceptionInformation[1];
+                std::array<uint8_t, 32> bytes{};
+                if (c.emu.try_read_memory(fault_addr, bytes.data(), bytes.size()))
+                {
+                    std::string hex{};
+                    for (const auto b : bytes)
+                    {
+                        char buf[4];
+                        std::snprintf(buf, sizeof(buf), "%02X ", b);
+                        hex += buf;
+                    }
+                    c.win_emu.log.error("SMPDIAG fault-target bytes @0x%llX: %s\n",
+                                        static_cast<unsigned long long>(fault_addr), hex.c_str());
+                }
+                else
+                {
+                    c.win_emu.log.error("SMPDIAG fault-target @0x%llX UNREADABLE on vCPU %zu (peer-view fault confirmed)\n",
+                                        static_cast<unsigned long long>(fault_addr), c.vcpu.cpu.index());
+                }
+            }
             c.proc.exit_status = record.ExceptionCode;
             c.win_emu.log.error("EXITDIAG NtRaiseException status=%#x tid=%u\n", (unsigned)record.ExceptionCode,
                                 (unsigned)GetCurrentThreadId());

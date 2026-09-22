@@ -975,11 +975,44 @@ namespace sogen::icicle
             // SMP 6.6c': kept so a racing HOST write that fails the guest-perm check can dispatch
             // the guest AV path on the acting vCPU instead of hard-throwing out of the syscall hook.
             this->violation_callback_ = callback;
+            // SMP 6.6 FINAL ITEM - fault-driven lazy application: a GUEST access that faults
+            // UNMAPPED while this vCPU still has queued cross-VM ops (the loader's async maps -
+            // the probe's terminal ntdll read-AV at ...FB20 is exactly this: the CONTEXT page read
+            // before the peer's map lands) drains its OWN queue and RESTARTS the instruction. The
+            // restarted access sees the landed map. No eager drains -> no timing perturbation;
+            // drains happen only when a real fault meets pending ops.
+            memory_violation_hook_callback wrapped = [this, cb = callback](cpu_interface& cpu, const uint64_t address, const size_t size,
+                                                            const memory_operation operation,
+                                                            const memory_violation_type type) -> memory_violation_continuation {
+                if (type == memory_violation_type::unmapped)
+                {
+                    auto* running = static_cast<icicle_vcpu*>(t_running_vcpu);
+                    auto* worker = static_cast<icicle_vcpu*>(t_worker_vcpu);
+                    icicle_vcpu* v = (running && &running->machine_ == this) ? running : worker;
+                    if (v && &v->machine_ == this)
+                    {
+                        std::vector<pending_op> ops;
+                        {
+                            std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                            ops.swap(this->pending_ops_[v->index()]);
+                        }
+                        if (!ops.empty())
+                        {
+                            for (auto& op : ops)
+                            {
+                                op.apply(v->handle());
+                            }
+                            return memory_violation_continuation::restart;
+                        }
+                    }
+                }
+                return cb(cpu, address, size, operation, type);
+            };
             auto* handle = this->fresh_hook_handle();
             auto reg = std::make_shared<hook_registration>();
             for (size_t i = 0; i < this->vcpus_.size(); ++i)
             {
-                auto obj = make_function_object(this->bind_cpu(i, callback));
+                auto obj = make_function_object(this->bind_cpu(i, wrapped));
                 auto* ptr = obj.get();
                 auto* wrapper = +[](void* user, const uint64_t address, const uint8_t operation, const int32_t unmapped) -> int32_t {
                     const auto violation_type = unmapped //
