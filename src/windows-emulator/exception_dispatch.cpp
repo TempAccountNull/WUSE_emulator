@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "std_include.hpp"
 #include "exception_dispatch.hpp"
 #include "process_context.hpp"
@@ -130,6 +131,14 @@ namespace sogen
             {
                 throw std::runtime_error("Bad exception record position on stack");
             }
+            if (const char* diag = std::getenv("SOGEN_SMP_TRACE"); diag && *diag == '1')
+            {
+                const auto& wr = *reinterpret_cast<exception_record*>(pointers.ExceptionRecord);
+                win_emu.log.error("RECDIAG write record@0x%llX code=%#x addr=0x%llX new_sp=0x%llX\n",
+                                  (unsigned long long)exception_record_obj.value(), (unsigned)wr.ExceptionCode,
+                                  (unsigned long long)wr.ExceptionAddress, (unsigned long long)new_sp);
+            }
+
 
             const emulator_object<machine_frame> machine_frame_obj{emu, new_sp + combined_size};
             machine_frame_obj.access([&](machine_frame& frame) {
