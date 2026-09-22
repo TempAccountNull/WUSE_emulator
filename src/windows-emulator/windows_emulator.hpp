@@ -473,6 +473,13 @@ namespace sogen
         void on_instruction_execution(vcpu_context& vcpu, uint64_t address);
         void on_basic_block_execution(vcpu_context& vcpu, const basic_block& block);
 
+        // Progress meter: 1 Hz snapshot of per-vCPU activity (instructions, RIP, module) written as
+        // emu-status.json into the SOGEN_GPU_STATUS_DIR telemetry directory (same channel the GPU
+        // bridge uses). Lets a watcher tell "grinding through a silent decrypt" from "stopped".
+        void publish_activity_status();
+        std::chrono::steady_clock::time_point activity_status_last_{};
+        std::vector<uint64_t> activity_status_prev_instructions_{};
+
         bool uses_section_first_execution_hooks() const;
         void clear_section_first_execution_hooks();
         void install_section_first_execution_hook(const mapped_module& mod, size_t section_index);

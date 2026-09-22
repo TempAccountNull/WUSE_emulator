@@ -397,6 +397,13 @@ namespace sogen::icicle
         // quiesce cancel (a peer's cross-VM mutation), so start() knows whether to return or re-enter.
         std::atomic_bool run_active_{false};
         std::atomic_bool stop_requested_{false};
+
+        // Activity telemetry (progress meter): retired-instruction count and last-parked RIP,
+        // published by the OWNING worker thread at its between-quanta safe point (VM parked there,
+        // so the reads that fill them are race-free). Readers poll vcpu_activity() without
+        // stopping peers.
+        std::atomic_uint64_t published_instructions_{0};
+        std::atomic_uint64_t published_rip_{0};
     };
 
     class icicle_x86_64_emulator : public x86_64_emulator, public detail::hook_exception_sink
@@ -1411,7 +1418,25 @@ namespace sogen::icicle
             if (worker && &worker->machine_ == this)
             {
                 this->drain_pending_ops(*worker);
+                // Progress-meter safe point: this thread owns `worker` and its VM is parked here,
+                // so both reads are race-free.
+                worker->published_instructions_.store(icicle_get_icount(worker->emu_), std::memory_order_relaxed);
+                worker->published_rip_.store(worker->read_instruction_pointer(), std::memory_order_relaxed);
             }
+        }
+
+        std::vector<vcpu_activity_snapshot> vcpu_activity() const override
+        {
+            std::vector<vcpu_activity_snapshot> out{};
+            out.reserve(this->vcpus_.size());
+            for (const auto& vcpu : this->vcpus_)
+            {
+                out.push_back(vcpu_activity_snapshot{
+                    .instructions = vcpu->published_instructions_.load(std::memory_order_relaxed),
+                    .rip = vcpu->published_rip_.load(std::memory_order_relaxed),
+                });
+            }
+            return out;
         }
 
       private:

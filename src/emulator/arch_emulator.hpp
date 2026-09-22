@@ -24,6 +24,9 @@ real per-vCPU objects (docs/multi-vcpu-design.md).
 #include "typed_cpu.hpp"
 #include "x86_register.hpp"
 
+#include <cstdint>
+#include <vector>
+
 #include <stdexcept>
 
 namespace sogen
@@ -95,6 +98,20 @@ namespace sogen
         virtual bool smp_op_applied(uint64_t) const
         {
             return true;
+        }
+
+        // Activity telemetry for progress meters: one entry per vCPU with the instructions it
+        // retired so far (0 when the backend cannot count) and the RIP it was last parked at.
+        // Values are advisory snapshots read without stopping peer vCPUs - for display only.
+        struct vcpu_activity_snapshot
+        {
+            uint64_t instructions{};
+            uint64_t rip{};
+        };
+
+        virtual std::vector<vcpu_activity_snapshot> vcpu_activity() const
+        {
+            return {};
         }
 
 

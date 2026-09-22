@@ -1,6 +1,8 @@
 #include "std_include.hpp"
 #include "windows_emulator.hpp"
 
+#include <cstdio>
+
 #include "cpu_context.hpp"
 
 #include <utils/io.hpp>
@@ -943,6 +945,10 @@ namespace sogen
             // save/restore) see freshly queued maps instead of racing them ('Unmapped').
             this->emu().sync_worker_context();
 
+            // Progress meter: publish the per-vCPU activity snapshot (rate-limited inside). The
+            // kernel lock is held here, so concurrent workers cannot interleave file writes.
+            this->publish_activity_status();
+
             if (!vcpu.switch_thread && !vcpu.cpu.has_violation())
             {
                 break;
@@ -953,6 +959,102 @@ namespace sogen
 
         // One vCPU winding down (process exit, fatal error) ends the whole run.
         this->stop();
+    }
+
+    void windows_emulator::publish_activity_status()
+    {
+        static const std::filesystem::path directory = [] {
+            const char* configured = std::getenv("SOGEN_GPU_STATUS_DIR");
+            return configured && *configured ? std::filesystem::path(configured) : std::filesystem::path{};
+        }();
+        if (directory.empty())
+        {
+            return; // telemetry not requested for this run
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (this->activity_status_last_.time_since_epoch().count() != 0 &&
+            now - this->activity_status_last_ < std::chrono::seconds(1))
+        {
+            return; // 1 Hz is plenty for a human-facing meter
+        }
+
+        const auto activity = this->emu().vcpu_activity();
+        if (activity.empty())
+        {
+            return; // backend does not report activity (e.g. WHP) - nothing truthful to publish
+        }
+
+        double elapsed_seconds = 0.0;
+        if (this->activity_status_last_.time_since_epoch().count() != 0)
+        {
+            elapsed_seconds = std::chrono::duration<double>(now - this->activity_status_last_).count();
+        }
+        this->activity_status_last_ = now;
+
+        if (this->activity_status_prev_instructions_.size() != activity.size())
+        {
+            this->activity_status_prev_instructions_.assign(activity.size(), 0);
+            elapsed_seconds = 0.0; // first sample after a resize carries no rate
+        }
+
+        uint64_t total_instructions = 0;
+        for (const auto& entry : activity)
+        {
+            total_instructions += entry.instructions;
+        }
+
+        std::string json{"{"};
+        const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+        char buf[160];
+
+        std::snprintf(buf, sizeof(buf), "\"t\":%lld,\"vcpu_count\":%zu,\"total_instructions\":%llu,\"elapsed_seconds\":%.3f",
+                      static_cast<long long>(stamp), activity.size(), static_cast<unsigned long long>(total_instructions),
+                      elapsed_seconds);
+        json += buf;
+
+        uint64_t total_previous = 0;
+        json += ",\"vcpus\":[";
+        for (size_t i = 0; i < activity.size(); ++i)
+        {
+            const auto& entry = activity[i];
+            const auto previous = this->activity_status_prev_instructions_[i];
+            total_previous += previous;
+
+            const auto* module_name = this->mod_manager.find_name(entry.rip);
+            const auto instructions_delta = entry.instructions > previous ? entry.instructions - previous : 0;
+            const auto mips = elapsed_seconds > 0.0
+                                  ? static_cast<double>(instructions_delta) / (elapsed_seconds * 1000000.0)
+                                  : 0.0;
+
+            std::snprintf(buf, sizeof(buf),
+                          "%s{\"i\":%zu,\"rip\":%llu,\"module\":\"%s\",\"instructions\":%llu,\"mips\":%.2f,\"active\":%s}", //
+                          i == 0 ? "" : ",", i, static_cast<unsigned long long>(entry.rip),
+                          module_name ? module_name : "", static_cast<unsigned long long>(entry.instructions), mips,
+                          instructions_delta > 0 ? "true" : "false");
+            json += buf;
+
+            this->activity_status_prev_instructions_[i] = entry.instructions;
+        }
+        json += "]";
+
+        const auto total_delta = total_instructions > total_previous ? total_instructions - total_previous : 0;
+        const auto total_mips = elapsed_seconds > 0.0 ? static_cast<double>(total_delta) / (elapsed_seconds * 1000000.0) : 0.0;
+        std::snprintf(buf, sizeof(buf), ",\"total_mips\":%.2f", total_mips);
+        json += buf;
+        json += "}";
+
+        // Telemetry failure must never alter emulation: swallow everything.
+        try
+        {
+            std::ofstream output(directory / "emu-status.json", std::ios::binary | std::ios::trunc);
+            output << json << '\n';
+        }
+        catch (...)
+        {
+        }
     }
 
     bool windows_emulator::activate_thread(vcpu_context& vcpu, const uint32_t id)
