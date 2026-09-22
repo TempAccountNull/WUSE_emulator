@@ -1,4 +1,5 @@
-﻿#include "std_include.hpp"
+#include <cstdio>
+#include "std_include.hpp"
 #include "emulator_thread.hpp"
 
 #include "cpu_context.hpp"
@@ -411,6 +412,12 @@ namespace sogen
                 teb_obj.NtTib.Self = this->teb64->value();
                 teb_obj.CurrentLocale = 0x409;
                 teb_obj.ProcessEnvironmentBlock = context.peb64.value();
+                if (const char* diag = std::getenv("SOGEN_SMP_TRACE"); diag && *diag == '1')
+                {
+                    std::fprintf(stderr, "[TEBDIAG w] teb=%#llx PEB=%#llx tid=%u\n",
+                                 (unsigned long long)this->teb64->value(),
+                                 (unsigned long long)teb_obj.ProcessEnvironmentBlock, this->id);
+                }
                 teb_obj.SameTebFlags.InitialThread = initial_thread;
                 teb_obj.SameTebFlags.SkipThreadAttach = (create_flags & THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH) ? 1 : 0;
                 teb_obj.SameTebFlags.LoaderWorker = (create_flags & THREAD_CREATE_FLAGS_LOADER_WORKER) ? 1 : 0;
@@ -491,6 +498,12 @@ namespace sogen
             teb_obj.CurrentLocale = 0x409;
 
             teb_obj.ProcessEnvironmentBlock = context.peb64.value();
+            if (const char* diag = std::getenv("SOGEN_SMP_TRACE"); diag && *diag == '1')
+            {
+                std::fprintf(stderr, "[TEBDIAG w2] teb=%#llx PEB=%#llx tid=%u\n",
+                             (unsigned long long)this->teb64->value(),
+                             (unsigned long long)teb_obj.ProcessEnvironmentBlock, this->id);
+            }
             teb_obj.SameTebFlags.InitialThread = initial_thread;
             teb_obj.SameTebFlags.SkipThreadAttach = (create_flags & THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH) ? 1 : 0;
             teb_obj.SameTebFlags.LoaderWorker = (create_flags & THREAD_CREATE_FLAGS_LOADER_WORKER) ? 1 : 0;

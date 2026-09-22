@@ -1,5 +1,6 @@
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include "../std_include.hpp"
 #include "../emulator_utils.hpp"
@@ -122,6 +123,24 @@ namespace sogen
                     (unsigned long long)c.emu.reg(x86_register::rax), (unsigned long long)c.emu.reg(x86_register::rcx),
                     (unsigned long long)c.emu.reg(x86_register::rdx), (unsigned long long)c.emu.reg(x86_register::rbx),
                     c.vcpu.cpu.index());
+                // SMP 6.7 ROOT-CAUSE #2: at the raise, dump what gs:[0x60] actually READS - the
+                // TEB at the raiser vCPU's CURRENT GS base, field +0x60 (ProcessEnvironmentBlock)
+                // vs +0x08 (Self). Compare with [TEBDIAG w] writes from initial_setup_thread.
+                {
+                    const auto gs_base = c.emu.reg(x86_register::gs_base);
+                    std::array<uint8_t, 16> teb_head{};
+                    if (gs_base && c.emu.try_read_memory(gs_base + 0x58, teb_head.data(), teb_head.size()))
+                    {
+                        uint64_t peb_field = 0;
+                        std::memcpy(&peb_field, teb_head.data() + 8, sizeof(peb_field)); // +0x60
+                        c.win_emu.log.error("TEBDIAG r gs_base=0x%llX PEBfield=0x%llX\n",
+                                            (unsigned long long)gs_base, (unsigned long long)peb_field);
+                    }
+                    else
+                    {
+                        c.win_emu.log.error("TEBDIAG r gs_base=0x%llX UNREADABLE\n", (unsigned long long)gs_base);
+                    }
+                }
                 // SMP 6.7: walk the raiser's GUEST STACK (ntdll-base return addresses at rsp) to
                 // name the exact raising path. Raw RVAs vs ntdll base 0x180000000, decoded offline.
                 {
