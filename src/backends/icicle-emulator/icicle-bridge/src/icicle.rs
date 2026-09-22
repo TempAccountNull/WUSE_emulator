@@ -857,6 +857,11 @@ impl IcicleEmulator {
             self.vm_running = false;
             self.last_vm_exit = reason;
 
+            // SMP 6.7: a locked RMW section can never legitimately span a VM exit - if the block
+            // ended between the LOCK and UNLOCK hooks (fault, kick, icount edge), release the RMW
+            // spinlock so peers never spin on a dead holder (post-6.7 probe showed 120s hangs).
+            smp_rmw_lock::release();
+
             match reason {
                 icicle_vm::VmExit::InstructionLimit => {
                     self.last_stop = IcicleStopInfo::instruction_limit();
