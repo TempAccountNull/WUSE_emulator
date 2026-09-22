@@ -569,6 +569,8 @@ namespace sogen::icicle
             // shared Arcs on this thread (source-safe), and queue an alias-from-capture for each peer — the
             // peer maps the captured Arcs on its own thread with NO cross-thread read of the source (6.5).
             icicle_emulator* const source = self->handle();
+            const fanout_guard fanout{this->ops_in_flight_};
+            this->ops_in_flight_.fetch_add(1, std::memory_order_acquire);
             ice(icicle_map_smp_shared_fresh(source, address, size, perm), "Failed to map SMP memory");
             void* const raw = icicle_smp_capture(source, address, size);
             ice(raw != nullptr, "Failed to capture SMP pages");
@@ -984,7 +986,9 @@ namespace sogen::icicle
             memory_violation_hook_callback wrapped = [this, cb = callback](cpu_interface& cpu, const uint64_t address, const size_t size,
                                                             const memory_operation operation,
                                                             const memory_violation_type type) -> memory_violation_continuation {
-                if (type == memory_violation_type::unmapped)
+                // Both fault classes race queued ops: UNMAPPED (map not yet applied) and
+                // PROTECTION (protect not yet applied - page mapped with restrictive perms).
+                if (type == memory_violation_type::unmapped || type == memory_violation_type::protection)
                 {
                     auto* running = static_cast<icicle_vcpu*>(t_running_vcpu);
                     auto* worker = static_cast<icicle_vcpu*>(t_worker_vcpu);
@@ -996,13 +1000,33 @@ namespace sogen::icicle
                             std::lock_guard<std::mutex> lock(this->pending_mutex_);
                             ops.swap(this->pending_ops_[v->index()]);
                         }
+                        if (ops.empty() && this->ops_in_flight_.load(std::memory_order_acquire) > 0)
+                        {
+                            // A peer is mid-fanout (own-VM applied, peer queue not yet filled) -
+                            // exactly the terminal-fault window (VIORESTART=0 + SMPDIAG=1 runs).
+                            // Bounded wait for the in-flight op to land, then restart.
+                            for (int spin = 0; spin < 4000 && ops.empty(); ++spin)
+                            {
+                                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                                ops.swap(this->pending_ops_[v->index()]);
+                            }
+                        }
                         if (!ops.empty())
                         {
+                            std::fprintf(stderr, "[VIORESTART] drained %zu ops on vcpu %zu for addr=%#llx type=%d, restarting instruction\n",
+                                         ops.size(), v->index(), (unsigned long long)address, (int)type);
                             for (auto& op : ops)
                             {
                                 op.apply(v->handle());
                             }
                             return memory_violation_continuation::restart;
+                        }
+                        if (smp_trace_enabled())
+                        {
+                            std::fprintf(stderr, "[VIORESTART-declined] type=%d addr=%#llx q-empty%s\n", (int)type,
+                                         (unsigned long long)address,
+                                         this->ops_in_flight_.load(std::memory_order_acquire) > 0 ? "+inflight" : "");
                         }
                     }
                 }
@@ -1370,6 +1394,11 @@ namespace sogen::icicle
         // Next sequence number per issuer vCPU index (monotonic).
         std::vector<uint64_t> issuer_seq_{};
 
+        // 6.6: nonzero while ANY vCPU is between applying a cross-VM mutation to its own VM and
+        // queueing it for peers. A peer faulting UNMAPPED with an empty queue can briefly wait for
+        // the in-flight op to land (guest synchronization assumes maps are instantly coherent).
+        std::atomic<uint64_t> ops_in_flight_{0};
+
         // Queue `op` for peer vCPU `target`, stamped with the ISSUING vCPU's sequence. External
         // (setup) callers issue as vCPU 0 semantics with their own counter — use size_t max issuer?
         // Simpler: external callers pass issuer = their own index sentinel via issuer_next().
@@ -1381,6 +1410,16 @@ namespace sogen::icicle
             }
             return this->issuer_seq_[issuer]++;
         }
+
+        // RAII: marks a cross-VM fanout in flight (own-VM apply ... peer queueing window).
+        struct fanout_guard
+        {
+            std::atomic<uint64_t>& counter;
+            ~fanout_guard()
+            {
+                counter.fetch_sub(1, std::memory_order_release);
+            }
+        };
 
         void queue_op(const size_t target, const uint64_t seq, std::function<void(icicle_emulator*)> op)
         {
