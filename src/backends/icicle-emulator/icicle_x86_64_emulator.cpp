@@ -772,21 +772,56 @@ namespace sogen::icicle
                 return;
             }
                         // 6.6c'': a BETWEEN-quantum worker write (t_running_vcpu null, but this thread owns a
-            // vCPU via t_worker_vcpu): DEFER the fault to that vCPU's next begin_run_quantum - a
-            // REAL vCPU context outside any syscall handler - instead of ice()-throwing out of the
-            // worker. (Dispatching immediately from here SEGFAULTS - tried, reverted.)
+            // vCPU via t_worker_vcpu). ROOT-CAUSE CLOSEOUT: the recurring 1232-byte CONTEXT write
+            // fails Unmapped while its map is queued/in-flight; deferring only the FAULT left the
+            // page zeroed (the write never retried) and ntdll later read the zero CONTEXT and
+            // synthesized the terminal AV (VIENTRY=0 proved no icicle violation delivers it). So:
+            // drain own queue (+ bounded in-flight wait) and RETRY THE WRITE; only if it still
+            // fails, defer the fault (real guest-visible fault).
             auto* worker = static_cast<icicle_vcpu*>(t_worker_vcpu);
-            if (worker && &worker->machine_ == this && this->violation_callback_)
+            if (worker && &worker->machine_ == this)
             {
-                std::lock_guard<std::mutex> lock(this->write_faults_mutex_);
-                this->pending_write_faults_[worker->index()].emplace_back(address, size);
-                if (smp_trace_enabled())
                 {
-                    std::fprintf(stderr, "[SMPTRC] write-DEFERRED addr=%#llx size=%zu vcpu=%zu tid=%u\n",
-                                 (unsigned long long)address, size, worker->index(),
-                                 (unsigned)(GetCurrentThreadId()));
+                    std::vector<pending_op> ops;
+                    {
+                        std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                        ops.swap(this->pending_ops_[worker->index()]);
+                    }
+                    if (ops.empty() && this->ops_in_flight_.load(std::memory_order_acquire) > 0)
+                    {
+                        for (int spin = 0; spin < 4000 && ops.empty(); ++spin)
+                        {
+                            std::this_thread::sleep_for(std::chrono::microseconds(50));
+                            std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                            ops.swap(this->pending_ops_[worker->index()]);
+                        }
+                    }
+                    for (auto& op : ops)
+                    {
+                        op.apply(worker->handle());
+                    }
                 }
-                return;
+                if (icicle_write_memory(worker->handle(), address, data, size))
+                {
+                    if (smp_trace_enabled())
+                    {
+                        std::fprintf(stderr, "[SMPTRC] write-RETRIED-OK addr=%#llx size=%zu vcpu=%zu\n",
+                                     (unsigned long long)address, size, worker->index());
+                    }
+                    return;
+                }
+                if (this->violation_callback_)
+                {
+                    std::lock_guard<std::mutex> lock(this->write_faults_mutex_);
+                    this->pending_write_faults_[worker->index()].emplace_back(address, size);
+                    if (smp_trace_enabled())
+                    {
+                        std::fprintf(stderr, "[SMPTRC] write-DEFERRED addr=%#llx size=%zu vcpu=%zu tid=%u\n",
+                                     (unsigned long long)address, size, worker->index(),
+                                     (unsigned)(GetCurrentThreadId()));
+                    }
+                    return;
+                }
             }
             if (smp_trace_enabled())
             {

@@ -1080,6 +1080,17 @@ impl IcicleEmulator {
     }
 
     fn handle_violation(&mut self, address: u64, permission: u8, unmapped: bool) -> bool {
+        // SMP 6.6: trace every ENTRY so the terminal-fault delivery path is identifiable
+        // (failing probe runs show restarted=0/declined=0 - some faults never reach the
+        // C++ wrapper; printing here catches whichever icicle path delivers them).
+        if std::env::var("SOGEN_SMP_TRACE").map(|v| v == "1").unwrap_or(false) {
+            let pc = self.vm.cpu.read_pc();
+            eprintln!(
+                "[VIENTRY] addr={address:#x} perm={permission:#x} unmapped={unmapped} pc={pc:#x} hooks_empty={} tid={:?}",
+                self.violation_hooks.is_empty(),
+                std::thread::current().id()
+            );
+        }
         if self.violation_hooks.is_empty() {
             return false;
         }
