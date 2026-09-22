@@ -657,7 +657,21 @@ namespace sogen::icicle
 
         bool try_read_memory(const uint64_t address, void* data, const size_t size) const override
         {
-            return icicle_read_memory(this->acting_handle(), address, data, size);
+            const auto ok = icicle_read_memory(this->acting_handle(), address, data, size);
+            if (ok || this->vcpus_.size() == 1)
+            {
+                return ok;
+            }
+            // 6.6: a BETWEEN-quantum worker READ races queued maps exactly like the write path
+            // (the peer's loader map not yet applied on this vCPU). Drain own queue (+ bounded
+            // in-flight wait) and RETRY the read. Mirrors write_memory's drain+retry closeout.
+            auto* worker = static_cast<icicle_vcpu*>(t_worker_vcpu);
+            if (worker && &worker->machine_ == this && t_running_vcpu == nullptr)
+            {
+                const_cast<icicle_x86_64_emulator*>(this)->drain_own_queue_with_inflight_wait(*worker);
+                return icicle_read_memory(worker->handle(), address, data, size);
+            }
+            return ok;
         }
 
         void read_memory(const uint64_t address, void* data, const size_t size) const override
@@ -705,7 +719,16 @@ namespace sogen::icicle
                 // (trace: "pause still waiting (44s) for: vcpu0" after write 0x101cd39fb20/1232).
                 // If the range was translated, queue invalidate ops for every VM instead (peers
                 // drain at their next quantum; the kick bounds the latency).
-                const bool ok = icicle_write_memory(this->emu_, address, data, size);
+                bool ok = icicle_write_memory(this->emu_, address, data, size);
+                if (!ok)
+                {
+                    // 6.6: the MAIN-thread loader write can hit a map that is queued for the
+                    // MASTER but issued by a peer (the master's own queue). Drain the master's
+                    // queue (+ in-flight wait) and retry - the write-RETRIED-OK trace showed the
+                    // worker branch doing exactly this; the external branch needed it too.
+                    this->drain_own_queue_with_inflight_wait(*this->vcpus_[0]);
+                    ok = icicle_write_memory(this->emu_, address, data, size);
+                }
                 if (cached)
                 {
                     // External writer: its own issuer slot (index == vcpus_.size(), beyond any vCPU).
@@ -722,7 +745,16 @@ namespace sogen::icicle
             }
 
             const auto own = self->index();
-            const bool ok = icicle_write_memory(self->handle(), address, data, size);
+            bool ok = icicle_write_memory(self->handle(), address, data, size);
+            if (!ok)
+            {
+                // 6.6: an IN-quantum hook write (syscall handler) races queued maps the same way
+                // (the remaining untraced ...FB20 write failures land here: vCPU caller, uncached
+                // range). Drain own queue (+ in-flight wait) and retry - same discipline the
+                // violation wrapper already proves safe from inside a hook.
+                this->drain_own_queue_with_inflight_wait(*self);
+                ok = icicle_write_memory(self->handle(), address, data, size);
+            }
             if (cached)
             {
                 const uint64_t iseq = this->issuer_next(own);
@@ -1858,6 +1890,30 @@ namespace sogen::icicle
             }
             t_draining_own_queue = true;
             const auto clear = utils::finally([] { t_draining_own_queue = false; });
+            for (auto& op : ops)
+            {
+                op.apply(v.handle());
+            }
+        }
+
+        // 6.6: drain this vCPU's own queue; if empty while a cross-VM fanout is in flight,
+        // bounded-wait for the in-flight op to land first (drain+retry's shared core).
+        void drain_own_queue_with_inflight_wait(icicle_vcpu& v)
+        {
+            std::vector<pending_op> ops;
+            {
+                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                ops.swap(this->pending_ops_[v.index()]);
+            }
+            if (ops.empty() && this->ops_in_flight_.load(std::memory_order_acquire) > 0)
+            {
+                for (int spin = 0; spin < 4000 && ops.empty(); ++spin)
+                {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                    ops.swap(this->pending_ops_[v.index()]);
+                }
+            }
             for (auto& op : ops)
             {
                 op.apply(v.handle());
