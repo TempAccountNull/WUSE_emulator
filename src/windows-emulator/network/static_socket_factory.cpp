@@ -128,12 +128,31 @@ namespace sogen
 
                     uint32_t query_information(const uint32_t information_class, uint64_t& value, std::span<const std::byte>) override
                     {
-                        if (information_class == 4)
+                        // AFD information classes the static (non-networked) socket must still
+                        // answer: 4 = poll counter handled below; 6 = AFD_MAX_PACKET_SIZE;
+                        // 7 = AFD_SEND_SIZE / bytes-in-send. Real Windows reports per-socket
+                        // defaults for these; failing them (0xC00000BB) makes the sample's
+                        // Winsock self-test bail out with exit code 1 (measured on the probe).
+                        switch (information_class)
                         {
+                        case 4:
                             value = 0;
                             return 0;
+                        case 6: // AFD_MAX_PACKET_SIZE (datagram MTU-ish; loopback-safe default)
+                            value = 0xFFFF;
+                            return 0;
+                        case 7: // AFD_SEND_SIZE (outstanding send bytes - nothing queued here)
+                            value = 0;
+                            return 0;
+                        case 3: // AFD_INBOUND_BYTES
+                            value = 0;
+                            return 0;
+                        case 8: // AFD_BYTES_PENDING - nothing pending on a static endpoint
+                            value = 0;
+                            return 0;
+                        default:
+                            return 0xc00000bb;
                         }
-                        return 0xc00000bb;
                     }
 
                     int get_last_error() override

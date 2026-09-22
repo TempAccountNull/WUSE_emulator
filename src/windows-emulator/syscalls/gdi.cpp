@@ -2236,7 +2236,10 @@ namespace sogen
             c.emu.read_memory(info + 16, &compression, sizeof(compression));
 
             constexpr uint32_t bi_rgb = 0;
-            if ((bit_count != 32 && bit_count != 24) || compression != bi_rgb || bi_width <= 0)
+            // 1/4/8-bpp BI_RGB DIBs are palette-driven (RGBQUAD table at info+40). The blit loop
+            // consumes 32-bpp rows, so palettized sources are expanded below before blitting.
+            if ((bit_count != 32 && bit_count != 24 && bit_count != 8 && bit_count != 4 && bit_count != 1) ||
+                compression != bi_rgb || bi_width <= 0)
             {
                 c.win_emu.log.warn("NtGdiSetDIBitsToDeviceInternal: unsupported DIB (bpp=%u compression=%u width=%d)\n", bit_count,
                                    compression, bi_width);
@@ -2247,7 +2250,6 @@ namespace sogen
             const auto src_width = static_cast<uint32_t>(bi_width);
             const auto src_height = static_cast<uint32_t>(top_down ? -bi_height : bi_height);
             const auto stored_rows = std::min(scan_lines, src_height);
-            const size_t bytes_per_pixel = bit_count / 8;
             // DIB scanlines are DWORD-aligned, not tightly packed.
             const size_t stride = ((static_cast<size_t>(src_width) * bit_count + 31u) / 32u) * 4u;
 
@@ -2263,6 +2265,50 @@ namespace sogen
             c.emu.read_memory(bits, data.data(), data.size());
             const auto available_rows = static_cast<uint32_t>(data.size() / stride);
 
+            // Expand 1/4/8-bpp rows to 32-bpp BGRA via the DIB's palette; the loop below then
+            // reads every source with the same 4-bytes-per-pixel math.
+            std::vector<uint8_t> expanded{};
+            const uint8_t* pixels = data.data();
+            size_t pixel_stride = stride;
+            if (bit_count <= 8)
+            {
+                std::vector<uint8_t> palette((size_t{1} << bit_count) * 4);
+                c.emu.read_memory(info + 40, palette.data(), palette.size());
+                const size_t expanded_stride = static_cast<size_t>(src_width) * 4;
+                expanded.resize(expanded_stride * available_rows);
+                for (uint32_t row = 0; row < available_rows; ++row)
+                {
+                    const uint8_t* src_row = data.data() + static_cast<size_t>(row) * stride;
+                    uint8_t* dst_row = expanded.data() + static_cast<size_t>(row) * expanded_stride;
+                    for (uint32_t x = 0; x < src_width; ++x)
+                    {
+                        uint8_t index = 0;
+                        if (bit_count == 8)
+                        {
+                            index = src_row[x];
+                        }
+                        else if (bit_count == 4)
+                        {
+                            const uint8_t pair = src_row[x / 2];
+                            index = (x % 2) == 0 ? static_cast<uint8_t>(pair >> 4) : static_cast<uint8_t>(pair & 0x0F);
+                        }
+                        else // bit_count == 1
+                        {
+                            const uint8_t byte = src_row[x / 8];
+                            index = static_cast<uint8_t>((byte >> (7u - (x % 8))) & 0x01u);
+                        }
+                        // RGBQUAD layout: blue, green, red, reserved.
+                        const uint8_t* quad = palette.data() + static_cast<size_t>(index) * 4;
+                        dst_row[x * 4 + 0] = quad[0];
+                        dst_row[x * 4 + 1] = quad[1];
+                        dst_row[x * 4 + 2] = quad[2];
+                        dst_row[x * 4 + 3] = 0xFF;
+                    }
+                }
+                pixels = expanded.data();
+                pixel_stride = static_cast<size_t>(src_width) * 4;
+            }
+
             uint32_t copied = 0;
             for (uint32_t j = 0; j < height; ++j)
             {
@@ -2277,7 +2323,7 @@ namespace sogen
                     continue;
                 }
 
-                const uint8_t* row = data.data() + static_cast<size_t>(bits_row) * stride;
+                const uint8_t* row = pixels + static_cast<size_t>(bits_row) * pixel_stride;
                 for (uint32_t i = 0; i < width; ++i)
                 {
                     const auto src_x = static_cast<uint32_t>(x_src) + i;
@@ -2285,7 +2331,7 @@ namespace sogen
                     {
                         break;
                     }
-                    const uint8_t* px = row + static_cast<size_t>(src_x) * bytes_per_pixel;
+                    const uint8_t* px = row + static_cast<size_t>(src_x) * 4;
                     const uint32_t pixel =
                         static_cast<uint32_t>(px[0]) | (static_cast<uint32_t>(px[1]) << 8) | (static_cast<uint32_t>(px[2]) << 16);
                     set_surface_pixel(*surface, x_dest + origin_x + static_cast<int>(i), y_dest + origin_y + static_cast<int>(j),
