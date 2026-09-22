@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <filesystem>
@@ -495,23 +496,19 @@ namespace sogen::test
         EXPECT_EQ(observed, magic) << "vCPU 1 never executed the region mapped from vCPU 0's hook";
     }
 
-    // Step 6.5/6.8 regression (previously DISABLED_): runs the multi-threaded test-sample on 2 icicle
-    // vCPUs through the REAL windows_emulator. This is the exact shape that deadlocked before 6.5's async
-    // cross-VM mutation (memory + hooks). N>1 requires the lean, wall-clock path
-    // (use_instruction_precision=false + use_relative_time=false; both otherwise hard-error "requires a
-    // single vCPU"). Requires the emulator root to contain filesys/c/test-sample.exe.
-    // DISABLED again at a LATER stage (progress): after the write_ptr shared-page clone fix and the
-    // dangling-capture fix, the sample runs guest code on both vCPUs and terminates with a GUEST
-    // ACCESS_VIOLATION (0xC0000005) instead of a host exception/hang — i.e. the host SMP machinery
-    // now holds; the remaining failure is guest-visible correctness (cross-vCPU TLB/SMC invalidation
-    // = 6.6, LOCK-op atomics on shared bytes = 6.7). Re-enable when those land.
-    // DISABLED: the HOST deadlock is fixed (external writes no longer pause), and the sample now
-    // completes without hanging — but the run is RACY because the guest still hits an AV mid-run
-    // (SMPDIAG: read of ntdll+0x75D68 .text at rip ntdll+0xA0342, tid=12/vCPU1). When the guest's
-    // own handler chain re-raises with code 0 the test passes; when the first 0xC0000005 stands it
-    // fails. Re-enable only when that guest-visible fault is fixed (6.6 TLB-coherency window /
-    // 6.7 atomics). Run with SOGEN_SMP_TRACE=1 to trace cross-VM coordination events.
-    TEST(IcicleSmp, DISABLED_MultiThreadedSampleRunsOnTwoVcpus)
+    // Step 6.5/6.8 regression: runs the multi-threaded test-sample on 2 icicle vCPUs through the
+    // REAL windows_emulator. This is the exact shape that deadlocked before 6.5's async cross-VM
+    // mutation (memory + hooks). N>1 requires the lean, wall-clock path
+    // (use_instruction_precision=false + use_relative_time=false; both otherwise hard-error
+    // "requires a single vCPU"). Requires the emulator root to contain filesys/c/test-sample.exe.
+    // GREEN since 6.7 + the static-NSI adapter row: 8/8 deterministic passes on 2 vCPUs.
+    // The sample's Interrupts self-test needs per-instruction precision, which the lean path
+    // disables by design, so the guest env gets EMULATOR_ICICLE=1 (the sample skips it).
+    // Debug knobs: SOGEN_SMP_PROBE_VCPUS=N (default 2) to compare 1-vCPU vs N-vCPU behavior of
+    // the same lean configuration; SOGEN_SMP_TRACE=1 adds guest stdout + every guest file/registry
+    // access; EMULATOR_VERBOSE=1 adds guest stdout. Run for a quick health check:
+    //   EMULATOR_ROOT=<root> EMULATOR_ICICLE=1 windows-emulator-test.exe --gtest_filter='IcicleSmp.*'
+    TEST(IcicleSmp, MultiThreadedSampleRunsOnTwoVcpus)
     {
         emulator_settings settings{};
         settings.use_relative_time = false;         // N>1 requires wall-clock time
@@ -525,11 +522,46 @@ namespace sogen::test
         interfaces.dns_lookup = create_sample_dns_lookup();
         interfaces.ui = std::make_unique<null_ui_backend>();
 
+        emulator_callbacks callbacks{};
+        if (enable_verbose_logging())
+        {
+            // Print guest stdout so failing sample self-tests (puts/printf lines) are visible in
+            // the gtest output alongside SMPTRC/TERMCTX diagnostics.
+            callbacks.on_stdout = [](const std::string_view data) {
+                std::cout << data; //
+            };
+        }
+        if (const auto* trace = getenv("SOGEN_SMP_TRACE"); trace && *trace == '1')
+        {
+            // REGDIAG: log every registry key open + file open the guest performs, so DNS/adapter
+            // discovery failures can be traced to the exact missing key.
+            callbacks.on_generic_access = [](const std::string_view type, const std::u16string_view name) {
+                std::string narrow{};
+                narrow.reserve(name.size());
+                for (const auto c16 : name)
+                {
+                    narrow.push_back(static_cast<char>(c16));
+                }
+                std::cout << "[ACC] " << type << ": " << narrow << "\n"; //
+            };
+        }
+
+        // Debug knob: SOGEN_SMP_PROBE_VCPUS=N (default 2) to compare 1-vCPU vs N-vCPU behavior
+        // of the exact same lean/wall-clock configuration without rebuilding.
+        int vcpu_count = 2;
+        if (const auto* vcpu_env = getenv("SOGEN_SMP_PROBE_VCPUS"))
+        {
+            vcpu_count = std::max(1, atoi(vcpu_env));
+        }
+
+        auto app_settings = get_sample_app_settings({});
+        app_settings.environment[u"EMULATOR_ICICLE"] = u"1";
+
         windows_emulator emu{
-            create_x86_64_emulator(backend_type::icicle, 2),
-            get_sample_app_settings({}),
+            create_x86_64_emulator(backend_type::icicle, vcpu_count),
+            std::move(app_settings),
             settings,
-            {},
+            std::move(callbacks),
             std::move(interfaces),
         };
 

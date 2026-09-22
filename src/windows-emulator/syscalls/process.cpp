@@ -4,6 +4,8 @@
 
 #include <utils/finally.hpp>
 
+#include <cstdio>
+
 namespace sogen
 {
 
@@ -648,6 +650,35 @@ namespace sogen
                 c.proc.exit_status = exit_status;
                 c.win_emu.log.error("EXITDIAG NtTerminateProcess status=%#x tid=%u\n", (unsigned)exit_status,
                                     (unsigned)GetCurrentThreadId());
+                // TERMCTX: name the terminating caller - dump registers + a guest stack chain of
+                // code pointers (resolved offline against module bases) so a failing sample
+                // self-test checkpoint can be identified. Gated on SOGEN_SMP_TRACE to keep green
+                // runs quiet; EXITDIAG above always fires.
+                if (const char* diag = std::getenv("SOGEN_SMP_TRACE"); diag && *diag == '1')
+                {
+                    const auto rsp = c.emu.reg(x86_register::rsp);
+                    c.win_emu.log.error(
+                        "TERMCTX caller rip=0x%llX rsp=0x%llX rax=0x%llX rcx=0x%llX rdx=0x%llX r8=0x%llX r9=0x%llX vcpu=%zu\n",
+                        (unsigned long long)c.emu.reg(x86_register::rip), (unsigned long long)rsp,
+                        (unsigned long long)c.emu.reg(x86_register::rax), (unsigned long long)c.emu.reg(x86_register::rcx),
+                        (unsigned long long)c.emu.reg(x86_register::rdx), (unsigned long long)c.emu.reg(x86_register::r8),
+                        (unsigned long long)c.emu.reg(x86_register::r9), c.vcpu.cpu.index());
+                    std::array<uint64_t, 32> stack{};
+                    if (rsp && c.emu.try_read_memory(rsp, stack.data(), stack.size() * sizeof(uint64_t)))
+                    {
+                        std::string chain{};
+                        char buf[24];
+                        for (const auto q : stack)
+                        {
+                            if (q >= 0x100000000ull && q < 0x200000000ull)
+                            {
+                                std::snprintf(buf, sizeof(buf), "%llX ", (unsigned long long)q);
+                                chain += buf;
+                            }
+                        }
+                        c.win_emu.log.error("TERMCTX stack-chain: %s\n", chain.c_str());
+                    }
+                }
 
                 c.win_emu.stop();
                 return STATUS_SUCCESS;

@@ -1,5 +1,6 @@
 #include "static_socket_factory.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <deque>
 #include <queue>
@@ -56,8 +57,80 @@ namespace sogen
 
             struct static_socket_factory_impl : socket_factory
             {
-                uint32_t query_network_store(network_store_query&) override
+                uint32_t query_network_store(network_store_query& query) override
                 {
+                    // Deterministic offline network view: report exactly one adapter - the same
+                    // hardcoded interface row the NSI device itself returned before the rework
+                    // that routed NSI queries through the socket backend. The win backend answers
+                    // with real host nsi.dll data; the static backend stays isolated from host
+                    // queries, so it must synthesize the row or iphlpapi's
+                    // GetAdaptersAddresses fails and dnsapi aborts resolution with
+                    // DNS_ERROR_NO_DNS_SERVERS (9852) - measured on the sample probe.
+                    constexpr uint64_t adapter_index = 7;
+                    static constexpr std::array<uint8_t, 0xB8> adapter_parameter = {
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00, 0x00, 0x30, 0x75, 0x00, 0x00, 0xE8, 0x03, 0x00, 0x00, 0xC0, 0x27,
+                        0x09, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x64, 0x19, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00,
+                        0x00, 0x07, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+                        0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+                        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xDC, 0x05, 0x00, 0x00, 0x40, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x07, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x35, 0x97, 0x98, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    };
+
+                    const auto fill_row = [&](network_store_buffer& buffer) {
+                        const auto bytes_to_write = std::min<size_t>(buffer.bytes.size(), adapter_parameter.size());
+                        buffer.bytes.assign(adapter_parameter.begin(), adapter_parameter.begin() + static_cast<std::ptrdiff_t>(bytes_to_write));
+                    };
+                    const auto fill_zero = [](network_store_buffer& buffer) {
+                        std::fill(buffer.bytes.begin(), buffer.bytes.end(), uint8_t{0});
+                    };
+                    const auto fill_key = [&](network_store_buffer& buffer) {
+                        if (buffer.bytes.size() < sizeof(uint64_t))
+                        {
+                            return;
+                        }
+                        uint64_t index = adapter_index;
+                        std::memcpy(buffer.bytes.data(), &index, sizeof(index));
+                    };
+
+                    switch (query.operation)
+                    {
+                    case network_store_operation::parameter:
+                        // NsiGetParameter: 4-byte outputs read a count/state (1), 8-byte outputs
+                        // read the adapter index, larger outputs read the interface row.
+                        if (query.buffers[1].bytes.size() == sizeof(uint32_t))
+                        {
+                            uint32_t value = 1;
+                            std::memcpy(query.buffers[1].bytes.data(), &value, sizeof(value));
+                        }
+                        else if (query.buffers[1].bytes.size() == sizeof(uint64_t))
+                        {
+                            uint64_t value = adapter_index;
+                            std::memcpy(query.buffers[1].bytes.data(), &value, sizeof(value));
+                        }
+                        else
+                        {
+                            fill_row(query.buffers[1]);
+                        }
+                        return 0;
+
+                    case network_store_operation::all_parameters:
+                        fill_row(query.buffers[1]);
+                        fill_zero(query.buffers[2]);
+                        fill_zero(query.buffers[3]);
+                        return 0;
+
+                    case network_store_operation::enumerate:
+                        query.count = 1;
+                        fill_key(query.buffers[0]);
+                        fill_row(query.buffers[1]);
+                        fill_zero(query.buffers[2]);
+                        fill_zero(query.buffers[3]);
+                        return 0;
+                    }
+
                     return 50;
                 }
 
