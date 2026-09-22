@@ -1039,6 +1039,13 @@ namespace sogen
 
     bool emulator_thread::is_thread_ready(windows_emulator& win_emu)
     {
+        // SMP 6.7 RC#2: hold a freshly created thread until its creator's earlier queued GS/TEB
+        // map ops are applied on every vCPU (the idle loop drains this - see perform_thread_switch).
+        if (this->smp_visibility_mark != 0 && !win_emu.emu().smp_op_applied(this->smp_visibility_mark))
+        {
+            return false;
+        }
+
         if (this->is_terminated() || this->suspended > 0)
         {
             return false;

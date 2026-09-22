@@ -879,6 +879,10 @@ namespace sogen
 
             // Idle: nothing is ready. Release the kernel lock while pumping UI events
             // and sleeping so other threads (UI delivery, vCPU workers) can run.
+            // SMP 6.7 RC#2: draining OUR OWN queued cross-vm ops here is the missing drain
+            // trigger - it lets a thread-visibility gate (is_thread_ready) make progress even
+            // when no thread is runnable, instead of parking with an undrained queue forever.
+            this->emu().sync_worker_context();
             lock.unlock();
 
             if (this->vcpu_count_ == 1)

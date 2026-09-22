@@ -382,6 +382,11 @@ namespace sogen
 
         bool is_thread_ready(windows_emulator& win_emu);
 
+        // SMP 6.7 RC#2: cross-vm op watermark at creation. The thread is not schedulable until
+        // every vCPU has applied all ops issued before this mark (its GS/TEB pages are then
+        // mapped everywhere), closing the stale-first-read window.
+        uint64_t smp_visibility_mark{0};
+
         void save(x86_64_cpu& emu)
         {
             this->last_registers = emu.save_registers();

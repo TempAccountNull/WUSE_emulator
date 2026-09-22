@@ -1015,6 +1015,13 @@ namespace sogen
 
             const auto h = c.proc.create_thread(c.win_emu.memory, start_routine, argument, actual_stack_size, create_flags);
 
+            // SMP 6.7 RC#2: gate schedulability on the creator's earlier queued GS/TEB map ops
+            // being applied everywhere (the scheduler's idle pass drains the queues - no waiting).
+            if (auto entry = c.proc.threads.get(h))
+            {
+                entry->smp_visibility_mark = c.win_emu.emu().smp_op_watermark();
+            }
+
             thread_handle.write(h);
 
             if (!attribute_list)

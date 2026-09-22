@@ -1382,6 +1382,29 @@ namespace sogen::icicle
         // icicle run and outside any write path) - the safe point five write-path attempts could
         // not synthesize. Fixes the between-quantum 'Unmapped' race (the recurring 1232-byte
         // CONTEXT write during thread switches hitting a map queued but not yet applied).
+        uint64_t smp_op_watermark() const override
+        {
+            return this->ops_issued_watermark_.load(std::memory_order_acquire);
+        }
+
+        bool smp_op_applied(const uint64_t mark) const override
+        {
+            if (this->vcpus_.size() == 1)
+            {
+                return true;
+            }
+            const auto issued = this->ops_issued_watermark_.load(std::memory_order_acquire);
+            uint64_t pending = 0;
+            {
+                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                for (const auto& q : this->pending_ops_)
+                {
+                    pending += q.size();
+                }
+            }
+            return issued >= pending && (issued - pending) >= mark;
+        }
+
         void sync_worker_context() override
         {
             auto* worker = static_cast<icicle_vcpu*>(t_worker_vcpu);
@@ -1459,7 +1482,7 @@ namespace sogen::icicle
         // BEL, so it cannot pause a peer parked in a hook blocked on that BEL (deadlock, confirmed by the
         // N>1 sample probe). Instead it applies to its OWN VM now and queues the op per-peer; each peer
         // drains its queue on its own thread at begin_run_quantum, before it next executes.
-        std::mutex pending_mutex_{};
+        mutable std::mutex pending_mutex_{};
         // 6.6c'' per-issuer op queues: every queued op carries (issuer, seq). Same-issuer
         // sequences (the loader's map->protect) ALWAYS apply in order; the perm_epoch stale-skip
         // only applies to CROSS-issuer ops (a stale protect from another thread over a range this
@@ -1472,6 +1495,9 @@ namespace sogen::icicle
         std::vector<std::vector<pending_op>> pending_ops_{}; // [vm index] -> ops(handle)
         // Next sequence number per issuer vCPU index (monotonic).
         std::vector<uint64_t> issuer_seq_{};
+        // SMP 6.7 RC#2: count of ops ever queued to peers. applied(mark) = issued - pending
+        // (per-target FIFO), so a host gate can wait for its earlier queued memory ops.
+        std::atomic<uint64_t> ops_issued_watermark_{0};
 
         // 6.6: nonzero while ANY vCPU is between applying a cross-VM mutation to its own VM and
         // queueing it for peers. A peer faulting UNMAPPED with an empty queue can briefly wait for
@@ -1502,6 +1528,7 @@ namespace sogen::icicle
 
         void queue_op(const size_t target, const uint64_t seq, std::function<void(icicle_emulator*)> op)
         {
+            this->ops_issued_watermark_.fetch_add(1, std::memory_order_acq_rel);
             std::lock_guard<std::mutex> lock(this->pending_mutex_);
             if (target >= this->pending_ops_.size())
             {

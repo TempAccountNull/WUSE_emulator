@@ -84,6 +84,19 @@ namespace sogen
         // memory. Default: nothing (single-VM backends; mirrors WHP's no-op semantics).
         virtual void sync_worker_context() {}
 
+        // SMP: watermark of cross-VM ops issued to peer queues, and whether every op issued up
+        // to `mark` has been applied (per-target FIFO). Lets host code gate a transition on its
+        // earlier queued ops being visible everywhere - without holding a lock. Defaults: none.
+        virtual uint64_t smp_op_watermark() const
+        {
+            return 0;
+        }
+
+        virtual bool smp_op_applied(uint64_t) const
+        {
+            return true;
+        }
+
 
         virtual x86_cpu<Traits>& get_cpu(const size_t index)
         {
