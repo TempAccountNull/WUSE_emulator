@@ -4,6 +4,8 @@
 #include "memory_manager.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <system_error>
 #include <string_view>
 #include <serialization_helper.hpp>
 #include <utils/file_handle.hpp>
@@ -740,7 +742,9 @@ namespace sogen
                 }
                 else
                 {
-                    throw std::runtime_error("Failed to reobtain file handle");
+                    // Snapshot restoration must identify the host file that disappeared or became inaccessible.
+                    throw std::system_error(errno, std::generic_category(),
+                                            "Failed to reobtain file handle: " + u16_to_u8(this->host_path.u16string()));
                 }
             }
         }
