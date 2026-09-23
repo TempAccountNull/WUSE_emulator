@@ -951,7 +951,12 @@ impl IcicleEmulator {
 
     fn handle_exception(&mut self, code: ExceptionCode, value: u64) -> bool {
         smp_rmw_lock::release(); // 6.7: faulted mid-locked-section - never leave the RMW spinlock held
-        smp_dbg(&format!("handle_exception code={code:?} value={value:#x} pc={:#x}", self.vm.cpu.read_pc()));
+        // The analyzer already records syscalls and faults. Keep this per-exception Rust echo opt-in:
+        // it allocates a format string and writes stderr on every syscall in busy guest loops.
+        static EXCEPTION_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *EXCEPTION_DEBUG.get_or_init(|| std::env::var("SOGEN_SMP_EXCEPTION_DEBUG").as_deref() == Ok("1")) {
+            smp_dbg(&format!("handle_exception code={code:?} value={value:#x} pc={:#x}", self.vm.cpu.read_pc()));
+        }
         let continue_execution = match code {
             ExceptionCode::Syscall => self.handle_syscall(value),
             ExceptionCode::ReadPerm => self.handle_violation(value, FOREIGN_READ, false),
