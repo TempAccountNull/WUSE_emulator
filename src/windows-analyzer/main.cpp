@@ -955,42 +955,64 @@ namespace sogen
             if (options.log_foreign_module_access)
             {
                 auto module_cache = std::make_shared<std::map<std::string, uint64_t>>();
-                win_emu->emu().hook_memory_read(0, std::numeric_limits<uint64_t>::max(),
-                                                [&, module_cache](cpu_interface& cpu, const uint64_t address, const void*, size_t size) {
-                                                    win_emu->dispatch_on_cpu(cpu, [&] {
-                                                        const auto rip = win_emu->active_cpu().read_instruction_pointer();
-                                                        const auto accessor =
-                                                            get_module_if_interesting(win_emu->mod_manager, options.modules, rip);
+                auto foreign_hooks = std::make_shared<std::map<uint64_t, emulator_hook*>>();
+                const auto register_foreign_module = [&, module_cache, foreign_hooks](const mapped_module& module) {
+                    if (module.size_of_image == 0 || foreign_hooks->contains(module.image_base))
+                    {
+                        return;
+                    }
 
-                                                        if (!accessor.has_value())
-                                                        {
-                                                            return;
-                                                        }
+                    // Icicle excludes hooked pages from its read TLB; keep stack and heap reads on the fast path.
+                    auto* const hook = win_emu->emu().hook_memory_read(
+                        module.image_base, module.size_of_image,
+                        [&, module_cache](cpu_interface& cpu, const uint64_t address, const void*, size_t size) {
+                            win_emu->dispatch_on_cpu(cpu, [&] {
+                                const auto rip = win_emu->active_cpu().read_instruction_pointer();
+                                const auto accessor = get_module_if_interesting(win_emu->mod_manager, options.modules, rip);
+                                if (!accessor.has_value())
+                                {
+                                    return;
+                                }
 
-                                                        const auto* mod = win_emu->mod_manager.find_by_address(address);
-                                                        if (!mod || mod == *accessor)
-                                                        {
-                                                            return;
-                                                        }
+                                const auto* mod = win_emu->mod_manager.find_by_address(address);
+                                if (!mod || mod == *accessor)
+                                {
+                                    return;
+                                }
 
-                                                        if (concise_logging)
-                                                        {
-                                                            const auto count = ++(*module_cache)[mod->name];
-                                                            if (count > 30 && count % 100000 != 0)
-                                                            {
-                                                                return;
-                                                            }
-                                                        }
+                                if (concise_logging)
+                                {
+                                    const auto count = ++(*module_cache)[mod->name];
+                                    if (count > 30 && count % 100000 != 0)
+                                    {
+                                        return;
+                                    }
+                                }
 
-                                                        const auto* region_name = get_module_memory_region_name(*mod, address);
-                                                        context.emit_observation<foreign_module_read_event>([&](auto& event) {
-                                                            event.address = address;
-                                                            event.size = size;
-                                                            event.module_name = mod->name;
-                                                            event.region_name = region_name;
-                                                        });
-                                                    });
-                                                });
+                                const auto* region_name = get_module_memory_region_name(*mod, address);
+                                context.emit_observation<foreign_module_read_event>([&](auto& event) {
+                                    event.address = address;
+                                    event.size = size;
+                                    event.module_name = mod->name;
+                                    event.region_name = region_name;
+                                });
+                            });
+                        });
+                    foreign_hooks->emplace(module.image_base, hook);
+                };
+
+                for (const auto& [base, module] : win_emu->mod_manager.modules())
+                {
+                    register_foreign_module(module);
+                }
+                (void)win_emu->callbacks.on_module_load.add(register_foreign_module);
+                (void)win_emu->callbacks.on_module_unload.add([&, foreign_hooks](const mapped_module& module) {
+                    if (const auto it = foreign_hooks->find(module.image_base); it != foreign_hooks->end())
+                    {
+                        win_emu->emu().delete_hook(it->second);
+                        foreign_hooks->erase(it);
+                    }
+                });
             }
 
             const auto exec_mode = !options.executable_access.empty()
