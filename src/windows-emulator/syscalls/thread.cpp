@@ -1015,6 +1015,19 @@ namespace sogen
 
             const auto h = c.proc.create_thread(c.win_emu.memory, start_routine, argument, actual_stack_size, create_flags);
 
+            // FULLTRACE: thread births are the other half of the story - young-thread block
+            // logging starts from the first scheduled block, this records the creation itself.
+            if (const char* full = std::getenv("SOGEN_LEANDIAG_FULLTRACE"); full && *full == '1')
+            {
+                if (auto born = c.proc.threads.get(h))
+                {
+                    windows_emulator::leandiag_note_thread_birth(born->id);
+                    c.win_emu.log.error("FULLTRACE thread-create tid=%u start=%#llx arg=%#llx creator-tid=%u\n",
+                                        born->id, (unsigned long long)start_routine, (unsigned long long)argument,
+                                        c.vcpu.active_thread ? c.vcpu.active_thread->id : 0);
+                }
+            }
+
             // SMP 6.7 RC#2: gate schedulability on the creator's earlier queued GS/TEB map ops
             // being applied everywhere (the scheduler's idle pass drains the queues - no waiting).
             if (auto entry = c.proc.threads.get(h))

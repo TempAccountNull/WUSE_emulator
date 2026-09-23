@@ -765,6 +765,52 @@ namespace sogen
                 return STATUS_INVALID_PARAMETER;
             }
 
+            // LEANDIAG: the loader unloads a failed DLL before raising DLL_INIT_FAILED. The
+            // failing DLL is never registered in mod_manager (init never completed), so at
+            // unmap time read the PE image's OWN export-directory name straight from the
+            // still-mapped bytes at base_address - the one moment it is guaranteed nameable.
+            {
+                const auto name_image_at = [&c](const uint64_t base) -> const char* {
+                    thread_local std::string image_name{};
+                    uint16_t dos_magic = 0;
+                    int32_t lfanew = 0;
+                    uint32_t export_rva = 0, name_rva = 0;
+                    std::array<char, 40> name{};
+                    if (!c.emu.try_read_memory(base, &dos_magic, sizeof(dos_magic)) || dos_magic != 0x5A4D ||
+                        !c.emu.try_read_memory(base + 0x3C, &lfanew, sizeof(lfanew)) || lfanew <= 0 || lfanew > 0x400 ||
+                        !c.emu.try_read_memory(base + lfanew + 0x18 + 0x70, &export_rva, sizeof(export_rva)) ||
+                        export_rva == 0 ||
+                        !c.emu.try_read_memory(base + export_rva + 12, &name_rva, sizeof(name_rva)) || name_rva == 0 ||
+                        !c.emu.try_read_memory(base + name_rva, name.data(), name.size() - 1))
+                    {
+                        return nullptr;
+                    }
+                    name.back() = '\0';
+                    const auto len = strnlen(name.data(), name.size() - 1);
+                    if (len < 3)
+                    {
+                        return nullptr;
+                    }
+                    image_name.assign(name.data(), len);
+                    return image_name.c_str();
+                };
+                if (const auto* mod = c.win_emu.mod_manager.find_by_address(base_address))
+                {
+                    c.win_emu.log.error("LEANDIAG unmap base=%#llx module=%s tid=%u\n",
+                                        (unsigned long long)base_address, mod->name.c_str(), (unsigned)GetCurrentThreadId());
+                }
+                else if (const char* image = name_image_at(base_address))
+                {
+                    c.win_emu.log.error("LEANDIAG unmap base=%#llx PE-image=%s (unregistered) tid=%u\n",
+                                        (unsigned long long)base_address, image, (unsigned)GetCurrentThreadId());
+                }
+                else
+                {
+                    c.win_emu.log.error("LEANDIAG unmap base=%#llx module=<untracked, no PE header> tid=%u\n",
+                                        (unsigned long long)base_address, (unsigned)GetCurrentThreadId());
+                }
+            }
+
             if (c.proc.shared_section_address && base_address >= c.proc.shared_section_address &&
                 base_address < c.proc.shared_section_address + c.proc.shared_section_size)
             {

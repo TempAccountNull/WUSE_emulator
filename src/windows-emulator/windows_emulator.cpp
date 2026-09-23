@@ -628,6 +628,78 @@ namespace sogen
             }
         };
 
+        // LEAN timing fix: with per-instruction hooks off (fast path) but N>1 forcing wall-clock
+        // mode, the guest's QPC/InterruptTime/system-elapsed read REAL host time. The emulated
+        // CPU then appears to do hours of work in seconds - Authenticode/anti-tamper timing
+        // checks in the loader (wintrust trail: msvcrt __C_specific_handler loop + wintrust
+        // internals -> STATUS_DLL_INIT_FAILED) fail on exactly that. With hooks ON the same
+        // code passes because the run is 5-13x slower. Drive the guest-visible clocks from the
+        // retired-instruction count instead: 1 instruction = 1ns ("a 1 GHz CPU"), so elapsed
+        // time tracks work done. System DATE stays anchored to the real clock at boot. Only
+        // used when the backend always knows the icount (icicle lean paths).
+        class icount_clock : public utils::clock
+        {
+          public:
+            icount_clock(const x86_64_emulator& emu)
+                : emu_(emu),
+                  base_instructions_(emu.executed_instructions_total()),
+                  boot_system_(std::chrono::system_clock::now()),
+                  boot_steady_(std::chrono::steady_clock::now())
+            {
+            }
+
+            system_time_point system_now() override
+            {
+                return this->boot_system_ +
+                       std::chrono::duration_cast<system_duration>(std::chrono::nanoseconds(this->elapsed_instructions()));
+            }
+
+            steady_time_point steady_now() override
+            {
+                return this->boot_steady_ + std::chrono::nanoseconds(this->elapsed_instructions());
+            }
+
+            uint64_t timestamp_counter() override
+            {
+                // Mirror the dedicated virtual TSC (timestamp_counter_for_guest) so QPC-vs-TSC
+                // comparisons stay coherent: cycles == instructions on both.
+                return virtual_tsc_origin + this->elapsed_instructions();
+            }
+
+          private:
+            uint64_t elapsed_instructions() const
+            {
+                const auto now = this->emu_.executed_instructions_total();
+                return now > this->base_instructions_ ? now - this->base_instructions_ : 0;
+            }
+
+            static constexpr uint64_t virtual_tsc_origin = 0x0000'0100'0000'0000ULL;
+
+            const x86_64_emulator& emu_;
+            uint64_t base_instructions_;
+            system_time_point boot_system_;
+            steady_time_point boot_steady_;
+        };
+
+        std::unique_ptr<utils::clock> get_clock(emulator_interfaces& interfaces, const uint64_t& instructions,
+                                                const bool use_relative_time);
+
+        std::unique_ptr<utils::clock> make_guest_clock(const x86_64_emulator& emu, emulator_interfaces& interfaces,
+                                                       const uint64_t& instructions, const bool use_relative_time)
+        {
+            auto base = get_clock(interfaces, instructions, use_relative_time);
+            // Opt-in only (SOGEN_ICOUNT_CLOCK=1): a pure icount clock FREEZES while a guest
+            // thread sleeps/waits (no instructions retire), so wait deadlines never arrive and
+            // the sample's thread joins deadlock. Falsified as the lean-crash fix anyway.
+            const bool icount_clock_requested =
+                [] { const char* v = std::getenv("SOGEN_ICOUNT_CLOCK"); return v && *v == '1'; }();
+            if (use_relative_time || !emu.has_deterministic_instruction_count() || !icount_clock_requested)
+            {
+                return base;
+            }
+            return std::make_unique<icount_clock>(emu);
+        }
+
         std::unique_ptr<utils::clock> get_clock(emulator_interfaces& interfaces, const uint64_t& instructions, const bool use_relative_time)
         {
             if (interfaces.clock)
@@ -710,7 +782,7 @@ namespace sogen
     windows_emulator::windows_emulator(std::unique_ptr<x86_64_emulator> emu, const emulator_settings& settings,
                                        emulator_callbacks callbacks, emulator_interfaces interfaces)
         : emu_(std::move(emu)),
-          clock_(get_clock(interfaces, this->executed_instructions_, settings.use_relative_time)),
+          clock_(make_guest_clock(*this->emu_, interfaces, this->executed_instructions_, settings.use_relative_time)),
           dns_lookup_(get_dns_lookup(interfaces)),
           socket_factory_(get_socket_factory(interfaces)),
           ui_backend_(get_ui_backend(interfaces)),
@@ -1254,8 +1326,136 @@ namespace sogen
         }
     }
 
+    namespace
+    {
+        // LEANDIAG block-trail storage (SOGEN_LEANDIAG_BLOCKTRACE=1, diagnosis only): the last
+        // few executed guest block addresses per guest thread id, newest last.
+        struct leandiag_block_trail
+        {
+            static constexpr size_t k_depth = 128;
+            std::array<uint64_t, k_depth> addresses{};
+            size_t next{0};
+            bool full{false};
+            // The loader does hundreds of ntdll-only teardown blocks between a failing
+            // DllMain and the raise; keep the last non-ntdll blocks separately so the
+            // answer survives that chatter.
+            static constexpr size_t k_foreign_depth = 24;
+            std::array<uint64_t, k_foreign_depth> foreign_addresses{};
+            size_t foreign_next{0};
+            bool foreign_full{false};
+        };
+        std::mutex leandiag_trail_mutex{};
+        std::unordered_map<uint32_t, leandiag_block_trail> leandiag_trails{};
+    } // namespace
+
+    void windows_emulator::leandiag_note_thread_birth(const uint32_t tid)
+    {
+        std::lock_guard<std::mutex> lock(leandiag_trail_mutex);
+        leandiag_trails[tid]; // creates the trail - birth is implicit in first record
+    }
+
+    bool windows_emulator::leandiag_thread_is_young(const uint32_t tid)
+    {
+        // "Young" = fewer than 20k recorded blocks. Boot-time threads age out fast; a thread
+        // that fails during its own initialization never gets close to the cap, so its entire
+        // execution lands in the FULLTRACE console log.
+        std::lock_guard<std::mutex> lock(leandiag_trail_mutex);
+        const auto it = leandiag_trails.find(tid);
+        return it == leandiag_trails.end() || !it->second.full;
+    }
+
+    void windows_emulator::leandiag_record_block(const uint32_t tid, const uint64_t address)
+    {
+        std::lock_guard<std::mutex> lock(leandiag_trail_mutex);
+        auto& trail = leandiag_trails[tid];
+        trail.addresses[trail.next] = address;
+        trail.next = (trail.next + 1) % leandiag_block_trail::k_depth;
+        trail.full = trail.full || trail.next == 0;
+    }
+
+    void windows_emulator::leandiag_record_foreign_block(const uint32_t tid, const uint64_t address)
+    {
+        std::lock_guard<std::mutex> lock(leandiag_trail_mutex);
+        auto& trail = leandiag_trails[tid];
+        trail.foreign_addresses[trail.foreign_next] = address;
+        trail.foreign_next = (trail.foreign_next + 1) % leandiag_block_trail::k_foreign_depth;
+        trail.foreign_full = trail.foreign_full || trail.foreign_next == 0;
+    }
+
+    std::vector<uint64_t> windows_emulator::leandiag_last_foreign_blocks(const uint32_t tid)
+    {
+        std::lock_guard<std::mutex> lock(leandiag_trail_mutex);
+        const auto it = leandiag_trails.find(tid);
+        if (it == leandiag_trails.end())
+        {
+            return {};
+        }
+        const auto& trail = it->second;
+        const auto depth = trail.foreign_full ? leandiag_block_trail::k_foreign_depth : trail.foreign_next;
+        std::vector<uint64_t> out{};
+        out.reserve(depth);
+        for (size_t i = trail.foreign_full ? trail.foreign_next : 0; out.size() < depth;
+             i = (i + 1) % leandiag_block_trail::k_foreign_depth)
+        {
+            out.push_back(trail.foreign_addresses[i]);
+        }
+        return out;
+    }
+
+    std::vector<uint64_t> windows_emulator::leandiag_last_blocks(const uint32_t tid)
+    {
+        std::lock_guard<std::mutex> lock(leandiag_trail_mutex);
+        const auto it = leandiag_trails.find(tid);
+        if (it == leandiag_trails.end())
+        {
+            return {};
+        }
+        const auto& trail = it->second;
+        const auto depth = trail.full ? leandiag_block_trail::k_depth : trail.next;
+        std::vector<uint64_t> out{};
+        out.reserve(depth);
+        for (size_t i = trail.full ? trail.next : 0; out.size() < depth; i = (i + 1) % leandiag_block_trail::k_depth)
+        {
+            out.push_back(trail.addresses[i]);
+        }
+        return out;
+    }
+
     void windows_emulator::setup_hooks()
     {
+        // LEANDIAG block trace: lean runs have no per-instruction observation, so a failing
+        // DllMain(THREAD_ATTACH) - pure guest code, zero syscalls - is invisible. This optional
+        // block-level breadcrumb (SOGEN_LEANDIAG_BLOCKTRACE=1) records the last few executed
+        // block addresses per guest thread; the LEANDIAG raise dump prints the raiser's trail
+        // with module names, naming the DLL whose init returned FALSE.
+        const char* leandiag_blocktrace = std::getenv("SOGEN_LEANDIAG_BLOCKTRACE");
+        const char* leandiag_fulltrace = std::getenv("SOGEN_LEANDIAG_FULLTRACE");
+        if ((leandiag_blocktrace && *leandiag_blocktrace == '1') || (leandiag_fulltrace && *leandiag_fulltrace == '1'))
+        {
+            const bool full = leandiag_fulltrace && *leandiag_fulltrace == '1';
+            this->emu().hook_basic_block([&](cpu_interface& cpu, const basic_block& block) {
+                const std::scoped_lock lock(this->kernel_lock_);
+                auto& vcpu = this->vcpu(cpu.index());
+                if (!vcpu.active_thread)
+                {
+                    return;
+                }
+                const auto tid = vcpu.active_thread->id;
+                windows_emulator::leandiag_record_block(tid, block.address);
+                const auto* trail_owner = this->mod_manager.find_name(block.address);
+                if (trail_owner && std::string_view(trail_owner) != "ntdll.dll")
+                {
+                    windows_emulator::leandiag_record_foreign_block(tid, block.address);
+                }
+                if (full && windows_emulator::leandiag_thread_is_young(tid))
+                {
+                    const auto* owner = this->mod_manager.find_name(block.address);
+                    this->log.error("FULLTRACE tid=%u block=%llX (%s)\n", tid,
+                                    (unsigned long long)block.address, owner ? owner : "no module");
+                }
+            });
+        }
+
         this->callbacks.on_module_load.add([this](mapped_module& mod) {
             this->last_executed_section_ = {};
             for (size_t i = 0; i < mod.sections.size(); ++i)
@@ -1265,6 +1465,11 @@ namespace sogen
         });
 
         this->callbacks.on_module_unload.add([this](mapped_module& mod) {
+            // LEANDIAG: the loader deregisters a failed DLL from the manager BEFORE the unmap
+            // syscall, so unmap-time and raise-time lookups both miss it. Name it here - the
+            // last module unloaded right before STATUS_DLL_INIT_FAILED is the failing DLL.
+            this->log.error("LEANDIAG module-unload name=%s base=%#llx\n", mod.name.c_str(),
+                            (unsigned long long)mod.image_base);
             this->last_executed_section_ = {};
             const auto hooks = this->section_first_execution_hooks_.extract(mod.image_base);
             if (hooks)
@@ -1564,11 +1769,19 @@ namespace sogen
 
         if (!this->uses_instruction_precision() && this->emu().is_stop_thread_safe())
         {
+            // LEAN preemption tick. With per-instruction hooks on, the stop flag is observed
+            // every instruction; lean paths rely on this timer thread alone, so the tick IS
+            // the scheduling quantum for pure-compute stretches. Env-tunable for the
+            // preemption-granularity experiments (default 20 ms).
+            const int preempt_ms = [] {
+                const char* configured = std::getenv("SOGEN_PREEMPT_MS");
+                return configured ? std::max(1, atoi(configured)) : 20;
+            }();
             interrupt_thread = std::thread([&] {
                 while (!this->should_stop)
                 {
                     std::unique_lock lock{interrupt_mutex};
-                    interrupt_cond.wait_for(lock, std::chrono::milliseconds(20), [&] {
+                    interrupt_cond.wait_for(lock, std::chrono::milliseconds(preempt_ms), [&] {
                         return this->should_stop.load(); //
                     });
 

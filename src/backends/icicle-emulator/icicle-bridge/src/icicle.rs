@@ -41,11 +41,17 @@ mod smp_rmw_lock {
 fn create_x64_vm() -> icicle_vm::Vm {
     let mut cpu_config = icicle_vm::cpu::Config::from_target_triple("x86_64-none");
     cpu_config.enable_jit = std::env::var("SOGEN_ICICLE_JIT").as_deref() == Ok("1");
-    cpu_config.enable_jit_mem = true;
+    // SOGEN_ICICLE_JIT_MEM=0 disables the JIT's compiled memory fast path. Hooked blocks never
+    // use it (hook ops force slow paths); lean blocks do — and it runs through the vendored
+    // icicle-mem layer (our smp_shared rework). The lean-miscompile discriminator.
+    cpu_config.enable_jit_mem = std::env::var("SOGEN_ICICLE_JIT_MEM").map(|v| v != "0").unwrap_or(true);
     cpu_config.enable_shadow_stack = false;
-    cpu_config.enable_recompilation = true;
+    cpu_config.enable_recompilation = std::env::var("SOGEN_ICICLE_RECOMP").map(|v| v != "0").unwrap_or(true);
     cpu_config.track_uninitialized = false;
-    cpu_config.optimize_instructions = true;
+    // SOGEN_ICICLE_OPT_INSTR=0 disables the pcode instruction optimizer — the lean-mode
+    // (hookless) JIT miscompile discriminator: hooks fragment optimized sequences, so the
+    // optimizer's lean path was never exercised before lean mode existed.
+    cpu_config.optimize_instructions = std::env::var("SOGEN_ICICLE_OPT_INSTR").map(|v| v != "0").unwrap_or(true);
     cpu_config.optimize_block = false;
 
     let mut vm = icicle_vm::build(&cpu_config).unwrap();
@@ -318,6 +324,8 @@ impl<Func: ?Sized> HookContainer<Func> {
 struct InstructionHookInjector {
     inst_hook: pcode::HookId,
     block_hook: pcode::HookId,
+    /// LEANDIAG: block-only mode (per-instruction hooks disabled, block breadcrumb wanted).
+    block_only: bool,
 }
 
 fn count_instructions(block: &icicle_cpu::lifter::Block) -> u64 {
@@ -361,7 +369,9 @@ impl icicle_vm::CodeInjector for InstructionHookInjector {
                         tmp_block.push(pcode::Op::Hook(self.block_hook));
                     }
 
-                    tmp_block.push(pcode::Op::Hook(self.inst_hook));
+                    if !self.block_only {
+                        tmp_block.push(pcode::Op::Hook(self.inst_hook));
+                    }
                     let length = stmt.inputs.second().as_u64();
                     let mut bytes = [0u8; 15];
                     if length <= 15
@@ -771,12 +781,29 @@ impl IcicleEmulator {
         // per-instruction breakpoints, so the panel pairs this with the debugger being off.
         let install_instruction_hooks =
             std::env::var("SOGEN_ICICLE_INSTRUCTION_HOOK").map(|v| v != "0").unwrap_or(true);
-        if install_instruction_hooks {
+        // LEANDIAG: with per-instruction hooks off (lean), the block hook was not installed
+        // either - so a block-level execution breadcrumb was impossible exactly where it is
+        // needed. The trace envs install the block hook alone (cheap: one op per block).
+        let trace_blocks = ["SOGEN_LEANDIAG_BLOCKTRACE", "SOGEN_LEANDIAG_FULLTRACE"]
+            .iter()
+            .any(|key| std::env::var(key).map(|v| v == "1").unwrap_or(false));
+        // LEAN BARRIER (default on; SOGEN_ICICLE_LEAN_BARRIER=0 opts out): the original sogen
+        // ALWAYS injected a hook op per instruction - an opaque call that forces the JIT to
+        // spill/reload live pcode temporaries. Lean mode removed them and a deterministic
+        // JIT miscompile surfaced (DLL_INIT_FAILED at ~9.4M; interpreter passes - see
+        // prompt.md 6.14). Injecting a NO-OP hook per instruction restores the compiler
+        // barrier without any callback cost - and keeps the RDTSC rewrite active (icicle's
+        // native RDTSC returns a constant 0).
+        let lean_barrier =
+            std::env::var("SOGEN_ICICLE_LEAN_BARRIER").map(|v| v != "0").unwrap_or(true);
+        if install_instruction_hooks || trace_blocks || lean_barrier {
             let inst_exec_hooks = Rc::clone(&exec_hooks);
 
             let inst_hook = icicle_cpu::InstHook::new(move |cpu: &mut icicle_cpu::Cpu, addr: u64| {
                 inst_exec_hooks.borrow_mut().execute(cpu, addr);
             });
+            // no-op per-instruction hook for lean mode: pure compiler barrier, empty body
+            let noop_hook = icicle_cpu::InstHook::new(|_cpu: &mut icicle_cpu::Cpu, _addr: u64| {});
 
             let block_exec_hooks = Rc::clone(&exec_hooks);
 
@@ -785,11 +812,26 @@ impl IcicleEmulator {
                 block_exec_hooks.borrow_mut().on_block(addr, instructions);
             });
 
-            let inst_hook_id = virtual_machine.cpu.add_hook(inst_hook);
-            let block_hook_id = virtual_machine.cpu.add_hook(block_hook);
+            let inst_hook_id = if install_instruction_hooks {
+                virtual_machine.cpu.add_hook(inst_hook)
+            } else {
+                // lean: noop barrier (also when trace_blocks set the block-only mode ran
+                // before; the barrier covers it - the RDTSC rewrite stays identical)
+                virtual_machine.cpu.add_hook(noop_hook)
+            };
+            let block_hook_id = if install_instruction_hooks || trace_blocks {
+                virtual_machine.cpu.add_hook(block_hook)
+            } else {
+                inst_hook_id
+            };
+            // block_only=true ONLY for trace-only mode (per-instr hooks off AND barrier off):
+            // there the injector pushes just the block hook + RDTSC rewrite. With the lean
+            // barrier (or full hooks) per-instruction ops are pushed.
+            let block_only = !install_instruction_hooks && !lean_barrier;
             virtual_machine.add_injector(InstructionHookInjector {
                 inst_hook: inst_hook_id,
                 block_hook: block_hook_id,
+                block_only,
             });
         }
 

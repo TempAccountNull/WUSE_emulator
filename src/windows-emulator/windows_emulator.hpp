@@ -155,6 +155,16 @@ namespace sogen
         bool setup_completed_{false};
 
       public:
+
+        // LEANDIAG block trace (SOGEN_LEANDIAG_BLOCKTRACE=1, diagnosis only): last executed
+        // guest block addresses per guest thread, so a failing DllMain(THREAD_ATTACH) on a
+        // syscall-less fresh thread can be attributed to its module at the raise.
+        static void leandiag_record_block(uint32_t tid, uint64_t address);
+        static void leandiag_record_foreign_block(uint32_t tid, uint64_t address);
+        static std::vector<uint64_t> leandiag_last_blocks(uint32_t tid);
+        static std::vector<uint64_t> leandiag_last_foreign_blocks(uint32_t tid);
+        static void leandiag_note_thread_birth(uint32_t tid);
+        static bool leandiag_thread_is_young(uint32_t tid);
         const std::filesystem::path emulation_root{};
         const fake_environment_config fake_env{};
         emulator_callbacks callbacks{};
@@ -491,6 +501,7 @@ namespace sogen
         // guest execution, so deltas equal instruction counts - smooth, monotonic, and
         // migration-immune. System/QPC-style time stays on the real clock.
         uint64_t timestamp_counter_for_guest();
+
 
         bool uses_section_first_execution_hooks() const;
         void clear_section_first_execution_hooks();
