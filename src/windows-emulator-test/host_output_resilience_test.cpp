@@ -372,12 +372,48 @@ namespace sogen
         jsonl->flush();
 
         const auto text = read_text(path);
-        EXPECT_EQ(count_prefixed(text, "{\"type\":\"suspicious_activity\""), 2U) << text;
+        EXPECT_EQ(count_prefixed(text, "{\"type\":\"suspicious_activity\""), 6U) << text;
         EXPECT_EQ(count_prefixed(text, "{\"type\":\"function_execution\""), 1U) << text;
         EXPECT_EQ(count_prefixed(text, "{\"type\":\"memory_violation\""), 2U) << text;
         const auto status_text = read_text(status);
         EXPECT_NE(status_text.find("\"dedupe\":true"), std::string::npos) << status_text;
-        EXPECT_NE(status_text.find("\"deduplicated_events\":\"6\""), std::string::npos) << status_text;
+        EXPECT_NE(status_text.find("\"deduplicated_events\":\"2\""), std::string::npos) << status_text;
+    }
+
+    TEST(Dedupe, KeepsEveryDiagnosticOccurrenceInAuditMode)
+    {
+        const auto path = unique_path("sogen-diagnostic-journal", ".jsonl");
+        const auto cleanup = utils::finally([&] {
+            std::error_code error;
+            std::filesystem::remove(path, error);
+        });
+        jsonl_report_settings settings{};
+        settings.mode = jsonl_report_mode::audit;
+        settings.dedupe = true;
+        auto jsonl = create_jsonl_reporter(path, settings);
+
+        suspicious_activity_event suspicious{};
+        suspicious.details = "Repeated suspicious operation";
+        debug_print_call_event call{};
+        call.api = "OutputDebugStringA";
+        debug_string_event emission{};
+        emission.details = "Repeated guest text";
+        for (uint64_t i = 1; i <= 2; ++i)
+        {
+            suspicious.header.instruction_count = i;
+            call.header.instruction_count = i;
+            emission.header.instruction_count = i;
+            jsonl->report(suspicious);
+            jsonl->report(call);
+            jsonl->report(emission);
+            jsonl->report(function_call(8, i, "memcpy"));
+        }
+        jsonl->flush();
+        const auto text = read_text(path);
+        EXPECT_EQ(count_prefixed(text, "{\"type\":\"suspicious_activity\""), 2U) << text;
+        EXPECT_EQ(count_prefixed(text, "{\"type\":\"debug_print_call\""), 2U) << text;
+        EXPECT_EQ(count_prefixed(text, "{\"type\":\"debug_string\""), 2U) << text;
+        EXPECT_EQ(count_prefixed(text, "{\"type\":\"function_execution\""), 1U) << text;
     }
 
     TEST(Dedupe, RecordHashIgnoresCountersOnly)

@@ -258,7 +258,12 @@ namespace sogen
                     std::visit(make_overloaded([&](const auto& e) { write_record(object, e); }), event);
                 }
 
-                if (this->settings_.dedupe && event_is_deduplicable(event))
+                // Keep every diagnostic occurrence for the structured journals. The visible console
+                // still coalesces repeated lines through event_is_deduplicable().
+                if (this->settings_.dedupe && event_is_deduplicable(event) &&
+                    !std::holds_alternative<suspicious_activity_event>(event) &&
+                    !std::holds_alternative<debug_print_call_event>(event) &&
+                    !std::holds_alternative<debug_string_event>(event))
                 {
                     const auto hash = record_content_hash(line);
                     if (this->seen_content_.contains(hash))
