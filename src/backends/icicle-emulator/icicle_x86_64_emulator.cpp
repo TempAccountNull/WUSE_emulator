@@ -445,7 +445,10 @@ namespace sogen::icicle
         ~icicle_x86_64_emulator() override
         {
             // Free hook/storage objects first (nothing is running), then tear down every VM handle.
-            this->registrations_.clear();
+            // A hook callback may own a scoped_hook whose destructor calls delete_hook().
+            // Move the table out before destroying callbacks so that a reentrant
+            // delete cannot mutate the container being torn down.
+            utils::reset_object_with_delayed_destruction(this->registrations_);
             reset_object_with_delayed_destruction(this->storage_);
             utils::reset_object_with_delayed_destruction(this->hooks_to_install_);
 

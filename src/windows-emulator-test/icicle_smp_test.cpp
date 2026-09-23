@@ -1,5 +1,6 @@
 #include "emulation_test_utils.hpp"
 #include "../backends/icicle-emulator/icicle_x86_64_emulator.hpp"
+#include "../emulator/scoped_hook.hpp"
 #include <memory_manager.hpp>
 #include <array>
 #include <atomic>
@@ -58,6 +59,25 @@ namespace sogen::test
         auto emu = icicle::create_x86_64_emulator(1);
         EXPECT_EQ(emu->vcpu_count(), 1U);
         EXPECT_FALSE(emu->supports_multiple_vcpus());
+    }
+
+    // A callback can own a scoped hook referring to the same registration.
+    // Destroying the emulator must empty its registration table before the
+    // callback destructor reenters delete_hook(); clearing in place double-frees.
+    TEST(IcicleSmp, DestroyReentrantScopedHook)
+    {
+        for (const auto vcpus : {1U, 2U})
+        {
+            auto emu = icicle::create_x86_64_emulator(vcpus);
+            constexpr uint64_t page = 0x60000000;
+            // Hook registration itself does not require mapped guest memory.
+            auto scope = std::make_shared<scoped_hook>(*emu);
+            auto* hook = emu->hook_memory_read(page, 8,
+                [scope](cpu_interface&, uint64_t, const void*, size_t) {});
+            *scope = hook;
+            scope.reset();
+            EXPECT_NO_THROW(emu.reset()) << "vCPUs=" << vcpus;
+        }
     }
 
     // Step 6.1 verification: two vCPUs execute a bounded countdown loop over the SAME shared code page
