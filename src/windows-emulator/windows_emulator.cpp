@@ -983,9 +983,22 @@ namespace sogen
         this->stop();
     }
 
-    void windows_emulator::publish_activity_status()
+    uint64_t windows_emulator::timestamp_counter_for_guest()
     {
-        static const std::filesystem::path directory = [] {
+        if (this->use_relative_time_ || !this->emu().has_deterministic_instruction_count())
+        {
+            return this->clock_->timestamp_counter();
+        }
+
+        // Virtual TSC: one tick per retired guest instruction plus a large origin so early
+        // reads look like a machine that has been up for a while. Monotonic (icounts only
+        // grow), jitter-free (no host clock), and lean-path compatible.
+        constexpr uint64_t virtual_tsc_origin = 0x0000'0100'0000'0000ULL;
+        return virtual_tsc_origin + this->emu().executed_instructions_total();
+    }
+
+    void windows_emulator::publish_activity_status()
+    {        static const std::filesystem::path directory = [] {
             const char* configured = std::getenv("SOGEN_GPU_STATUS_DIR");
             return configured && *configured ? std::filesystem::path(configured) : std::filesystem::path{};
         }();
@@ -1281,7 +1294,7 @@ namespace sogen
             auto& acting = vcpu.cpu;
             this->callbacks.on_rdtscp();
 
-            const auto ticks = this->clock_->timestamp_counter();
+            const auto ticks = this->timestamp_counter_for_guest();
             acting.reg(x86_register::rax, static_cast<uint32_t>(ticks));
             acting.reg(x86_register::rdx, static_cast<uint32_t>(ticks >> 32));
 
@@ -1299,7 +1312,7 @@ namespace sogen
             auto& acting = vcpu.cpu;
             this->callbacks.on_rdtsc();
 
-            const auto ticks = this->clock_->timestamp_counter();
+            const auto ticks = this->timestamp_counter_for_guest();
             acting.reg(x86_register::rax, static_cast<uint32_t>(ticks));
             acting.reg(x86_register::rdx, static_cast<uint32_t>(ticks >> 32));
 

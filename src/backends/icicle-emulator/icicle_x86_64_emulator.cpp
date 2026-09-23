@@ -1442,9 +1442,25 @@ namespace sogen::icicle
             return out;
         }
 
-        std::string smp_gate_debug() const override
+        bool has_deterministic_instruction_count() const override
         {
-            std::string out{};
+            return true; // icicle maintains cpu.icount via fuel accounting even in lean JIT mode
+        }
+
+        uint64_t executed_instructions_total() const override
+        {
+            uint64_t total = 0;
+            for (const auto& vcpu : this->vcpus_)
+            {
+                // Peers may be executing: u64 reads are advisory-stale, which is fine - the
+                // sum only ever grows, so callers get a monotonic time source either way.
+                total += icicle_get_icount(vcpu->emu_);
+            }
+            return total;
+        }
+
+        std::string smp_gate_debug() const override
+        {            std::string out{};
             char buf[48];
             {
                 std::lock_guard<std::mutex> lock(this->pending_mutex_);

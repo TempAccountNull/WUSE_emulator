@@ -125,6 +125,21 @@ namespace sogen
             return {};
         }
 
+        // Whether this backend always knows how many guest instructions retired (per vCPU),
+        // even on lean/fast paths. Lets the scheduler virtualize time sources (RDTSC) off the
+        // instruction count instead of the host clock when wall-clock mode is forced (N>1).
+        virtual bool has_deterministic_instruction_count() const
+        {
+            return false;
+        }
+
+        // Live sum of retired guest instructions across all vCPUs (advisory: a peer executing
+        // concurrently makes its term slightly stale - fine for a monotonic time source).
+        virtual uint64_t executed_instructions_total() const
+        {
+            return 0;
+        }
+
 
         virtual x86_cpu<Traits>& get_cpu(const size_t index)
         {

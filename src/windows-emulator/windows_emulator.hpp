@@ -480,6 +480,18 @@ namespace sogen
         std::chrono::steady_clock::time_point activity_status_last_{};
         std::vector<uint64_t> activity_status_prev_instructions_{};
 
+        // Guest-visible timestamp counter. In relative mode the tick clock is already
+        // instruction-driven. In wall-clock mode (forced at N>1 - relative mode's counter is not
+        // maintained on lean paths) the default would be the HOST __rdtsc(), whose deltas carry
+        // host-scheduling jitter of the emulated section; Destiny's anti-tamper measures RDTSC
+        // pairs around its own code and that jitter (orders of magnitude between reads, worse
+        // with vCPU contention/migration) trips its timing gate -> deliberate FAST_FAIL.
+        // When the backend always knows the retired-instruction count (icicle: fuel-maintained
+        // icount), derive a deterministic virtual TSC from it instead: it only advances with
+        // guest execution, so deltas equal instruction counts - smooth, monotonic, and
+        // migration-immune. System/QPC-style time stays on the real clock.
+        uint64_t timestamp_counter_for_guest();
+
         bool uses_section_first_execution_hooks() const;
         void clear_section_first_execution_hooks();
         void install_section_first_execution_hook(const mapped_module& mod, size_t section_index);
