@@ -5,6 +5,8 @@
 #include <utils/finally.hpp>
 
 #include <cstdio>
+#include <atomic>
+#include <limits>
 
 namespace sogen
 {
@@ -650,6 +652,67 @@ namespace sogen
                 c.proc.exit_status = exit_status;
                 c.win_emu.log.error("EXITDIAG NtTerminateProcess status=%#x tid=%u\n", (unsigned)exit_status,
                                     (unsigned)GetCurrentThreadId());
+                // A process exit with STATUS_HEAP_CORRUPTION may arrive without going through
+                // NtRaiseException. Preserve a small first-failure guest packet before stop(),
+                // even when the broad SMP trace is disabled.
+                if (static_cast<uint32_t>(exit_status) == 0xC0000374u)
+                {
+                    static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+                    if (!reported.test_and_set(std::memory_order_relaxed))
+                    {
+                        const auto rip = c.emu.reg(x86_register::rip);
+                        const auto rsp = c.emu.reg(x86_register::rsp);
+                        const auto guest_tid = c.vcpu.active_thread ? c.vcpu.active_thread->id : 0;
+                        std::string stack_words;
+                        std::string code_addresses;
+                        stack_words.reserve(16 * 21);
+                        code_addresses.reserve(4 * 80);
+                        char word_buffer[40]{};
+                        unsigned resolved = 0;
+                        for (size_t i = 0; i < 16; ++i)
+                        {
+                            if (i)
+                            {
+                                stack_words += ',';
+                            }
+                            uint64_t word = 0;
+                            const auto offset = i * sizeof(word);
+                            if (!rsp || rsp > std::numeric_limits<uint64_t>::max() - offset ||
+                                !c.emu.try_read_memory(rsp + offset, &word, sizeof(word)))
+                            {
+                                stack_words += '?';
+                                continue;
+                            }
+                            std::snprintf(word_buffer, sizeof(word_buffer), "0x%llX", static_cast<unsigned long long>(word));
+                            stack_words += word_buffer;
+                            if (resolved < 4)
+                            {
+                                if (const auto* module = c.win_emu.mod_manager.find_by_address(word))
+                                {
+                                    if (!code_addresses.empty())
+                                    {
+                                        code_addresses += ',';
+                                    }
+                                    std::snprintf(word_buffer, sizeof(word_buffer), "s%zu:", i);
+                                    code_addresses += word_buffer;
+                                    code_addresses += module->name;
+                                    std::snprintf(word_buffer, sizeof(word_buffer), "+0x%llX",
+                                                  static_cast<unsigned long long>(word - module->image_base));
+                                    code_addresses += word_buffer;
+                                    ++resolved;
+                                }
+                            }
+                        }
+                        const auto* rip_module = c.win_emu.mod_manager.find_by_address(rip);
+                        c.win_emu.log.error(
+                            "[GUEST-HEAP-EXIT] status=0x%08X guest_tid=%u vcpu=%zu rip=0x%llX rip_module=%s rip_rva=0x%llX "
+                            "rsp=0x%llX stack16=[%s] code_candidates=[%s]\n",
+                            static_cast<unsigned>(exit_status), static_cast<unsigned>(guest_tid), c.vcpu.cpu.index(),
+                            static_cast<unsigned long long>(rip), rip_module ? rip_module->name.c_str() : "<unmapped>",
+                            rip_module ? static_cast<unsigned long long>(rip - rip_module->image_base) : 0ull,
+                            static_cast<unsigned long long>(rsp), stack_words.c_str(), code_addresses.c_str());
+                    }
+                }
                 // TERMCTX: name the terminating caller - dump registers + a guest stack chain of
                 // code pointers (resolved offline against module bases) so a failing sample
                 // self-test checkpoint can be identified. Gated on SOGEN_SMP_TRACE to keep green
