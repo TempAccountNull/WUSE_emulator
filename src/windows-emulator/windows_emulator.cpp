@@ -1016,6 +1016,10 @@ namespace sogen
 
     void windows_emulator::vcpu_worker(vcpu_context& vcpu)
     {
+        this->emu().set_scheduler_worker_context(vcpu.cpu.index(), true);
+        const auto clear_scheduler_worker = utils::finally([this, &vcpu] {
+            this->emu().set_scheduler_worker_context(vcpu.cpu.index(), false);
+        });
         std::unique_lock lock(this->kernel_lock_);
 
         while (!this->should_stop)

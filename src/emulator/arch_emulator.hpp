@@ -91,6 +91,10 @@ namespace sogen
         // Default: nothing (single-VM backends; mirrors WHP's no-op semantics).
         virtual void sync_worker_context(size_t /*vcpu_index*/) {}
 
+        // Bound to the scheduler worker lifetime, including host work between guest quanta.
+        // Backends without thread-local vCPU routing need no special handling.
+        virtual void set_scheduler_worker_context(size_t /*vcpu_index*/, bool /*active*/) {}
+
         // SMP: watermark of cross-VM ops issued to peer queues, and whether every op issued up
         // to `mark` has been applied (per-target FIFO). Lets host code gate a transition on its
         // earlier queued ops being visible everywhere - without holding a lock. Defaults: none.

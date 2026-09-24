@@ -172,11 +172,11 @@ namespace sogen::icicle
         // stop-the-world initiated from inside a vCPU's own hook skip pausing/awaiting itself (6.3/6.5).
         thread_local void* t_running_vcpu = nullptr;
 
-    // The vCPU this OS thread OWNS (set at start entry, never cleared). Between quanta -
-    // after start() returns, while the windows_emulator worker still runs host code on this
-    // thread - t_running_vcpu is null but the thread still belongs to this vCPU, so host-write
-    // perm failures can be attributed and DEFERRED to this vCPU's next quantum (6.6c'').
+    // Legacy start()-scope owner used by in-run fault retries. It must be restored when
+    // start() returns: scheduler ownership between quanta is tracked separately below.
     thread_local void* t_worker_vcpu = nullptr;
+    // Direct start() callers are not scheduler workers; only the scheduler sets this marker.
+    thread_local void* t_scheduler_worker_vcpu = nullptr;
     // True while THIS thread is inside drain_pending_ops: a drained op (e.g. a map) can re-enter
     // try_write_memory, which would otherwise drain again (re-entrancy broke CrossVmMap/RangedExec).
     thread_local bool t_draining_own_queue = false;
@@ -527,6 +527,19 @@ namespace sogen::icicle
             return this->vcpus_.size();
         }
 
+        void set_scheduler_worker_context(const size_t index, const bool active) override
+        {
+            auto* const worker = this->vcpus_.at(index).get();
+            if (active)
+            {
+                t_scheduler_worker_vcpu = worker;
+            }
+            else if (t_scheduler_worker_vcpu == worker)
+            {
+                t_scheduler_worker_vcpu = nullptr;
+            }
+        }
+
         x86_64_cpu& get_cpu(const size_t index) override
         {
             return *this->vcpus_.at(index);
@@ -602,8 +615,8 @@ namespace sogen::icicle
                 ice(icicle_map_memory(this->emu_, address, size, perm), "Failed to map memory");
                 return;
             }
-            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
-            const bool caller_is_vcpu = self && &self->machine_ == this;
+            auto* self = this->mutation_owner();
+            const bool caller_is_vcpu = self != nullptr;
             if (!caller_is_vcpu)
             {
                 // External/setup mutator: pause peers, allocate on the master, share into the rest directly.
@@ -665,8 +678,8 @@ namespace sogen::icicle
                                const memory_permission permissions) override
         {
             const auto perm = static_cast<uint8_t>(permissions);
-            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
-            const bool caller_is_vcpu = self && &self->machine_ == this;
+            auto* self = this->mutation_owner();
+            const bool caller_is_vcpu = self != nullptr;
             if (this->vcpus_.size() == 1 || !caller_is_vcpu)
             {
                 bool ok = true;
@@ -701,6 +714,20 @@ namespace sogen::icicle
 
         void unmap_memory(const uint64_t address, const size_t size) override
         {
+            if (t_running_vcpu == nullptr)
+            {
+                if (auto* worker = this->mutation_owner())
+                {
+                    // Failure-only-path proof for the former BEL/quiesce lock inversion.
+                    static std::atomic<bool> reported{false};
+                    if (!reported.exchange(true, std::memory_order_relaxed))
+                    {
+                        std::fprintf(stderr,
+                                     "[SMPROUTE] scheduler_unmap vcpu=%zu address=%#llx size=%zu route=own_apply_peer_queue\n",
+                                     worker->index(), static_cast<unsigned long long>(address), size);
+                    }
+                }
+            }
             this->apply_to_all_vms([=](icicle_emulator* h) { ice(icicle_unmap_memory(h, address, size), "Failed to unmap memory"); });
         }
 
@@ -710,8 +737,8 @@ namespace sogen::icicle
         // N=1, where the acting vCPU IS vcpus_[0]==emu_) fall back to the master.
         icicle_emulator* acting_handle() const
         {
-            auto* v = static_cast<icicle_vcpu*>(t_running_vcpu);
-            if (v && &v->machine_ == this)
+            auto* v = this->mutation_owner();
+            if (v)
             {
                 return v->handle();
             }
@@ -728,7 +755,11 @@ namespace sogen::icicle
             // 6.6: a BETWEEN-quantum worker READ races queued maps exactly like the write path
             // (the peer's loader map not yet applied on this vCPU). Drain own queue (+ bounded
             // in-flight wait) and RETRY the read. Mirrors write_memory's drain+retry closeout.
-            auto* worker = static_cast<icicle_vcpu*>(t_worker_vcpu);
+            auto* worker = t_running_vcpu == nullptr ? this->mutation_owner() : nullptr;
+            if (!worker)
+            {
+                worker = static_cast<icicle_vcpu*>(t_worker_vcpu); // legacy direct-start fallback
+            }
             if (worker && &worker->machine_ == this && t_running_vcpu == nullptr)
             {
                 const_cast<icicle_x86_64_emulator*>(this)->drain_own_queue_with_inflight_wait(*worker);
@@ -764,8 +795,8 @@ namespace sogen::icicle
             // SMP 6.6: if the written range is translated on ANY VM (detected via the shared PageData
             // IN_CODE_CACHE perms — visible from any single view), every OTHER VM's translation of it
             // must be dropped too, or a peer keeps executing stale code after this write.
-            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
-            const bool caller_is_vcpu = self && &self->machine_ == this;
+            auto* self = this->mutation_owner();
+            const bool caller_is_vcpu = self != nullptr;
             const bool cached = icicle_code_range_is_cached(this->acting_handle(), address, size);
             if (smp_trace_enabled() && (cached || !caller_is_vcpu))
             {
@@ -885,7 +916,11 @@ namespace sogen::icicle
             // synthesized the terminal AV (VIENTRY=0 proved no icicle violation delivers it). So:
             // drain own queue (+ bounded in-flight wait) and RETRY THE WRITE; only if it still
             // fails, defer the fault (real guest-visible fault).
-            auto* worker = static_cast<icicle_vcpu*>(t_worker_vcpu);
+            auto* worker = t_running_vcpu == nullptr ? this->mutation_owner() : nullptr;
+            if (!worker)
+            {
+                worker = static_cast<icicle_vcpu*>(t_worker_vcpu); // legacy direct-start fallback
+            }
             if (worker && &worker->machine_ == this)
             {
                 {
@@ -941,8 +976,8 @@ namespace sogen::icicle
         void apply_memory_protection(const uint64_t address, const size_t size, memory_permission permissions) override
         {
             const auto perm = static_cast<uint8_t>(permissions);
-            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
-            const bool caller_is_vcpu = self && &self->machine_ == this;
+            auto* self = this->mutation_owner();
+            const bool caller_is_vcpu = self != nullptr;
             if (this->vcpus_.size() == 1 || !caller_is_vcpu)
             {
                 this->apply_to_all_vms([=](icicle_emulator* h) { ice(icicle_protect_memory(h, address, size, perm), "Failed to apply permissions"); });
@@ -1570,6 +1605,17 @@ namespace sogen::icicle
         }
 
       private:
+        icicle_vcpu* mutation_owner() const
+        {
+            auto* running = static_cast<icicle_vcpu*>(t_running_vcpu);
+            if (running && &running->machine_ == this)
+            {
+                return running;
+            }
+            auto* worker = static_cast<icicle_vcpu*>(t_scheduler_worker_vcpu);
+            return worker && &worker->machine_ == this ? worker : nullptr;
+        }
+
         std::list<std::unique_ptr<utils::object>> storage_{};
 
         // One hook API handle maps to one icicle registration per vCPU VM: (vm index, icicle hook id, and
@@ -1687,8 +1733,8 @@ namespace sogen::icicle
 
         void queue_op(const size_t target, const uint64_t seq, std::function<void(icicle_emulator*)> op)
         {
-            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
-            auto* profile = this->profile_enabled_ && self && &self->machine_ == this ? &self->smp_profile_ : nullptr;
+            auto* self = this->mutation_owner();
+            auto* profile = this->profile_enabled_ && self ? &self->smp_profile_ : nullptr;
             const smp_profile_timer queue_timer{profile ? &profile->queue_nanos : nullptr};
             // Push under the mutex FIRST, bump the issued watermark AFTER: smp_op_applied() reads
             // issued then sums the queues under the same mutex, so a watermark bumped before the
@@ -1733,13 +1779,9 @@ namespace sogen::icicle
             this->run_with_vcpus_paused(std::forward<Fn>(fn));
         }
 
-        // 6.5 routing rule: a mutation requested BY a vCPU of this machine (from its own hook, the
-        // deferred-action one-shot, or its quantum-end drain — contexts that may hold the BEL) applies to
-        // its OWN VM now and queues the op for each peer, drained on the peer's thread at
-        // begin_run_quantum. An external/setup caller pauses peers instead — it holds no BEL, so a peer
-        // parked in a hook can always acquire the BEL, finish, exit run(), and become stoppable. Because
-        // vCPU threads never pause, the A-B/B-A hazard between partition_mutex_ and the quiesce wait
-        // cannot form.
+        // A running vCPU or an explicitly bound scheduler worker may hold the kernel lock.
+        // Apply its own mutation now and queue peer work; external callers pause and apply
+        // synchronously to all VMs. Never wait for a peer while holding the kernel lock.
         void route_to_all_vms(const std::function<void(size_t)>& per_vm_op)
         {
             if (this->vcpus_.size() == 1)
@@ -1747,8 +1789,8 @@ namespace sogen::icicle
                 per_vm_op(0);
                 return;
             }
-            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
-            const bool caller_is_vcpu = self && &self->machine_ == this;
+            auto* self = this->mutation_owner();
+            const bool caller_is_vcpu = self != nullptr;
             if (!caller_is_vcpu)
             {
                 this->pause_peers_and([&] {
@@ -2224,7 +2266,7 @@ namespace sogen::icicle
         // (peer's last few blocks before the kick lands) is the documented 6.6 TLB-coherency window.
         void kick_peers(const size_t own_index)
         {
-            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
+            auto* self = this->mutation_owner();
             auto* profile = this->profile_enabled_ && own_index < this->vcpus_.size() &&
                                     self == this->vcpus_[own_index].get() ? &self->smp_profile_ : nullptr;
             const smp_profile_timer kick_timer{profile ? &profile->kick_nanos : nullptr};
@@ -2338,9 +2380,12 @@ namespace sogen::icicle
     inline void icicle_vcpu::start(const size_t count)
     {
         this->stop_requested_ = false;
-        t_worker_vcpu = this;
-        t_running_vcpu = this;
-        const auto clear_current = utils::finally([] { t_running_vcpu = nullptr; });
+        auto* previous_worker = std::exchange(t_worker_vcpu, static_cast<void*>(this));
+        auto* previous_running = std::exchange(t_running_vcpu, static_cast<void*>(this));
+        const auto clear_current = utils::finally([previous_worker, previous_running] {
+            t_running_vcpu = previous_running;
+            t_worker_vcpu = previous_worker;
+        });
         // start(count) must run at most `count` instructions in TOTAL. A kick-ended quantum resumes
         // here, and re-issuing the full count would extend the budget past the caller's contract
         // (caught by RangedExecHook...: the resumed vCPU ran off the end of its code). Track the
