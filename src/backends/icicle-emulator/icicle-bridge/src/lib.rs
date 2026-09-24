@@ -11,7 +11,41 @@ mod xstate;
 
 use icicle::{IcicleEmulator, IcicleStopInfo};
 use registers::X86Register;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::os::raw::c_void;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+fn stop_flags() -> &'static Mutex<HashMap<usize, Arc<AtomicBool>>> {
+    static FLAGS: OnceLock<Mutex<HashMap<usize, Arc<AtomicBool>>>> = OnceLock::new();
+    FLAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+thread_local! {
+    // An owner callback can also stop its execution hook on the next instruction.
+    static RUNNING_STOP: RefCell<Option<(usize, Rc<RefCell<bool>>)>> = const { RefCell::new(None) };
+}
+
+struct RunningStopGuard;
+
+impl RunningStopGuard {
+    fn new(ptr: usize, stop: Rc<RefCell<bool>>) -> Self {
+        RUNNING_STOP.with(|slot| {
+            let mut current = slot.borrow_mut();
+            assert!(current.is_none(), "nested Icicle execution on one host thread");
+            *current = Some((ptr, stop));
+        });
+        Self
+    }
+}
+
+impl Drop for RunningStopGuard {
+    fn drop(&mut self) {
+        RUNNING_STOP.with(|slot| *slot.borrow_mut() = None);
+    }
+}
 
 fn to_cbool(value: bool) -> i32 {
     if value {
@@ -27,13 +61,17 @@ pub fn icicle_create_emulator(memory_limit_mib: u64) -> *mut c_void {
     if memory_limit_mib != 0 && !emulator.set_memory_limit_mib(memory_limit_mib) {
         return std::ptr::null_mut();
     }
-    return Box::into_raw(emulator) as *mut c_void;
+    let stop_flag = emulator.stop_flag();
+    let ptr = Box::into_raw(emulator) as *mut c_void;
+    stop_flags().lock().unwrap().insert(ptr as usize, stop_flag);
+    return ptr;
 }
 
 #[unsafe(no_mangle)]
 pub fn icicle_start(ptr: *mut c_void, count: usize) {
     unsafe {
         let emulator = &mut *(ptr as *mut IcicleEmulator);
+        let _owner = RunningStopGuard::new(ptr as usize, emulator.owner_stop_cell());
         emulator.start(count as u64);
     }
 }
@@ -99,9 +137,25 @@ pub fn icicle_get_exception_name(code: u32, callback: DataFunction, data: *mut c
 
 #[unsafe(no_mangle)]
 pub fn icicle_stop(ptr: *mut c_void) {
-    unsafe {
-        let emulator = &mut *(ptr as *mut IcicleEmulator);
-        emulator.stop();
+    if ptr.is_null() {
+        return;
+    }
+    let stopped_on_owner = RUNNING_STOP.with(|slot| {
+        if let Some((owner, stop)) = slot.borrow().as_ref() {
+            if *owner == ptr as usize {
+                *stop.borrow_mut() = true;
+                return true;
+            }
+        }
+        false
+    });
+    if stopped_on_owner {
+        return;
+    }
+    // Clone while locked so destruction cannot free the flag before this store.
+    let flag = stop_flags().lock().unwrap().get(&(ptr as usize)).cloned();
+    if let Some(flag) = flag {
+        flag.store(true, Ordering::Release);
     }
 }
 
@@ -590,8 +644,141 @@ pub fn icicle_destroy_emulator(ptr: *mut c_void) {
         return;
     }
 
+    stop_flags().lock().unwrap().remove(&(ptr as usize));
     unsafe {
         let _ = Box::from_raw(ptr as *mut IcicleEmulator);
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn remote_stop_updates_only_registered_atomic() {
+        let ptr = icicle_create_emulator(0);
+        assert!(!ptr.is_null());
+        let flag = stop_flags().lock().unwrap().get(&(ptr as usize)).cloned().unwrap();
+        assert!(!flag.load(Ordering::Acquire));
+
+        let address = ptr as usize;
+        std::thread::spawn(move || icicle_stop(address as *mut c_void)).join().unwrap();
+        assert!(flag.load(Ordering::Acquire));
+
+        icicle_destroy_emulator(ptr);
+        assert!(!stop_flags().lock().unwrap().contains_key(&address));
+    }
+
+    #[test]
+    fn remote_stop_before_start_retires_no_instructions_and_is_consumed() {
+        let ptr = icicle_create_emulator(0);
+        assert!(!ptr.is_null());
+        let emulator = unsafe { &mut *(ptr as *mut IcicleEmulator) };
+        assert!(emulator.map_memory(0x10000, 4096, 7));
+        assert!(emulator.write_memory(0x10000, &[0xeb, 0xfe]));
+        assert_eq!(emulator.write_register(X86Register::Rip, &0x10000u64.to_le_bytes()), 8);
+        icicle_stop(ptr);
+        icicle_start(ptr, 100);
+        assert_eq!(icicle_get_icount(ptr), 0);
+        let mut info = IcicleStopInfo { kind: 0, code: 0, value: 0 };
+        assert_eq!(icicle_get_stop_info(ptr, &mut info), 1);
+        assert_eq!(info.kind, 1); // instruction-limit stop kind in the FFI contract
+        assert!(!stop_flags().lock().unwrap().get(&(ptr as usize)).unwrap().load(Ordering::Acquire));
+
+        icicle_start(ptr, 2);
+        assert_eq!(icicle_get_icount(ptr), 2);
+        icicle_destroy_emulator(ptr);
+    }
+
+    extern "C" fn signal_first_instruction(data: *mut c_void, _: u64) {
+        let seen = unsafe { &*(data as *const AtomicBool) };
+        seen.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn remote_stop_exits_a_running_vm() {
+        let ptr = icicle_create_emulator(0);
+        assert!(!ptr.is_null());
+        let emulator = unsafe { &mut *(ptr as *mut IcicleEmulator) };
+        assert!(emulator.map_memory(0x10000, 4096, 7));
+        assert!(emulator.write_memory(0x10000, &[0xeb, 0xfe]));
+        assert_eq!(emulator.write_register(X86Register::Rip, &0x10000u64.to_le_bytes()), 8);
+
+        let seen = Arc::new(AtomicBool::new(false));
+        let id = icicle_add_execution_hook(ptr, 0x10000, signal_first_instruction, Arc::as_ptr(&seen) as *mut c_void);
+        assert_ne!(id, 0);
+        let address = ptr as usize;
+        let worker = std::thread::spawn(move || {
+            icicle_start(address as *mut c_void, 100_000_000);
+            let mut info = IcicleStopInfo { kind: 0, code: 0, value: 0 };
+            assert_eq!(icicle_get_stop_info(address as *mut c_void, &mut info), 1);
+            (info, icicle_get_icount(address as *mut c_void))
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !seen.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(seen.load(Ordering::Acquire), "guest did not execute the entry block");
+        icicle_stop(ptr);
+        let (info, count) = worker.join().unwrap();
+        assert_eq!(info.kind, 1); // instruction-limit stop kind in the FFI contract
+        assert!(count < 50_000_000, "remote stop did not interrupt the run: {count}");
+        icicle_destroy_emulator(ptr);
+    }
+
+    struct OwnerInterruptStop {
+        emulator: usize,
+        hits: AtomicUsize,
+    }
+
+    extern "C" fn stop_on_guest_interrupt(data: *mut c_void, code: i32) {
+        let state = unsafe { &*(data as *const OwnerInterruptStop) };
+        assert_eq!(code, 41); // int 29h fast-fail interrupt
+        state.hits.fetch_add(1, Ordering::Relaxed);
+        icicle_stop(state.emulator as *mut c_void);
+    }
+
+    #[test]
+    fn owner_stop_inside_interrupt_hook_ends_before_reexecuting_int29() {
+        let ptr = icicle_create_emulator(0);
+        assert!(!ptr.is_null());
+        let emulator = unsafe { &mut *(ptr as *mut IcicleEmulator) };
+        assert!(emulator.map_memory(0x10000, 4096, 7));
+        // mov ecx, 7; int 29h; jmp $ — the fast-fail path may not retire int29.
+        assert!(emulator.write_memory(0x10000, &[0xb9, 7, 0, 0, 0, 0xcd, 0x29, 0xeb, 0xfe]));
+        assert_eq!(emulator.write_register(X86Register::Rip, &0x10000u64.to_le_bytes()), 8);
+
+        let mut state = Box::new(OwnerInterruptStop {
+            emulator: ptr as usize,
+            hits: AtomicUsize::new(0),
+        });
+        assert_ne!(icicle_add_interrupt_hook(ptr, stop_on_guest_interrupt,
+            (&mut *state as *mut OwnerInterruptStop).cast()), 0);
+        icicle_start(ptr, 100);
+
+        let mut info = IcicleStopInfo { kind: 0, code: 0, value: 0 };
+        assert_eq!(icicle_get_stop_info(ptr, &mut info), 1);
+        assert_eq!(info.kind, 1); // owner-requested stop maps to instruction limit
+        assert_eq!(state.hits.load(Ordering::Relaxed), 1);
+        assert!(icicle_get_icount(ptr) < 100);
+        icicle_destroy_emulator(ptr);
+    }
+
+    #[test]
+    fn owner_stop_marks_execution_hook_and_atomic() {
+        let ptr = icicle_create_emulator(0);
+        assert!(!ptr.is_null());
+        let owner_stop = unsafe { (&*(ptr as *mut IcicleEmulator)).owner_stop_cell() };
+        let flag = stop_flags().lock().unwrap().get(&(ptr as usize)).cloned().unwrap();
+        let owner = RunningStopGuard::new(ptr as usize, Rc::clone(&owner_stop));
+
+        icicle_stop(ptr);
+        assert!(*owner_stop.borrow());
+        assert!(!flag.load(Ordering::Acquire));
+
+        drop(owner);
+        icicle_destroy_emulator(ptr);
     }
 }
 

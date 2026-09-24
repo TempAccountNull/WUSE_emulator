@@ -25,6 +25,8 @@ namespace sogen
 
         virtual void start(size_t count = 0) = 0;
         virtual void stop() = 0;
+        // Retire a stop request after a guest scheduler consumes its switch.
+        virtual void acknowledge_stop() {}
 
         virtual size_t read_raw_register(int reg, void* value, size_t size) = 0;
         virtual size_t write_raw_register(int reg, const void* value, size_t size) = 0;

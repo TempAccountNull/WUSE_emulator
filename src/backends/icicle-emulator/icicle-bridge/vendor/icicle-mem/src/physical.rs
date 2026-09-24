@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::{cell::UnsafeCell, ptr::NonNull, sync::Arc};
 
 use crate::{MemError, MemResult, perm};
@@ -248,6 +248,13 @@ impl Page {
     /// A page that shares an existing `Arc<PageData>` backing with other MMUs (SMP). Writes go
     /// through to the shared bytes; see `Mmu::map_smp_shared`.
     pub(crate) fn from_shared(data: Arc<PageData>) -> Self {
+        // Make executable mappings visible to the direct-store JIT before
+        // any decoder read. The opt-out retains all-shared epoch tracking.
+        if !smp_code_epoch_only_enabled()
+            || data.perm.iter().any(|permission| permission & perm::EXEC != 0)
+        {
+            data.smp_code_seen.store(1, Ordering::Release);
+        }
         Self {
             data: UnsafeCell::new(data),
             modified: false,
@@ -421,6 +428,9 @@ pub struct PageData {
     /// vCPU threads; cloned pages snapshot the current value.
     pub code_epoch: AtomicU64,
 
+    /// Sticky shared-code marker read by the JIT's direct-store epoch path.
+    pub smp_code_seen: AtomicU8,
+
     /// SMP 6.6c'': bumped whenever this page's perms are re-established (map / update_perm).
     /// A DEFERRED cross-VM protect captures the epoch at queue time and skips applying if the
     /// page was re-perm'd since (a stale protect over a freed-and-remapped range must not land
@@ -430,7 +440,8 @@ pub struct PageData {
 
 impl Default for PageData {
     fn default() -> Self {
-        Self { data: PageBytes::default(), perm: [0; PAGE_SIZE], code_epoch: AtomicU64::new(0), perm_epoch: AtomicU64::new(0) }
+        Self { data: PageBytes::default(), perm: [0; PAGE_SIZE], code_epoch: AtomicU64::new(0),
+               smp_code_seen: AtomicU8::new(0), perm_epoch: AtomicU64::new(0) }
     }
 }
 
@@ -440,12 +451,20 @@ impl Clone for PageData {
             data: self.data.clone(),
             perm: self.perm,
             code_epoch: AtomicU64::new(self.code_epoch.load(Ordering::Relaxed)),
+            smp_code_seen: AtomicU8::new(0),
             perm_epoch: AtomicU64::new(self.perm_epoch.load(Ordering::Relaxed)),
         }
     }
 }
 
 impl PageData {
+    /// The vendored JIT calls this only with SOGEN_SMP_EXEC_WRITE_WAKE=1.
+    /// This narrow source patch restores epoch tracking, not peer wake linkage.
+    /// Fail visibly if that separate opt-in is requested without its bridge.
+    pub fn notify_exec_write_jit(&self, _addr: u64, _len: usize) {
+        panic!("SOGEN_SMP_EXEC_WRITE_WAKE requires the full peer-wake bridge");
+    }
+
     /// SMP 6.6a: bump the cross-VM code epoch for this page.
     pub fn bump_code_epoch(&self) {
         self.code_epoch.fetch_add(1, Ordering::Release);
@@ -645,11 +664,22 @@ impl PageRef {
         value: [u8; N],
         perm: u8,
     ) -> MemResult<()> {
-        self.ptr.as_mut().write::<N>(addr, value, perm)
+        let page = self.ptr.as_mut();
+        page.write::<N>(addr, value, perm)?;
+        if page.smp_code_seen.load(Ordering::Acquire) != 0 {
+            page.bump_code_epoch();
+        }
+        Ok(())
     }
 }
 
 #[inline(always)]
 pub fn is_aligned<const N: usize>(value: u64) -> bool {
     (value & (N - 1) as u64) == 0
+}
+
+#[cold]
+fn smp_code_epoch_only_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SOGEN_SMP_CODE_EPOCH_ONLY").as_deref() != Ok("0"))
 }

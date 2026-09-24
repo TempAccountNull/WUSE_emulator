@@ -877,6 +877,13 @@ impl IcicleEmulator {
         self.executing_thread = std::thread::current().id();
         self.last_stop = IcicleStopInfo::none();
         self.last_vm_exit = icicle_vm::VmExit::Running;
+        // Consume a stop delivered after the scheduler marked this VM active
+        // but before vm.run() entered generated code.
+        if self.vm.interrupt_flag.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            self.last_vm_exit = icicle_vm::VmExit::Interrupted;
+            self.last_stop = IcicleStopInfo::instruction_limit();
+            return;
+        }
 
         self.vm.icount_limit = match count {
             0 => u64::MAX,
@@ -909,8 +916,18 @@ impl IcicleEmulator {
                     self.last_stop = IcicleStopInfo::instruction_limit();
                     break;
                 }
+                icicle_vm::VmExit::Interrupted => {
+                    self.last_stop = IcicleStopInfo::instruction_limit();
+                    break;
+                }
                 icicle_vm::VmExit::UnhandledException((code, value)) => {
                     let continue_execution = self.handle_exception(code, value);
+                    // Honor an owner-thread stop requested by the exception hook
+                    // before the next iteration clears the hook stop cell.
+                    if *self.stop.borrow() {
+                        self.last_stop = IcicleStopInfo::instruction_limit();
+                        break;
+                    }
                     if !continue_execution {
                         self.last_stop = IcicleStopInfo::unhandled_exception(code, value);
                         break;
@@ -925,6 +942,8 @@ impl IcicleEmulator {
                 }
             };
         }
+        // A late remote stop must not leak into the following quantum.
+        self.vm.interrupt_flag.store(false, std::sync::atomic::Ordering::Release);
     }
 
     pub fn vm_exit_description(&self) -> String {
@@ -1238,12 +1257,12 @@ impl IcicleEmulator {
         return self.vm.cpu.icount;
     }
 
-    pub fn stop(&mut self) {
-        self.vm.icount_limit = 0;
+    pub(crate) fn stop_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.vm.interrupt_flag)
+    }
 
-        if self.executing_thread == std::thread::current().id() {
-            *self.stop.borrow_mut() = true;
-        }
+    pub(crate) fn owner_stop_cell(&self) -> Rc<RefCell<bool>> {
+        Rc::clone(&self.stop)
     }
 
     pub fn add_block_hook(&mut self, callback: Box<dyn Fn(u64, u64)>) -> u32 {

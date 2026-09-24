@@ -95,6 +95,14 @@ namespace sogen
         // Backends without thread-local vCPU routing need no special handling.
         virtual void set_scheduler_worker_context(size_t /*vcpu_index*/, bool /*active*/) {}
 
+        // A scheduler worker owns its VM while doing host work with the kernel lock held.
+        // Paused external callers use this marker to exclude that parked VM access.
+        virtual void set_scheduler_vm_parked(size_t /*vcpu_index*/, bool /*active*/) {}
+
+        // Nonblocking parked-gate probe for reacquiring it while the kernel lock is held.
+        // Backends without a parked gate succeed immediately.
+        virtual bool try_set_scheduler_vm_parked(size_t /*vcpu_index*/) { return true; }
+
         // SMP: watermark of cross-VM ops issued to peer queues, and whether every op issued up
         // to `mark` has been applied (per-target FIFO). Lets host code gate a transition on its
         // earlier queued ops being visible everywhere - without holding a lock. Defaults: none.

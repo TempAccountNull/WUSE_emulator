@@ -869,6 +869,9 @@ impl Mmu {
                         tracing::error!("Changed perms of code page. JIT cache may now be invalid");
                     }
                     if page.smp_shared {
+                        if perm & perm::EXEC != 0 {
+                            page.data().smp_code_seen.store(1, std::sync::atomic::Ordering::Release);
+                        }
                         // SMP: never make_mut a shared page — the clone privatizes this VM's copy
                         // (protect_does_not_privatize_shared_page: the protecting VM loses all
                         // subsequent peer writes; the N>1 probe's WritePerm fault on ntdll .data
@@ -1125,6 +1128,10 @@ impl Mmu {
                         unsafe { page.write_ptr().ptr.as_mut().get_perm_unchecked(offset, len) };
                     perm::check(if mapping.shared_perm != 0 { mapping.shared_perm } else { perm },
                         perm::INIT | perm::EXEC)?;
+
+                    if page.smp_shared {
+                        page.data().smp_code_seen.store(1, std::sync::atomic::Ordering::Release);
+                    }
 
                     // Mark the page as executed
                     page.executed = true;
@@ -1411,7 +1418,9 @@ impl Mmu {
                 .iter()
                 .any(|p| p & perm::IN_CODE_CACHE != 0);
             shared.write(addr, value, perm)?;
-            if was_cached {
+            if was_cached
+                || shared.smp_code_seen.load(std::sync::atomic::Ordering::Acquire) != 0
+            {
                 shared.bump_code_epoch();
             }
             if !self.write_hooks.contains_address(addr, page_size) {
@@ -1720,6 +1729,57 @@ impl_read_write!(read_u8, write_u8, u8);
 impl_read_write!(read_u16, write_u16, u16);
 impl_read_write!(read_u32, write_u32, u32);
 impl_read_write!(read_u64, write_u64, u64);
+
+#[cfg(test)]
+mod smp_code_epoch_contract_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn promotion_to_exec_makes_tlb_writes_advance_shared_epoch() {
+        const ADDRESS: u64 = 0x6000;
+        let mut mem = Mmu::default();
+        assert!(mem.map_smp_shared_fresh(ADDRESS, perm::READ | perm::WRITE));
+        let shared = mem.share_page(ADDRESS).unwrap();
+        let initially_tracked = std::env::var("SOGEN_SMP_CODE_EPOCH_ONLY").as_deref() == Ok("0");
+        assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), u8::from(initially_tracked));
+
+        mem.update_perm(ADDRESS, 0x1000, perm::READ | perm::WRITE | perm::EXEC).unwrap();
+        assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), 1);
+        let before = shared.code_epoch();
+        let index = mem.get_physical_index(ADDRESS).unwrap();
+        let mut write_ptr = unsafe { mem.physical.get_mut(index).write_ptr() };
+        unsafe { write_ptr.write(ADDRESS, [0x90_u8], perm::WRITE) }.unwrap();
+        assert_eq!(shared.code_epoch(), before + 1);
+
+        mem.update_perm(ADDRESS, 0x1000, perm::READ | perm::WRITE).unwrap();
+        assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn executable_mapping_tracks_write_before_first_decode() {
+        const ADDRESS: u64 = 0x7000;
+        let mut mem = Mmu::default();
+        assert!(mem.map_smp_shared_fresh(ADDRESS, perm::READ | perm::EXEC));
+        let shared = mem.share_page(ADDRESS).unwrap();
+        assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), 1);
+        mem.write(ADDRESS, [0x90_u8], perm::NONE).unwrap();
+        assert_eq!(shared.code_epoch(), 1);
+        let index = mem.get_physical_index(ADDRESS).unwrap();
+        assert!(!mem.get_physical(index).executed);
+    }
+
+    #[test]
+    fn successful_ensure_exec_reasserts_marker() {
+        const ADDRESS: u64 = 0x8000;
+        let mut mem = Mmu::default();
+        assert!(mem.map_smp_shared_fresh(ADDRESS, perm::READ | perm::WRITE | perm::EXEC));
+        let shared = mem.share_page(ADDRESS).unwrap();
+        shared.smp_code_seen.store(0, Ordering::Release);
+        assert!(mem.ensure_executable(ADDRESS, 1));
+        assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), 1);
+    }
+}
 
 #[cfg(test)]
 mod smp_batch_tests {

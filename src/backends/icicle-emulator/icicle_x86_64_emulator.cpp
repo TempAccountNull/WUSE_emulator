@@ -177,6 +177,8 @@ namespace sogen::icicle
     thread_local void* t_worker_vcpu = nullptr;
     // Direct start() callers are not scheduler workers; only the scheduler sets this marker.
     thread_local void* t_scheduler_worker_vcpu = nullptr;
+    // The scheduler holds this VM's parked-owner gate only while it has the kernel lock.
+    thread_local void* t_parked_vm_vcpu = nullptr;
     // True while THIS thread is inside drain_pending_ops: a drained op (e.g. a map) can re-enter
     // try_write_memory, which would otherwise drain again (re-entrancy broke CrossVmMap/RangedExec).
     thread_local bool t_draining_own_queue = false;
@@ -276,7 +278,19 @@ namespace sogen::icicle
         void stop() override
         {
             this->stop_requested_ = true;
-            icicle_stop(this->emu_);
+            // An idle worker may consume switch_thread before its next start().
+            // Leave no stale atomic interrupt that would end that new quantum
+            // without a pending scheduler switch. A running quantum still needs
+            // the remote interrupt to reach its next VM timer boundary.
+            if (this->run_active_.load(std::memory_order_acquire))
+            {
+                icicle_stop(this->emu_);
+            }
+        }
+
+        void acknowledge_stop() override
+        {
+            this->stop_requested_.store(false, std::memory_order_release);
         }
 
         void load_gdt(const pointer_type address, const uint32_t limit) override
@@ -437,6 +451,8 @@ namespace sogen::icicle
         // quiesce cancel (a peer's cross-VM mutation), so start() knows whether to return or re-enter.
         std::atomic_bool run_active_{false};
         std::atomic_bool stop_requested_{false};
+        // Excludes external stop-the-world VM access from parked scheduler host work.
+        std::recursive_mutex parked_vm_mutex_{};
 
         // Activity telemetry (progress meter): retired-instruction count and last-parked RIP,
         // published by the OWNING worker thread at its between-quanta safe point (VM parked there,
@@ -538,6 +554,50 @@ namespace sogen::icicle
             {
                 t_scheduler_worker_vcpu = nullptr;
             }
+        }
+
+        void set_scheduler_vm_parked(const size_t index, const bool active) override
+        {
+            if (this->vcpus_.size() == 1)
+            {
+                return;
+            }
+            auto* const worker = this->vcpus_.at(index).get();
+            if (active)
+            {
+                if (t_parked_vm_vcpu == worker)
+                {
+                    return;
+                }
+                assert(t_scheduler_worker_vcpu == worker && t_parked_vm_vcpu == nullptr);
+                worker->parked_vm_mutex_.lock();
+                t_parked_vm_vcpu = worker;
+            }
+            else if (t_parked_vm_vcpu == worker)
+            {
+                t_parked_vm_vcpu = nullptr;
+                worker->parked_vm_mutex_.unlock();
+            }
+        }
+
+        bool try_set_scheduler_vm_parked(const size_t index) override
+        {
+            if (this->vcpus_.size() == 1)
+            {
+                return true;
+            }
+            auto* const worker = this->vcpus_.at(index).get();
+            if (t_parked_vm_vcpu == worker)
+            {
+                return true;
+            }
+            assert(t_scheduler_worker_vcpu == worker && t_parked_vm_vcpu == nullptr);
+            if (!worker->parked_vm_mutex_.try_lock())
+            {
+                return false;
+            }
+            t_parked_vm_vcpu = worker;
+            return true;
         }
 
         x86_64_cpu& get_cpu(const size_t index) override
@@ -1517,6 +1577,7 @@ namespace sogen::icicle
             if (vcpu_index < this->vcpus_.size())
             {
                 auto& worker = *this->vcpus_[vcpu_index];
+                std::lock_guard<std::recursive_mutex> parked_owner(worker.parked_vm_mutex_);
                 this->drain_pending_ops(worker);
                 // Progress-meter safe point: the caller owns this vCPU and its VM is parked
                 // here, so both reads are race-free.
@@ -1601,6 +1662,10 @@ namespace sogen::icicle
                 std::snprintf(buf, sizeof(buf), "v%u=%s ", vcpu->index_, vcpu->run_active_.load() ? "RUN" : "park");
                 out += buf;
             }
+            {
+                std::lock_guard<std::mutex> lock(this->quiesce_mutex_);
+                out += this->quiescing_ ? "quiescing=1" : "quiescing=0";
+            }
             return out;
         }
 
@@ -1677,7 +1742,7 @@ namespace sogen::icicle
         // Step 6.2/6.3 — stop-the-world quiesce (mirrors WHP's cancel-without-stop_requested_ resume): an
         // icicle VM can only be touched by its own thread, so before a cross-VM MMU mutation we pause every
         // OTHER vCPU (icicle_stop, marking it to resume not to stop) and wait for its run_active_ to clear.
-        std::mutex quiesce_mutex_{};
+        mutable std::mutex quiesce_mutex_{};
         std::condition_variable quiesce_cv_{};
         bool quiescing_{false};
         std::vector<uint8_t> quiesce_cancel_{}; // per-vCPU: was cancelled for a mutation (resume, don't stop)
@@ -2221,11 +2286,23 @@ namespace sogen::icicle
             icicle_stop(this->vcpus_[index]->handle());
         }
 
-        bool complete_run_quantum(icicle_vcpu& v)
+        void abort_run_quantum(icicle_vcpu& v)
         {
-            v.run_active_ = false;
             if (this->vcpus_.size() == 1)
             {
+                v.run_active_ = false;
+                return;
+            }
+            std::lock_guard<std::mutex> lock(this->quiesce_mutex_);
+            v.run_active_ = false;
+            this->quiesce_cv_.notify_all();
+        }
+
+        bool complete_run_quantum(icicle_vcpu& v)
+        {
+            if (this->vcpus_.size() == 1)
+            {
+                v.run_active_ = false;
                 // N=1: honor a self-kick (deferred execution-hook install) by resuming the quantum —
                 // begin_run_quantum drains it outside icicle run().
                 std::lock_guard<std::mutex> lock(this->quiesce_mutex_);
@@ -2237,6 +2314,7 @@ namespace sogen::icicle
                 return false;
             }
             std::unique_lock lock(this->quiesce_mutex_);
+            v.run_active_ = false;
             this->quiesce_cv_.notify_all();
             if (v.stop_requested_ || v.pending_hook_exception_)
             {
@@ -2304,7 +2382,11 @@ namespace sogen::icicle
             }
             std::unique_lock lock(this->quiesce_mutex_);
             this->quiescing_ = true;
-            const auto resume = utils::finally([this] {
+            const auto resume = utils::finally([this, &lock] {
+                if (!lock.owns_lock())
+                {
+                    lock.lock();
+                }
                 this->quiescing_ = false;
                 this->quiesce_cv_.notify_all();
             });
@@ -2361,7 +2443,18 @@ namespace sogen::icicle
                     return true;
                 });
             }
-            // Every peer is now outside icicle run(): safe to touch their VMs from this thread.
+            // Keep quiescing_ true so no worker can enter a new quantum, but release its
+            // mutex before waiting for parked-owner gates. A worker may hold its gate and
+            // the kernel lock while a queued operation briefly needs quiesce_mutex_.
+            lock.unlock();
+            std::vector<std::unique_lock<std::recursive_mutex>> parked_owners;
+            parked_owners.reserve(this->vcpus_.size());
+            for (auto& vcpu : this->vcpus_)
+            {
+                parked_owners.emplace_back(vcpu->parked_vm_mutex_);
+            }
+            // Every VM is now excluded from both guest execution and parked host use.
+            // parked_owners is destroyed before resume clears quiescing_, including on throw.
             fn();
         }
     };
@@ -2379,7 +2472,6 @@ namespace sogen::icicle
 
     inline void icicle_vcpu::start(const size_t count)
     {
-        this->stop_requested_ = false;
         auto* previous_worker = std::exchange(t_worker_vcpu, static_cast<void*>(this));
         auto* previous_running = std::exchange(t_running_vcpu, static_cast<void*>(this));
         const auto clear_current = utils::finally([previous_worker, previous_running] {
@@ -2390,7 +2482,9 @@ namespace sogen::icicle
         // here, and re-issuing the full count would extend the budget past the caller's contract
         // (caught by RangedExecHook...: the resumed vCPU ran off the end of its code). Track the
         // remainder via the VM's retired-instruction counter. count==0 means unlimited (icicle contract).
+        std::unique_lock<std::recursive_mutex> parked_access(this->parked_vm_mutex_);
         const uint64_t base_icount = icicle_get_icount(this->emu_);
+        uint32_t empty_interrupt_retries = 0;
         for (;;)
         {
             // Budget check BEFORE begin_run_quantum: breaking after it would leak run_active_ = true
@@ -2405,11 +2499,44 @@ namespace sogen::icicle
                 }
                 remaining = count - executed;
             }
+            parked_access.unlock(); // begin may wait for an external pause; never hold this gate then
+            auto retire_on_error = utils::finally([this] {
+                this->machine_.abort_run_quantum(*this);
+            });
             this->machine_.begin_run_quantum(*this);
+            if (this->stop_requested_.load(std::memory_order_acquire))
+            {
+                // A prestart switch or shutdown needs no guest instructions.
+                // Retire run_active_ before returning so an external pauser cannot wait forever.
+                (void)this->machine_.complete_run_quantum(*this);
+                retire_on_error.cancel();
+                parked_access.lock();
+                return;
+            }
+            const uint64_t before_icount = icicle_get_icount(this->emu_);
             icicle_start(this->emu_, remaining);
-            if (this->machine_.complete_run_quantum(*this))
+            const bool resume_quantum = this->machine_.complete_run_quantum(*this);
+            retire_on_error.cancel();
+            parked_access.lock(); // protect post-run VM reads while run_active_ is false
+            if (resume_quantum)
             {
                 continue; // paused for a peer's cross-VM mutation — resume this quantum
+            }
+            // A remote atomic interrupt can race the quantum-end decision. Resume
+            // unlimited runs that report an empty instruction-limit exit, bounded
+            // against a permanently asserted interrupt without guest progress.
+            if (count == 0 && !this->stop_requested_.load(std::memory_order_acquire) &&
+                !this->pending_hook_exception_)
+            {
+                icicle_stop_info info{};
+                ice(icicle_get_stop_info(this->emu_, &info) != 0, "Failed to read icicle stop info");
+                if (static_cast<icicle_stop_kind>(info.kind) == icicle_stop_kind::instruction_limit)
+                {
+                    empty_interrupt_retries = icicle_get_icount(this->emu_) == before_icount
+                        ? empty_interrupt_retries + 1 : 0;
+                    ice(empty_interrupt_retries <= 16, "Icicle repeatedly interrupted without guest progress");
+                    continue;
+                }
             }
             break;
         }

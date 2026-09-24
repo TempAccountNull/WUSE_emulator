@@ -1,5 +1,6 @@
 #include "std_include.hpp"
 #include "windows_emulator.hpp"
+#include "scheduler_vm_gate.hpp"
 
 #include <cctype>
 #include <cstdio>
@@ -999,6 +1000,7 @@ namespace sogen
         this->kernel_lock_.assert_held();
 
         const auto needed_switch = vcpu.switch_thread.exchange(false);
+        vcpu.cpu.acknowledge_stop();
 
         while (!switch_to_next_thread(*this, vcpu))
         {
@@ -1040,6 +1042,7 @@ namespace sogen
                     }
                 }
             }
+            this->emu().set_scheduler_vm_parked(vcpu.cpu.index(), false);
             lock.unlock();
 
             if (this->vcpu_count_ == 1)
@@ -1063,7 +1066,7 @@ namespace sogen
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
 
-            lock.lock();
+            acquire_scheduler_vm_parked(this->emu(), vcpu.cpu.index(), lock);
 
             if (this->should_stop)
             {
@@ -1081,7 +1084,11 @@ namespace sogen
         const auto clear_scheduler_worker = utils::finally([this, &vcpu] {
             this->emu().set_scheduler_worker_context(vcpu.cpu.index(), false);
         });
-        std::unique_lock lock(this->kernel_lock_);
+        std::unique_lock<kernel_lock> lock(this->kernel_lock_, std::defer_lock);
+        acquire_scheduler_vm_parked(this->emu(), vcpu.cpu.index(), lock);
+        const auto clear_parked_vm = utils::finally([this, &vcpu] {
+            this->emu().set_scheduler_vm_parked(vcpu.cpu.index(), false);
+        });
 
         while (!this->should_stop)
         {
@@ -1096,12 +1103,13 @@ namespace sogen
             // Guest code executes with the kernel lock released; hook callbacks
             // (syscalls, exceptions, exec hooks) re-acquire it on VM exit.
             vcpu.running.store(true, std::memory_order_relaxed);
+            this->emu().set_scheduler_vm_parked(vcpu.cpu.index(), false);
             lock.unlock();
             {
                 const auto clear_running = utils::finally([&vcpu] { vcpu.running.store(false, std::memory_order_relaxed); });
                 this->start_cpu(vcpu);
             }
-            lock.lock();
+            acquire_scheduler_vm_parked(this->emu(), vcpu.cpu.index(), lock);
 
             // SMP: between quanta (kernel lock held, outside any write path) apply every cross-VM
             // op queued for this vCPU, so the scheduler's own host writes below (thread-context
@@ -1118,6 +1126,7 @@ namespace sogen
             }
         }
 
+        this->emu().set_scheduler_vm_parked(vcpu.cpu.index(), false);
         lock.unlock();
 
         // One vCPU winding down (process exit, fatal error) ends the whole run.
