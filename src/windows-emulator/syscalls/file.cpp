@@ -1323,7 +1323,7 @@ namespace sogen
             }
 
             const auto* f = c.proc.files.get(file_handle);
-            if (!f)
+            if (!f || !f->is_file())
             {
                 return STATUS_INVALID_HANDLE;
             }
@@ -1428,7 +1428,7 @@ namespace sogen
             }
 
             const auto* f = c.proc.files.get(file_handle);
-            if (!f)
+            if (!f || !f->is_file())
             {
                 return STATUS_INVALID_HANDLE;
             }
