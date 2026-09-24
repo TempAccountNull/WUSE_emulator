@@ -7,6 +7,7 @@
 #include <gpu_bridge_protocol.hpp>
 #include <native_wsi_wire.hpp>
 #include <platform/ui_owned_completion.hpp>
+#include <atomic>
 #include <cstdlib>
 #include <chrono>
 #include <bit>
@@ -28,10 +29,25 @@ namespace sogen
             {
                 this->memory_ = &win_emu.memory;
                 const char* option = std::getenv("SOGEN_VULKAN_PRESENT");
-                const std::string_view mode = option && *option ? option : "readback";
-                if (mode != "readback" && mode != "native" && mode != "direct" && mode != "gpu-copy")
+                const std::string_view requested_mode = option && *option ? option : "readback";
+                if (requested_mode != "readback" && requested_mode != "native" && requested_mode != "direct" &&
+                    requested_mode != "gpu-copy")
                 {
                     throw std::runtime_error("SOGEN_VULKAN_PRESENT must be readback, native (alias direct), or gpu-copy");
+                }
+                // Multi-vCPU syscalls run on worker threads while SDL and native WSI objects
+                // belong to the UI pump thread. The existing readback presenter already queues
+                // UI work and remains safe for workers; retain the native owner checks below.
+                const bool readback_fallback = win_emu.vcpu_count() > 1 && requested_mode != "readback";
+                const std::string_view mode = readback_fallback ? std::string_view{"readback"} : requested_mode;
+                if (readback_fallback)
+                {
+                    static std::atomic_bool logged{false};
+                    if (!logged.exchange(true, std::memory_order_relaxed))
+                    {
+                        win_emu.log.warn("[gpu-bridge] presentation requested=%s effective=readback (vcpus=%u; native WSI requires UI owner)\n",
+                                         option, win_emu.vcpu_count());
+                    }
                 }
                 this->native_wsi_ = mode != "readback";
                 this->gpu_copy_ = mode == "gpu-copy";
