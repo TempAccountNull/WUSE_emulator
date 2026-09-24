@@ -138,6 +138,47 @@ namespace
         return true;
     }
 
+    bool run_smp_cpu_load()
+    {
+        constexpr uint64_t iterations = 1'000'000;
+        std::atomic<unsigned> ready{0};
+        std::atomic<bool> go{false};
+        std::array<uint64_t, 2> results{};
+        std::array<std::thread, 2> workers;
+
+        for (size_t index = 0; index < workers.size(); ++index)
+        {
+            workers[index] = std::thread([&, index] {
+                volatile uint64_t value = index + 1;
+                ready.fetch_add(1, std::memory_order_release);
+                while (!go.load(std::memory_order_acquire))
+                {
+                    _mm_pause();
+                }
+                for (uint64_t i = 0; i < iterations; ++i)
+                {
+                    value = value * 6364136223846793005ULL + i;
+                }
+                results[index] = value;
+            });
+        }
+
+        while (ready.load(std::memory_order_acquire) != workers.size())
+        {
+            Sleep(0);
+        }
+        puts("SOGEN_SMP_LOAD_START");
+        fflush(stdout);
+        go.store(true, std::memory_order_release);
+        for (auto& worker : workers)
+        {
+            worker.join();
+        }
+        printf("SOGEN_SMP_LOAD_END %llu %llu\n", static_cast<unsigned long long>(results[0]), static_cast<unsigned long long>(results[1]));
+        fflush(stdout);
+        return results[0] != results[1];
+    }
+
     bool test_tls()
     {
         std::atomic_bool kill{false};
@@ -1941,6 +1982,11 @@ namespace
 
 int main(const int argc, const char* argv[])
 {
+    if (argc == 2 && argv[1] == "-smp-load"sv)
+    {
+        return run_smp_cpu_load() ? 0 : 1;
+    }
+
     if (argc == 2 && argv[1] == "-time"sv)
     {
         print_time();
