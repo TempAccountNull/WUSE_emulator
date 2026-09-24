@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -386,9 +387,47 @@ namespace sogen
         std::string section_name{};
     };
 
+    struct fast_fail_caller_code
+    {
+        uint32_t stack_word_index{};
+        uint64_t return_address{};
+        std::string module_name{};
+        uint64_t module_base{};
+        uint64_t module_rva{};
+        uint64_t code_base{};
+        std::string code_bytes{};
+        uint32_t readable_code_bytes{};
+    };
+
     struct fast_fail_event : observation_event
     {
         uint32_t fail_code{};
+        std::string rip_module_name{};
+        uint64_t rip_module_base{};
+        uint64_t rip_module_rva{};
+        uint64_t stack_pointer{};
+        std::vector<uint64_t> stack_words{};
+        // Forty bytes surrounding RIP; each pair is hex or ?? when unreadable.
+        uint64_t code_base{};
+        std::string code_bytes{};
+        uint32_t readable_code_bytes{};
+        // Up to four distinct raw stack addresses within loaded-module ranges. These are
+        // candidates, not unwound frames. Code is the 16 bytes before each address.
+        std::vector<fast_fail_caller_code> caller_code{};
+        uint64_t security_cookie_address{};
+        uint64_t expected_security_cookie{};
+        bool expected_security_cookie_read{};
+        // __report_gsfailure saves the incoming RCX at its RSP+0x40.
+        uint64_t supplied_security_cookie{};
+        bool supplied_security_cookie_read{};
+        bool security_cookie_mismatch{};
+        // rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, then r8 through r15.
+        std::array<uint64_t, 16> gprs{};
+        uint64_t gs_base{};
+        uint64_t teb_self{};
+        uint64_t teb_peb{};
+        bool teb_self_read{};
+        bool teb_peb_read{};
     };
 
     using analysis_event =

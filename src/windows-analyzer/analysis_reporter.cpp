@@ -1148,6 +1148,72 @@ namespace sogen
             static void write_fields(json_object_builder& object, const fast_fail_event& event)
             {
                 object.field("fail_code", static_cast<uint64_t>(event.fail_code));
+                object.field("rip_module_name", event.rip_module_name);
+                object.hex_field("rip_module_base", event.rip_module_base);
+                object.hex_field("rip_module_rva", event.rip_module_rva);
+                object.hex_field("stack_pointer", event.stack_pointer);
+                object.hex_field("code_base", event.code_base);
+                object.field("code_bytes", event.code_bytes);
+                object.field("readable_code_bytes", event.readable_code_bytes);
+                object.array_field("caller_code", [&](const auto& emit) {
+                    for (const auto& caller : event.caller_code)
+                    {
+                        emit([&](std::string& output) {
+                            json_object_builder item{output};
+                            item.field("stack_word_index", caller.stack_word_index);
+                            item.hex_field("return_address", caller.return_address);
+                            item.field("module_name", caller.module_name);
+                            item.hex_field("module_base", caller.module_base);
+                            item.hex_field("module_rva", caller.module_rva);
+                            item.hex_field("code_base", caller.code_base);
+                            item.field("code_bytes", caller.code_bytes);
+                            item.field("readable_code_bytes", caller.readable_code_bytes);
+                        });
+                    }
+                });
+                object.hex_field("security_cookie_address", event.security_cookie_address);
+                object.field("expected_security_cookie_read", event.expected_security_cookie_read);
+                object.field("supplied_security_cookie_read", event.supplied_security_cookie_read);
+                object.field("security_cookie_mismatch", event.security_cookie_mismatch);
+                if (event.expected_security_cookie_read)
+                {
+                    object.hex_field("expected_security_cookie", event.expected_security_cookie);
+                }
+                if (event.supplied_security_cookie_read)
+                {
+                    object.hex_field("supplied_security_cookie", event.supplied_security_cookie);
+                }
+                constexpr std::array<std::string_view, 16> names{
+                    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+                };
+                object.object_field("gprs", [&](auto& registers) {
+                    for (size_t i = 0; i < names.size(); ++i)
+                    {
+                        registers.hex_field(names[i], event.gprs[i]);
+                    }
+                });
+                object.hex_field("gs_base", event.gs_base);
+                object.field("teb_self_read", event.teb_self_read);
+                object.field("teb_peb_read", event.teb_peb_read);
+                if (event.teb_self_read)
+                {
+                    object.hex_field("teb_self", event.teb_self);
+                }
+                if (event.teb_peb_read)
+                {
+                    object.hex_field("teb_peb", event.teb_peb);
+                }
+                object.array_field("stack_words", [&](const auto& emit) {
+                    for (const auto value : event.stack_words)
+                    {
+                        emit([&](std::string& output) {
+                            output += "\"0x";
+                            append_unsigned(output, value, 16);
+                            output += '"';
+                        });
+                    }
+                });
             }
         };
     }

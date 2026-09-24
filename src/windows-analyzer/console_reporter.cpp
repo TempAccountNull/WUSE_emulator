@@ -506,7 +506,34 @@ namespace sogen
                                              e.execution.rip_module.c_str());
                         },
                         [&](const fast_fail_event& e) {
-                            this->log_.print(color::red, "Process requested fast fail with code %d\n", e.fail_code);
+                            this->log_.print(color::red,
+                                             "Guest fast-fail code=%u tid=%u rip=%s+0x%" PRIx64 " base=0x%" PRIx64
+                                             " addr=0x%" PRIx64 " rcx=0x%" PRIx64
+                                             " rsp=0x%" PRIx64 " stack0=0x%" PRIx64 " gs=0x%" PRIx64
+                                             " tebSelf=0x%" PRIx64 " peb=0x%" PRIx64
+                                             " tebRead=%u/%u codeBase=0x%" PRIx64 " codeRead=%u/40 code=%s\n",
+                                             e.fail_code, e.execution.thread_id, e.rip_module_name.c_str(), e.rip_module_rva,
+                                             e.rip_module_base, e.execution.rip, e.gprs[2], e.stack_pointer,
+                                             e.stack_words.empty() ? 0 : e.stack_words.front(), e.gs_base,
+                                             e.teb_self, e.teb_peb, static_cast<unsigned>(e.teb_self_read),
+                                             static_cast<unsigned>(e.teb_peb_read),
+                                             e.code_base, e.readable_code_bytes, e.code_bytes.c_str());
+                            this->log_.print(color::red,
+                                             "  cookie global=0x%" PRIx64 " read=%u expected=0x%" PRIx64
+                                             " suppliedRead=%u supplied=0x%" PRIx64 " mismatch=%u callers=%zu\n",
+                                             e.security_cookie_address, static_cast<unsigned>(e.expected_security_cookie_read),
+                                             e.expected_security_cookie, static_cast<unsigned>(e.supplied_security_cookie_read),
+                                             e.supplied_security_cookie, static_cast<unsigned>(e.security_cookie_mismatch),
+                                             e.caller_code.size());
+                            for (const auto& caller : e.caller_code)
+                            {
+                                this->log_.print(color::red,
+                                                 "  raw stack candidate[%u]=0x%" PRIx64 " %s+0x%" PRIx64
+                                                 " moduleBase=0x%" PRIx64 " codeBase=0x%" PRIx64 " read=%u/16 code=%s\n",
+                                                 caller.stack_word_index, caller.return_address, caller.module_name.c_str(),
+                                                 caller.module_rva, caller.module_base, caller.code_base,
+                                                 caller.readable_code_bytes, caller.code_bytes.c_str());
+                            }
                         }),
                     event);
             }

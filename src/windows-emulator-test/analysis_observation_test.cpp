@@ -31,6 +31,7 @@ namespace sogen::test
         std::vector<foreign_code_transition_event> transitions{};
         std::vector<thread_terminated_event> terminated{};
         std::vector<memory_violation_event> violations{};
+        std::vector<fast_fail_event> fast_fails{};
         uint64_t caller{};
         uint64_t callee{};
         uint64_t stack{};
@@ -40,6 +41,10 @@ namespace sogen::test
             if (const auto* violation = std::get_if<memory_violation_event>(&event))
             {
                 violations.push_back(*violation);
+            }
+            if (const auto* fast_fail = std::get_if<fast_fail_event>(&event))
+            {
+                fast_fails.push_back(*fast_fail);
             }
             if (const auto* call = std::get_if<function_execution_event>(&event))
             {
@@ -106,6 +111,108 @@ namespace sogen::test
             register_analysis_callbacks(analysis);
         }
     };
+
+    TEST_F(AnalysisObservation, FastFailCapturesBoundedGuestCodeAndRegisters)
+    {
+        const auto page = win_emu.memory.allocate_memory(0x1000, memory_permission::read_write);
+        ASSERT_NE(page, 0U);
+        const auto rip = page + 0x100;
+        std::array<uint8_t, 40> bytes{};
+        for (size_t i = 0; i < bytes.size(); ++i)
+        {
+            bytes[i] = static_cast<uint8_t>(i);
+        }
+        win_emu.emu().write_memory(rip - 24, bytes.data(), bytes.size());
+        win_emu.emu().reg(x86_register::rip, rip);
+        win_emu.emu().reg(x86_register::rcx, 2);
+        win_emu.emu().reg(x86_register::r15, 0x12345678);
+        win_emu.emu().write_memory<uint64_t>(stack, caller);
+        win_emu.emu().write_memory<uint64_t>(stack + 8, caller); // Duplicate return address.
+        win_emu.emu().write_memory<uint64_t>(stack + 16, 0xDEADBEEF); // Outside the main image.
+        win_emu.emu().write_memory<uint64_t>(stack + 64, 0x123456789ULL); // Saved incoming RCX.
+        const std::array<uint8_t, 32> caller_bytes{0x48, 0x8B, 0xC1, 0xE8};
+        win_emu.emu().write_memory(caller - 16, caller_bytes.data(), caller_bytes.size());
+
+        win_emu.callbacks.on_fast_fail(2);
+        ASSERT_EQ(fast_fails.size(), 1U);
+        const auto& event = fast_fails.front();
+        EXPECT_EQ(event.fail_code, 2U);
+        EXPECT_EQ(event.execution.rip, rip);
+        EXPECT_EQ(event.code_base, rip - 24);
+        EXPECT_EQ(event.readable_code_bytes, 40U);
+        EXPECT_EQ(event.code_bytes.size(), 80U);
+        EXPECT_EQ(event.code_bytes.substr(0, 8), "00010203");
+        EXPECT_EQ(event.code_bytes.substr(48, 4), "1819");
+        EXPECT_EQ(event.gprs[2], 2U);
+        EXPECT_EQ(event.gprs[15], 0x12345678U);
+        EXPECT_EQ(event.stack_words.front(), caller);
+        ASSERT_EQ(event.caller_code.size(), 1U);
+        EXPECT_EQ(event.caller_code.front().stack_word_index, 0U);
+        EXPECT_EQ(event.caller_code.front().return_address, caller);
+        EXPECT_EQ(event.caller_code.front().module_name, win_emu.mod_manager.executable->name);
+        EXPECT_EQ(event.caller_code.front().module_base, win_emu.mod_manager.executable->image_base);
+        EXPECT_EQ(event.caller_code.front().module_rva, caller - win_emu.mod_manager.executable->image_base);
+        EXPECT_EQ(event.caller_code.front().code_base, caller - 16);
+        EXPECT_EQ(event.caller_code.front().code_bytes.size(), 32U);
+        EXPECT_EQ(event.caller_code.front().code_bytes.substr(0, 8), "488bc1e8");
+        EXPECT_FALSE(event.expected_security_cookie_read);
+        EXPECT_FALSE(event.supplied_security_cookie_read);
+        EXPECT_FALSE(event.security_cookie_mismatch);
+        EXPECT_EQ(event.gs_base, win_emu.emu().get_segment_base(x86_register::gs));
+    }
+
+    TEST_F(AnalysisObservation, FastFailResolvesExactDllRangeAndRawStackCandidate)
+    {
+        const auto* dll = win_emu.mod_manager.ntdll;
+        ASSERT_NE(dll, nullptr);
+        const auto rip = dll->entry_point;
+        const auto candidate = rip + 0x20;
+        ASSERT_TRUE(dll->contains(rip));
+        ASSERT_TRUE(dll->contains(candidate));
+        win_emu.emu().reg(x86_register::rip, rip);
+        win_emu.emu().write_memory<uint64_t>(stack, candidate);
+        win_emu.emu().write_memory<uint64_t>(stack + 8, candidate); // Duplicate is not another frame.
+        win_emu.emu().write_memory<uint64_t>(stack + 16, UINT64_MAX - 0x1000); // No loaded-module match.
+
+        win_emu.callbacks.on_fast_fail(7);
+        ASSERT_EQ(fast_fails.size(), 1U);
+        const auto& event = fast_fails.front();
+        EXPECT_EQ(event.fail_code, 7U);
+        EXPECT_EQ(event.rip_module_name, dll->name);
+        EXPECT_EQ(event.rip_module_base, dll->image_base);
+        EXPECT_EQ(event.rip_module_rva, rip - dll->image_base);
+        ASSERT_EQ(event.caller_code.size(), 1U);
+        const auto& raw = event.caller_code.front();
+        EXPECT_EQ(raw.stack_word_index, 0U);
+        EXPECT_EQ(raw.return_address, candidate);
+        EXPECT_EQ(raw.module_name, dll->name);
+        EXPECT_EQ(raw.module_base, dll->image_base);
+        EXPECT_EQ(raw.module_rva, candidate - dll->image_base);
+        EXPECT_EQ(raw.code_base, candidate - 16);
+        EXPECT_EQ(raw.code_bytes.size(), 32U);
+        EXPECT_LE(raw.readable_code_bytes, 16U);
+    }
+
+    TEST_F(AnalysisObservation, FastFailMarksUnreadableCodeBytesAcrossPageBoundary)
+    {
+        const auto page = win_emu.memory.allocate_memory(0x2000, memory_permission::read_write);
+        ASSERT_NE(page, 0U);
+        ASSERT_TRUE(win_emu.memory.decommit_memory(page + 0x1000, 0x1000));
+        const auto rip = page + 0xff8;
+        std::array<uint8_t, 32> bytes{};
+        bytes.fill(0xcc);
+        win_emu.emu().write_memory(rip - 24, bytes.data(), bytes.size());
+        win_emu.emu().reg(x86_register::rip, rip);
+
+        win_emu.callbacks.on_fast_fail(2);
+        ASSERT_EQ(fast_fails.size(), 1U);
+        const auto& event = fast_fails.front();
+        EXPECT_EQ(event.code_base, rip - 24);
+        EXPECT_EQ(event.readable_code_bytes, 32U);
+        EXPECT_EQ(event.code_bytes.size(), 80U);
+        EXPECT_EQ(event.code_bytes.substr(0, 4), "cccc");
+        EXPECT_EQ(event.code_bytes.substr(64), "????????????????");
+    }
 
     TEST_F(AnalysisObservation, ExecuteFaultCapturesActualAndLastTrackedIpWithHighStackWithoutMutation)
     {

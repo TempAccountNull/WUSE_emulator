@@ -352,7 +352,146 @@ namespace sogen
 
         void handle_fast_fail(const analysis_context& c, const uint32_t fail_code)
         {
-            c.emit_observation<fast_fail_event>([&](auto& event) { event.fail_code = fail_code; });
+            // A fast fail is terminal. Preserve the faulting guest stack now, while the CPU state
+            // still belongs to the failing thread; a post-exit GDB sample cannot recover it.
+            auto& cpu = c.win_emu->active_cpu();
+            const auto stack_pointer = cpu.reg(x86_register::rsp);
+            std::vector<uint64_t> stack_words;
+            stack_words.reserve(32);
+            for (size_t i = 0; i < 32; ++i)
+            {
+                uint64_t value{};
+                if (stack_pointer > UINT64_MAX - i * sizeof(value) ||
+                    !cpu.try_read_memory(stack_pointer + i * sizeof(value), &value, sizeof(value)))
+                {
+                    break;
+                }
+                stack_words.push_back(value);
+            }
+            // This callback runs only on a terminal guest fast-fail. Read one byte at a time
+            // so a boundary or unreadable page does not discard the rest of the snapshot.
+            constexpr uint64_t bytes_before = 24;
+            constexpr size_t code_window = 40;
+            constexpr char hex[] = "0123456789abcdef";
+            const auto rip = cpu.reg(x86_register::rip);
+            const auto code_base = rip >= bytes_before ? rip - bytes_before : 0;
+            const auto capture_code = [&](const uint64_t base, const size_t length, std::string& bytes,
+                                          uint32_t& readable) {
+                bytes.reserve(length * 2);
+                for (size_t i = 0; i < length; ++i)
+                {
+                    uint8_t byte{};
+                    if (base <= UINT64_MAX - i && cpu.try_read_memory(base + i, &byte, sizeof(byte)))
+                    {
+                        bytes += hex[byte >> 4];
+                        bytes += hex[byte & 15];
+                        ++readable;
+                    }
+                    else
+                    {
+                        bytes += "??";
+                    }
+                }
+            };
+            std::string code_bytes;
+            uint32_t readable_code_bytes = 0;
+            capture_code(code_base, code_window, code_bytes, readable_code_bytes);
+
+            auto& modules = c.win_emu->mod_manager;
+            const auto* rip_module = modules.find_by_address(rip);
+            const auto* main_image = modules.executable;
+            std::vector<fast_fail_caller_code> caller_code;
+            caller_code.reserve(4);
+            for (size_t i = 0; i < stack_words.size() && caller_code.size() < 4; ++i)
+            {
+                const auto address = stack_words[i];
+                if (address < 16)
+                {
+                    continue;
+                }
+                // find_by_address checks the candidate against the module's exact image range.
+                const auto* module = modules.find_by_address(address);
+                if (!module)
+                {
+                    continue;
+                }
+                bool duplicate = false;
+                for (const auto& existing : caller_code)
+                {
+                    duplicate |= existing.return_address == address;
+                }
+                if (duplicate)
+                {
+                    continue;
+                }
+                auto& candidate = caller_code.emplace_back();
+                candidate.stack_word_index = static_cast<uint32_t>(i);
+                candidate.return_address = address;
+                candidate.module_name = module->name;
+                candidate.module_base = module->image_base;
+                candidate.module_rva = address - module->image_base;
+                candidate.code_base = address - 16;
+                capture_code(candidate.code_base, 16, candidate.code_bytes, candidate.readable_code_bytes);
+            }
+
+            // The observed Destiny __report_gsfailure at RVA 0x187d148 saves its
+            // incoming RCX at current RSP+0x40. Interpret that word as a cookie only
+            // for this exact fast-fail site; other int29 paths have different frames.
+            constexpr uint64_t destiny_fail_rva = 0x187d164;
+            constexpr uint64_t destiny_cookie_rva = 0x20a9a88;
+            const bool known_cookie_fail = fail_code == 2 && main_image && main_image->name == "destiny2.exe" &&
+                                           main_image->contains(rip) && rip - main_image->image_base == destiny_fail_rva;
+            const auto cookie_address = known_cookie_fail &&
+                                        main_image->size_of_image >= destiny_cookie_rva + sizeof(uint64_t) &&
+                                        main_image->image_base <= UINT64_MAX - destiny_cookie_rva
+                                            ? main_image->image_base + destiny_cookie_rva
+                                            : 0;
+            uint64_t expected_cookie{};
+            const bool expected_cookie_read = cookie_address != 0 &&
+                                              cpu.try_read_memory(cookie_address, &expected_cookie, sizeof(expected_cookie));
+            const bool supplied_cookie_read = known_cookie_fail && stack_words.size() > 8;
+            const auto supplied_cookie = supplied_cookie_read ? stack_words[8] : 0;
+
+            const std::array<uint64_t, 16> gprs{
+                cpu.reg(x86_register::rax), cpu.reg(x86_register::rbx), cpu.reg(x86_register::rcx),
+                cpu.reg(x86_register::rdx), cpu.reg(x86_register::rsi), cpu.reg(x86_register::rdi),
+                cpu.reg(x86_register::rbp), stack_pointer,
+                cpu.reg(x86_register::r8), cpu.reg(x86_register::r9), cpu.reg(x86_register::r10),
+                cpu.reg(x86_register::r11), cpu.reg(x86_register::r12), cpu.reg(x86_register::r13),
+                cpu.reg(x86_register::r14), cpu.reg(x86_register::r15),
+            };
+            const auto gs_base = cpu.get_segment_base(x86_register::gs);
+            uint64_t teb_self{};
+            uint64_t teb_peb{};
+            const bool teb_self_read = gs_base <= UINT64_MAX - 0x60 &&
+                                       cpu.try_read_memory(gs_base + 0x30, &teb_self, sizeof(teb_self));
+            const bool teb_peb_read = gs_base <= UINT64_MAX - 0x60 &&
+                                      cpu.try_read_memory(gs_base + 0x60, &teb_peb, sizeof(teb_peb));
+            c.emit_observation<fast_fail_event>([&](auto& event) {
+                event.fail_code = fail_code;
+                event.rip_module_name = rip_module ? rip_module->name : "<unmapped>";
+                event.rip_module_base = rip_module ? rip_module->image_base : 0;
+                event.rip_module_rva = rip_module ? rip - rip_module->image_base : 0;
+                event.stack_pointer = stack_pointer;
+                event.stack_words = std::move(stack_words);
+                event.code_base = code_base;
+                event.code_bytes = std::move(code_bytes);
+                event.readable_code_bytes = readable_code_bytes;
+                event.caller_code = std::move(caller_code);
+                event.security_cookie_address = cookie_address;
+                event.expected_security_cookie = expected_cookie;
+                event.expected_security_cookie_read = expected_cookie_read;
+                event.supplied_security_cookie = supplied_cookie;
+                event.supplied_security_cookie_read = supplied_cookie_read;
+                event.security_cookie_mismatch = expected_cookie_read && supplied_cookie_read &&
+                                                 expected_cookie != supplied_cookie;
+                event.gprs = gprs;
+                event.gs_base = gs_base;
+                event.teb_self = teb_self;
+                event.teb_peb = teb_peb;
+                event.teb_self_read = teb_self_read;
+                event.teb_peb_read = teb_peb_read;
+            });
         }
 
         bool is_thread_alive(const analysis_context& c, const uint32_t thread_id)
