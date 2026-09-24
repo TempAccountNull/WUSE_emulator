@@ -669,6 +669,10 @@ impl Mmu {
             let value = self.read::<1>(address, perm::NONE)?;
             self.write(address, value, perm::NONE)?;
             let index = self.get_physical_index(address).ok_or(MemError::Unmapped)?;
+            if permissions & perm::EXEC != 0 && self.physical.get(index).smp_shared {
+                self.physical.get(index).data().smp_code_seen
+                    .store(1, std::sync::atomic::Ordering::Release);
+            }
             self.mapping.overlapping_mut::<_, MemError>(address..=address + page_size - 1,
                 |_, _, entry| {
                     if let Some(MemoryMapping::Physical(mapping)) = entry {
@@ -850,6 +854,12 @@ impl Mmu {
                     tlb.remove_range(start, len);
 
                     if entry.shared_perm != 0 {
+                        if perm & perm::EXEC != 0 {
+                            let page = physical.get(entry.index);
+                            if page.smp_shared {
+                                page.data().smp_code_seen.store(1, std::sync::atomic::Ordering::Release);
+                            }
+                        }
                         entry.shared_perm = perm;
                         return Ok(());
                     }
@@ -879,7 +889,9 @@ impl Mmu {
                         // perm bytes in place so every sharing VM sees the same protection.
                         // Safety: smp_shared pages are never cloned; see Page::data_mut_shared.
                         let data = unsafe { page.data_mut_shared() };
-                        data.perm[offset..offset + len].fill(perm);
+                        for old_perm in &mut data.perm[offset..offset + len] {
+                            *old_perm = perm | (*old_perm & perm::IN_CODE_CACHE);
+                        }
                         data.bump_perm_epoch();
                     } else {
                         page.data_mut().perm[offset..offset + len].fill(perm);
@@ -1779,6 +1791,41 @@ mod smp_code_epoch_contract_tests {
         assert!(mem.ensure_executable(ADDRESS, 1));
         assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), 1);
     }
+
+    #[test]
+    fn executable_shared_alias_tracks_writes_before_first_decode() {
+        const SOURCE: u64 = 0x8000;
+        const ALIAS: u64 = 0xa000;
+        let mut mem = Mmu::default();
+        assert!(mem.map_smp_shared_fresh(SOURCE, perm::READ | perm::WRITE));
+        let shared = mem.share_page(SOURCE).unwrap();
+        shared.smp_code_seen.store(0, Ordering::Release);
+        mem.map_shared(ALIAS, SOURCE, 0x1000, perm::READ | perm::EXEC).unwrap();
+        assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), 1);
+        let before = shared.code_epoch();
+        mem.write(SOURCE + 1, [0x90_u8], perm::WRITE).unwrap();
+        assert_eq!(shared.code_epoch(), before + 1);
+    }
+
+    #[test]
+    fn executable_shared_alias_promotion_tracks_writes_before_first_decode() {
+        const SOURCE: u64 = 0xb000;
+        const ALIAS: u64 = 0xd000;
+        let mut mem = Mmu::default();
+        assert!(mem.map_smp_shared_fresh(SOURCE, perm::READ | perm::WRITE));
+        let shared = mem.share_page(SOURCE).unwrap();
+        mem.map_shared(ALIAS, SOURCE, 0x1000, perm::READ | perm::WRITE).unwrap();
+        shared.smp_code_seen.store(0, Ordering::Release);
+        let index = mem.get_physical_index(SOURCE).unwrap();
+        let mut write_ptr = unsafe { mem.physical.get_mut(index).write_ptr() };
+        unsafe { write_ptr.write(SOURCE + 1, [1_u8], perm::WRITE) }.unwrap();
+        let before = shared.code_epoch();
+        mem.update_perm(ALIAS, 0x1000, perm::READ | perm::EXEC).unwrap();
+        assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), 1);
+        unsafe { write_ptr.write(SOURCE + 2, [2_u8], perm::WRITE) }.unwrap();
+        assert_eq!(shared.code_epoch(), before + 1);
+    }
+
 }
 
 #[cfg(test)]
