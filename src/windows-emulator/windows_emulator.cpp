@@ -1091,6 +1091,7 @@ namespace sogen
         }
 
         const auto activity = this->emu().vcpu_activity();
+        const auto smp_profile = this->emu().smp_profile();
         if (activity.empty())
         {
             return; // backend does not report activity (e.g. WHP) - nothing truthful to publish
@@ -1119,7 +1120,7 @@ namespace sogen
         const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
                                std::chrono::system_clock::now().time_since_epoch())
                                .count();
-        char buf[160];
+        char buf[512];
 
         std::snprintf(buf, sizeof(buf), "\"t\":%lld,\"vcpu_count\":%zu,\"total_instructions\":%llu,\"elapsed_seconds\":%.3f",
                       static_cast<long long>(stamp), activity.size(), static_cast<unsigned long long>(total_instructions),
@@ -1155,6 +1156,42 @@ namespace sogen
         const auto total_mips = elapsed_seconds > 0.0 ? static_cast<double>(total_delta) / (elapsed_seconds * 1000000.0) : 0.0;
         std::snprintf(buf, sizeof(buf), ",\"total_mips\":%.2f", total_mips);
         json += buf;
+
+        if (!smp_profile.empty() && smp_profile.size() == activity.size())
+        {
+            // The first snapshot establishes a baseline; subsequent entries are 1 Hz deltas.
+            if (this->activity_status_prev_smp_profile_.size() != smp_profile.size())
+            {
+                this->activity_status_prev_smp_profile_ = smp_profile;
+            }
+            const auto delta = [](uint64_t current, uint64_t previous) {
+                return current >= previous ? current - previous : uint64_t{0};
+            };
+            json += ",\"smp_profile\":{\"window_seconds\":" + std::to_string(elapsed_seconds) + ",\"vcpus\":[";
+            for (size_t i = 0; i < smp_profile.size(); ++i)
+            {
+                const auto& current = smp_profile[i];
+                const auto& previous = this->activity_status_prev_smp_profile_[i];
+                std::snprintf(buf, sizeof(buf),
+                              "%s{\"i\":%zu,\"map_calls\":%llu,\"map_nanos\":%llu,\"protect_calls\":%llu,"
+                              "\"protect_nanos\":%llu,\"queue_ops\":%llu,\"queue_nanos\":%llu,"
+                              "\"kick_calls\":%llu,\"kick_targets\":%llu,\"kick_nanos\":%llu}",
+                              i == 0 ? "" : ",", i,
+                              static_cast<unsigned long long>(delta(current.map_calls, previous.map_calls)),
+                              static_cast<unsigned long long>(delta(current.map_nanos, previous.map_nanos)),
+                              static_cast<unsigned long long>(delta(current.protect_calls, previous.protect_calls)),
+                              static_cast<unsigned long long>(delta(current.protect_nanos, previous.protect_nanos)),
+                              static_cast<unsigned long long>(delta(current.queue_ops, previous.queue_ops)),
+                              static_cast<unsigned long long>(delta(current.queue_nanos, previous.queue_nanos)),
+                              static_cast<unsigned long long>(delta(current.kick_calls, previous.kick_calls)),
+                              static_cast<unsigned long long>(delta(current.kick_targets, previous.kick_targets)),
+                              static_cast<unsigned long long>(delta(current.kick_nanos, previous.kick_nanos)));
+                json += buf;
+            }
+            json += "]}";
+            this->activity_status_prev_smp_profile_ = smp_profile;
+        }
+
         json += "}";
 
         // Telemetry failure must never alter emulation: swallow everything.

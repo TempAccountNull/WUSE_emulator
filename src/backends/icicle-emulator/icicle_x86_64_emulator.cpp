@@ -210,6 +210,46 @@ namespace sogen::icicle
 
     class icicle_x86_64_emulator;
 
+    // Separate worker-owned counters keep status reads lock-free. Timing is opt-in and
+    // applies only to coarse cross-VM operations, never to guest stores or instructions.
+    struct smp_profile_counters
+    {
+        std::atomic<uint64_t> map_calls{0};
+        std::atomic<uint64_t> map_nanos{0};
+        std::atomic<uint64_t> protect_calls{0};
+        std::atomic<uint64_t> protect_nanos{0};
+        std::atomic<uint64_t> queue_ops{0};
+        std::atomic<uint64_t> queue_nanos{0};
+        std::atomic<uint64_t> kick_calls{0};
+        std::atomic<uint64_t> kick_targets{0};
+        std::atomic<uint64_t> kick_nanos{0};
+    };
+
+    struct smp_profile_timer
+    {
+        explicit smp_profile_timer(std::atomic<uint64_t>* total) : total_(total)
+        {
+            if (this->total_)
+            {
+                this->start_ = std::chrono::steady_clock::now();
+            }
+        }
+
+        ~smp_profile_timer()
+        {
+            if (this->total_)
+            {
+                const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - this->start_).count();
+                this->total_->fetch_add(static_cast<uint64_t>(nanos), std::memory_order_relaxed);
+            }
+        }
+
+      private:
+        std::atomic<uint64_t>* total_{};
+        std::chrono::steady_clock::time_point start_{};
+    };
+
     // One vCPU: register + run state on its own icicle VM handle; memory delegates to the shared
     // machine. Mirrors whp_vcpu so windows-emulator's N-vCPU scheduler can drive N icicle VMs (SMP).
     // The machine (icicle_x86_64_emulator) delegates its own CPU-0 role to vcpus_[0] (see get_cpu).
@@ -404,6 +444,7 @@ namespace sogen::icicle
         // stopping peers.
         std::atomic_uint64_t published_instructions_{0};
         std::atomic_uint64_t published_rip_{0};
+        smp_profile_counters smp_profile_{};
     };
 
     class icicle_x86_64_emulator : public x86_64_emulator, public detail::hook_exception_sink
@@ -578,6 +619,12 @@ namespace sogen::icicle
             // vCPU mutator (inside its own hook, may hold the BEL): allocate on its OWN VM now, capture the
             // shared Arcs on this thread (source-safe), and queue an alias-from-capture for each peer — the
             // peer maps the captured Arcs on its own thread with NO cross-thread read of the source (6.5).
+            auto* profile = this->profile_enabled_ ? &self->smp_profile_ : nullptr;
+            const smp_profile_timer map_timer{profile ? &profile->map_nanos : nullptr};
+            if (profile)
+            {
+                profile->map_calls.fetch_add(1, std::memory_order_relaxed);
+            }
             icicle_emulator* const source = self->handle();
             const fanout_guard fanout{this->ops_in_flight_};
             this->ops_in_flight_.fetch_add(1, std::memory_order_acquire);
@@ -632,6 +679,12 @@ namespace sogen::icicle
                 return ok;
             }
             // vCPU mutator: apply to own VM now (its result represents the coherent shared space), queue peers.
+            auto* profile = this->profile_enabled_ ? &self->smp_profile_ : nullptr;
+            const smp_profile_timer map_timer{profile ? &profile->map_nanos : nullptr};
+            if (profile)
+            {
+                profile->map_calls.fetch_add(1, std::memory_order_relaxed);
+            }
             const bool ok = icicle_map_shared_memory(self->handle(), address, source, size, perm) != 0;
             const uint64_t seq = this->issuer_next(self->index());
             for (auto& v : this->vcpus_)
@@ -900,6 +953,12 @@ namespace sogen::icicle
             // protect over the loader's fresh module). Capture the range's perm epoch at queue
             // time; the peer's apply skips if the epoch changed (a newer map/protect won).
             const auto own = self->index();
+            auto* profile = this->profile_enabled_ ? &self->smp_profile_ : nullptr;
+            const smp_profile_timer protect_timer{profile ? &profile->protect_nanos : nullptr};
+            if (profile)
+            {
+                profile->protect_calls.fetch_add(1, std::memory_order_relaxed);
+            }
             const uint64_t epoch = icicle_perm_epoch_of_range(self->handle(), address, size);
             ice(icicle_protect_memory(self->handle(), address, size, perm), "Failed to apply permissions");
             const uint64_t pseq = this->issuer_next(own);
@@ -1445,6 +1504,32 @@ namespace sogen::icicle
             return out;
         }
 
+        std::vector<smp_profile_snapshot> smp_profile() const override
+        {
+            if (!this->profile_enabled_)
+            {
+                return {};
+            }
+            std::vector<smp_profile_snapshot> out;
+            out.reserve(this->vcpus_.size());
+            for (const auto& vcpu : this->vcpus_)
+            {
+                const auto& p = vcpu->smp_profile_;
+                out.push_back(smp_profile_snapshot{
+                    .map_calls = p.map_calls.load(std::memory_order_relaxed),
+                    .map_nanos = p.map_nanos.load(std::memory_order_relaxed),
+                    .protect_calls = p.protect_calls.load(std::memory_order_relaxed),
+                    .protect_nanos = p.protect_nanos.load(std::memory_order_relaxed),
+                    .queue_ops = p.queue_ops.load(std::memory_order_relaxed),
+                    .queue_nanos = p.queue_nanos.load(std::memory_order_relaxed),
+                    .kick_calls = p.kick_calls.load(std::memory_order_relaxed),
+                    .kick_targets = p.kick_targets.load(std::memory_order_relaxed),
+                    .kick_nanos = p.kick_nanos.load(std::memory_order_relaxed),
+                });
+            }
+            return out;
+        }
+
         bool has_deterministic_instruction_count() const override
         {
             return true; // icicle maintains cpu.icount via fuel accounting even in lean JIT mode
@@ -1504,6 +1589,10 @@ namespace sogen::icicle
 
         icicle_emulator* emu_{};
         std::vector<std::unique_ptr<icicle_vcpu>> vcpus_{};
+        const bool profile_enabled_ = [] {
+            const char* value = std::getenv("SOGEN_SMP_PROFILE");
+            return value && std::strcmp(value, "1") == 0;
+        }();
         uint32_t index_{0};
 
         // icicle_vcpu::start() runs pending hook installs/deletes through the machine (hook machinery is
@@ -1598,6 +1687,9 @@ namespace sogen::icicle
 
         void queue_op(const size_t target, const uint64_t seq, std::function<void(icicle_emulator*)> op)
         {
+            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
+            auto* profile = this->profile_enabled_ && self && &self->machine_ == this ? &self->smp_profile_ : nullptr;
+            const smp_profile_timer queue_timer{profile ? &profile->queue_nanos : nullptr};
             // Push under the mutex FIRST, bump the issued watermark AFTER: smp_op_applied() reads
             // issued then sums the queues under the same mutex, so a watermark bumped before the
             // push could make an un-queued op count as applied (the gate opens early - the 6.7
@@ -1612,6 +1704,10 @@ namespace sogen::icicle
                 this->pending_ops_[target].push_back(pending_op{seq, std::move(op)});
             }
             this->ops_issued_watermark_.fetch_add(1, std::memory_order_acq_rel);
+            if (profile)
+            {
+                profile->queue_ops.fetch_add(1, std::memory_order_relaxed);
+            }
         }
 
         emulator_hook* fresh_hook_handle()
@@ -2128,6 +2224,14 @@ namespace sogen::icicle
         // (peer's last few blocks before the kick lands) is the documented 6.6 TLB-coherency window.
         void kick_peers(const size_t own_index)
         {
+            auto* self = static_cast<icicle_vcpu*>(t_running_vcpu);
+            auto* profile = this->profile_enabled_ && own_index < this->vcpus_.size() &&
+                                    self == this->vcpus_[own_index].get() ? &self->smp_profile_ : nullptr;
+            const smp_profile_timer kick_timer{profile ? &profile->kick_nanos : nullptr};
+            if (profile)
+            {
+                profile->kick_calls.fetch_add(1, std::memory_order_relaxed);
+            }
             std::lock_guard<std::mutex> lock(this->quiesce_mutex_);
             for (auto& v : this->vcpus_)
             {
@@ -2137,6 +2241,10 @@ namespace sogen::icicle
                 }
                 this->quantum_kick_[v->index_] = 1;
                 icicle_stop(v->handle());
+                if (profile)
+                {
+                    profile->kick_targets.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
 

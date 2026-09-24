@@ -118,6 +118,26 @@ namespace sogen
             return {};
         }
 
+        // Advisory cumulative costs recorded by each owning vCPU worker. An empty vector
+        // means that the backend is not profiling this run.
+        struct smp_profile_snapshot
+        {
+            uint64_t map_calls{};
+            uint64_t map_nanos{};
+            uint64_t protect_calls{};
+            uint64_t protect_nanos{};
+            uint64_t queue_ops{};
+            uint64_t queue_nanos{};
+            uint64_t kick_calls{};
+            uint64_t kick_targets{};
+            uint64_t kick_nanos{};
+        };
+
+        virtual std::vector<smp_profile_snapshot> smp_profile() const
+        {
+            return {};
+        }
+
         // SMP diagnostics: human-readable cross-VM queue/vCPU state for a stalled
         // thread-visibility gate (printed by the scheduler's idle loop). Default: empty.
         virtual std::string smp_gate_debug() const

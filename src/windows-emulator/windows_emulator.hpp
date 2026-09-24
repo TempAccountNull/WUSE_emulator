@@ -490,6 +490,7 @@ namespace sogen
         void publish_activity_status();
         std::chrono::steady_clock::time_point activity_status_last_{};
         std::vector<uint64_t> activity_status_prev_instructions_{};
+        std::vector<x86_64_emulator::smp_profile_snapshot> activity_status_prev_smp_profile_{};
 
         // Guest-visible timestamp counter. In relative mode the tick clock is already
         // instruction-driven. In wall-clock mode (forced at N>1 - relative mode's counter is not
