@@ -1866,6 +1866,9 @@ namespace sogen
             }
             lock.lock();
 
+            this->emu().sync_worker_context(vcpu.cpu.index());
+            this->publish_activity_status();
+
             if (!vcpu.switch_thread && !vcpu.cpu.has_violation())
             {
                 break;
