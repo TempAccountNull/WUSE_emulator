@@ -1,7 +1,9 @@
 #include "std_include.hpp"
 #include "windows_emulator.hpp"
 
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 
 #include "cpu_context.hpp"
 
@@ -24,6 +26,65 @@ namespace sogen
 
     namespace
     {
+        bool is_vcruntime_throw_module(const std::string_view name)
+        {
+            constexpr std::string_view prefix = "vcruntime";
+            constexpr std::string_view suffix = ".dll";
+            if (name.size() < prefix.size() + suffix.size())
+            {
+                return false;
+            }
+            for (size_t i = 0; i < name.size(); ++i)
+            {
+                const auto lower = static_cast<char>(std::tolower(static_cast<unsigned char>(name[i])));
+                if (i < prefix.size() && lower != prefix[i])
+                {
+                    return false;
+                }
+                if (i >= name.size() - suffix.size() && lower != suffix[i - (name.size() - suffix.size())])
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool is_d3d11_throw_module(const std::string_view name)
+        {
+            constexpr std::string_view expected = "d3d11.dll";
+            if (name.size() != expected.size())
+            {
+                return false;
+            }
+            for (size_t i = 0; i < name.size(); ++i)
+            {
+                if (static_cast<char>(std::tolower(static_cast<unsigned char>(name[i]))) != expected[i])
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        template <size_t N>
+        uint32_t capture_guest_hex(x86_64_cpu& cpu, const uint64_t address, std::array<char, N>& output)
+        {
+            static_assert(N > 1 && (N - 1) % 2 == 0);
+            constexpr char digits[] = "0123456789abcdef";
+            uint32_t readable = 0;
+            for (size_t i = 0; i < (N - 1) / 2; ++i)
+            {
+                uint8_t byte{};
+                const bool ok = address != 0 && address <= UINT64_MAX - i &&
+                                cpu.try_read_memory(address + i, &byte, sizeof(byte));
+                output[i * 2] = ok ? digits[byte >> 4] : '?';
+                output[i * 2 + 1] = ok ? digits[byte & 15] : '?';
+                readable += ok;
+            }
+            output[N - 1] = '\0';
+            return readable;
+        }
+
         // Register reads and exception construction materialize temporary objects. Keep them out of
         // the instruction observer's common path without weakening its callback or error handling.
         NO_INLINE void capture_callback_return(vcpu_context& vcpu, emulator_thread& thread)
@@ -1508,6 +1569,107 @@ namespace sogen
                 this->install_section_first_execution_hook(mod, i);
             }
         });
+
+        // Exact execution hooks only: no global instruction callback or default hot-path work.
+        // The first few guest C++ throws identify the caller preceding a DXVK/d3d11 terminate.
+        if (const auto* probe = std::getenv("SOGEN_GUEST_CXX_THROW_PROBE"); probe && *probe == '1')
+        {
+            auto samples = std::make_shared<uint32_t>(0);
+            auto hooks = std::make_shared<std::unordered_map<uint64_t, emulator_hook*>>();
+            // The captured x64 DXVK build links the CRT statically. Its matching PDB places
+            // _CxxThrowException at RVA 0x4eeb68; require an explicit RVA plus image/signature
+            // match so other d3d11.dll builds cannot accidentally receive this hook.
+            constexpr uint64_t dxvk_image_size = 0x794000;
+            constexpr std::array<uint8_t, 16> dxvk_throw_entry{
+                0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x74,
+                0x24, 0x20, 0x57, 0x48, 0x83, 0xec, 0x50, 0x48};
+            uint64_t dxvk_throw_rva = 0;
+            if (const auto* rva_text = std::getenv("SOGEN_GUEST_CXX_THROW_RVA"))
+            {
+                char* end = nullptr;
+                const auto parsed = std::strtoull(rva_text, &end, 0);
+                if (end != rva_text && *end == '\0')
+                {
+                    dxvk_throw_rva = parsed;
+                }
+            }
+            this->callbacks.on_module_load.add(
+                [this, samples, hooks, dxvk_throw_rva, dxvk_throw_entry](mapped_module& mod) {
+                if (hooks->contains(mod.image_base))
+                {
+                    return;
+                }
+                uint64_t entry = 0;
+                if (is_vcruntime_throw_module(mod.name))
+                {
+                    entry = mod.find_export("_CxxThrowException");
+                }
+                else if (dxvk_throw_rva && is_d3d11_throw_module(mod.name) &&
+                         mod.size_of_image == dxvk_image_size &&
+                         dxvk_throw_rva <= mod.size_of_image - dxvk_throw_entry.size() &&
+                         mod.image_base <= UINT64_MAX - dxvk_throw_rva)
+                {
+                    const auto candidate = mod.image_base + dxvk_throw_rva;
+                    std::array<uint8_t, dxvk_throw_entry.size()> actual{};
+                    if (this->emu().try_read_memory(candidate, actual.data(), actual.size()) &&
+                        actual == dxvk_throw_entry)
+                    {
+                        entry = candidate;
+                    }
+                }
+                if (!entry || !mod.contains(entry))
+                {
+                    return;
+                }
+                const auto runtime_name = mod.name;
+                auto* hook = this->emu().hook_memory_execution(
+                    entry, [this, samples, runtime_name](cpu_interface& cpu, const uint64_t rip) {
+                        const std::scoped_lock lock(this->kernel_lock_);
+                        if (*samples >= 8)
+                        {
+                            return;
+                        }
+                        const auto sample = ++*samples;
+                        const auto& vcpu = this->vcpu(cpu.index());
+                        auto& acting = vcpu.cpu;
+                        const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                        const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
+                        const auto object = acting.reg<uint64_t>(x86_register::rcx);
+                        const auto throw_info = acting.reg<uint64_t>(x86_register::rdx);
+                        uint64_t return_address{};
+                        const bool return_ok = acting.try_read_memory(rsp, &return_address, sizeof(return_address));
+                        const auto* caller = return_ok ? this->mod_manager.find_by_address(return_address) : nullptr;
+                        const std::string_view caller_name = caller ? std::string_view{caller->name} : "<unmapped>";
+                        const auto caller_rva = caller ? return_address - caller->image_base : 0;
+                        std::array<char, 65> object_hex{};
+                        std::array<char, 33> throw_info_hex{};
+                        const auto object_readable = capture_guest_hex(acting, object, object_hex);
+                        const auto info_readable = capture_guest_hex(acting, throw_info, throw_info_hex);
+                        this->log.error(
+                            "[GUESTCXXTHROW] n=%u tid=%u vcpu=%zu runtime=%.*s rip=%#llx rsp=%#llx object=%#llx "
+                            "throw_info=%#llx caller_ret=%#llx ret_ok=%u caller=%.*s+%#llx "
+                            "object_bytes=%s object_readable=%u throw_info_bytes=%s info_readable=%u\n",
+                            sample, tid, cpu.index(), static_cast<int>(std::min<size_t>(runtime_name.size(), 32)),
+                            runtime_name.c_str(), static_cast<unsigned long long>(rip),
+                            static_cast<unsigned long long>(rsp), static_cast<unsigned long long>(object),
+                            static_cast<unsigned long long>(throw_info),
+                            static_cast<unsigned long long>(return_address), static_cast<unsigned>(return_ok),
+                            static_cast<int>(std::min<size_t>(caller_name.size(), 48)), caller_name.data(),
+                            static_cast<unsigned long long>(caller_rva), object_hex.data(), object_readable,
+                            throw_info_hex.data(), info_readable);
+                    });
+                if (hook)
+                {
+                    hooks->emplace(mod.image_base, hook);
+                }
+            });
+            this->callbacks.on_module_unload.add([this, hooks](mapped_module& mod) {
+                if (auto entry = hooks->extract(mod.image_base); entry && entry.mapped())
+                {
+                    this->emu().delete_hook(entry.mapped());
+                }
+            });
+        }
 
         this->callbacks.on_module_unload.add([this](mapped_module& mod) {
             // LEANDIAG: the loader deregisters a failed DLL from the manager BEFORE the unmap
