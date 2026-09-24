@@ -427,7 +427,8 @@ impl icicle_vm::CodeInjector for InstructionHookInjector {
 
 #[inline]
 fn smp_dbg(msg: &str) {
-    if smp_epoch_mode() != 0 {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var("SOGEN_SMP_DEBUG").as_deref() == Ok("1")) {
         eprintln!("[SMPDBG-R] {msg}");
     }
 }
