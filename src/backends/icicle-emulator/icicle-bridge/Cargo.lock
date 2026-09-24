@@ -467,7 +467,6 @@ dependencies = [
 [[package]]
 name = "icicle-jit"
 version = "0.2.0"
-source = "git+https://github.com/icicle-emu/icicle-emu#3292602fd4857b53ed653dec69398efe4cdb435e"
 dependencies = [
  "cranelift",
  "cranelift-codegen",

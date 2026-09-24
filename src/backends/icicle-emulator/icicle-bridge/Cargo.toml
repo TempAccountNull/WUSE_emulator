@@ -13,6 +13,7 @@ pcode = { git = "https://github.com/icicle-emu/icicle-emu" }
 
 [patch."https://github.com/icicle-emu/icicle-emu"]
 icicle-mem = { path = "vendor/icicle-mem" }
+icicle-jit = { path = "vendor/icicle-jit" }
 
 [patch.crates-io]
 cranelift-jit = { path = "vendor/cranelift-jit" }

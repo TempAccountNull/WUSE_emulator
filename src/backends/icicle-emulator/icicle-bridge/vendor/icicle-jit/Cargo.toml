@@ -1,0 +1,23 @@
+[package]
+name = "icicle-jit"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+doctest = false
+
+[dependencies]
+icicle-cpu = { git = "https://github.com/icicle-emu/icicle-emu" }
+pcode = { git = "https://github.com/icicle-emu/icicle-emu" }
+target-lexicon = "0.13.3"
+tracing = { version = "0.1.40", default-features = false }
+memoffset = "0.9.1"
+cranelift = "0.129.0"
+cranelift-native = "0.129.0"
+cranelift-module = "0.129.0"
+cranelift-jit = "0.129.0"
+cranelift-codegen = { version = "0.129.0", default-features = false, features = ["std"] }
+wasmtime-jit-debug = { version = "34.0.2", features = ["perf_jitdump"] }
+
+[dev-dependencies]
+quickcheck = { version = "1.0.3", default-features = false }
