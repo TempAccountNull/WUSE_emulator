@@ -1030,8 +1030,12 @@ namespace sogen
 
             // Guest code executes with the kernel lock released; hook callbacks
             // (syscalls, exceptions, exec hooks) re-acquire it on VM exit.
+            vcpu.running.store(true, std::memory_order_relaxed);
             lock.unlock();
-            this->start_cpu(vcpu);
+            {
+                const auto clear_running = utils::finally([&vcpu] { vcpu.running.store(false, std::memory_order_relaxed); });
+                this->start_cpu(vcpu);
+            }
             lock.lock();
 
             // SMP: between quanta (kernel lock held, outside any write path) apply every cross-VM
@@ -1778,10 +1782,12 @@ namespace sogen
                 return configured ? std::max(1, atoi(configured)) : 20;
             }();
             interrupt_thread = std::thread([&] {
+                constexpr auto heartbeat_interval = std::chrono::milliseconds(1000);
+                auto last_preemption = std::chrono::steady_clock::now();
                 while (!this->should_stop)
                 {
                     std::unique_lock lock{interrupt_mutex};
-                    interrupt_cond.wait_for(lock, std::chrono::milliseconds(preempt_ms), [&] {
+                    interrupt_cond.wait_for(lock, std::min(std::chrono::milliseconds(preempt_ms), heartbeat_interval), [&] {
                         return this->should_stop.load(); //
                     });
 
@@ -1796,11 +1802,51 @@ namespace sogen
                         // lands either fully before the consume (plain early switch) or fully inside the
                         // running quantum (ordinary preemption), never split across it.
                         const std::scoped_lock kernel_lock(this->kernel_lock_);
+                        uint32_t running_vcpus = 0;
+                        bool running_thread_needs_switch = false;
+                        for (const auto& v : this->vcpus_)
+                        {
+                            if (v->running.load(std::memory_order_relaxed))
+                            {
+                                ++running_vcpus;
+                                running_thread_needs_switch |= v->active_thread && !v->active_thread->is_thread_ready(*this);
+                            }
+                        }
+
+                        uint32_t ready_threads = 0;
+                        for (auto& thread : this->process.threads | std::views::values)
+                        {
+                            ready_threads += thread.is_thread_ready(*this);
+                        }
+
+                        const auto now = std::chrono::steady_clock::now();
+                        if (running_vcpus == 0)
+                        {
+                            last_preemption = now;
+                            continue;
+                        }
+
+                        const bool heartbeat_due = now - last_preemption >= heartbeat_interval;
+                        if (ready_threads <= running_vcpus && !running_thread_needs_switch && !heartbeat_due)
+                        {
+                            continue;
+                        }
+
+                        bool preempted = false;
                         for (uint32_t i = 0; i < this->vcpu_count_; ++i)
                         {
                             auto& v = this->vcpu(i);
+                            if (!v.running.load(std::memory_order_relaxed))
+                            {
+                                continue;
+                            }
                             v.switch_thread = true;
                             v.cpu.stop();
+                            preempted = true;
+                        }
+                        if (preempted)
+                        {
+                            last_preemption = now;
                         }
                     }
                 }
@@ -1859,8 +1905,10 @@ namespace sogen
                 }
             }
 
+            vcpu.running.store(true, std::memory_order_relaxed);
             lock.unlock();
             {
+                const auto clear_running = utils::finally([&vcpu] { vcpu.running.store(false, std::memory_order_relaxed); });
                 const kernel_lock::guest_execution_scope guest_scope(this->kernel_lock_, this->uses_instruction_precision());
                 this->start_cpu(vcpu, count);
             }

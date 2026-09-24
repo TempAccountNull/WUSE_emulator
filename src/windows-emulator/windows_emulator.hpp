@@ -129,6 +129,7 @@ namespace sogen
         x86_64_cpu& cpu;
         emulator_thread* active_thread{};
         std::atomic_bool switch_thread{false};
+        std::atomic_bool running{false};
 
         emulator_thread& thread() const
         {
