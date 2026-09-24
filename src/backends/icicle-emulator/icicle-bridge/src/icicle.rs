@@ -1422,6 +1422,10 @@ impl IcicleEmulator {
             return false;
         }
         let native = map_permissions(permissions);
+        if std::env::var("SOGEN_ICICLE_SMP_BATCH_MAP").ok().as_deref() == Some("1") {
+            let Ok(count) = usize::try_from(length / PAGE) else { return false; };
+            return self.vm.cpu.mem.map_smp_shared_fresh_pages(address, count, native);
+        }
         let mut page = address;
         let end = address + length;
         while page < end {
@@ -1477,6 +1481,9 @@ impl IcicleEmulator {
         const PAGE: u64 = 0x1000;
         if address % PAGE != 0 {
             return false;
+        }
+        if std::env::var("SOGEN_ICICLE_SMP_BATCH_MAP").ok().as_deref() == Some("1") {
+            return self.vm.cpu.mem.map_smp_shared_pages(address, captured);
         }
         let mut page = address;
         for data in captured {

@@ -543,6 +543,69 @@ impl Mmu {
         true
     }
 
+    fn can_map_smp_page_range(&self, address: u64, count: usize) -> bool {
+        let page_size = self.page_size();
+        if address % page_size != 0 {
+            return false;
+        }
+        if count == 0 {
+            return true;
+        }
+        let Some(length) = u64::try_from(count).ok().and_then(|n| n.checked_mul(page_size)) else {
+            return false;
+        };
+        let Some(last) = address.checked_add(length - 1) else { return false; };
+        self.mapping.get_range(address..=last).is_none()
+    }
+
+    /// Map a contiguous captured SMP range with one virtual-map insertion and one TLB clear.
+    /// An overlapping range is rejected before any page is mapped. On allocation failure, retain
+    /// the successfully allocated prefix, as repeated `map_smp_shared` did.
+    pub fn map_smp_shared_pages(&mut self, address: u64, pages: &[std::sync::Arc<PageData>]) -> bool {
+        if !self.can_map_smp_page_range(address, pages.len()) {
+            return false;
+        }
+
+        let page_size = self.page_size();
+        let mut entries = Vec::with_capacity(pages.len());
+        let mut success = true;
+        for (offset, data) in pages.iter().enumerate() {
+            data.bump_perm_epoch();
+            // The checked full-range preflight above proves these addresses cannot overflow.
+            let start = address + offset as u64 * page_size;
+            let last = start + page_size - 1;
+            let Some(index) = self.physical.alloc_shared(std::sync::Arc::clone(data)) else {
+                success = false;
+                break;
+            };
+            let mapping = PhysicalMapping { addr: start, index, shared_perm: 0 };
+            entries.push((start, last, MemoryMapping::Physical(mapping)));
+        }
+
+        if !entries.is_empty() {
+            // Every entry is one page, addresses are increasing, and PhysicalMapping.addr makes
+            // adjacent values unequal. Existing overlaps were checked in the same order as before.
+            assert!(self.mapping.insert_disjoint_batch(&entries));
+            self.mapping_changed = true;
+            self.clear_tlb();
+        }
+        success
+    }
+
+    /// Allocate and map a fresh contiguous SMP range using the same single-splice path.
+    pub fn map_smp_shared_fresh_pages(&mut self, address: u64, count: usize, permissions: u8) -> bool {
+        if count == 0 || !self.can_map_smp_page_range(address, count) {
+            return false;
+        }
+        let mut pages = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut data = PageData::default();
+            data.perm.fill(permissions | perm::MAP | perm::INIT);
+            pages.push(std::sync::Arc::new(data));
+        }
+        self.map_smp_shared_pages(address, &pages)
+    }
+
     /// Create and map a fresh shared page (SMP) with the given internal permission bits. Other vCPUs
     /// map the same page via `share_page` + `map_smp_shared`.
     pub fn map_smp_shared_fresh(&mut self, address: u64, permissions: u8) -> bool {
@@ -1657,6 +1720,138 @@ impl_read_write!(read_u8, write_u8, u8);
 impl_read_write!(read_u16, write_u16, u16);
 impl_read_write!(read_u32, write_u32, u32);
 impl_read_write!(read_u64, write_u64, u64);
+
+#[cfg(test)]
+mod smp_batch_tests {
+    use super::*;
+
+    #[test]
+    fn captured_batch_keeps_noncontiguous_neighbors_and_shares_page_bytes() {
+        let mut source = Mmu::default();
+        let mut peer = Mmu::default();
+        for address in [0x4000, 0x5000, 0x6000] {
+            assert!(source.map_smp_shared_fresh(address, perm::READ | perm::WRITE));
+        }
+        for address in [0x2000, 0x9000] {
+            assert!(peer.map_smp_shared_fresh(address, perm::READ | perm::WRITE));
+        }
+        // Warm an old translation, then replace it via the captured batch.
+        assert!(peer.map_smp_shared_fresh(0x4000, perm::READ | perm::WRITE));
+        peer.write(0x4000, [0x77_u8], perm::WRITE).unwrap();
+        assert_eq!(peer.read_u8(0x4000, perm::READ).unwrap(), 0x77);
+        assert!(peer.unmap_memory_len(0x4000, 0x1000));
+
+        let captured = [0x4000, 0x5000, 0x6000]
+            .map(|address| source.share_page(address).unwrap());
+        assert!(peer.map_smp_shared_pages(0x4000, &captured));
+        assert_eq!(peer.mapping.len(), 5);
+        assert!(std::sync::Arc::ptr_eq(&peer.share_page(0x5000).unwrap(), &captured[1]));
+        assert_eq!(peer.read_u8(0x4000, perm::READ).unwrap(), 0);
+        source.write(0x5001, [0x5a_u8], perm::WRITE).unwrap();
+        assert_eq!(peer.read_u8(0x5001, perm::READ).unwrap(), 0x5a);
+        peer.write(0x6002, [0xa5_u8], perm::WRITE).unwrap();
+        assert_eq!(source.read_u8(0x6002, perm::READ).unwrap(), 0xa5);
+        assert!(peer.share_page(0x2000).is_some());
+        assert!(peer.share_page(0x9000).is_some());
+        assert!(peer.share_page(0x7000).is_none());
+    }
+
+    #[test]
+    fn captured_batch_overlap_preflight_preserves_existing_map() {
+        let mut source = Mmu::default();
+        let mut peer = Mmu::default();
+        for address in [0x4000, 0x5000, 0x6000] {
+            assert!(source.map_smp_shared_fresh(address, perm::READ | perm::WRITE));
+        }
+        assert!(peer.map_smp_shared_fresh(0x5000, perm::READ | perm::WRITE));
+        let existing = peer.share_page(0x5000).unwrap();
+        let captured = [0x4000, 0x5000, 0x6000]
+            .map(|address| source.share_page(address).unwrap());
+
+        assert!(!peer.map_smp_shared_pages(0x4000, &captured));
+        assert!(peer.share_page(0x4000).is_none());
+        assert!(std::sync::Arc::ptr_eq(&peer.share_page(0x5000).unwrap(), &existing));
+        assert!(peer.share_page(0x6000).is_none());
+    }
+
+    #[test]
+    fn captured_batch_capacity_failure_retains_successful_prefix() {
+        let mut source = Mmu::default();
+        let mut peer = Mmu::default();
+        for address in [0x4000, 0x5000, 0x6000] {
+            assert!(source.map_smp_shared_fresh(address, perm::READ | perm::WRITE));
+        }
+        // Two built-in zero pages plus one existing mapping leave only two new slots.
+        assert!(peer.set_capacity(5));
+        assert!(peer.map_smp_shared_fresh(0x9000, perm::READ | perm::WRITE));
+        peer.write(0x9000, [0x51_u8], perm::WRITE).unwrap();
+        assert_eq!(peer.read_u8(0x9000, perm::READ).unwrap(), 0x51);
+        let captured = [0x4000, 0x5000, 0x6000]
+            .map(|address| source.share_page(address).unwrap());
+
+        assert!(!peer.map_smp_shared_pages(0x4000, &captured));
+        assert_eq!(peer.mapping.len(), 3);
+        assert!(std::sync::Arc::ptr_eq(&peer.share_page(0x4000).unwrap(), &captured[0]));
+        assert!(std::sync::Arc::ptr_eq(&peer.share_page(0x5000).unwrap(), &captured[1]));
+        assert!(peer.share_page(0x6000).is_none());
+        assert_eq!(peer.read_u8(0x9000, perm::READ).unwrap(), 0x51);
+        source.write(0x5000, [0xa5_u8], perm::WRITE).unwrap();
+        assert_eq!(peer.read_u8(0x5000, perm::READ).unwrap(), 0xa5);
+    }
+
+    #[test]
+    fn fresh_batch_creates_distinct_shared_pages_between_existing_regions() {
+        let mut source = Mmu::default();
+        assert!(source.map_smp_shared_fresh(0x2000, perm::READ | perm::WRITE));
+        assert!(source.map_smp_shared_fresh(0x9000, perm::READ | perm::WRITE));
+        assert!(source.map_smp_shared_fresh_pages(0x4000, 3, perm::READ | perm::WRITE));
+        assert_eq!(source.mapping.len(), 5);
+        let first = source.share_page(0x4000).unwrap();
+        let second = source.share_page(0x5000).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+        source.write(0x4000, [0x13_u8], perm::WRITE).unwrap();
+        assert_eq!(source.read_u8(0x4000, perm::READ).unwrap(), 0x13);
+        assert_eq!(source.read_u8(0x5000, perm::READ).unwrap(), 0);
+        assert!(!source.map_smp_shared_fresh_pages(0x5000, 2, perm::READ));
+        assert_eq!(source.mapping.len(), 5);
+    }
+
+    #[test]
+    #[ignore = "manual Release microbenchmark; does not assert a machine-dependent speed ratio"]
+    fn captured_batch_middle_insert_benchmark() {
+        use std::time::Instant;
+
+        const EXISTING: u64 = 4096;
+        const CAPTURED: u64 = 2131;
+        const HIGH: u64 = 0x8000_0000;
+        const MIDDLE: u64 = 0x4000_0000;
+        let pages = (0..CAPTURED)
+            .map(|_| std::sync::Arc::new(PageData::default()))
+            .collect::<Vec<_>>();
+        let prepare = || {
+            let mut mem = Mmu::default();
+            for i in 0..EXISTING {
+                assert!(mem.map_smp_shared_fresh(HIGH + i * 0x1000, perm::READ | perm::WRITE));
+            }
+            mem
+        };
+
+        let mut serial = prepare();
+        let started = Instant::now();
+        for (i, page) in pages.iter().enumerate() {
+            assert!(serial.map_smp_shared(MIDDLE + i as u64 * 0x1000, page.clone()));
+        }
+        let serial_time = started.elapsed();
+
+        let mut batch = prepare();
+        let started = Instant::now();
+        assert!(batch.map_smp_shared_pages(MIDDLE, &pages));
+        let batch_time = started.elapsed();
+        assert_eq!(serial.mapping.len(), batch.mapping.len());
+        assert_eq!(batch.mapping.len(), (EXISTING + CAPTURED) as usize);
+        eprintln!("middle insert: existing={EXISTING} captured={CAPTURED} mappings={} serial={serial_time:?} batch={batch_time:?}", batch.mapping.len());
+    }
+}
 
 #[cfg(test)]
 mod watchpoint_tests {

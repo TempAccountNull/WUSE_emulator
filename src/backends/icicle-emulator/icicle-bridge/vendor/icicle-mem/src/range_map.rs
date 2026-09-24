@@ -571,6 +571,42 @@ where
         Ok(())
     }
 
+    /// Insert an ordered batch of nonoverlapping ranges without merging. This is intended for
+    /// physical page mappings: their address is part of the value, so adjacent pages never have
+    /// equal values. Validate before modifying either parallel vector, then shift the suffix once.
+    pub fn insert_disjoint_batch(&mut self, entries: &[(u64, u64, T)]) -> bool {
+        let Some((first_start, _, first_data)) = entries.first() else { return true; };
+        let &(_, last_end, ref last_data) = entries.last().unwrap();
+        if entries.iter().any(|(start, end, _)| start > end)
+            || entries.windows(2).any(|pair| {
+                let (prev_start, prev_end, prev_data) = &pair[0];
+                let (next_start, _, next_data) = &pair[1];
+                prev_start >= next_start || prev_end >= next_start
+                    || (prev_end.checked_add(1) == Some(*next_start) && prev_data == next_data)
+            }) {
+            return false;
+        }
+
+        let at = self.upper_bound(*first_start);
+        if let Some(prev) = at.checked_sub(1) {
+            let (prev_end, prev_data) = &self.data[prev];
+            if *prev_end >= *first_start
+                || (prev_end.checked_add(1) == Some(*first_start) && prev_data == first_data) {
+                return false;
+            }
+        }
+        if let Some(&next_start) = self.starts.get(at) {
+            if next_start <= last_end
+                || (last_end.checked_add(1) == Some(next_start)
+                    && &self.data[at].1 == last_data) {
+                return false;
+            }
+        }
+        self.starts.splice(at..at, entries.iter().map(|(start, _, _)| *start));
+        self.data.splice(at..at, entries.iter().map(|(_, end, data)| (*end, data.clone())));
+        true
+    }
+
     /// Removes the last overlapping entry in the mapping that overlap with `range`
     ///
     /// Returns the range removed any data associated with the removed range.
@@ -1105,4 +1141,34 @@ fn remove_range_all_complex() {
     let mut map = init_map();
     map.remove_all(0x2000..0x3000);
     assert_eq!(map.iter().collect::<Vec<_>>(), vec![(0x1000, 0x1fff, &1), (0x4000, 0x4fff, &3)]);
+}
+
+#[test]
+fn disjoint_batch_matches_single_inserts_and_rejects_overlap_without_mutation() {
+    let mut batch = RangeMap::new();
+    let mut single = RangeMap::new();
+    for map in [&mut batch, &mut single] {
+        map.insert(0x1000..=0x1fff, 1_u64).unwrap();
+        map.insert(0x8000..=0x8fff, 8).unwrap();
+        map.insert(0x12000..=0x12fff, 18).unwrap();
+    }
+    let entries = [
+        (0x2000, 0x2fff, 2),
+        (0x3000, 0x3fff, 3),
+        (0x5000, 0x5fff, 5),
+    ];
+    assert!(batch.insert_disjoint_batch(&entries));
+    for &(start, end, value) in &entries {
+        single.insert(start..=end, value).unwrap();
+    }
+    assert_eq!(batch.iter().collect::<Vec<_>>(), single.iter().collect::<Vec<_>>());
+    for address in [0x1000, 0x2000, 0x3fff, 0x4000, 0x5000, 0x8fff, 0x12000] {
+        assert_eq!(batch.get(address), single.get(address));
+    }
+
+    let before = batch.iter().map(|(start, end, value)| (start, end, *value)).collect::<Vec<_>>();
+    assert!(!batch.insert_disjoint_batch(&[(0x9000, 0x9fff, 9), (0x12000, 0x12fff, 19)]));
+    assert!(!batch.insert_disjoint_batch(&[(0xb000, 0xbfff, 11), (0xa000, 0xafff, 10)]));
+    assert!(!batch.insert_disjoint_batch(&[(0xa000, 0xafff, 10), (0xb000, 0xbfff, 10)]));
+    assert_eq!(batch.iter().map(|(start, end, value)| (start, end, *value)).collect::<Vec<_>>(), before);
 }
