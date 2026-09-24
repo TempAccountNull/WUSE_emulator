@@ -7,6 +7,7 @@
 #include <utils/io.hpp>
 #include <fstream>
 #include <utils/finally.hpp>
+#include <cstdlib>
 
 namespace sogen
 {
@@ -769,6 +770,7 @@ namespace sogen
             // failing DLL is never registered in mod_manager (init never completed), so at
             // unmap time read the PE image's OWN export-directory name straight from the
             // still-mapped bytes at base_address - the one moment it is guaranteed nameable.
+            if (const auto* debug = std::getenv("SOGEN_LEANDIAG_UNMAP"); debug && *debug == '1')
             {
                 const auto name_image_at = [&c](const uint64_t base) -> const char* {
                     thread_local std::string image_name{};
