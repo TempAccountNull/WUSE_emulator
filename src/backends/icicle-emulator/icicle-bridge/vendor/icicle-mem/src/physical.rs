@@ -251,10 +251,11 @@ impl Page {
         // Make executable mappings visible to the direct-store JIT before
         // any decoder read. The opt-out retains all-shared epoch tracking.
         if !smp_code_epoch_only_enabled()
-            || data.perm.iter().any(|permission| permission & perm::EXEC != 0)
+            || data.any_perm_bit(0, PAGE_SIZE, perm::EXEC)
         {
             data.smp_code_seen.store(1, Ordering::Release);
         }
+        data.smp_shared.store(1, Ordering::Release);
         Self {
             data: UnsafeCell::new(data),
             modified: false,
@@ -428,6 +429,9 @@ pub struct PageData {
     /// vCPU threads; cloned pages snapshot the current value.
     pub code_epoch: AtomicU64,
 
+    /// Shared permission bytes are accessed exclusively as aligned AtomicU64 words.
+    pub smp_shared: AtomicU8,
+
     /// Sticky shared-code marker read by the JIT's direct-store epoch path.
     pub smp_code_seen: AtomicU8,
 
@@ -438,10 +442,14 @@ pub struct PageData {
     pub perm_epoch: AtomicU64,
 }
 
+const _: () = assert!(std::mem::offset_of!(PageData, data) == 0);
+const _: () = assert!(std::mem::offset_of!(PageData, perm) % std::mem::align_of::<AtomicU64>() == 0);
+const _: () = assert!(std::mem::align_of::<PageData>() >= std::mem::align_of::<AtomicU64>());
+
 impl Default for PageData {
     fn default() -> Self {
         Self { data: PageBytes::default(), perm: [0; PAGE_SIZE], code_epoch: AtomicU64::new(0),
-               smp_code_seen: AtomicU8::new(0), perm_epoch: AtomicU64::new(0) }
+               smp_shared: AtomicU8::new(0), smp_code_seen: AtomicU8::new(0), perm_epoch: AtomicU64::new(0) }
     }
 }
 
@@ -449,8 +457,17 @@ impl Clone for PageData {
     fn clone(&self) -> Self {
         Self {
             data: self.data.clone(),
-            perm: self.perm,
+            perm: if self.smp_shared.load(Ordering::Acquire) != 0 {
+                let mut snapshot = [0; PAGE_SIZE];
+                for (index, bytes) in snapshot.chunks_exact_mut(8).enumerate() {
+                    bytes.copy_from_slice(&self.shared_perm_word(index).load(Ordering::Acquire).to_ne_bytes());
+                }
+                snapshot
+            } else {
+                self.perm
+            },
             code_epoch: AtomicU64::new(self.code_epoch.load(Ordering::Relaxed)),
+            smp_shared: AtomicU8::new(0),
             smp_code_seen: AtomicU8::new(0),
             perm_epoch: AtomicU64::new(self.perm_epoch.load(Ordering::Relaxed)),
         }
@@ -458,6 +475,89 @@ impl Clone for PageData {
 }
 
 impl PageData {
+    #[inline(always)]
+    fn shared_perm_word(&self, word: usize) -> &AtomicU64 {
+        // Keep PageData's byte-array ABI, but use the same aligned 64-bit atomic access width as
+        // the JIT. No shared-page reader or writer may access an overlapping permission byte with
+        // another width. The static assertions above guarantee the overlay's alignment.
+        debug_assert!(word < PAGE_SIZE / 8);
+        unsafe { AtomicU64::from_ptr(self.perm.as_ptr().add(word * 8) as *mut u64) }
+    }
+
+    #[inline(always)]
+    fn load_shared_perm_byte(&self, offset: usize) -> u8 {
+        debug_assert!(offset < PAGE_SIZE);
+        self.shared_perm_word(offset / 8).load(Ordering::Acquire).to_ne_bytes()[offset % 8]
+    }
+
+    fn update_shared_perm_range(&self, offset: usize, len: usize, update: impl Fn(u8) -> u8) {
+        assert!(self.smp_shared.load(Ordering::Acquire) != 0);
+        assert!(offset.checked_add(len).is_some_and(|end| end <= PAGE_SIZE));
+        let end = offset + len;
+        let mut word = offset / 8;
+        while word * 8 < end {
+            let start_byte = offset.saturating_sub(word * 8);
+            let end_byte = (end - word * 8).min(8);
+            let _ = self.shared_perm_word(word).fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |old| {
+                    let mut bytes = old.to_ne_bytes();
+                    for byte in &mut bytes[start_byte..end_byte] {
+                        *byte = update(*byte);
+                    }
+                    Some(u64::from_ne_bytes(bytes))
+                },
+            );
+            word += 1;
+        }
+    }
+
+    #[inline(always)]
+    pub fn load_perm(&self, offset: usize) -> u8 {
+        if self.smp_shared.load(Ordering::Acquire) != 0 {
+            self.load_shared_perm_byte(offset)
+        } else {
+            self.perm[offset]
+        }
+    }
+
+    pub fn any_perm_bit(&self, offset: usize, len: usize, bit: u8) -> bool {
+        assert!(offset.checked_add(len).is_some_and(|end| end <= PAGE_SIZE));
+        if self.smp_shared.load(Ordering::Acquire) != 0 {
+            let end = offset + len;
+            let mut cursor = offset;
+            while cursor < end {
+                let bytes = self.shared_perm_word(cursor / 8).load(Ordering::Acquire).to_ne_bytes();
+                let first = cursor % 8;
+                let count = (8 - first).min(end - cursor);
+                if bytes[first..first + count].iter().any(|value| value & bit != 0) {
+                    return true;
+                }
+                cursor += count;
+            }
+            false
+        } else {
+            self.perm[offset..offset + len].iter().any(|value| value & bit != 0)
+        }
+    }
+
+    pub fn set_shared_perm_preserving_cache(&self, offset: usize, len: usize, permissions: u8) {
+        self.update_shared_perm_range(offset, len, |old| {
+            permissions | (old & perm::IN_CODE_CACHE)
+        });
+    }
+
+    pub fn add_shared_perm_bits(&self, offset: usize, len: usize, bits: u8) {
+        self.update_shared_perm_range(offset, len, |old| old | bits);
+    }
+
+    pub fn clear_shared_uninitialized_exec(&self, offset: usize, len: usize) {
+        self.update_shared_perm_range(offset, len, |old| {
+            if old & perm::INIT == 0 { old & !perm::EXEC } else { old }
+        });
+    }
+
     /// The vendored JIT calls this only with SOGEN_SMP_EXEC_WRITE_WAKE=1.
     /// This narrow source patch restores epoch tracking, not peer wake linkage.
     /// Fail visibly if that separate opt-in is requested without its bridge.
@@ -499,7 +599,13 @@ impl PageData {
     pub fn as_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(2 * PAGE_SIZE);
         bytes.extend_from_slice(&self.data[..]);
-        bytes.extend_from_slice(&self.perm[..PAGE_SIZE]);
+        if self.smp_shared.load(Ordering::Acquire) != 0 {
+            for word in 0..PAGE_SIZE / 8 {
+                bytes.extend_from_slice(&self.shared_perm_word(word).load(Ordering::Acquire).to_ne_bytes());
+            }
+        } else {
+            bytes.extend_from_slice(&self.perm[..PAGE_SIZE]);
+        }
         bytes
     }
 
@@ -511,8 +617,14 @@ impl PageData {
     #[inline(always)]
     pub unsafe fn get_perm_unchecked(&self, offset: usize, len: usize) -> u8 {
         let mut check = perm::ALL;
-        for i in 0..len {
-            check &= *self.perm.as_ptr().add(offset + i);
+        if self.smp_shared.load(Ordering::Acquire) != 0 {
+            for i in 0..len {
+                check &= self.load_shared_perm_byte(offset + i);
+            }
+        } else {
+            for i in 0..len {
+                check &= *self.perm.as_ptr().add(offset + i);
+            }
         }
         check
     }
@@ -533,6 +645,11 @@ impl PageData {
     /// The range `offset .. offset + len` must be entirely in-bounds
     #[inline]
     pub unsafe fn add_perm_unchecked(&mut self, offset: usize, len: usize, perm: u8) {
+        if self.smp_shared.load(Ordering::Acquire) != 0 {
+            self.add_shared_perm_bits(offset, len, perm);
+            return;
+        }
+
         #[cold]
         #[inline(never)]
         unsafe fn slow(data: &mut PageData, offset: usize, len: usize, perm: u8) {
@@ -597,10 +714,17 @@ impl PageData {
         let offset = PageData::offset(addr);
         // Safety: `offset..offset + N` is always in-bounds.
         unsafe {
-            perm::check_bytes::<N>(
-                self.perm.get_unchecked(offset..offset + N).try_into().unwrap(),
-                perm | perm::MAP,
-            )?;
+            if self.smp_shared.load(Ordering::Acquire) != 0 {
+                let permissions = std::array::from_fn(|i| {
+                    self.load_shared_perm_byte(offset + i)
+                });
+                perm::check_bytes::<N>(permissions, perm | perm::MAP)?;
+            } else {
+                perm::check_bytes::<N>(
+                    self.perm.get_unchecked(offset..offset + N).try_into().unwrap(),
+                    perm | perm::MAP,
+                )?;
+            }
             buf.copy_from_slice(self.data.get_unchecked(offset..offset + N));
         }
         Ok(buf)
@@ -618,10 +742,17 @@ impl PageData {
         let offset = PageData::offset(addr);
         // Safety: `offset..offset + N` is always in-bounds.
         unsafe {
-            perm::check_bytes::<N>(
-                self.perm.get_unchecked(offset..offset + N).try_into().unwrap(),
-                perm | perm::MAP,
-            )?;
+            if self.smp_shared.load(Ordering::Acquire) != 0 {
+                let permissions = std::array::from_fn(|i| {
+                    self.load_shared_perm_byte(offset + i)
+                });
+                perm::check_bytes::<N>(permissions, perm | perm::MAP)?;
+            } else {
+                perm::check_bytes::<N>(
+                    self.perm.get_unchecked(offset..offset + N).try_into().unwrap(),
+                    perm | perm::MAP,
+                )?;
+            }
             self.add_perm_unchecked(offset, N, perm::INIT);
             self.data.get_unchecked_mut(offset..offset + N).copy_from_slice(&value);
         }

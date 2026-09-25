@@ -887,11 +887,8 @@ impl Mmu {
                         // subsequent peer writes; the N>1 probe's WritePerm fault on ntdll .data
                         // traces to this). Protection is a property of the shared page: apply the
                         // perm bytes in place so every sharing VM sees the same protection.
-                        // Safety: smp_shared pages are never cloned; see Page::data_mut_shared.
-                        let data = unsafe { page.data_mut_shared() };
-                        for old_perm in &mut data.perm[offset..offset + len] {
-                            *old_perm = perm | (*old_perm & perm::IN_CODE_CACHE);
-                        }
+                        let data = page.data();
+                        data.set_shared_perm_preserving_cache(offset, len, perm);
                         data.bump_perm_epoch();
                     } else {
                         page.data_mut().perm[offset..offset + len].fill(perm);
@@ -1108,7 +1105,7 @@ impl Mmu {
                 }
                 let page = self.physical.get(entry.index).data();
                 let (offset, _) = PageData::offset_and_len(addr, addr + 1);
-                page.perm[offset]
+                page.load_perm(offset)
             }
             MemoryMapping::Unallocated(metadata) => metadata.perm,
             MemoryMapping::Io(_) => {
@@ -1136,8 +1133,7 @@ impl Mmu {
                     // Check whether the code is actually executable.
                     let offset = PageData::offset(start);
                     let len = len as usize;
-                    let perm =
-                        unsafe { page.write_ptr().ptr.as_mut().get_perm_unchecked(offset, len) };
+                    let perm = unsafe { page.data().get_perm_unchecked(offset, len) };
                     perm::check(if mapping.shared_perm != 0 { mapping.shared_perm } else { perm },
                         perm::INIT | perm::EXEC)?;
 
@@ -1151,13 +1147,17 @@ impl Mmu {
                     // Prevent writes to the region we are executing (we don't currently support
                     // self modifying code).
                     if self.detect_self_modifying_code {
-                        unsafe {
-                            page.write_ptr().ptr.as_mut().add_perm_unchecked(
-                                offset,
-                                len,
-                                perm::IN_CODE_CACHE,
-                            );
-                        };
+                        if page.smp_shared {
+                            page.data().add_shared_perm_bits(offset, len, perm::IN_CODE_CACHE);
+                        } else {
+                            unsafe {
+                                page.write_ptr().ptr.as_mut().add_perm_unchecked(
+                                    offset,
+                                    len,
+                                    perm::IN_CODE_CACHE,
+                                );
+                            }
+                        }
                     }
 
                     if mapping.shared_perm != 0 { tlb.clear_write(); }
@@ -1183,12 +1183,7 @@ impl Mmu {
                     let page = physical.get_mut(entry.index);
                     if page.smp_shared {
                         // SMP: in-place (a clone would privatize this VM's view of a shared page).
-                        // Safety: smp_shared pages are never cloned; see Page::data_mut_shared.
-                        unsafe { page.data_mut_shared() }.perm[offset..offset + len].iter_mut().for_each(|p| {
-                            if *p & perm::INIT == 0 {
-                                *p &= !perm::EXEC;
-                            }
-                        });
+                        page.data().clear_shared_uninitialized_exec(offset, len);
                     } else {
                         page.data_mut().perm[offset..offset + len].iter_mut().for_each(|p| {
                             if *p & perm::INIT == 0 {
@@ -1273,7 +1268,13 @@ impl Mmu {
                     let (old_page, new_page) = physical.get_pair_mut(existing.index, index);
                     let (old, new) = (old_page.data(), new_page.data_mut());
                     new.data[offset..offset + len].copy_from_slice(&old.data[offset..offset + len]);
-                    new.perm[offset..offset + len].copy_from_slice(&old.perm[offset..offset + len]);
+                    if old_page.smp_shared {
+                        for (i, destination) in new.perm[offset..offset + len].iter_mut().enumerate() {
+                            *destination = old.load_perm(offset + i);
+                        }
+                    } else {
+                        new.perm[offset..offset + len].copy_from_slice(&old.perm[offset..offset + len]);
+                    }
 
                     *entry = Some(MemoryMapping::Physical(new_mapping));
                     return Ok(());
@@ -1431,9 +1432,7 @@ impl Mmu {
             // by ANY VM's lifter), bump the page's cross-VM code epoch. Peers validate the epoch per
             // block execution and flush their stale translation. This is the path GUEST stores take
             // (including cached TLB write pointers on re-entry), which host-side fan-out cannot see.
-            let was_cached = shared.perm[PageData::offset(addr)..PageData::offset(addr) + N]
-                .iter()
-                .any(|p| p & perm::IN_CODE_CACHE != 0);
+            let was_cached = shared.any_perm_bit(PageData::offset(addr), N, perm::IN_CODE_CACHE);
             shared.write(addr, value, perm)?;
             if was_cached
                 || shared.smp_code_seen.load(std::sync::atomic::Ordering::Acquire) != 0
@@ -1707,7 +1706,7 @@ fn smp_private_code_epoch_enabled() -> bool {
 fn check_self_modifying_memset(page: &PageData, start: u64, len: u64, value: u8) -> MemResult<()> {
     let offset = PageData::offset(start);
     for i in offset..offset + len as usize {
-        if page.perm[i] & perm::IN_CODE_CACHE != 0 && page.data[i] != value {
+        if page.load_perm(i) & perm::IN_CODE_CACHE != 0 && page.data[i] != value {
             let addr = start + (i - offset) as u64;
             tracing::error!("Self modifying code detected at {addr:#x}. Currently unsupported.");
             return Err(MemError::SelfModifyingCode);
@@ -1719,10 +1718,8 @@ fn check_self_modifying_memset(page: &PageData, start: u64, len: u64, value: u8)
 #[cold]
 fn check_self_modifying_write(page: &PageData, addr: u64, value: &[u8]) -> MemResult<()> {
     let offset = PageData::offset(addr);
-    for (i, ((old, perm), new)) in
-        page.data[offset..].iter().zip(&page.perm[offset..]).zip(value).enumerate()
-    {
-        if perm & perm::IN_CODE_CACHE != 0 && *old != *new {
+    for (i, (old, new)) in page.data[offset..].iter().zip(value).enumerate() {
+        if page.load_perm(offset + i) & perm::IN_CODE_CACHE != 0 && *old != *new {
             tracing::error!(
                 "Self modifying code detected at {:#x}. Currently unsupported.",
                 addr + i as u64
@@ -2142,5 +2139,106 @@ mod watchpoint_tests {
         assert_eq!(observed[0].address, 0x1000);
         assert_eq!(observed[0].value, external);
         assert_eq!(observed[0].after, Some(external.to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod smp_atomic_perm_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn shared_permission_word_edges_preserve_neighbors() {
+        const BASE: u8 = perm::READ | perm::MAP | perm::INIT;
+        let mut page = PageData::default();
+        page.perm.fill(BASE);
+        let shared = Arc::new(page);
+        shared.smp_shared.store(1, Ordering::Release);
+
+        // The JIT can issue same-page accesses that are unaligned to eight or sixteen bytes.
+        // Exercise every possible valid length at the first, word, and last-page boundaries.
+        for offset in [0, 1, 7, 8, 0xff0, 0xfff] {
+            for len in [1, 2, 4, 8, 16] {
+                if offset + len > physical::PAGE_SIZE {
+                    continue;
+                }
+                shared.set_shared_perm_preserving_cache(offset, len, BASE | perm::WRITE);
+                for i in 0..physical::PAGE_SIZE {
+                    let expected = if (offset..offset + len).contains(&i) {
+                        BASE | perm::WRITE
+                    } else {
+                        BASE
+                    };
+                    assert_eq!(shared.load_perm(i), expected, "offset={offset:#x} len={len} i={i:#x}");
+                }
+                shared.set_shared_perm_preserving_cache(offset, len, BASE);
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_code_cache_marking_survives_shared_protection() {
+        const BASE: u8 = perm::READ | perm::MAP | perm::INIT;
+        let mut page = PageData::default();
+        page.perm.fill(BASE);
+        let shared = Arc::new(page);
+        shared.smp_shared.store(1, Ordering::Release);
+
+        std::thread::scope(|scope| {
+            let marker = Arc::clone(&shared);
+            scope.spawn(move || {
+                for _ in 0..512 {
+                    marker.add_shared_perm_bits(7, 16, perm::IN_CODE_CACHE);
+                }
+            });
+            let protector = Arc::clone(&shared);
+            scope.spawn(move || {
+                for i in 0..512 {
+                    protector.set_shared_perm_preserving_cache(
+                        0,
+                        physical::PAGE_SIZE,
+                        BASE | if i & 1 == 0 { perm::WRITE } else { 0 },
+                    );
+                }
+            });
+        });
+        for i in 0..physical::PAGE_SIZE {
+            let expected_cache = (7..23).contains(&i);
+            assert_eq!(shared.load_perm(i) & perm::IN_CODE_CACHE != 0, expected_cache, "i={i:#x}");
+        }
+    }
+
+    #[test]
+    fn concurrent_shared_protect_keeps_permission_reads_valid() {
+        const ADDRESS: u64 = 0x4000;
+        const BASE: u8 = perm::READ | perm::MAP | perm::INIT;
+        let mut page = PageData::default();
+        page.perm.fill(BASE | perm::WRITE);
+        let shared = Arc::new(page);
+        shared.smp_shared.store(1, Ordering::Release);
+        let done = Arc::new(AtomicBool::new(false));
+
+        std::thread::scope(|scope| {
+            let writer = Arc::clone(&shared);
+            let done_writer = Arc::clone(&done);
+            scope.spawn(move || {
+                for i in 0..256 {
+                    let permissions = BASE | if i & 1 == 0 { perm::WRITE } else { 0 };
+                    writer.set_shared_perm_preserving_cache(0, physical::PAGE_SIZE, permissions);
+                }
+                done_writer.store(true, Ordering::Release);
+            });
+            let reader = Arc::clone(&shared);
+            scope.spawn(move || {
+                while !done.load(Ordering::Acquire) {
+                    let permissions = reader.load_perm(0);
+                    assert_eq!(permissions & !perm::WRITE, BASE);
+                    assert_eq!(unsafe { reader.get_perm_unchecked(0, 1) } & !perm::WRITE, BASE);
+                    assert_eq!(reader.read::<1>(ADDRESS, perm::READ).unwrap(), [0]);
+                }
+            });
+        });
+        assert_eq!(shared.load_perm(0) & !perm::WRITE, BASE);
     }
 }

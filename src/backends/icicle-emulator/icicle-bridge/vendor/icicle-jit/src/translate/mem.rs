@@ -1,7 +1,7 @@
 //! Module for interacting with memory inside of the JIT.
 
 use cranelift::prelude::{
-    Block, InstBuilder, IntCC, MemFlags, StackSlotData, StackSlotKind::ExplicitSlot, Type, Value,
+    Block, InstBuilder, IntCC, MemFlags, StackSlotData, StackSlotKind::ExplicitSlot, Value,
     types,
 };
 use cranelift_codegen::ir::{AliasRegion, AtomicRmwOp, BlockArg, Endianness};
@@ -145,54 +145,54 @@ fn tlb_lookup_const(
 /// Generate code for checking that the permissons associated with the value at `host_addr`
 /// satisfies `perm`.
 fn check_perm(trans: &mut Translator, host_addr: Value, size: u8, perm: u8, invalid_perm: Block) {
-    let perm_offset: i32 = offset_of!(PageData, perm).try_into().unwrap();
+    // PageData keeps its byte-array layout for the TLB, but SMP permission updates use aligned
+    // AtomicU64 words. The JIT must use the identical atomic width even for one-byte accesses:
+    // an I8/I16/I32/I128 load overlapping an AtomicU64 store is a data race.
+    let perm_addr = trans.builder.ins().iadd_imm(host_addr, offset_of!(PageData, perm) as i64);
+    let word_addr = trans.builder.ins().band_imm(perm_addr, -8);
+    let byte_offset = trans.builder.ins().band_imm(perm_addr, 7);
+    let shift = trans.builder.ins().ishl_imm(byte_offset, 3);
 
-    let ty = sized_int(size);
-    let value = trans.builder.ins().load(
-        ty,
-        MemFlags::trusted().with_alias_region(Some(AliasRegion::Heap)),
-        host_addr,
-        perm_offset,
-    );
+    let mut bytes = [0_u8; 8];
+    bytes[..usize::from(size.min(8))].fill(perm);
+    let required = trans.builder.ins().iconst(types::I64, i64::from_le_bytes(bytes));
+    let first_mask = trans.builder.ins().ishl(required, shift);
+    check_atomic_perm_word(trans, word_addr, first_mask, invalid_perm);
 
-    // Duplicate `perm` to cover all bytes that we need to check
-    let perm = splat_const(trans, perm, ty);
+    if size == 16 {
+        // A 16-byte unaligned access can touch three words. The middle word is always full.
+        let second_addr = trans.builder.ins().iadd_imm(word_addr, 8);
+        check_atomic_perm_word(trans, second_addr, required, invalid_perm);
+    }
 
-    // Check if the all the bits in `perm` are set for this address.
-    //
-    // Note we avoid an extra comparison (which is particularly bad for large values) by using the
-    // identity:
-    //
-    // `a & b == b => b & !a == 0`
-    let value = trans.builder.ins().band_not(perm, value);
-    trans.branch_non_zero(value, invalid_perm);
+    let extra_word = trans.builder.create_block();
+    let done = trans.builder.create_block();
+    let needs_extra = if size == 16 {
+        trans.builder.ins().icmp_imm(IntCC::NotEqual, byte_offset, 0)
+    } else {
+        let end_byte = trans.builder.ins().iadd_imm(byte_offset, size as i64);
+        trans.builder.ins().icmp_imm(IntCC::UnsignedGreaterThan, end_byte, 8)
+    };
+    trans.builder.ins().brif(needs_extra, extra_word, &[], done, &[]);
 
-    // TODO: Use the following code if Cranelift adds the same optimization internally.
-    //
-    // let value = trans.builder.ins().band(value, perm);
-    // let cond = trans.builder.ins().icmp(IntCC::Equal, value, perm);
-    // trans.branch_zero(cond, invalid_perm);
+    trans.builder.switch_to_block(extra_word);
+    trans.builder.seal_block(extra_word);
+    // This branch is reached only when check_same_page proved the whole access is within the
+    // page. Never speculatively load the next word at the end of the 4 KiB permission array.
+    let extra_addr = trans.builder.ins().iadd_imm(word_addr, if size == 16 { 16 } else { 8 });
+    let inverse_shift = trans.builder.ins().irsub_imm(shift, 64);
+    let extra_mask = trans.builder.ins().ushr(required, inverse_shift);
+    check_atomic_perm_word(trans, extra_addr, extra_mask, invalid_perm);
+    trans.builder.ins().jump(done, &[]);
+
+    trans.builder.switch_to_block(done);
+    trans.builder.seal_block(done);
 }
 
-/// Create a constant of `ty` that consists of `value` repeated for every byte.
-fn splat_const(trans: &mut Translator, value: u8, ty: Type) -> Value {
-    let mut tmp = [0; 8];
-    for i in 0..ty.bytes().min(8) {
-        tmp[i as usize] = value;
-    }
-    let expanded = i64::from_le_bytes(tmp);
-
-    match ty {
-        types::I8 | types::I16 | types::I32 | types::I64 => {
-            trans.builder.ins().iconst(ty, expanded)
-        }
-        types::I128 => {
-            let lo = trans.builder.ins().iconst(types::I64, expanded);
-            let hi = trans.builder.ins().iconst(types::I64, expanded);
-            trans.builder.ins().iconcat(lo, hi)
-        }
-        _ => unreachable!(),
-    }
+fn check_atomic_perm_word(trans: &mut Translator, addr: Value, required: Value, invalid_perm: Block) {
+    let present = trans.builder.ins().atomic_load(types::I64, MemFlags::trusted(), addr);
+    let missing = trans.builder.ins().band_not(required, present);
+    trans.branch_non_zero(missing, invalid_perm);
 }
 
 fn load_host(trans: &mut Translator, addr: Value, size: u8) -> Value {
