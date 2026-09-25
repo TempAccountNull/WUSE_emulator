@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <kernel_lock.hpp>
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 namespace sogen::test
@@ -169,5 +170,88 @@ namespace sogen::test
         }
         EXPECT_FALSE(lock.is_held_by_current_thread());
         EXPECT_EQ(lock.profile().acquisitions, expected_acquisitions + (kernel_lock::profiling_enabled() ? 1U : 0U));
+    }
+
+    TEST(KernelExecutionScope, AttributionReportsActiveOwnerWithoutTakingLock)
+    {
+        if (!kernel_lock::attribution_enabled())
+        {
+            GTEST_SKIP() << "Run with SOGEN_LOCK_ATTRIBUTION=1";
+        }
+
+        kernel_lock lock;
+        std::atomic<bool> ready{};
+        std::atomic<bool> release{};
+        std::thread holder([&] {
+            const kernel_lock::attribution_scope site("test_holder", 7);
+            const std::scoped_lock physical_lock(lock);
+            ready.store(true, std::memory_order_release);
+            while (!release.load(std::memory_order_acquire))
+            {
+                std::this_thread::yield();
+            }
+        });
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!ready.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+        {
+            std::this_thread::yield();
+        }
+        if (ready.load(std::memory_order_acquire))
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+            const auto owner = lock.current_owner();
+            EXPECT_TRUE(owner);
+            if (owner)
+            {
+                EXPECT_STREQ(owner.site, "test_holder");
+                EXPECT_EQ(owner.detail, 7U);
+                EXPECT_GE(owner.held_nanos, 1'000'000U);
+            }
+            EXPECT_FALSE(lock.try_lock());
+        }
+        release.store(true, std::memory_order_release);
+        holder.join();
+        EXPECT_TRUE(ready);
+        EXPECT_FALSE(lock.current_owner());
+    }
+
+    TEST(KernelExecutionScope, BorrowedCallbackKeepsPhysicalOwnerAttribution)
+    {
+        if (!kernel_lock::attribution_enabled())
+        {
+            GTEST_SKIP() << "Run with SOGEN_LOCK_ATTRIBUTION=1";
+        }
+
+        kernel_lock lock;
+        {
+            const kernel_lock::attribution_scope outer("test_quantum", 3);
+            const kernel_lock::guest_execution_scope quantum(lock, true);
+            const auto physical_owner = lock.current_owner();
+            EXPECT_TRUE(physical_owner);
+            {
+                const kernel_lock::attribution_scope inner("test_callback", 4);
+                const std::scoped_lock callback(lock);
+                const auto borrowed_owner = lock.current_owner();
+                EXPECT_EQ(borrowed_owner.generation, physical_owner.generation);
+                EXPECT_EQ(borrowed_owner.site, physical_owner.site);
+                EXPECT_EQ(borrowed_owner.detail, physical_owner.detail);
+            }
+        }
+        EXPECT_FALSE(lock.current_owner());
+
+        // The nested callback site must not leak into a later physical acquisition.
+        kernel_lock second_lock;
+        {
+            const kernel_lock::attribution_scope next("test_next", 9);
+            const std::scoped_lock next_owner(second_lock);
+            const auto owner = second_lock.current_owner();
+            EXPECT_TRUE(owner);
+            if (owner)
+            {
+                EXPECT_STREQ(owner.site, "test_next");
+                EXPECT_EQ(owner.detail, 9U);
+            }
+        }
     }
 }

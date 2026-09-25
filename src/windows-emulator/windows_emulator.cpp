@@ -1124,6 +1124,7 @@ namespace sogen
 
     void windows_emulator::vcpu_worker(vcpu_context& vcpu)
     {
+        const kernel_lock::attribution_scope lock_site("vcpu_worker", vcpu.cpu.index());
         this->emu().set_scheduler_worker_context(vcpu.cpu.index(), true);
         const auto clear_scheduler_worker = utils::finally([this, &vcpu] {
             this->emu().set_scheduler_worker_context(vcpu.cpu.index(), false);
@@ -1776,6 +1777,7 @@ namespace sogen
         });
 
         this->emu().hook_instruction(x86_hookable_instructions::syscall, [&](cpu_interface& cpu, uint64_t) {
+            const kernel_lock::attribution_scope lock_site("syscall", cpu.index());
             const std::scoped_lock lock(this->kernel_lock_);
             auto& vcpu = this->vcpu(cpu.index());
             const scoped_dispatch dispatch(*this, vcpu);
@@ -1784,6 +1786,7 @@ namespace sogen
         });
 
         this->emu().hook_instruction(x86_hookable_instructions::rdtscp, [&](cpu_interface& cpu, uint64_t) {
+            const kernel_lock::attribution_scope lock_site("rdtscp", cpu.index());
             const std::scoped_lock lock(this->kernel_lock_);
             auto& vcpu = this->vcpu(cpu.index());
             const scoped_dispatch dispatch(*this, vcpu);
@@ -1802,6 +1805,7 @@ namespace sogen
         });
 
         this->emu().hook_instruction(x86_hookable_instructions::rdtsc, [&](cpu_interface& cpu, uint64_t) {
+            const kernel_lock::attribution_scope lock_site("rdtsc", cpu.index());
             const std::scoped_lock lock(this->kernel_lock_);
             auto& vcpu = this->vcpu(cpu.index());
             const scoped_dispatch dispatch(*this, vcpu);
@@ -1817,6 +1821,7 @@ namespace sogen
 
         // TODO: Unicorn needs this - This should be handled in the backend
         this->emu().hook_instruction(x86_hookable_instructions::invalid, [&](cpu_interface& cpu, uint64_t) {
+            const kernel_lock::attribution_scope lock_site("invalid_instruction", cpu.index());
             const std::scoped_lock lock(this->kernel_lock_);
             // TODO: Unify icicle & unicorn handling
             dispatch_illegal_instruction_violation(*this, this->vcpu(cpu.index()));
@@ -1941,6 +1946,7 @@ namespace sogen
 
         this->emu().hook_memory_violation([&](cpu_interface& cpu, const uint64_t address, const size_t size,
                                               const memory_operation operation, const memory_violation_type type) {
+            const kernel_lock::attribution_scope lock_site("memory_violation", cpu.index());
             const std::scoped_lock lock(this->kernel_lock_);
             auto& vcpu = this->vcpu(cpu.index());
             const scoped_dispatch dispatch(*this, vcpu);
@@ -2028,6 +2034,7 @@ namespace sogen
         std::mutex interrupt_mutex{};
         std::condition_variable interrupt_cond{};
         std::thread interrupt_thread{};
+        std::thread lock_owner_monitor{};
         std::vector<std::thread> workers{};
         std::atomic<uint32_t> active_workers{0};
 
@@ -2056,7 +2063,33 @@ namespace sogen
             {
                 interrupt_thread.join();
             }
+
+            if (lock_owner_monitor.joinable())
+            {
+                lock_owner_monitor.join();
+            }
         });
+
+        if (kernel_lock::attribution_enabled())
+        {
+            lock_owner_monitor = std::thread([this] {
+                uint64_t last_reported_generation = 0;
+                while (!this->should_stop)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    const auto owner = this->kernel_lock_.current_owner();
+                    if (owner && owner.held_nanos >= 2'000'000'000ULL && owner.generation != last_reported_generation)
+                    {
+                        last_reported_generation = owner.generation;
+                        std::fprintf(stderr, "[KERNELLOCKOWNER] site=%s detail=%llu host_thread=%llu held_ms=%llu generation=%llu\n",
+                                     owner.site, static_cast<unsigned long long>(owner.detail),
+                                     static_cast<unsigned long long>(owner.host_thread),
+                                     static_cast<unsigned long long>(owner.held_nanos / 1'000'000ULL),
+                                     static_cast<unsigned long long>(owner.generation));
+                    }
+                }
+            });
+        }
 
         if (!this->uses_instruction_precision() && this->emu().is_stop_thread_safe())
         {
@@ -2069,6 +2102,7 @@ namespace sogen
                 return configured ? std::max(1, atoi(configured)) : 20;
             }();
             interrupt_thread = std::thread([&] {
+                const kernel_lock::attribution_scope lock_site("preemption_timer");
                 constexpr auto heartbeat_interval = std::chrono::milliseconds(1000);
                 auto last_preemption = std::chrono::steady_clock::now();
                 while (!this->should_stop)
@@ -2181,6 +2215,7 @@ namespace sogen
 
         auto& vcpu = this->vcpu(0);
 
+        const kernel_lock::attribution_scope lock_site("main_vcpu", vcpu.cpu.index());
         std::unique_lock lock(this->kernel_lock_);
 
         while (!this->should_stop)
