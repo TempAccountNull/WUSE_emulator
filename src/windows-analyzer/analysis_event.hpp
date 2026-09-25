@@ -211,6 +211,13 @@ namespace sogen
 
     struct memory_violation_event : observation_event
     {
+        struct private_execute_memory_row
+        {
+            uint64_t address{};
+            std::string bytes_hex{};
+            uint32_t readable_bytes{};
+        };
+
         uint64_t address{};
         uint64_t size{};
         std::string operation{};
@@ -223,6 +230,8 @@ namespace sogen
         fault_stack_snapshot stack_slot{};
         bool near_null_execute{};
         std::string capture_error{};
+        std::optional<size_t> private_execute_vcpu{};
+        std::vector<private_execute_memory_row> private_execute_memory{};
     };
 
     struct io_control_event : observation_event

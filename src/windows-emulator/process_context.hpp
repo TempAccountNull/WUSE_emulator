@@ -14,6 +14,7 @@
 #include "kusd_mmio.hpp"
 #include "windows_objects.hpp"
 #include "emulator_thread.hpp"
+#include "thread_handle_journal.hpp"
 #include "port.hpp"
 #include "user_handle_table.hpp"
 
@@ -594,6 +595,7 @@ namespace sogen
         static constexpr uint32_t process_id = 4;
         uint32_t spawned_thread_count{0};
         handle_store<handle_types::thread, emulator_thread> threads{};
+        thread_handle_journal thread_handle_events{};
 
         // Handles delivered with the most recent ALPC reply message (NtAlpcSendWaitReceivePort). rpcrt4's
         // system-handle import retrieves them via NtAlpcQueryInformationMessage(AlpcMessageHandleInformation)

@@ -635,8 +635,16 @@ namespace sogen
             {
                 if (t.id == id.UniqueThread)
                 {
-                    ++t.ref_count;
-                    thread_handle.write(c.proc.threads.make_handle(h_val));
+                    const auto h = c.proc.threads.make_handle(h_val);
+                    const auto refs_before = t.ref_count++;
+                    c.proc.thread_handle_events.record({.action = thread_handle_journal::operation::open,
+                                                        .value = h,
+                                                        .target_tid = t.id,
+                                                        .caller_tid = c.thread().id,
+                                                        .caller_rip = c.emu.reg(x86_register::rip),
+                                                        .refs_before = refs_before,
+                                                        .refs_after = t.ref_count});
+                    thread_handle.write(h);
                     return STATUS_SUCCESS;
                 }
             }

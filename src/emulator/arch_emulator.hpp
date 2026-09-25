@@ -97,11 +97,16 @@ namespace sogen
 
         // A scheduler worker owns its VM while doing host work with the kernel lock held.
         // Paused external callers use this marker to exclude that parked VM access.
-        virtual void set_scheduler_vm_parked(size_t /*vcpu_index*/, bool /*active*/) {}
+        virtual void set_scheduler_vm_parked(size_t /*vcpu_index*/, bool /*active*/)
+        {
+        }
 
         // Nonblocking parked-gate probe for reacquiring it while the kernel lock is held.
         // Backends without a parked gate succeed immediately.
-        virtual bool try_set_scheduler_vm_parked(size_t /*vcpu_index*/) { return true; }
+        virtual bool try_set_scheduler_vm_parked(size_t /*vcpu_index*/)
+        {
+            return true;
+        }
 
         // SMP: watermark of cross-VM ops issued to peer queues, and whether every op issued up
         // to `mark` has been applied (per-target FIFO). Lets host code gate a transition on its
@@ -136,16 +141,83 @@ namespace sogen
         {
             uint64_t map_calls{};
             uint64_t map_nanos{};
+            uint64_t peer_map_calls{};
+            uint64_t peer_map_pages{};
+            uint64_t peer_map_nanos{};
+            uint64_t peer_map_max_nanos{};
             uint64_t protect_calls{};
             uint64_t protect_nanos{};
             uint64_t queue_ops{};
             uint64_t queue_nanos{};
+            // Target-vCPU counters include work issued by external loader threads.
+            uint64_t invalidate_queued{};
+            uint64_t invalidate_queue_nanos{};
+            uint64_t invalidate_applied{};
+            uint64_t invalidate_no_change{};
+            uint64_t invalidate_apply_nanos{};
+            uint64_t invalidate_adjacent_same_pages{};
             uint64_t kick_calls{};
             uint64_t kick_targets{};
             uint64_t kick_nanos{};
+            bool exec_write_wake_enabled{};
+            uint64_t exec_write_wake_events_total{};
+            uint64_t exec_write_guest_jit_total{};
+            uint64_t exec_write_guest_mmu_total{};
+            uint64_t exec_write_host_total{};
+            uint64_t exec_write_owner_flushes_total{};
+            uint64_t exec_write_filtered_noncode_total{};
+            uint64_t exec_write_notified_overlap_total{};
+            uint64_t exec_write_notified_concurrent_total{};
+            bool invalidation_profile_enabled{};
+            uint64_t epoch_mismatches_total{};
+            uint64_t jit_resets_total{};
+            uint64_t jit_reset_epoch_total{};
+            uint64_t jit_reset_wake_total{};
+            uint64_t jit_reset_manual_total{};
+            uint64_t jit_reset_mixed_total{};
+            uint64_t jit_reset_unknown_total{};
+            uint64_t manual_origin_resets_total{};
+            uint64_t manual_peer_protection_total{};
+            uint64_t manual_public_invalidate_total{};
+            uint64_t manual_self_modifying_total{};
+            uint64_t manual_host_cache_total{};
+            uint64_t manual_unmap_total{};
+            uint64_t manual_protect_total{};
+            uint64_t manual_host_write_total{};
+            uint64_t manual_multiple_origins_total{};
+            uint64_t manual_unknown_origin_total{};
         };
 
         virtual std::vector<smp_profile_snapshot> smp_profile() const
+        {
+            return {};
+        }
+
+        struct jit_profile_snapshot
+        {
+            uint64_t compile_calls{};
+            uint64_t compile_nanos{};
+            uint64_t reset_calls{};
+            uint64_t recompile_calls{};
+            uint64_t recompile_nanos{};
+            uint64_t recompile_compile_calls{};
+            uint64_t recompile_compile_nanos{};
+            uint64_t reset_generation{};
+            uint64_t reset_cause_flags{};
+            uint64_t reset_manual_origin_flags{};
+            uint64_t flush_code_nanos{};
+            uint64_t jit_reset_nanos{};
+            uint64_t generation_compile_calls{};
+            uint64_t generation_compile_nanos{};
+            uint64_t origin_first_address_compiles{};
+            uint64_t origin_repeat_after_reset_compiles{};
+            uint64_t origin_repeat_in_generation_compiles{};
+            uint64_t origin_periodic_recompile_compiles{};
+            uint64_t origin_unclassified_compiles{};
+            uint64_t origin_generation_number{};
+        };
+
+        virtual std::vector<jit_profile_snapshot> jit_profile() const
         {
             return {};
         }

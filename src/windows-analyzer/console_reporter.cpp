@@ -245,6 +245,20 @@ namespace sogen
                                                  value.error.empty() ? "" : " | ", value.error.c_str());
                             };
                             instruction("CPU IP", e.actual_instruction);
+                            if (e.private_execute_vcpu)
+                            {
+                                const auto& region = *e.actual_instruction.location.region;
+                                this->log_.print(color::red,
+                                                 "  Private execute memory: tid=%u vcpu=%zu rip=0x%" PRIx64 " allocation=0x%" PRIx64
+                                                 " size=0x%" PRIx64 " region=0x%" PRIx64 " permissions=%s\n",
+                                                 e.execution.thread_id, *e.private_execute_vcpu, e.actual_instruction.location.address,
+                                                 region.allocation_base, region.allocation_length, region.start,
+                                                 region.permissions.c_str());
+                                for (const auto& row : e.private_execute_memory)
+                                {
+                                    this->log_.print(color::cyan, "    0x%" PRIx64 ": %s\n", row.address, row.bytes_hex.c_str());
+                                }
+                            }
                             if (e.last_tracked_instruction)
                             {
                                 instruction("Last tracked (fault CS)", *e.last_tracked_instruction);

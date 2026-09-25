@@ -855,6 +855,7 @@ namespace sogen
         }
 
         buffer.read(this->threads);
+        this->thread_handle_events.clear();
         this->thread_handles_by_id.clear();
         for (const auto& [index, thread] : this->threads)
         {
@@ -1271,6 +1272,11 @@ namespace sogen
         emulator_thread t{memory, *this, start_address, argument, stack_size, create_flags, thread_id, initial_thread};
         auto [h, thr] = this->threads.store_and_get(std::move(t));
         this->thread_handles_by_id[thr->id] = h;
+        this->thread_handle_events.record({.action = thread_handle_journal::operation::create,
+                                           .value = h,
+                                           .target_tid = thr->id,
+                                           .detail = argument,
+                                           .refs_after = thr->ref_count});
 
         // The desktop window is created during process setup, before any thread exists, so it has no owning
         // thread. GetWindowThreadProcessId(GetDesktopWindow()) must return a real thread id (DirectSound, for
@@ -1292,6 +1298,13 @@ namespace sogen
     void process_context::terminate_thread(emulator_thread& thread, const NTSTATUS thread_exit_status)
     {
         thread.exit_status = thread_exit_status;
+        this->thread_handle_events.record({.action = thread_handle_journal::operation::terminate,
+                                           .value = this->threads.find_handle(thread),
+                                           .target_tid = thread.id,
+                                           .caller_tid = thread.id,
+                                           .detail = static_cast<uint32_t>(thread_exit_status),
+                                           .refs_before = thread.ref_count,
+                                           .refs_after = thread.ref_count});
 
         for (auto& mutant : this->mutants | std::views::values)
         {

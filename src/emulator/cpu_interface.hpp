@@ -14,6 +14,7 @@ namespace sogen
 
         // Identity of this virtual CPU within its machine, in [0, vcpu_count).
         virtual size_t index() const = 0;
+        virtual bool has_guest_cpu_context() const { return true; }
 
         struct descriptor_table_register
         {

@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::{cell::UnsafeCell, ptr::NonNull, sync::Arc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::{cell::UnsafeCell, ptr::NonNull, sync::{Arc, OnceLock}};
 
 use crate::{MemError, MemResult, perm};
 
@@ -219,6 +219,8 @@ pub struct Page {
     /// writes go straight through to it (no copy-on-write), so all vCPUs observe one coherent page.
     /// Coherency of the shared bytes is the host CPU's (MESI), as on real hardware.
     pub smp_shared: bool,
+    pub smp_mapping_epoch: u64,
+    pub smp_mapping_generation: u64,
 }
 
 impl Clone for Page {
@@ -230,6 +232,8 @@ impl Clone for Page {
             modified: self.modified,
             executed: self.executed,
             smp_shared: false, // a clone is an independent copy, not part of the shared set
+            smp_mapping_epoch: 0,
+            smp_mapping_generation: 0,
         }
     }
 }
@@ -242,26 +246,30 @@ impl Page {
             copy_on_write: false,
             executed: false,
             smp_shared: false,
+            smp_mapping_epoch: 0,
+            smp_mapping_generation: 0,
         }
     }
 
     /// A page that shares an existing `Arc<PageData>` backing with other MMUs (SMP). Writes go
     /// through to the shared bytes; see `Mmu::map_smp_shared`.
     pub(crate) fn from_shared(data: Arc<PageData>) -> Self {
-        // Make executable mappings visible to the direct-store JIT before
-        // any decoder read. The opt-out retains all-shared epoch tracking.
+        static NEXT_MAPPING_GENERATION: AtomicU64 = AtomicU64::new(1);
         if !smp_code_epoch_only_enabled()
             || data.any_perm_bit(0, PAGE_SIZE, perm::EXEC)
         {
             data.smp_code_seen.store(1, Ordering::Release);
         }
         data.smp_shared.store(1, Ordering::Release);
+        let smp_mapping_epoch = data.code_epoch();
         Self {
             data: UnsafeCell::new(data),
             modified: false,
             copy_on_write: false,
             executed: false,
             smp_shared: true,
+            smp_mapping_epoch,
+            smp_mapping_generation: NEXT_MAPPING_GENERATION.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -308,6 +316,8 @@ impl Page {
         self.copy_on_write = false;
         self.executed = false;
         self.smp_shared = false;
+        self.smp_mapping_epoch = 0;
+        self.smp_mapping_generation = 0;
     }
 
     #[inline(always)]
@@ -414,6 +424,107 @@ impl std::ops::DerefMut for PageBytes {
     }
 }
 
+/// Setup-only linkage shared by the VMs mapping one guest address space. The page only owns
+/// atomic control flags; no pointer into a live VM is borrowed by a writer.
+pub enum ExecWriteWakeSource {
+    GuestJit,
+    GuestMmu,
+    Host,
+}
+
+pub struct ExecWriteWake {
+    peers: Vec<(Arc<AtomicBool>, Arc<AtomicBool>)>,
+    running_vms: AtomicU64,
+    guest_jit_writes: AtomicU64,
+    guest_mmu_writes: AtomicU64,
+    host_writes: AtomicU64,
+    filtered_noncode: AtomicU64,
+    notified_overlap: AtomicU64,
+    notified_concurrent: AtomicU64,
+}
+
+pub struct ExecWriteRunGuard(Arc<ExecWriteWake>);
+
+impl Drop for ExecWriteRunGuard {
+    fn drop(&mut self) {
+        self.0.leave_vm();
+    }
+}
+
+impl ExecWriteWake {
+    pub fn new(peers: Vec<(Arc<AtomicBool>, Arc<AtomicBool>)>) -> Self {
+        Self {
+            peers,
+            running_vms: AtomicU64::new(0),
+            guest_jit_writes: AtomicU64::new(0),
+            guest_mmu_writes: AtomicU64::new(0),
+            host_writes: AtomicU64::new(0),
+            filtered_noncode: AtomicU64::new(0),
+            notified_overlap: AtomicU64::new(0),
+            notified_concurrent: AtomicU64::new(0),
+        }
+    }
+
+    pub fn write_counts(&self) -> (u64, u64, u64) {
+        (
+            self.guest_jit_writes.load(Ordering::Relaxed),
+            self.guest_mmu_writes.load(Ordering::Relaxed),
+            self.host_writes.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn filter_counts(&self) -> (u64, u64, u64) {
+        (
+            self.filtered_noncode.load(Ordering::Relaxed),
+            self.notified_overlap.load(Ordering::Relaxed),
+            self.notified_concurrent.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn enter_vm(&self) {
+        self.running_vms.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn run_guard(self: &Arc<Self>) -> ExecWriteRunGuard {
+        self.enter_vm();
+        ExecWriteRunGuard(Arc::clone(self))
+    }
+
+    pub fn leave_vm(&self) {
+        self.running_vms.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub fn running_vms(&self) -> u64 {
+        self.running_vms.load(Ordering::SeqCst)
+    }
+
+    pub fn record_filtered_noncode(&self) {
+        self.filtered_noncode.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_notified_overlap(&self) {
+        self.notified_overlap.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_notified_concurrent(&self) {
+        self.notified_concurrent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn notify(&self, source: ExecWriteWakeSource) {
+        match source {
+            ExecWriteWakeSource::GuestJit => { self.guest_jit_writes.fetch_add(1, Ordering::Relaxed); }
+            ExecWriteWakeSource::GuestMmu => { self.guest_mmu_writes.fetch_add(1, Ordering::Relaxed); }
+            ExecWriteWakeSource::Host => { self.host_writes.fetch_add(1, Ordering::Relaxed); }
+        }
+        for (pending, interrupt) in &self.peers {
+            if !pending.swap(true, Ordering::AcqRel) {
+                interrupt.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
 #[repr(C)]
 pub struct PageData {
     /// The actual data stored in this page.
@@ -429,17 +540,21 @@ pub struct PageData {
     /// vCPU threads; cloned pages snapshot the current value.
     pub code_epoch: AtomicU64,
 
-    /// Shared permission bytes are accessed exclusively as aligned AtomicU64 words.
-    pub smp_shared: AtomicU8,
+    pub smp_shared: std::sync::atomic::AtomicU8,
 
-    /// Sticky shared-code marker read by the JIT's direct-store epoch path.
-    pub smp_code_seen: AtomicU8,
+    pub smp_code_seen: std::sync::atomic::AtomicU8,
+
+    /// Sticky once any VM has lifted code from this shared page. Unlike smp_code_seen this
+    /// stays zero for merely executable (or all-shared-mode data) pages.
+    pub smp_translated: std::sync::atomic::AtomicU8,
+    exec_write_wake: OnceLock<Arc<ExecWriteWake>>,
 
     /// SMP 6.6c'': bumped whenever this page's perms are re-established (map / update_perm).
     /// A DEFERRED cross-VM protect captures the epoch at queue time and skips applying if the
     /// page was re-perm'd since (a stale protect over a freed-and-remapped range must not land
     /// over the newer mapping's perms - the probe's 'Failed to write memory').
     pub perm_epoch: AtomicU64,
+    exec_code_slots: [AtomicU64; 4],
 }
 
 const _: () = assert!(std::mem::offset_of!(PageData, data) == 0);
@@ -448,8 +563,7 @@ const _: () = assert!(std::mem::align_of::<PageData>() >= std::mem::align_of::<A
 
 impl Default for PageData {
     fn default() -> Self {
-        Self { data: PageBytes::default(), perm: [0; PAGE_SIZE], code_epoch: AtomicU64::new(0),
-               smp_shared: AtomicU8::new(0), smp_code_seen: AtomicU8::new(0), perm_epoch: AtomicU64::new(0) }
+        Self { data: PageBytes::default(), perm: [0; PAGE_SIZE], code_epoch: AtomicU64::new(0), smp_shared: std::sync::atomic::AtomicU8::new(0), smp_code_seen: std::sync::atomic::AtomicU8::new(0), smp_translated: std::sync::atomic::AtomicU8::new(0), exec_write_wake: OnceLock::new(), perm_epoch: AtomicU64::new(0), exec_code_slots: std::array::from_fn(|_| AtomicU64::new(0)) }
     }
 }
 
@@ -467,9 +581,12 @@ impl Clone for PageData {
                 self.perm
             },
             code_epoch: AtomicU64::new(self.code_epoch.load(Ordering::Relaxed)),
-            smp_shared: AtomicU8::new(0),
-            smp_code_seen: AtomicU8::new(0),
+            smp_shared: std::sync::atomic::AtomicU8::new(0),
+            smp_code_seen: std::sync::atomic::AtomicU8::new(0),
+            smp_translated: std::sync::atomic::AtomicU8::new(0),
+            exec_write_wake: OnceLock::new(),
             perm_epoch: AtomicU64::new(self.perm_epoch.load(Ordering::Relaxed)),
+            exec_code_slots: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -558,11 +675,73 @@ impl PageData {
         });
     }
 
-    /// The vendored JIT calls this only with SOGEN_SMP_EXEC_WRITE_WAKE=1.
-    /// This narrow source patch restores epoch tracking, not peer wake linkage.
-    /// Fail visibly if that separate opt-in is requested without its bridge.
-    pub fn notify_exec_write_jit(&self, _addr: u64, _len: usize) {
-        panic!("SOGEN_SMP_EXEC_WRITE_WAKE requires the full peer-wake bridge");
+    pub fn mark_exec_code_slots(&self, addr: u64, len: usize) {
+        if self.exec_write_wake.get().is_none() || len == 0 {
+            return;
+        }
+        let offset = Self::offset(addr);
+        assert!(len <= PAGE_SIZE - offset);
+        let first = offset / 16;
+        let last = (offset + len - 1) / 16;
+        for slot in first..=last {
+            self.exec_code_slots[slot / 64].fetch_or(1_u64 << (slot % 64), Ordering::SeqCst);
+        }
+    }
+
+    pub fn overlaps_exec_code_slots(&self, addr: u64, len: usize) -> bool {
+        let offset = Self::offset(addr);
+        if len == 0 || len > PAGE_SIZE - offset {
+            return true;
+        }
+        let first = offset / 16;
+        let last = (offset + len - 1) / 16;
+        (first..=last).any(|slot| {
+            self.exec_code_slots[slot / 64].load(Ordering::SeqCst) & (1_u64 << (slot % 64)) != 0
+        })
+    }
+
+    pub fn notify_exec_write_jit(
+        &self,
+        addr: u64,
+        len: usize,
+    ) {
+        self.notify_exec_write_guest(addr, len, ExecWriteWakeSource::GuestJit);
+    }
+
+    pub fn notify_exec_write_guest(&self, addr: u64, len: usize, source: ExecWriteWakeSource) {
+        let Some(wake) = self.exec_write_wake.get() else { return };
+        let running = wake.running_vms();
+        if running == 0 && self.smp_translated.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        if running == 1 {
+            if self.smp_translated.load(Ordering::Acquire) != 0
+                && !self.overlaps_exec_code_slots(addr, len)
+            {
+                wake.record_filtered_noncode();
+                return;
+            }
+            wake.record_notified_overlap();
+        } else {
+            wake.record_notified_concurrent();
+        }
+        wake.notify(source);
+    }
+    /// Link once before guest execution; every alias of this Arc observes the same notifier.
+    pub fn attach_exec_write_wake(&self, wake: &Arc<ExecWriteWake>) -> bool {
+        match self.exec_write_wake.set(Arc::clone(wake)) {
+            Ok(()) => true,
+            Err(_) => self.exec_write_wake.get().is_some_and(|existing| Arc::ptr_eq(existing, wake)),
+        }
+    }
+
+    #[inline]
+    pub fn notify_exec_write(&self, source: ExecWriteWakeSource) {
+        if self.smp_translated.load(Ordering::Acquire) != 0 {
+            if let Some(wake) = self.exec_write_wake.get() {
+                wake.notify(source);
+            }
+        }
     }
 
     /// SMP 6.6a: bump the cross-VM code epoch for this page.
@@ -799,6 +978,11 @@ impl PageRef {
         page.write::<N>(addr, value, perm)?;
         if page.smp_code_seen.load(Ordering::Acquire) != 0 {
             page.bump_code_epoch();
+            if perm & perm::WRITE != 0 {
+                page.notify_exec_write_guest(addr, N, ExecWriteWakeSource::GuestMmu);
+            } else {
+                page.notify_exec_write(ExecWriteWakeSource::Host);
+            }
         }
         Ok(())
     }

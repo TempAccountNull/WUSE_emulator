@@ -2,7 +2,7 @@ mod debug;
 pub mod runtime;
 mod translate;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use smallvec::SmallVec;
 
 use codegen::ir::Endianness;
@@ -63,6 +63,60 @@ impl<'a> CompilationTarget<'a> {
 
 const FAST_LOOKUP_TABLE_SIZE: usize = 0x10000;
 
+// Only cold compilation touches this opt-in probe. The cap keeps a long guest run
+// from turning a diagnostic into an unbounded second code cache.
+const COMPILE_ORIGIN_ADDRESS_LIMIT: usize = 524_288;
+
+#[derive(Default)]
+pub struct CompileOriginProfile {
+    enabled: bool,
+    ever: HashSet<u64>,
+    generation: HashSet<u64>,
+    pub first_address_compiles: u64,
+    pub repeat_after_reset_compiles: u64,
+    pub repeat_in_generation_compiles: u64,
+    pub periodic_recompile_compiles: u64,
+    pub unclassified_compiles: u64,
+    pub generation_number: u64,
+}
+
+impl CompileOriginProfile {
+    fn record(&mut self, address: Option<u64>, periodic: bool) {
+        if !self.enabled {
+            return;
+        }
+        if periodic {
+            self.periodic_recompile_compiles += 1;
+            return;
+        }
+        let Some(address) = address else {
+            self.unclassified_compiles += 1;
+            return;
+        };
+        if self.generation.contains(&address) {
+            self.repeat_in_generation_compiles += 1;
+        } else if self.generation.len() >= COMPILE_ORIGIN_ADDRESS_LIMIT {
+            self.unclassified_compiles += 1;
+        } else if self.ever.contains(&address) {
+            self.generation.insert(address);
+            self.repeat_after_reset_compiles += 1;
+        } else if self.ever.len() < COMPILE_ORIGIN_ADDRESS_LIMIT {
+            self.ever.insert(address);
+            self.generation.insert(address);
+            self.first_address_compiles += 1;
+        } else {
+            self.unclassified_compiles += 1;
+        }
+    }
+
+    fn reset_generation(&mut self) {
+        if self.enabled {
+            self.generation.clear();
+            self.generation_number += 1;
+        }
+    }
+}
+
 pub struct JIT {
     /// The endianness of the guest architecture
     endianness: Endianness,
@@ -98,6 +152,8 @@ pub struct JIT {
     pub profile_compile_nanos: u64,
     pub profile_reset_calls: u64,
     generated_code_bytes: u64,
+    pub compile_origin: CompileOriginProfile,
+    pub compile_origin_recompile_active: bool,
 
     /// Cached JIT functions indexed by entrypoint.
     pub entry_points: HashMap<u64, JitFunction>,
@@ -152,11 +208,17 @@ impl JIT {
             il_dump: None,
             jit_hit: 0,
             jit_miss: 0,
-            profile_enabled: std::env::var("SOGEN_ICICLE_JIT_PROFILE").as_deref() == Ok("1"),
+            profile_enabled: std::env::var("SOGEN_ICICLE_JIT_PROFILE").as_deref() == Ok("1")
+                || std::env::var("SOGEN_ICICLE_COMPILE_ORIGIN_PROFILE").as_deref() == Ok("1"),
             profile_compile_calls: 0,
             profile_compile_nanos: 0,
             profile_reset_calls: 0,
             generated_code_bytes: 0,
+            compile_origin: CompileOriginProfile {
+                enabled: std::env::var("SOGEN_ICICLE_COMPILE_ORIGIN_PROFILE").as_deref() == Ok("1"),
+                ..CompileOriginProfile::default()
+            },
+            compile_origin_recompile_active: false,
             // Exploit the fact that `vec![]` has a specialized implementation using `#[rustc_box]`
             active: vec![INITIAL_LOOKUP_TABLE_VALUE; FAST_LOOKUP_TABLE_SIZE]
                 .into_boxed_slice()
@@ -179,6 +241,8 @@ impl JIT {
 
     pub fn clear(&mut self) {
         tracing::debug!("clearing JIT");
+
+        self.compile_origin.reset_generation();
 
         self.code_ctx.clear();
         self.active.fill(INITIAL_LOOKUP_TABLE_VALUE);
@@ -266,6 +330,7 @@ impl JIT {
     }
 
     pub fn compile(&mut self, target: &CompilationTarget) -> ModuleResult<()> {
+        self.compile_origin.record(target.entry_points().next(), self.compile_origin_recompile_active);
         if !self.profile_enabled {
             return self.compile_impl(target);
         }
@@ -637,4 +702,31 @@ fn declare_runtime_functions(module: &mut JITModule) -> ModuleResult<RuntimeFunc
             sig
         },
     })
+}
+
+#[cfg(test)]
+mod compile_origin_tests {
+    use super::CompileOriginProfile;
+
+    #[test]
+    fn separates_new_repeated_reset_and_periodic_compiles() {
+        let mut profile = CompileOriginProfile {
+            enabled: true,
+            ..CompileOriginProfile::default()
+        };
+        profile.record(Some(0x1000), false);
+        profile.record(Some(0x1000), false);
+        profile.record(Some(0x2000), true);
+        profile.reset_generation();
+        profile.record(Some(0x1000), false);
+        profile.record(Some(0x2000), false);
+        profile.record(None, false);
+
+        assert_eq!(profile.first_address_compiles, 2);
+        assert_eq!(profile.repeat_in_generation_compiles, 1);
+        assert_eq!(profile.repeat_after_reset_compiles, 1);
+        assert_eq!(profile.periodic_recompile_compiles, 1);
+        assert_eq!(profile.unclassified_compiles, 1);
+        assert_eq!(profile.generation_number, 1);
+    }
 }

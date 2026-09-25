@@ -1,8 +1,10 @@
 #include "std_include.hpp"
 
 #include "analysis_reporter.hpp"
+#include "analysis_hook_profile.hpp"
 #include "analysis_reporter_common.hpp"
 #include "jsonl_reporter.hpp"
+#include "../windows-emulator/telemetry_shared_memory.hpp"
 #include <utils/async_file_writer.hpp>
 
 #include <algorithm>
@@ -11,6 +13,8 @@
 #include <charconv>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <optional>
@@ -221,16 +225,31 @@ namespace sogen
         {
           public:
             explicit jsonl_analysis_reporter(const std::filesystem::path& path, jsonl_report_settings settings)
-                : file_(path),
+                : file_(path.empty() ? nullptr : std::make_unique<utils::async_file_writer>(path)),
                   settings_(std::move(settings)),
+                  shared_memory_enabled_([] {
+                      const auto* value = std::getenv("SOGEN_TELEMETRY_SHM");
+                      return value && std::strcmp(value, "1") == 0;
+                  }()),
+                  status_mapping_(L"SogenAnalysis-"),
                   last_aggregate_(std::chrono::steady_clock::now()),
-                  last_status_(last_aggregate_)
+                  last_status_(this->shared_memory_enabled_ ? std::chrono::steady_clock::time_point{} : this->last_aggregate_)
             {
+                if (this->shared_memory_enabled_)
+                {
+                    this->maybe_publish_status(true);
+                }
             }
 
             void report(const analysis_event& event) override
             {
                 this->observe_location(event);
+                ++this->observed_events_;
+                if (!this->file_)
+                {
+                    this->maybe_publish_status(false);
+                    return;
+                }
 
                 if ((!this->settings_.hidden_modules.empty() && event_from_hidden_module(event, this->settings_.hidden_modules)) ||
                     (!this->settings_.hidden_event_types.empty() && event_of_hidden_type(event, this->settings_.hidden_event_types)))
@@ -260,10 +279,8 @@ namespace sogen
 
                 // Keep every diagnostic occurrence for the structured journals. The visible console
                 // still coalesces repeated lines through event_is_deduplicable().
-                if (this->settings_.dedupe && event_is_deduplicable(event) &&
-                    !std::holds_alternative<suspicious_activity_event>(event) &&
-                    !std::holds_alternative<debug_print_call_event>(event) &&
-                    !std::holds_alternative<debug_string_event>(event))
+                if (this->settings_.dedupe && event_is_deduplicable(event) && !std::holds_alternative<suspicious_activity_event>(event) &&
+                    !std::holds_alternative<debug_print_call_event>(event) && !std::holds_alternative<debug_string_event>(event))
                 {
                     const auto hash = record_content_hash(line);
                     if (this->seen_content_.contains(hash))
@@ -279,15 +296,18 @@ namespace sogen
                 }
 
                 line.push_back('\n');
-                this->file_.write(line);
+                this->file_->write(line);
                 ++this->retained_events_;
                 this->maybe_publish_status(false);
             }
 
             void flush() override
             {
-                this->emit_aggregate(true);
-                this->file_.flush();
+                if (this->file_)
+                {
+                    this->emit_aggregate(true);
+                    this->file_->flush();
+                }
                 this->maybe_publish_status(true);
             }
 
@@ -312,10 +332,13 @@ namespace sogen
             static constexpr size_t max_retained_keys = 65536;
             static constexpr size_t max_dedupe_entries = size_t{1} << 20;
 
-            utils::async_file_writer file_;
+            std::unique_ptr<utils::async_file_writer> file_{};
             jsonl_report_settings settings_{};
+            bool shared_memory_enabled_{};
+            detail::telemetry_shared_memory status_mapping_;
             std::chrono::steady_clock::time_point last_aggregate_{};
             std::chrono::steady_clock::time_point last_status_{};
+            uint64_t observed_events_{};
             uint64_t retained_events_{};
             uint64_t deduplicated_events_{};
             uint64_t hidden_events_{};
@@ -559,7 +582,7 @@ namespace sogen
                     });
                 }
                 line.push_back('\n');
-                this->file_.write(line);
+                this->file_->write(line);
                 ++this->retained_events_;
                 ++this->aggregates_written_;
                 this->window_counts_.clear();
@@ -570,7 +593,12 @@ namespace sogen
             // Small sidecar for panels/MCP readers; best effort and never throws.
             void maybe_publish_status(const bool force)
             {
-                if (this->settings_.status_path.empty())
+                if (!this->shared_memory_enabled_ && this->settings_.status_path.empty())
+                {
+                    return;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (!force && this->shared_memory_enabled_ && now - this->last_status_ < std::chrono::seconds(1))
                 {
                     return;
                 }
@@ -580,12 +608,12 @@ namespace sogen
                     {
                         return;
                     }
-                    if (std::chrono::steady_clock::now() - this->last_status_ < this->settings_.status_interval)
+                    if (now - this->last_status_ < this->settings_.status_interval)
                     {
                         return;
                     }
                 }
-                this->last_status_ = std::chrono::steady_clock::now();
+                this->last_status_ = now;
                 try
                 {
                     std::string text;
@@ -593,7 +621,8 @@ namespace sogen
                     {
                         json_object_builder object{text};
                         object.field("schema_version", 1U);
-                        object.field("mode", this->settings_.mode == jsonl_report_mode::audit ? "audit" : "full");
+                        object.field("mode", !this->file_ ? "status" : this->settings_.mode == jsonl_report_mode::audit ? "audit" : "full");
+                        object.field("observed_events", this->observed_events_);
                         object.field("retained_events", this->retained_events_);
                         object.field("summarized_events", this->summarized_events_);
                         object.field("aggregates_written", this->aggregates_written_);
@@ -611,6 +640,23 @@ namespace sogen
                                 by_type.field(name, value);
                             }
                         });
+                        if (const auto* profile = this->settings_.hook_profile; profile && profile->enabled)
+                        {
+                            object.object_field("hook_profile", [&](json_object_builder& hooks) {
+                                hooks.field("sample_period", analysis_hook_profile::sample_period);
+                                const auto write_duration = [&](const std::string_view name, const sampled_analysis_duration& counter) {
+                                    hooks.object_field(name, [&](json_object_builder& duration) {
+                                        duration.field("samples", counter.samples.load(std::memory_order_relaxed));
+                                        duration.field("sampled_nanos", counter.sampled_nanos.load(std::memory_order_relaxed));
+                                        duration.field("max_nanos", counter.max_nanos.load(std::memory_order_relaxed));
+                                    });
+                                };
+                                write_duration("object_callback", profile->object_callback);
+                                write_duration("environment_callback", profile->environment_callback);
+                                write_duration("object_report", profile->object_report);
+                                write_duration("environment_report", profile->environment_report);
+                            });
+                        }
                         object.object_field("last_location", [&](json_object_builder& location) {
                             location.hex_field("rip", this->last_rip_);
                             location.field("module", this->last_module_);
@@ -618,13 +664,20 @@ namespace sogen
                             location.field("ic", this->last_instruction_count_);
                         });
                     }
-                    text.push_back('\n');
-                    const auto temporary = this->settings_.status_path.string() + ".tmp";
+                    if (this->shared_memory_enabled_)
                     {
-                        std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
-                        stream.write(text.data(), static_cast<std::streamsize>(text.size()));
+                        (void)this->status_mapping_.publish(text);
                     }
-                    std::filesystem::rename(temporary, this->settings_.status_path);
+                    if (!this->settings_.status_path.empty())
+                    {
+                        text.push_back('\n');
+                        const auto temporary = this->settings_.status_path.string() + ".tmp";
+                        {
+                            std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+                            stream.write(text.data(), static_cast<std::streamsize>(text.size()));
+                        }
+                        std::filesystem::rename(temporary, this->settings_.status_path);
+                    }
                 }
                 catch (...)
                 {
@@ -916,6 +969,21 @@ namespace sogen
                 object.field("violation", event.violation_type);
                 object.field("nearNullExecute", event.near_null_execute);
                 object.field("captureError", event.capture_error);
+                if (event.private_execute_vcpu)
+                {
+                    object.field("privateExecuteVcpu", static_cast<uint32_t>(*event.private_execute_vcpu));
+                    object.array_field("privateExecuteMemory", [&](const auto& emit) {
+                        for (const auto& row : event.private_execute_memory)
+                        {
+                            emit([&](std::string& output) {
+                                json_object_builder value{output};
+                                value.hex_field("address", row.address);
+                                value.field("bytes", row.bytes_hex);
+                                value.field("readableBytes", row.readable_bytes);
+                            });
+                        }
+                    });
+                }
                 if (event.code_bits)
                 {
                     object.field("codeBits", *event.code_bits);

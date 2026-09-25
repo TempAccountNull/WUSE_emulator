@@ -11,6 +11,7 @@ namespace sogen
 {
 
     class analysis_reporter;
+    struct analysis_hook_profile;
 
     enum class jsonl_report_mode
     {
@@ -36,6 +37,7 @@ namespace sogen
         std::vector<std::string> hidden_event_types{};
         // Optional small sidecar (rewritten atomically) with counters and the last guest location.
         std::filesystem::path status_path{};
+        const analysis_hook_profile* hook_profile{};
     };
 
     std::unique_ptr<analysis_reporter> create_jsonl_reporter(const std::filesystem::path& path, jsonl_report_settings settings = {});

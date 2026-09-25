@@ -1,5 +1,6 @@
 #include "std_include.hpp"
 #include "../windows-analyzer/analysis_reporter.hpp"
+#include "../windows-analyzer/analysis_hook_profile.hpp"
 #include "../windows-analyzer/jsonl_reporter.hpp"
 
 #include <gtest/gtest.h>
@@ -231,6 +232,44 @@ namespace sogen
         jsonl->flush();
         EXPECT_EQ(count_prefixed(fixture.text, "Executing function: memcpy"), 1U);
         EXPECT_EQ(count_prefixed(read_text(path), "{\"type\":\"function_execution\""), 50U);
+    }
+
+    TEST(AnalyzerHookProfile, SamplesOptInAndPublishesBoundedStatus)
+    {
+        analysis_hook_profile profile{};
+        for (size_t i = 0; i < analysis_hook_profile::sample_period; ++i)
+        {
+            sampled_analysis_timer<analysis_profile_channel::object_callback> timer{&profile, &profile.object_callback};
+        }
+        EXPECT_EQ(profile.object_callback.samples.load(), 0U);
+
+        profile.enabled = true;
+        for (size_t i = 0; i < analysis_hook_profile::sample_period; ++i)
+        {
+            sampled_analysis_timer<analysis_profile_channel::object_callback> timer{&profile, &profile.object_callback};
+        }
+        EXPECT_EQ(profile.object_callback.samples.load(), 1U);
+        profile.object_report.record(42);
+
+        const auto path = unique_path("sogen-hook-profile", ".jsonl");
+        const auto status = unique_path("sogen-hook-profile-status", ".json");
+        const auto cleanup = utils::finally([&] {
+            std::error_code error;
+            std::filesystem::remove(path, error);
+            std::filesystem::remove(status, error);
+        });
+        jsonl_report_settings settings{};
+        settings.status_path = status;
+        settings.hook_profile = &profile;
+        auto reporter = create_jsonl_reporter(path, settings);
+        reporter->report(function_call(8, 1, "memcpy"));
+        reporter->flush();
+        const auto status_text = read_text(status);
+        EXPECT_NE(status_text.find("\"hook_profile\""), std::string::npos) << status_text;
+        EXPECT_NE(status_text.find("\"sample_period\":\"1024\""), std::string::npos) << status_text;
+        EXPECT_NE(status_text.find("\"object_report\":{\"samples\":\"1\",\"sampled_nanos\":\"42\",\"max_nanos\":\"42\"}"),
+                  std::string::npos)
+            << status_text;
     }
 
     // ------------------------------------------------------------------ audit report mode

@@ -125,6 +125,9 @@ namespace sogen::test
         cpu.reg(x86_register::rip, entry);
         cpu.start(1);
         EXPECT_EQ(log_lines.find("[GUESTCXXTHROW]"), std::string::npos);
+        EXPECT_NE(log_lines.find("[GUESTCXXPROBE]"), std::string::npos);
+        EXPECT_NE(log_lines.find("signature_read=1 signature_match=0 installed=0 reason=signature_mismatch"),
+                  std::string::npos);
 
         constexpr std::array<uint8_t, 16> signature{
             0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x74,
@@ -135,13 +138,59 @@ namespace sogen::test
         cpu.reg(x86_register::rip, entry);
         cpu.start(1);
         EXPECT_EQ(log_lines.find("[GUESTCXXTHROW]"), std::string::npos);
+        EXPECT_NE(log_lines.find("signature_read=0 signature_match=0 installed=0 reason=image_size"),
+                  std::string::npos);
+        constexpr uint64_t terminate_rva = 0x5334f4;
+        constexpr uint64_t abort_rva = 0x536904;
+        constexpr std::array<uint8_t, 8> terminate_signature{
+            0x48, 0x83, 0xec, 0x28, 0xe8, 0x43, 0xc4, 0x00};
+        constexpr std::array<uint8_t, 8> abort_signature{
+            0x48, 0x83, 0xec, 0x28, 0xe8, 0x8f, 0x13, 0x01};
+        constexpr std::array<uint8_t, 10> join_signature{
+            0x48, 0x89, 0x5c, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x70};
+        constexpr std::array<uint8_t, 5> join_throw_call{0xe8, 0x5f, 0x8b, 0x1c, 0x00};
+        win_emu.emu().write_memory(image + terminate_rva, terminate_signature.data(), terminate_signature.size());
+        win_emu.emu().write_memory(image + abort_rva, abort_signature.data(), abort_signature.size());
+        win_emu.emu().write_memory(image + 0x325f10, join_signature.data(), join_signature.size());
+        win_emu.emu().write_memory(image + 0x326004, join_throw_call.data(), join_throw_call.size());
+        const auto join_throw_return = image + 0x326009;
+        const auto queue_finish_return = image + 0x2009ba;
+        const auto join_this = stack + 0x200;
+        const auto join_data = stack + 0x208;
+        constexpr uint64_t join_handle = 0x4800013;
+        win_emu.emu().write_memory(stack + 0x100, &join_throw_return, sizeof(join_throw_return));
+        win_emu.emu().write_memory(stack + 0x180, &queue_finish_return, sizeof(queue_finish_return));
+        win_emu.emu().write_memory(join_this, &join_data, sizeof(join_data));
+        win_emu.emu().write_memory(join_data, &join_handle, sizeof(join_handle));
         runtime.size_of_image = image_size;
         win_emu.callbacks.on_module_load(runtime);
+        cpu.reg(x86_register::rdi, join_this);
         cpu.reg(x86_register::rip, entry);
         cpu.start(1);
         EXPECT_NE(log_lines.find("[GUESTCXXTHROW] n=1"), std::string::npos);
+        EXPECT_NE(log_lines.find("signature_read=1 signature_match=1 installed="), std::string::npos);
+        EXPECT_NE(log_lines.find("reason=installed"), std::string::npos);
         EXPECT_NE(log_lines.find("runtime=D3D11.DLL"), std::string::npos);
         EXPECT_NE(log_lines.find("ret_ok=1"), std::string::npos);
+        EXPECT_NE(log_lines.find("[GUESTDXVKJOINFAIL]"), std::string::npos);
+        EXPECT_NE(log_lines.find("handle=0x4800013 handle_read=1"), std::string::npos);
+        EXPECT_NE(log_lines.find("join_layout_match=1"), std::string::npos);
+        EXPECT_NE(log_lines.find("outer_ret_read=1 outer_caller=D3D11.DLL+0x2009ba"), std::string::npos);
+        cpu.reg(x86_register::rsp, stack + 0x100);
+        cpu.reg(x86_register::rip, image + terminate_rva);
+        cpu.start(1);
+        cpu.reg(x86_register::rsp, stack + 0x100);
+        cpu.reg(x86_register::rip, image + abort_rva);
+        cpu.start(1);
+        EXPECT_NE(log_lines.find("[GUESTCXXTERM] n=1 kind=terminate"), std::string::npos);
+        EXPECT_NE(log_lines.find("[GUESTCXXTERM] n=2 kind=abort"), std::string::npos);
+        EXPECT_NE(log_lines.find("stack_readable=32"), std::string::npos);
         win_emu.callbacks.on_module_unload(runtime);
+        const auto before_unloaded_run = log_lines.size();
+        cpu.reg(x86_register::rsp, stack + 0x100);
+        cpu.reg(x86_register::rip, image + terminate_rva);
+        cpu.start(1);
+        EXPECT_EQ(log_lines.find("[GUESTCXXTERM]", before_unloaded_run), std::string::npos)
+            << "unloaded DXVK left a terminal execution hook behind";
     }
 }

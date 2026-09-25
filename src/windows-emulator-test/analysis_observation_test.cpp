@@ -297,6 +297,68 @@ namespace sogen::test
         EXPECT_EQ(event.last_tracked_instruction->bytes_hex, "ffd0");
     }
 
+    TEST_F(AnalysisObservation, PrivateExecuteFaultCapturesOneImmutableBoundedMemoryWindow)
+    {
+        const auto allocation = win_emu.memory.allocate_memory(0x2000, memory_permission::read_write);
+        ASSERT_NE(allocation, 0U);
+        ASSERT_TRUE(win_emu.memory.decommit_memory(allocation + 0x1000, 0x1000));
+        const auto rip = allocation + 0xFF8;
+        const std::array<uint8_t, 8> bytes{0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7};
+        win_emu.emu().write_memory(rip, bytes.data(), bytes.size());
+        win_emu.emu().reg(x86_register::rip, rip);
+        const auto before = win_emu.emu().save_registers();
+        const auto layout = win_emu.memory.get_layout_version();
+        win_emu.callbacks.on_memory_violate(rip, 1, memory_operation::exec, memory_violation_type::protection);
+        EXPECT_EQ(win_emu.emu().save_registers(), before);
+        EXPECT_EQ(win_emu.memory.get_layout_version(), layout);
+        ASSERT_EQ(violations.size(), 1U);
+        const auto first = violations.front();
+        ASSERT_TRUE(first.private_execute_vcpu);
+        EXPECT_EQ(*first.private_execute_vcpu, 0U);
+        ASSERT_TRUE(first.actual_instruction.location.region);
+        EXPECT_EQ(first.actual_instruction.location.region->allocation_base, allocation);
+        ASSERT_EQ(first.private_execute_memory.size(), 8U);
+        EXPECT_EQ(first.private_execute_memory.front().address, allocation + 0xFB0);
+        EXPECT_EQ(first.private_execute_memory[4].address, allocation + 0xFF0);
+        EXPECT_NE(first.private_execute_memory[4].bytes_hex.find("a0 a1 a2 a3 a4 a5 a6 a7"), std::string::npos);
+        EXPECT_EQ(first.private_execute_memory[5].address, allocation + 0x1000);
+        EXPECT_EQ(first.private_execute_memory[5].readable_bytes, 0U);
+        EXPECT_NE(first.private_execute_memory[5].bytes_hex.find("?? ?? ??"), std::string::npos);
+
+        win_emu.emu().write_memory<uint8_t>(rip, 0xCC);
+        win_emu.emu().reg(x86_register::rip, allocation + 0x200);
+        win_emu.callbacks.on_memory_violate(allocation + 0x200, 1, memory_operation::exec, memory_violation_type::protection);
+        ASSERT_EQ(violations.size(), 2U);
+        EXPECT_FALSE(violations.back().private_execute_vcpu);
+        EXPECT_TRUE(violations.back().private_execute_memory.empty());
+        EXPECT_NE(first.private_execute_memory[4].bytes_hex.find("a0 a1 a2 a3 a4 a5 a6 a7"), std::string::npos);
+
+        std::string text;
+        logger log;
+        log.set_silent(true);
+        log.set_sink([&](const color, const std::string_view line) { text += line; });
+        auto console = create_console_reporter(log, {});
+        console->report(first);
+        EXPECT_NE(text.find("Private execute memory"), std::string::npos);
+        EXPECT_NE(text.find("a0 a1 a2 a3 a4 a5 a6 a7"), std::string::npos);
+        EXPECT_NE(text.find("?? ?? ??"), std::string::npos);
+
+        const auto file = std::filesystem::temp_directory_path() / ("sogen-private-execute-" + std::to_string(getpid()) + ".jsonl");
+        const auto cleanup = utils::finally([&] {
+            std::error_code error;
+            std::filesystem::remove(file, error);
+        });
+        auto jsonl = create_jsonl_reporter(file);
+        jsonl->report(first);
+        jsonl->flush();
+        const auto saved = utils::io::read_file(file);
+        const std::string json(reinterpret_cast<const char*>(saved.data()), saved.size());
+        EXPECT_NE(json.find("\"privateExecuteVcpu\":0"), std::string::npos);
+        EXPECT_NE(json.find("\"privateExecuteMemory\":"), std::string::npos);
+        EXPECT_NE(json.find("a0 a1 a2 a3 a4 a5 a6 a7"), std::string::npos);
+        EXPECT_NE(json.find("?? ?? ??"), std::string::npos);
+    }
+
     TEST_F(AnalysisObservation, NullReadAndWriteFaultsDoNotInferACallOrReturnAddress)
     {
         const std::array<uint8_t, 3> load{0x48, 0x8B, 0x00};

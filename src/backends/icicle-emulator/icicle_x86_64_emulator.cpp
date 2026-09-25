@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <cstdio>
 #include <charconv>
 #include <cstdlib>
@@ -15,8 +16,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <utils/object.hpp>
@@ -46,7 +49,52 @@ extern "C"
         uint64_t value;
     };
 
+    struct icicle_exec_write_wake_profile
+    {
+        uint64_t wake_events, guest_jit_writes, guest_mmu_writes, host_writes, owner_flushes;
+    };
+
+    struct icicle_exec_write_filter_profile
+    {
+        uint64_t filtered_noncode, notified_overlap, notified_concurrent;
+    };
+    static_assert(sizeof(icicle_exec_write_filter_profile) == 3 * sizeof(uint64_t));
+
+    struct icicle_invalidation_profile
+    {
+        uint64_t epoch_mismatches, jit_resets, epoch_resets, wake_resets, manual_resets, mixed_resets, unknown_resets;
+    };
+    static_assert(sizeof(icicle_invalidation_profile) == 7 * sizeof(uint64_t));
+
+    struct icicle_manual_invalidation_profile
+    {
+        uint64_t total, peer_protection, public_invalidate, self_modifying, host_cache;
+        uint64_t unmap, protect, host_write, multiple_origins, unknown_origin;
+    };
+    static_assert(sizeof(icicle_manual_invalidation_profile) == 10 * sizeof(uint64_t));
+
+    struct icicle_jit_profile
+    {
+        uint64_t compile_calls, compile_nanos, reset_calls;
+        uint64_t recompile_calls, recompile_nanos;
+        uint64_t recompile_compile_calls, recompile_compile_nanos;
+        uint64_t reset_generation, reset_cause_flags, reset_manual_origin_flags;
+        uint64_t flush_code_nanos, jit_reset_nanos;
+        uint64_t generation_compile_calls, generation_compile_nanos;
+        uint64_t origin_first_address_compiles, origin_repeat_after_reset_compiles;
+        uint64_t origin_repeat_in_generation_compiles, origin_periodic_recompile_compiles;
+        uint64_t origin_unclassified_compiles, origin_generation_number;
+    };
+    static_assert(sizeof(icicle_jit_profile) == 20 * sizeof(uint64_t));
+
     icicle_emulator* icicle_create_emulator(uint64_t memory_limit_mib);
+    int32_t icicle_link_exec_write_wake(icicle_emulator* const* handles, size_t count);
+    int32_t icicle_exec_write_pending(icicle_emulator*);
+    int32_t icicle_get_exec_write_wake_profile(icicle_emulator*, icicle_exec_write_wake_profile*);
+    int32_t icicle_get_exec_write_filter_profile(icicle_emulator*, icicle_exec_write_filter_profile*);
+    int32_t icicle_get_invalidation_profile(icicle_emulator*, icicle_invalidation_profile*);
+    int32_t icicle_get_manual_invalidation_profile(icicle_emulator*, icicle_manual_invalidation_profile*);
+    void icicle_reconcile_exec_write_wake(icicle_emulator*);
     int32_t icicle_protect_memory(icicle_emulator*, uint64_t address, uint64_t length, uint8_t permissions);
     int32_t icicle_map_memory(icicle_emulator*, uint64_t address, uint64_t length, uint8_t permissions);
     int32_t icicle_map_mmio(icicle_emulator*, uint64_t address, uint64_t length, icicle_mmio_read_func* read_callback, void* read_data,
@@ -90,11 +138,14 @@ extern "C"
     int32_t icicle_get_stop_info(icicle_emulator*, icicle_stop_info* info);
     // Retired-instruction counter: used to honor start(count) across kick-resumed quanta.
     uint64_t icicle_get_icount(icicle_emulator*);
+    int32_t icicle_get_jit_profile(icicle_emulator*, icicle_jit_profile*);
     // SMP 6.6: drop this VM's translations for a range (returns 1 if anything was cached), and a
     // read-only query for whether ANY sharing VM translated the range (shared IN_CODE_CACHE perms).
     int32_t icicle_invalidate_code_range(icicle_emulator*, uint64_t address, uint64_t length);
     int32_t icicle_code_range_is_cached(icicle_emulator*, uint64_t address, uint64_t length);
+    int32_t icicle_host_view_code_may_be_cached(icicle_emulator*, uint64_t address, uint64_t length);
     // SMP 6.6c'': smallest perm epoch over a range (0 = not shared/unmapped) for stale-op detection.
+    void icicle_refresh_peer_protection(icicle_emulator*, uint64_t address, uint64_t length);
     uint64_t icicle_perm_epoch_of_range(icicle_emulator*, uint64_t address, uint64_t length);
     void icicle_get_exception_name(uint32_t code, data_accessor_func* callback, void* data);
     void icicle_get_vm_exit_description(icicle_emulator*, data_accessor_func* callback, void* data);
@@ -113,6 +164,48 @@ namespace sogen::icicle
             {
                 throw std::runtime_error(std::string(error));
             }
+        }
+
+        // Only large failed host writes emit a native caller chain. The Rust bridge logs the
+        // corresponding MMU map state; the C++ memory manager owns reservation/commit metadata.
+        // Keep this failure-only diagnostic bounded even if a guest repeatedly retries a bad buffer.
+        void diagnose_large_write_failure(const uint64_t address, const size_t size)
+        {
+            if (size < 4096)
+            {
+                return;
+            }
+            static std::atomic<unsigned> emitted{0};
+            if (emitted.fetch_add(1, std::memory_order_relaxed) >= 8)
+            {
+                return;
+            }
+            void* frames[12]{};
+            const auto count = CaptureStackBackTrace(1, 12, frames, nullptr);
+            std::fprintf(stderr, "[ICWRITE] failed addr=%#llx size=%zu tid=%u callers=",
+                         static_cast<unsigned long long>(address), size, static_cast<unsigned>(GetCurrentThreadId()));
+            for (USHORT i = 0; i < count; ++i)
+            {
+                HMODULE module{};
+                const auto address_in_module = reinterpret_cast<LPCSTR>(frames[i]);
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       address_in_module, &module))
+                {
+                    char path[MAX_PATH]{};
+                    GetModuleFileNameA(module, path, MAX_PATH);
+                    const char* filename = std::strrchr(path, '\\');
+                    filename = filename ? filename + 1 : path;
+                    const auto offset = reinterpret_cast<uintptr_t>(frames[i]) - reinterpret_cast<uintptr_t>(module);
+                    std::fprintf(stderr, "%s%s+%#llx", i ? " <- " : "", filename,
+                                 static_cast<unsigned long long>(offset));
+                }
+                else
+                {
+                    std::fprintf(stderr, "%s%p", i ? " <- " : "", frames[i]);
+                }
+            }
+            std::fprintf(stderr, "\n");
         }
 
         constexpr size_t context_record_bytes = 1232;
@@ -239,10 +332,20 @@ namespace sogen::icicle
     {
         std::atomic<uint64_t> map_calls{0};
         std::atomic<uint64_t> map_nanos{0};
+        std::atomic<uint64_t> peer_map_calls{0};
+        std::atomic<uint64_t> peer_map_pages{0};
+        std::atomic<uint64_t> peer_map_nanos{0};
+        std::atomic<uint64_t> peer_map_max_nanos{0};
         std::atomic<uint64_t> protect_calls{0};
         std::atomic<uint64_t> protect_nanos{0};
         std::atomic<uint64_t> queue_ops{0};
         std::atomic<uint64_t> queue_nanos{0};
+        std::atomic<uint64_t> invalidate_queued{0};
+        std::atomic<uint64_t> invalidate_queue_nanos{0};
+        std::atomic<uint64_t> invalidate_applied{0};
+        std::atomic<uint64_t> invalidate_no_change{0};
+        std::atomic<uint64_t> invalidate_apply_nanos{0};
+        std::atomic<uint64_t> invalidate_adjacent_same_pages{0};
         std::atomic<uint64_t> kick_calls{0};
         std::atomic<uint64_t> kick_targets{0};
         std::atomic<uint64_t> kick_nanos{0};
@@ -279,16 +382,23 @@ namespace sogen::icicle
     class icicle_vcpu final : public x86_64_cpu, public detail::hook_exception_sink
     {
       public:
-        icicle_vcpu(icicle_emulator* emu, icicle_x86_64_emulator& machine, const uint32_t index)
+        icicle_vcpu(icicle_emulator* emu, icicle_x86_64_emulator& machine, const uint32_t index,
+                    const bool host_view_only = false)
             : emu_(emu),
               machine_(machine),
-              index_(index)
+              index_(index),
+              host_view_only_(host_view_only)
         {
         }
 
         size_t index() const override
         {
             return this->index_;
+        }
+
+        bool has_guest_cpu_context() const override
+        {
+            return !this->host_view_only_;
         }
 
         memory_interface& memory() override;
@@ -298,6 +408,10 @@ namespace sogen::icicle
 
         void stop() override
         {
+            if (this->host_view_only_)
+            {
+                throw std::logic_error("Icicle host-view callback has no running CPU context");
+            }
             this->stop_requested_ = true;
             // An idle worker may consume switch_thread before its next start().
             // Leave no stale atomic interrupt that would end that new quantum
@@ -363,11 +477,19 @@ namespace sogen::icicle
 
         size_t write_raw_register(const int reg, const void* value, const size_t size) override
         {
+            if (this->host_view_only_)
+            {
+                throw std::logic_error("Icicle host-view callback has no register context");
+            }
             return icicle_write_register(this->emu_, reg, value, size);
         }
 
         size_t read_raw_register(const int reg, void* value, const size_t size) override
         {
+            if (this->host_view_only_)
+            {
+                throw std::logic_error("Icicle host-view callback has no register context");
+            }
             return icicle_read_register(this->emu_, reg, value, size);
         }
 
@@ -399,6 +521,10 @@ namespace sogen::icicle
 
         std::vector<std::byte> save_registers() const override
         {
+            if (this->host_view_only_)
+            {
+                throw std::logic_error("Icicle host-view callback has no register context");
+            }
             std::vector<std::byte> data{};
             auto* accessor = +[](void* user, const void* data, const size_t length) {
                 auto& vec = *static_cast<std::vector<std::byte>*>(user);
@@ -413,6 +539,10 @@ namespace sogen::icicle
 
         void restore_registers(const std::vector<std::byte>& register_data) override
         {
+            if (this->host_view_only_)
+            {
+                throw std::logic_error("Icicle host-view callback has no register context");
+            }
             icicle_restore_registers(this->emu_, register_data.data(), register_data.size());
         }
 
@@ -464,6 +594,7 @@ namespace sogen::icicle
         icicle_emulator* emu_{};
         icicle_x86_64_emulator& machine_;
         uint32_t index_{0};
+        bool host_view_only_{false};
         std::exception_ptr pending_hook_exception_{};
 
         // Step 6.2 (mirrors WHP whp_vcpu::run_active_/stop_requested_): run_active_ is true only while this
@@ -482,6 +613,15 @@ namespace sogen::icicle
         std::atomic_uint64_t published_instructions_{0};
         std::atomic_uint64_t published_rip_{0};
         smp_profile_counters smp_profile_{};
+        std::atomic_uint64_t jit_compile_calls_{0}, jit_compile_nanos_{0}, jit_reset_calls_{0};
+        std::atomic_uint64_t jit_recompile_calls_{0}, jit_recompile_nanos_{0};
+        std::atomic_uint64_t jit_recompile_compile_calls_{0}, jit_recompile_compile_nanos_{0};
+        std::atomic_uint64_t jit_reset_generation_{0}, jit_reset_cause_flags_{0}, jit_reset_manual_origin_flags_{0};
+        std::atomic_uint64_t jit_flush_code_nanos_{0}, jit_reset_nanos_{0};
+        std::atomic_uint64_t jit_generation_compile_calls_{0}, jit_generation_compile_nanos_{0};
+        std::atomic_uint64_t jit_origin_first_address_compiles_{0}, jit_origin_repeat_after_reset_compiles_{0};
+        std::atomic_uint64_t jit_origin_repeat_in_generation_compiles_{0}, jit_origin_periodic_recompile_compiles_{0};
+        std::atomic_uint64_t jit_origin_unclassified_compiles_{0}, jit_origin_generation_number_{0};
     };
 
     class icicle_x86_64_emulator : public x86_64_emulator, public detail::hook_exception_sink
@@ -492,6 +632,10 @@ namespace sogen::icicle
             if (vcpu_count < 1)
             {
                 vcpu_count = 1;
+            }
+            if (vcpu_count == 1 && this->force_smp_memory_)
+            {
+                std::fprintf(stderr, "[SMPMEMPROBE] vcpu=0 mode=shared\n");
             }
             // One icicle VM per vCPU (each keeps its single-threaded Rc<RefCell> core pinned to its own
             // OS thread); guest RAM is shared across them via smp_shared pages in map_memory. VM 0 is the
@@ -514,9 +658,35 @@ namespace sogen::icicle
                 this->vcpus_.push_back(std::make_unique<icicle_vcpu>(handle, *this, static_cast<uint32_t>(i)));
             }
             this->emu_ = this->vcpus_[0]->handle();
+            if (vcpu_count > 1)
+            {
+                this->host_view_ = icicle_create_emulator(configured_memory_limit_mib());
+                if (!this->host_view_)
+                {
+                    throw std::runtime_error("Failed to create Icicle host memory view");
+                }
+                this->host_view_cpu_ = std::make_unique<icicle_vcpu>(this->host_view_, *this, 0, true);
+                const char* wake = std::getenv("SOGEN_SMP_EXEC_WRITE_WAKE");
+                this->exec_write_wake_enabled_ = wake && std::strcmp(wake, "1") == 0;
+                if (this->exec_write_wake_enabled_)
+                {
+                    std::vector<icicle_emulator*> handles;
+                    handles.reserve(vcpu_count);
+                    for (const auto& vcpu : this->vcpus_)
+                    {
+                        handles.push_back(vcpu->handle());
+                    }
+                    if (!icicle_link_exec_write_wake(handles.data(), handles.size()))
+                    {
+                        throw std::runtime_error("Failed to link Icicle executable-write wake flags");
+                    }
+                }
+            }
             this->quiesce_cancel_.assign(vcpu_count, 0);
             this->quantum_kick_.assign(vcpu_count, 0);
-            this->issuer_seq_.assign(vcpu_count, 0);
+            // Include the external issuer sentinel. A fixed-size atomic array avoids
+            // reallocating while a peer applies a queued protect operation.
+            this->issuer_seq_ = std::vector<std::atomic<uint64_t>>(vcpu_count + 1);
             this->pending_ops_.resize(vcpu_count);
         }
 
@@ -536,6 +706,11 @@ namespace sogen::icicle
                 {
                     icicle_destroy_emulator(vcpu->handle());
                 }
+            }
+            if (this->host_view_)
+            {
+                icicle_destroy_emulator(this->host_view_);
+                this->host_view_ = nullptr;
             }
             this->emu_ = nullptr;
         }
@@ -683,8 +858,47 @@ namespace sogen::icicle
                 w->write_cb(addr + w->base, data, length);
             };
 
-            // Every vCPU VM needs the MMIO region; the callback context (ptr) is shared and coherent.
-            this->apply_to_all_vms([=](icicle_emulator* h) { icicle_map_mmio(h, address, size, read_wrapper, ptr, write_wrapper, ptr); });
+            const auto map_vm = [&](icicle_emulator* h) {
+                ice(icicle_map_mmio(h, address, size, read_wrapper, ptr, write_wrapper, ptr), "Failed to map MMIO");
+            };
+            if (!this->host_view_)
+            {
+                map_vm(this->emu_);
+                return;
+            }
+            const auto map_view = [&] {
+                ice(icicle_map_mmio(this->host_view_, address, size, read_wrapper, ptr, write_wrapper, ptr),
+                    "Failed to map MMIO in Icicle host view");
+                this->mmio_ranges_.emplace_back(address, size);
+            };
+            if (auto* self = this->mutation_owner())
+            {
+                {
+                    std::lock_guard lock(this->host_view_mutex_);
+                    map_vm(self->handle());
+                    map_view();
+                }
+                const auto seq = this->issuer_next(self->index());
+                for (auto& vcpu : this->vcpus_)
+                {
+                    if (vcpu.get() != self)
+                    {
+                        this->queue_op(vcpu->index(), seq, [=](icicle_emulator* h) {
+                            ice(icicle_map_mmio(h, address, size, read_wrapper, ptr, write_wrapper, ptr), "Failed to map MMIO");
+                        });
+                    }
+                }
+                this->kick_peers(self->index());
+                return;
+            }
+            this->pause_peers_and([&] {
+                std::lock_guard lock(this->host_view_mutex_);
+                for (auto& vcpu : this->vcpus_)
+                {
+                    map_vm(vcpu->handle());
+                }
+                map_view();
+            });
         }
 
         void map_memory(const uint64_t address, const size_t size, memory_permission permissions) override
@@ -692,8 +906,14 @@ namespace sogen::icicle
             const auto perm = static_cast<uint8_t>(permissions);
             if (this->vcpus_.size() == 1)
             {
-                // Normal path: keeps COW + snapshots for the single-vCPU case (byte-identical to before SMP).
-                ice(icicle_map_memory(this->emu_, address, size, perm), "Failed to map memory");
+                if (this->force_smp_memory_)
+                {
+                    ice(icicle_map_smp_shared_fresh(this->emu_, address, size, perm), "Failed to map SMP memory");
+                }
+                else
+                {
+                    ice(icicle_map_memory(this->emu_, address, size, perm), "Failed to map memory");
+                }
                 return;
             }
             auto* self = this->mutation_owner();
@@ -707,6 +927,9 @@ namespace sogen::icicle
                     {
                         ice(icicle_share_smp_pages(this->vcpus_[i]->handle(), this->emu_, address, size), "Failed to share SMP memory");
                     }
+                    std::lock_guard lock(this->host_view_mutex_);
+                    ice(icicle_share_smp_pages(this->host_view_, this->emu_, address, size),
+                        "Failed to share SMP memory with Icicle host view");
                 });
                 return;
             }
@@ -719,6 +942,8 @@ namespace sogen::icicle
             {
                 profile->map_calls.fetch_add(1, std::memory_order_relaxed);
             }
+            ice(!t_draining_own_queue, "Cannot map SMP memory during a pending queue drain");
+            this->drain_pending_unmap_prefix_before_map(*self, address, size);
             icicle_emulator* const source = self->handle();
             const fanout_guard fanout{this->ops_in_flight_};
             this->ops_in_flight_.fetch_add(1, std::memory_order_acquire);
@@ -726,13 +951,37 @@ namespace sogen::icicle
             void* const raw = icicle_smp_capture(source, address, size);
             ice(raw != nullptr, "Failed to capture SMP pages");
             const std::shared_ptr<void> captured(raw, icicle_smp_release_capture);
+            {
+                std::lock_guard lock(this->host_view_mutex_);
+                ice(icicle_smp_map_captured(this->host_view_, captured.get(), address), "Failed to map SMP pages in Icicle host view");
+            }
             const uint64_t seq = this->issuer_next(self->index());
             for (auto& v : this->vcpus_)
             {
                 if (v.get() != self)
                 {
-                    this->queue_op(v->index(), seq, [captured, address](icicle_emulator* h) {
+                    // The captured alias is applied on the peer's owning thread. Profile
+                    // this cost separately from the issuer's map/capture/queue timer.
+                    auto* peer_profile = this->profile_enabled_ ? &v->smp_profile_ : nullptr;
+                    const auto page_count = size / 0x1000;
+                    this->queue_op(v->index(), seq, [captured, address, page_count, peer_profile](icicle_emulator* h) {
+                        const auto start = peer_profile ? std::chrono::steady_clock::now()
+                                                        : std::chrono::steady_clock::time_point{};
                         ice(icicle_smp_map_captured(h, captured.get(), address), "Failed to map captured SMP pages");
+                        if (peer_profile)
+                        {
+                            const auto nanos = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start).count());
+                            peer_profile->peer_map_calls.fetch_add(1, std::memory_order_relaxed);
+                            peer_profile->peer_map_pages.fetch_add(page_count, std::memory_order_relaxed);
+                            peer_profile->peer_map_nanos.fetch_add(nanos, std::memory_order_relaxed);
+                            auto maximum = peer_profile->peer_map_max_nanos.load(std::memory_order_relaxed);
+                            while (maximum < nanos &&
+                                   !peer_profile->peer_map_max_nanos.compare_exchange_weak(
+                                       maximum, nanos, std::memory_order_relaxed))
+                            {
+                            }
+                        }
                     });
                 }
             }
@@ -745,14 +994,52 @@ namespace sogen::icicle
         void map_host_memory(const uint64_t address, const size_t size, void* host_pointer, memory_permission permissions) override
         {
             const auto perm = static_cast<uint8_t>(permissions);
-            // Same host pointer in every VM: coherent because they all alias the one host buffer.
-            this->apply_to_all_vms(
-                [=](icicle_emulator* h) { ice(icicle_map_host_memory(h, address, host_pointer, size, perm), "Failed to map host memory"); });
+            const auto map_vm = [=](icicle_emulator* h) {
+                ice(icicle_map_host_memory(h, address, host_pointer, size, perm), "Failed to map host memory");
+            };
+            if (!this->host_view_)
+            {
+                map_vm(this->emu_);
+                return;
+            }
+            if (auto* self = this->mutation_owner())
+            {
+                {
+                    std::lock_guard lock(this->host_view_mutex_);
+                    map_vm(self->handle());
+                    ice(icicle_map_host_memory(this->host_view_, address, host_pointer, size, perm),
+                        "Failed to map caller-owned memory in Icicle host view");
+                }
+                const auto seq = this->issuer_next(self->index());
+                for (auto& vcpu : this->vcpus_)
+                {
+                    if (vcpu.get() != self)
+                    {
+                        this->queue_op(vcpu->index(), seq, map_vm);
+                    }
+                }
+                this->kick_peers(self->index());
+                return;
+            }
+            this->pause_peers_and([&] {
+                std::lock_guard lock(this->host_view_mutex_);
+                for (auto& vcpu : this->vcpus_)
+                {
+                    map_vm(vcpu->handle());
+                }
+                ice(icicle_map_host_memory(this->host_view_, address, host_pointer, size, perm),
+                    "Failed to map caller-owned memory in Icicle host view");
+            });
         }
 
         void flush_host_memory_cache(const void* host_pointer, const size_t size) override
         {
             this->apply_to_all_vms([=](icicle_emulator* h) { icicle_flush_host_memory_cache(h, host_pointer, size); });
+            if (this->host_view_)
+            {
+                std::lock_guard lock(this->host_view_mutex_);
+                icicle_flush_host_memory_cache(this->host_view_, host_pointer, size);
+            }
         }
 
         bool map_shared_memory(const uint64_t address, const uint64_t source, const size_t size,
@@ -769,6 +1056,11 @@ namespace sogen::icicle
                     {
                         ok = (icicle_map_shared_memory(vcpu->handle(), address, source, size, perm) != 0) && ok;
                     }
+                    if (this->host_view_)
+                    {
+                        std::lock_guard lock(this->host_view_mutex_);
+                        ok = (icicle_map_shared_memory(this->host_view_, address, source, size, perm) != 0) && ok;
+                    }
                 });
                 return ok;
             }
@@ -780,13 +1072,20 @@ namespace sogen::icicle
                 profile->map_calls.fetch_add(1, std::memory_order_relaxed);
             }
             const bool ok = icicle_map_shared_memory(self->handle(), address, source, size, perm) != 0;
+            if (ok)
+            {
+                std::lock_guard lock(this->host_view_mutex_);
+                ice(icicle_map_shared_memory(this->host_view_, address, source, size, perm),
+                    "Failed to map shared alias in Icicle host view");
+            }
             const uint64_t seq = this->issuer_next(self->index());
             for (auto& v : this->vcpus_)
             {
                 if (v.get() != self)
                 {
-                    this->queue_op(v->index(), seq,
-                                   [address, source, size, perm](icicle_emulator* h) { icicle_map_shared_memory(h, address, source, size, perm); });
+                    this->queue_op(v->index(), seq, [address, source, size, perm](icicle_emulator* h) {
+                        icicle_map_shared_memory(h, address, source, size, perm);
+                    });
                 }
             }
             this->kick_peers(self->index());
@@ -809,7 +1108,64 @@ namespace sogen::icicle
                     }
                 }
             }
-            this->apply_to_all_vms([=](icicle_emulator* h) { ice(icicle_unmap_memory(h, address, size), "Failed to unmap memory"); });
+            const auto unmap_vm = [=](icicle_emulator* h) {
+                ice(icicle_unmap_memory(h, address, size), "Failed to unmap memory");
+            };
+            if (!this->host_view_)
+            {
+                unmap_vm(this->emu_);
+                return;
+            }
+            const auto unmap_view = [&] {
+                ice(icicle_unmap_memory(this->host_view_, address, size), "Failed to unmap Icicle host view memory");
+                std::vector<std::pair<uint64_t, size_t>> remaining;
+                remaining.reserve(this->mmio_ranges_.size() + 1);
+                const auto unmap_end = address + size;
+                for (const auto& [start, length] : this->mmio_ranges_)
+                {
+                    if (!ranges_overlap(address, size, start, length))
+                    {
+                        remaining.emplace_back(start, length);
+                        continue;
+                    }
+                    const auto end = start + length;
+                    if (start < address)
+                    {
+                        remaining.emplace_back(start, static_cast<size_t>(address - start));
+                    }
+                    if (unmap_end < end)
+                    {
+                        remaining.emplace_back(unmap_end, static_cast<size_t>(end - unmap_end));
+                    }
+                }
+                this->mmio_ranges_ = std::move(remaining);
+            };
+            if (auto* self = this->mutation_owner())
+            {
+                {
+                    std::lock_guard lock(this->host_view_mutex_);
+                    unmap_vm(self->handle());
+                    unmap_view();
+                }
+                const auto seq = this->issuer_next(self->index());
+                for (auto& vcpu : this->vcpus_)
+                {
+                    if (vcpu.get() != self)
+                    {
+                        this->queue_op(vcpu->index(), seq, unmap_vm, std::pair{address, size});
+                    }
+                }
+                this->kick_peers(self->index());
+                return;
+            }
+            this->pause_peers_and([&] {
+                std::lock_guard lock(this->host_view_mutex_);
+                for (auto& vcpu : this->vcpus_)
+                {
+                    unmap_vm(vcpu->handle());
+                }
+                unmap_view();
+            });
         }
 
         // 6.4 — the icicle handle to read/write guest memory through. During a syscall/hook the acting
@@ -826,8 +1182,207 @@ namespace sogen::icicle
             return this->emu_;
         }
 
+        void report_external_mmio_refusal(const char* operation, const uint64_t address, const size_t size, const char* reason) const
+        {
+            static std::atomic<unsigned> emitted{0};
+            if (emitted.fetch_add(1, std::memory_order_relaxed) < 8)
+            {
+                std::fprintf(stderr, "[ICHOSTVIEW] external-mmio-refused operation=%s address=%#llx bytes=%zu reason=%s\n", operation,
+                             static_cast<unsigned long long>(address), size, reason);
+            }
+        }
+
+        bool access_parked_mmio(const char* operation, const uint64_t address, const size_t size, const std::function<bool()>& access)
+        {
+            std::unique_lock pause(this->pause_mutex_, std::try_to_lock);
+            if (!pause.owns_lock())
+            {
+                this->report_external_mmio_refusal(operation, address, size, "pause-in-progress");
+                return false;
+            }
+            std::unique_lock gate(this->quiesce_mutex_, std::try_to_lock);
+            if (!gate.owns_lock() || this->quiescing_ || std::any_of(this->vcpus_.begin(), this->vcpus_.end(), [](const auto& vcpu) {
+                    return vcpu->run_active_.load(std::memory_order_acquire);
+                }))
+            {
+                this->report_external_mmio_refusal(operation, address, size, "vcpu-active");
+                return false;
+            }
+            this->quiescing_ = true;
+            gate.unlock();
+            const auto resume = utils::finally([this] {
+                std::lock_guard lock(this->quiesce_mutex_);
+                this->quiescing_ = false;
+                this->quiesce_cv_.notify_all();
+            });
+            std::vector<std::unique_lock<std::recursive_mutex>> parked;
+            parked.reserve(this->vcpus_.size());
+            for (auto& vcpu : this->vcpus_)
+            {
+                parked.emplace_back(vcpu->parked_vm_mutex_, std::try_to_lock);
+                if (!parked.back().owns_lock())
+                {
+                    this->report_external_mmio_refusal(operation, address, size, "worker-using-vm");
+                    return false;
+                }
+            }
+            return access();
+        }
+
+        bool overlaps_mmio(const uint64_t address, const size_t size) const
+        {
+            return std::any_of(this->mmio_ranges_.begin(), this->mmio_ranges_.end(),
+                               [&](const auto& range) { return ranges_overlap(address, size, range.first, range.second); });
+        }
+
+        void report_host_view_hook_limit(const char* operation, const uint64_t address, const size_t size) const
+        {
+            static std::atomic<unsigned> emitted{0};
+            if (emitted.fetch_add(1, std::memory_order_relaxed) < 8)
+            {
+                std::fprintf(stderr, "[ICHOSTVIEW] hook-copy-refused operation=%s address=%#llx bytes=%zu limit=%zu\n", operation,
+                             static_cast<unsigned long long>(address), size, host_view_callback_limit);
+            }
+        }
+
+        bool hook_callback_bytes_exceed_limit(const uint64_t address, const size_t size, const bool is_read) const
+        {
+            size_t budget = host_view_callback_limit;
+            for (const auto& range : this->host_view_hook_ranges_)
+            {
+                if (range.is_read != is_read || !ranges_overlap(address, size, range.address, range.size))
+                {
+                    continue;
+                }
+                if (size > budget)
+                {
+                    return true;
+                }
+                budget -= size;
+            }
+            return false;
+        }
+
+        std::exception_ptr dispatch_host_view_callbacks(std::vector<std::function<void()>>& callbacks)
+        {
+            std::exception_ptr error;
+            for (auto& callback : callbacks)
+            {
+                try
+                {
+                    callback();
+                }
+                catch (...)
+                {
+                    if (!error)
+                    {
+                        error = std::current_exception();
+                    }
+                }
+            }
+            return error;
+        }
+
+        bool try_read_external(const uint64_t address, void* data, const size_t size)
+        {
+            bool mmio = false;
+            bool ok = false;
+            std::vector<std::function<void()>> callbacks;
+            std::exception_ptr staging_error;
+            {
+                std::lock_guard lock(this->host_view_mutex_);
+                mmio = this->overlaps_mmio(address, size);
+                if (!mmio)
+                {
+                    if (this->hook_callback_bytes_exceed_limit(address, size, true))
+                    {
+                        this->report_host_view_hook_limit("read", address, size);
+                        return false;
+                    }
+                    ok = icicle_read_memory(this->host_view_, address, data, size) != 0;
+                    callbacks.swap(this->host_view_callbacks_);
+                    staging_error = std::exchange(this->host_view_callback_error_, std::exception_ptr{});
+                    this->host_view_callback_bytes_ = 0;
+                }
+            }
+            if (mmio)
+            {
+                return this->access_parked_mmio("read", address, size,
+                                                [&] { return icicle_read_memory(this->emu_, address, data, size) != 0; });
+            }
+            auto callback_error = this->dispatch_host_view_callbacks(callbacks);
+            if (staging_error)
+            {
+                std::rethrow_exception(staging_error);
+            }
+            if (callback_error)
+            {
+                std::rethrow_exception(callback_error);
+            }
+            return ok;
+        }
+
+        bool try_write_external(const uint64_t address, const void* data, const size_t size, bool& cached,
+                                std::exception_ptr& callback_error)
+        {
+            bool mmio = false;
+            bool ok = false;
+            std::vector<std::function<void()>> callbacks;
+            std::exception_ptr staging_error;
+            {
+                std::lock_guard lock(this->host_view_mutex_);
+                mmio = this->overlaps_mmio(address, size);
+                if (!mmio)
+                {
+                    if (this->hook_callback_bytes_exceed_limit(address, size, false))
+                    {
+                        this->report_host_view_hook_limit("write", address, size);
+                        return false;
+                    }
+                    cached = icicle_host_view_code_may_be_cached(this->host_view_, address, size) != 0;
+                    ok = icicle_write_memory(this->host_view_, address, data, size) != 0;
+                    cached = icicle_host_view_code_may_be_cached(this->host_view_, address, size) != 0 || cached;
+                    callbacks.swap(this->host_view_callbacks_);
+                    staging_error = std::exchange(this->host_view_callback_error_, std::exception_ptr{});
+                    this->host_view_callback_bytes_ = 0;
+                }
+            }
+            if (mmio)
+            {
+                return this->access_parked_mmio("write", address, size,
+                                                [&] { return icicle_write_memory(this->emu_, address, data, size) != 0; });
+            }
+            auto dispatch_error = this->dispatch_host_view_callbacks(callbacks);
+            callback_error = staging_error ? staging_error : dispatch_error;
+            return ok;
+        }
+
+        void refresh_or_protect_host_view(const uint64_t address, const size_t size, const uint8_t permissions)
+        {
+            size_t offset = 0;
+            while (offset < size)
+            {
+                const auto page_address = address + offset;
+                const auto length = std::min(size - offset, size_t{0x1000} - static_cast<size_t>(page_address & 0xfff));
+                if (icicle_perm_epoch_of_range(this->host_view_, page_address, length) != 0)
+                {
+                    icicle_refresh_peer_protection(this->host_view_, page_address, length);
+                }
+                else
+                {
+                    ice(icicle_protect_memory(this->host_view_, page_address, length, permissions),
+                        "Failed to protect Icicle host view memory");
+                }
+                offset += length;
+            }
+        }
+
         bool try_read_memory(const uint64_t address, void* data, const size_t size) const override
         {
+            if (this->host_view_ && !this->mutation_owner())
+            {
+                return const_cast<icicle_x86_64_emulator*>(this)->try_read_external(address, data, size);
+            }
             const auto ok = icicle_read_memory(this->acting_handle(), address, data, size);
             if (ok || this->vcpus_.size() == 1)
             {
@@ -859,7 +1414,12 @@ namespace sogen::icicle
         {
             if (this->vcpus_.size() == 1 || size == 0)
             {
-                return icicle_write_memory(this->acting_handle(), address, data, size);
+                const bool ok = icicle_write_memory(this->acting_handle(), address, data, size);
+                if (!ok)
+                {
+                    diagnose_large_write_failure(address, size);
+                }
+                return ok;
             }
             // NOTE: even REENTRANCY-GUARDED, a pre-write own-queue drain here SEGV'd
             // TwoVcpusExecuteConcurrentlyOverSharedCode (host AV in test body) - reverted again.
@@ -873,60 +1433,42 @@ namespace sogen::icicle
             // Unmapped race needs the windows_emulator to stop issuing such writes outside a
             // quantum (or provide an explicit pre-write hook) - backend-only fixes are exhausted.
 
-            // SMP 6.6: if the written range is translated on ANY VM (detected via the shared PageData
-            // IN_CODE_CACHE perms — visible from any single view), every OTHER VM's translation of it
-            // must be dropped too, or a peer keeps executing stale code after this write.
             auto* self = this->mutation_owner();
-            const bool caller_is_vcpu = self != nullptr;
-            const bool cached = icicle_code_range_is_cached(this->acting_handle(), address, size);
-            if (smp_trace_enabled() && (cached || !caller_is_vcpu))
+            if (!self)
             {
-                std::fprintf(stderr, "[SMPTRC] write addr=%#llx size=%zu cached=%d caller=%s\n",
-                             (unsigned long long)address, size, (int)cached, caller_is_vcpu ? "vcpu" : "external");
-            }
-
-            if (!caller_is_vcpu)
-            {
-                // External caller: do NOT pause. A write through the master's view IS the coherent
-                // shared state for SMP-shared guest RAM, so no peer handle needs touching for the
-                // write itself. Pausing here DEADLOCKED: an external loader write waits for a peer's
-                // run_active_ to clear, but the peer can be parked in a hook that cannot progress
-                // (trace: "pause still waiting (44s) for: vcpu0" after write 0x101cd39fb20/1232).
-                // If the range was translated, queue invalidate ops for every VM instead (peers
-                // drain at their next quantum; the kick bounds the latency).
-                bool ok = icicle_write_memory(this->emu_, address, data, size);
-                if (!ok)
+                bool cached = false;
+                std::exception_ptr callback_error;
+                const bool ok = this->try_write_external(address, data, size, cached, callback_error);
+                if (!ok && size == context_record_bytes && t_context_write_retry_probe &&
+                    t_context_write_retry_probe->address == address)
                 {
-                    if (size == context_record_bytes && t_context_write_retry_probe && t_context_write_retry_probe->address == address)
-                    {
-                        t_context_write_retry_probe->initial_failed = true;
-                    }
-                    // 6.6: the MAIN-thread loader write can hit a map that is queued for the
-                    // MASTER but issued by a peer (the master's own queue). Drain the master's
-                    // queue (+ in-flight wait) and retry - the write-RETRIED-OK trace showed the
-                    // worker branch doing exactly this; the external branch needed it too.
-                    this->drain_own_queue_with_inflight_wait(*this->vcpus_[0]);
-                    ok = icicle_write_memory(this->emu_, address, data, size);
-                    if (!ok && smp_trace_enabled())
-                    {
-                        std::fprintf(stderr, "[SMPTRC] write-RETRY-FAILED(external) addr=%#llx size=%zu inflight=%llu\n",
-                                     (unsigned long long)address, size,
-                                     (unsigned long long)this->ops_in_flight_.load(std::memory_order_acquire));
-                    }
+                    t_context_write_retry_probe->initial_failed = true;
                 }
                 if (cached)
                 {
-                    // External writer: its own issuer slot (index == vcpus_.size(), beyond any vCPU).
-                    const uint64_t eseq = this->issuer_next(this->vcpus_.size());
+                    const uint64_t seq = this->issuer_next(this->vcpus_.size());
                     for (auto& v : this->vcpus_)
                     {
-                        this->queue_op(v->index(), eseq, [address, size](icicle_emulator* h) {
-                            (void)icicle_invalidate_code_range(h, address, size);
-                        });
+                        this->queue_invalidation(v->index(), seq, address, size);
                     }
-                    this->kick_peers(std::numeric_limits<size_t>::max()); // external: no own vCPU to skip
+                    this->kick_peers(std::numeric_limits<size_t>::max());
+                }
+                if (!ok)
+                {
+                    diagnose_large_write_failure(address, size);
+                }
+                if (callback_error)
+                {
+                    std::rethrow_exception(callback_error);
                 }
                 return ok;
+            }
+
+            const bool cached = icicle_code_range_is_cached(self->handle(), address, size);
+            if (smp_trace_enabled() && cached)
+            {
+                std::fprintf(stderr, "[SMPTRC] write addr=%#llx size=%zu cached=1 caller=vcpu\n",
+                             (unsigned long long)address, size);
             }
 
             const auto own = self->index();
@@ -959,11 +1501,13 @@ namespace sogen::icicle
                     {
                         continue;
                     }
-                    this->queue_op(v->index(), iseq, [address, size](icicle_emulator* h) {
-                        (void)icicle_invalidate_code_range(h, address, size);
-                    });
+                    this->queue_invalidation(v->index(), iseq, address, size);
                 }
                 this->kick_peers(own);
+            }
+            if (!ok)
+            {
+                diagnose_large_write_failure(address, size);
             }
             return ok;
         }
@@ -1019,8 +1563,8 @@ namespace sogen::icicle
                 report_retry(false, "guest-fault", self);
                 return;
             }
-                        // 6.6c'': a BETWEEN-quantum worker write (t_running_vcpu null, but this thread owns a
-            // vCPU via t_worker_vcpu). ROOT-CAUSE CLOSEOUT: the recurring 1232-byte CONTEXT write
+            // 6.6c'': a BETWEEN-quantum scheduler worker write (t_running_vcpu null, but
+            // the explicit scheduler context still identifies its vCPU). The recurring 1232-byte CONTEXT write
             // fails Unmapped while its map is queued/in-flight; deferring only the FAULT left the
             // page zeroed (the write never retried) and ntdll later read the zero CONTEXT and
             // synthesized the terminal AV (VIENTRY=0 proved no icicle violation delivers it). So:
@@ -1051,6 +1595,7 @@ namespace sogen::icicle
                     for (auto& op : ops)
                     {
                         op.apply(worker->handle());
+                        this->complete_op(op.ticket);
                     }
                 }
                 if (icicle_write_memory(worker->handle(), address, data, size))
@@ -1091,15 +1636,26 @@ namespace sogen::icicle
             const auto perm = static_cast<uint8_t>(permissions);
             auto* self = this->mutation_owner();
             const bool caller_is_vcpu = self != nullptr;
-            if (this->vcpus_.size() == 1 || !caller_is_vcpu)
+            if (this->vcpus_.size() == 1)
             {
-                this->apply_to_all_vms([=](icicle_emulator* h) { ice(icicle_protect_memory(h, address, size, perm), "Failed to apply permissions"); });
+                ice(icicle_protect_memory(this->emu_, address, size, perm), "Failed to apply permissions");
                 return;
             }
-            // SMP 6.6c'': STALE-OP GUARD. A deferred protect queued now can land on a peer AFTER
-            // the range was freed and RE-MAPPED (the probe's 'Failed to write memory': a stale
-            // protect over the loader's fresh module). Capture the range's perm epoch at queue
-            // time; the peer's apply skips if the epoch changed (a newer map/protect won).
+            if (!caller_is_vcpu)
+            {
+                this->pause_peers_and([&] {
+                    std::lock_guard lock(this->host_view_mutex_);
+                    for (auto& vcpu : this->vcpus_)
+                    {
+                        ice(icicle_protect_memory(vcpu->handle(), address, size, perm), "Failed to apply permissions");
+                    }
+                    this->refresh_or_protect_host_view(address, size, perm);
+                });
+                return;
+            }
+            // Protecting an SMP-shared page changes the one shared PageData immediately.
+            // Peers must drop their own TLB/JIT translations, but must not replay the old
+            // permission write: that can overwrite a newer protection or a remapped page.
             const auto own = self->index();
             auto* profile = this->profile_enabled_ ? &self->smp_profile_ : nullptr;
             const smp_profile_timer protect_timer{profile ? &profile->protect_nanos : nullptr};
@@ -1107,22 +1663,44 @@ namespace sogen::icicle
             {
                 profile->protect_calls.fetch_add(1, std::memory_order_relaxed);
             }
-            const uint64_t epoch = icicle_perm_epoch_of_range(self->handle(), address, size);
-            ice(icicle_protect_memory(self->handle(), address, size, perm), "Failed to apply permissions");
+            bool all_smp_shared = false;
+            {
+                std::lock_guard lock(this->host_view_mutex_);
+                all_smp_shared = icicle_perm_epoch_of_range(self->handle(), address, size) != 0;
+                ice(icicle_protect_memory(self->handle(), address, size, perm), "Failed to apply permissions");
+                this->refresh_or_protect_host_view(address, size, perm);
+            }
             const uint64_t pseq = this->issuer_next(own);
             for (auto& v : this->vcpus_)
             {
                 if (v->index() != own)
                 {
-                    this->queue_op(v->index(), pseq, [this, address, size, perm, epoch, own, pseq](icicle_emulator* h) {
-                        // Same-issuer sequences (this issuer's earlier map) always apply in order;
-                        // the perm_epoch stale-skip applies only CROSS-issuer (the recording vCPU's
-                        // own next seq > pseq means this protect was superseded by its own later op).
-                        const uint64_t now_seq = this->issuer_seq_.size() > own ? this->issuer_seq_[own] : pseq + 1;
-                        const bool superseded_by_same_issuer = now_seq > pseq + 1;
-                        if (!superseded_by_same_issuer && icicle_perm_epoch_of_range(h, address, size) == epoch)
+                    this->queue_op(v->index(), pseq, [address, size, perm, all_smp_shared](icicle_emulator* h) {
+                        if (all_smp_shared)
                         {
-                            ice(icicle_protect_memory(h, address, size, perm), "Failed to apply permissions");
+                            icicle_refresh_peer_protection(h, address, size);
+                        }
+                        else
+                        {
+                            // Mixed ranges need per-page handling. Never replay an old permission
+                            // write over a shared page, even if another page in the range is local.
+                            // Local mappings still require their own permission update.
+                            size_t offset = 0;
+                            while (offset < size)
+                            {
+                                const auto page_address = address + offset;
+                                const auto length = std::min(size - offset,
+                                                             size_t{0x1000} - static_cast<size_t>(page_address & 0xfff));
+                                if (icicle_perm_epoch_of_range(h, page_address, length) != 0)
+                                {
+                                    icicle_refresh_peer_protection(h, page_address, length);
+                                }
+                                else
+                                {
+                                    ice(icicle_protect_memory(h, page_address, length, perm), "Failed to apply permissions");
+                                }
+                                offset += length;
+                            }
                         }
                     });
                 }
@@ -1315,6 +1893,7 @@ namespace sogen::icicle
                             for (auto& op : ops)
                             {
                                 op.apply(v->handle());
+                                this->complete_op(op.ticket);
                             }
                             return memory_violation_continuation::restart;
                         }
@@ -1508,8 +2087,19 @@ namespace sogen::icicle
                 // Inside a running hook: icicle is iterating its hook tables on this thread, and the
                 // windows_emulator may hold the BEL — defer to quantum end, where the 6.5 routing applies
                 // the removals without pausing anyone.
-                std::unique_lock lock(this->partition_mutex_);
-                this->hooks_to_delete_.insert(hook);
+                std::shared_ptr<hook_registration> reg;
+                {
+                    std::unique_lock lock(this->partition_mutex_);
+                    this->hooks_to_delete_.insert(hook);
+                    if (const auto it = this->registrations_.find(hook); it != this->registrations_.end())
+                    {
+                        reg = it->second;
+                    }
+                }
+                if (reg)
+                {
+                    this->cancel_host_view_callback(reg, false);
+                }
                 return;
             }
             this->delete_hook_internal(hook);
@@ -1610,16 +2200,8 @@ namespace sogen::icicle
             {
                 return true;
             }
-            const auto issued = this->ops_issued_watermark_.load(std::memory_order_acquire);
-            uint64_t pending = 0;
-            {
-                std::lock_guard<std::mutex> lock(this->pending_mutex_);
-                for (const auto& q : this->pending_ops_)
-                {
-                    pending += q.size();
-                }
-            }
-            return issued >= pending && (issued - pending) >= mark;
+            std::lock_guard<std::mutex> lock(this->pending_mutex_);
+            return this->ops_completed_watermark_ >= mark;
         }
 
         void sync_worker_context(const size_t vcpu_index) override
@@ -1636,6 +2218,33 @@ namespace sogen::icicle
                 // here, so both reads are race-free.
                 worker.published_instructions_.store(icicle_get_icount(worker.emu_), std::memory_order_relaxed);
                 worker.published_rip_.store(worker.read_instruction_pointer(), std::memory_order_relaxed);
+                if (this->jit_profile_enabled_)
+                {
+                    icicle_jit_profile p{};
+                    if (icicle_get_jit_profile(worker.emu_, &p))
+                    {
+                        worker.jit_compile_calls_.store(p.compile_calls, std::memory_order_relaxed);
+                        worker.jit_compile_nanos_.store(p.compile_nanos, std::memory_order_relaxed);
+                        worker.jit_reset_calls_.store(p.reset_calls, std::memory_order_relaxed);
+                        worker.jit_recompile_calls_.store(p.recompile_calls, std::memory_order_relaxed);
+                        worker.jit_recompile_nanos_.store(p.recompile_nanos, std::memory_order_relaxed);
+                        worker.jit_recompile_compile_calls_.store(p.recompile_compile_calls, std::memory_order_relaxed);
+                        worker.jit_recompile_compile_nanos_.store(p.recompile_compile_nanos, std::memory_order_relaxed);
+                        worker.jit_reset_generation_.store(p.reset_generation, std::memory_order_relaxed);
+                        worker.jit_reset_cause_flags_.store(p.reset_cause_flags, std::memory_order_relaxed);
+                        worker.jit_reset_manual_origin_flags_.store(p.reset_manual_origin_flags, std::memory_order_relaxed);
+                        worker.jit_flush_code_nanos_.store(p.flush_code_nanos, std::memory_order_relaxed);
+                        worker.jit_reset_nanos_.store(p.jit_reset_nanos, std::memory_order_relaxed);
+                        worker.jit_generation_compile_calls_.store(p.generation_compile_calls, std::memory_order_relaxed);
+                        worker.jit_generation_compile_nanos_.store(p.generation_compile_nanos, std::memory_order_relaxed);
+                        worker.jit_origin_first_address_compiles_.store(p.origin_first_address_compiles, std::memory_order_relaxed);
+                        worker.jit_origin_repeat_after_reset_compiles_.store(p.origin_repeat_after_reset_compiles, std::memory_order_relaxed);
+                        worker.jit_origin_repeat_in_generation_compiles_.store(p.origin_repeat_in_generation_compiles, std::memory_order_relaxed);
+                        worker.jit_origin_periodic_recompile_compiles_.store(p.origin_periodic_recompile_compiles, std::memory_order_relaxed);
+                        worker.jit_origin_unclassified_compiles_.store(p.origin_unclassified_compiles, std::memory_order_relaxed);
+                        worker.jit_origin_generation_number_.store(p.origin_generation_number, std::memory_order_relaxed);
+                    }
+                }
             }
         }
 
@@ -1655,7 +2264,7 @@ namespace sogen::icicle
 
         std::vector<smp_profile_snapshot> smp_profile() const override
         {
-            if (!this->profile_enabled_)
+            if (!this->profile_enabled_ && !this->exec_write_wake_enabled_)
             {
                 return {};
             }
@@ -1664,16 +2273,107 @@ namespace sogen::icicle
             for (const auto& vcpu : this->vcpus_)
             {
                 const auto& p = vcpu->smp_profile_;
+                icicle_exec_write_wake_profile wake{};
+                icicle_exec_write_filter_profile filter{};
+                icicle_invalidation_profile invalidation{};
+                icicle_manual_invalidation_profile manual{};
+                if (this->profile_enabled_)
+                {
+                    ice(icicle_get_invalidation_profile(vcpu->handle(), &invalidation) != 0,
+                        "Failed to read Icicle invalidation profile");
+                    ice(icicle_get_manual_invalidation_profile(vcpu->handle(), &manual) != 0,
+                        "Failed to read Icicle manual invalidation profile");
+                }
+                if (this->exec_write_wake_enabled_)
+                {
+                    ice(icicle_get_exec_write_wake_profile(vcpu->handle(), &wake) != 0,
+                        "Failed to read Icicle executable-write wake counters");
+                    ice(icicle_get_exec_write_filter_profile(vcpu->handle(), &filter) != 0,
+                        "Failed to read Icicle executable-write filter counters");
+                }
                 out.push_back(smp_profile_snapshot{
                     .map_calls = p.map_calls.load(std::memory_order_relaxed),
                     .map_nanos = p.map_nanos.load(std::memory_order_relaxed),
+                    .peer_map_calls = p.peer_map_calls.load(std::memory_order_relaxed),
+                    .peer_map_pages = p.peer_map_pages.load(std::memory_order_relaxed),
+                    .peer_map_nanos = p.peer_map_nanos.load(std::memory_order_relaxed),
+                    .peer_map_max_nanos = p.peer_map_max_nanos.load(std::memory_order_relaxed),
                     .protect_calls = p.protect_calls.load(std::memory_order_relaxed),
                     .protect_nanos = p.protect_nanos.load(std::memory_order_relaxed),
                     .queue_ops = p.queue_ops.load(std::memory_order_relaxed),
                     .queue_nanos = p.queue_nanos.load(std::memory_order_relaxed),
+                    .invalidate_queued = p.invalidate_queued.load(std::memory_order_relaxed),
+                    .invalidate_queue_nanos = p.invalidate_queue_nanos.load(std::memory_order_relaxed),
+                    .invalidate_applied = p.invalidate_applied.load(std::memory_order_relaxed),
+                    .invalidate_no_change = p.invalidate_no_change.load(std::memory_order_relaxed),
+                    .invalidate_apply_nanos = p.invalidate_apply_nanos.load(std::memory_order_relaxed),
+                    .invalidate_adjacent_same_pages = p.invalidate_adjacent_same_pages.load(std::memory_order_relaxed),
                     .kick_calls = p.kick_calls.load(std::memory_order_relaxed),
                     .kick_targets = p.kick_targets.load(std::memory_order_relaxed),
                     .kick_nanos = p.kick_nanos.load(std::memory_order_relaxed),
+                    .exec_write_wake_enabled = this->exec_write_wake_enabled_,
+                    .exec_write_wake_events_total = wake.wake_events,
+                    .exec_write_guest_jit_total = wake.guest_jit_writes,
+                    .exec_write_guest_mmu_total = wake.guest_mmu_writes,
+                    .exec_write_host_total = wake.host_writes,
+                    .exec_write_owner_flushes_total = wake.owner_flushes,
+                    .exec_write_filtered_noncode_total = filter.filtered_noncode,
+                    .exec_write_notified_overlap_total = filter.notified_overlap,
+                    .exec_write_notified_concurrent_total = filter.notified_concurrent,
+                    .invalidation_profile_enabled = this->profile_enabled_,
+                    .epoch_mismatches_total = invalidation.epoch_mismatches,
+                    .jit_resets_total = invalidation.jit_resets,
+                    .jit_reset_epoch_total = invalidation.epoch_resets,
+                    .jit_reset_wake_total = invalidation.wake_resets,
+                    .jit_reset_manual_total = invalidation.manual_resets,
+                    .jit_reset_mixed_total = invalidation.mixed_resets,
+                    .jit_reset_unknown_total = invalidation.unknown_resets,
+                    .manual_origin_resets_total = manual.total,
+                    .manual_peer_protection_total = manual.peer_protection,
+                    .manual_public_invalidate_total = manual.public_invalidate,
+                    .manual_self_modifying_total = manual.self_modifying,
+                    .manual_host_cache_total = manual.host_cache,
+                    .manual_unmap_total = manual.unmap,
+                    .manual_protect_total = manual.protect,
+                    .manual_host_write_total = manual.host_write,
+                    .manual_multiple_origins_total = manual.multiple_origins,
+                    .manual_unknown_origin_total = manual.unknown_origin,
+                });
+            }
+            return out;
+        }
+
+        std::vector<jit_profile_snapshot> jit_profile() const override
+        {
+            if (!this->jit_profile_enabled_)
+            {
+                return {};
+            }
+            std::vector<jit_profile_snapshot> out;
+            out.reserve(this->vcpus_.size());
+            for (const auto& vcpu : this->vcpus_)
+            {
+                out.push_back(jit_profile_snapshot{
+                    .compile_calls = vcpu->jit_compile_calls_.load(std::memory_order_relaxed),
+                    .compile_nanos = vcpu->jit_compile_nanos_.load(std::memory_order_relaxed),
+                    .reset_calls = vcpu->jit_reset_calls_.load(std::memory_order_relaxed),
+                    .recompile_calls = vcpu->jit_recompile_calls_.load(std::memory_order_relaxed),
+                    .recompile_nanos = vcpu->jit_recompile_nanos_.load(std::memory_order_relaxed),
+                    .recompile_compile_calls = vcpu->jit_recompile_compile_calls_.load(std::memory_order_relaxed),
+                    .recompile_compile_nanos = vcpu->jit_recompile_compile_nanos_.load(std::memory_order_relaxed),
+                    .reset_generation = vcpu->jit_reset_generation_.load(std::memory_order_relaxed),
+                    .reset_cause_flags = vcpu->jit_reset_cause_flags_.load(std::memory_order_relaxed),
+                    .reset_manual_origin_flags = vcpu->jit_reset_manual_origin_flags_.load(std::memory_order_relaxed),
+                    .flush_code_nanos = vcpu->jit_flush_code_nanos_.load(std::memory_order_relaxed),
+                    .jit_reset_nanos = vcpu->jit_reset_nanos_.load(std::memory_order_relaxed),
+                    .generation_compile_calls = vcpu->jit_generation_compile_calls_.load(std::memory_order_relaxed),
+                    .generation_compile_nanos = vcpu->jit_generation_compile_nanos_.load(std::memory_order_relaxed),
+                    .origin_first_address_compiles = vcpu->jit_origin_first_address_compiles_.load(std::memory_order_relaxed),
+                    .origin_repeat_after_reset_compiles = vcpu->jit_origin_repeat_after_reset_compiles_.load(std::memory_order_relaxed),
+                    .origin_repeat_in_generation_compiles = vcpu->jit_origin_repeat_in_generation_compiles_.load(std::memory_order_relaxed),
+                    .origin_periodic_recompile_compiles = vcpu->jit_origin_periodic_recompile_compiles_.load(std::memory_order_relaxed),
+                    .origin_unclassified_compiles = vcpu->jit_origin_unclassified_compiles_.load(std::memory_order_relaxed),
+                    .origin_generation_number = vcpu->jit_origin_generation_number_.load(std::memory_order_relaxed),
                 });
             }
             return out;
@@ -1697,7 +2397,8 @@ namespace sogen::icicle
         }
 
         std::string smp_gate_debug() const override
-        {            std::string out{};
+        {
+            std::string out{};
             char buf[48];
             {
                 std::lock_guard<std::mutex> lock(this->pending_mutex_);
@@ -1746,13 +2447,84 @@ namespace sogen::icicle
         struct hook_registration
         {
             std::vector<std::tuple<size_t, uint32_t, std::unique_ptr<utils::object>>> entries{};
-            bool pending{false};  // reserved handle for a hook queued from inside a running hook
-            bool deleted{false};  // delete_hook seen; queued installs must not apply
+            bool pending{false}; // reserved handle for a hook queued from inside a running hook
+            bool deleted{false}; // delete_hook seen; queued installs must not apply
+            std::mutex callback_mutex{};
+            std::condition_variable callback_finished{};
+            bool callback_cancelled{false};
+            size_t active_callbacks{};
         };
+
+        inline static thread_local const hook_registration* active_host_view_callback_ = nullptr;
+
+        template <typename Fn>
+        void invoke_host_view_callback(const std::shared_ptr<hook_registration>& reg, Fn&& callback)
+        {
+            {
+                std::lock_guard lock(reg->callback_mutex);
+                if (reg->callback_cancelled)
+                {
+                    return; // The callback was staged before its hook was removed.
+                }
+                ++reg->active_callbacks;
+            }
+            const auto* previous = active_host_view_callback_;
+            active_host_view_callback_ = reg.get();
+            const auto complete = utils::finally([reg, previous] {
+                active_host_view_callback_ = previous;
+                {
+                    std::lock_guard lock(reg->callback_mutex);
+                    --reg->active_callbacks;
+                }
+                reg->callback_finished.notify_all();
+            });
+            callback();
+        }
+
+        void cancel_host_view_callback(const std::shared_ptr<hook_registration>& reg, const bool may_wait)
+        {
+            std::unique_lock lock(reg->callback_mutex);
+            reg->callback_cancelled = true;
+            // A host callback may delete itself or another hook. A guest vCPU may hold the BEL.
+            // Neither caller may wait for a callback that could need that same execution context.
+            if (may_wait && active_host_view_callback_ == nullptr && !this->mutation_owner())
+            {
+                reg->callback_finished.wait(lock, [&] { return reg->active_callbacks == 0; });
+            }
+        }
+
         std::unordered_map<emulator_hook*, std::shared_ptr<hook_registration>> registrations_{};
 
+        struct host_view_hook_range
+        {
+            const hook_registration* owner{};
+            uint64_t address{};
+            size_t size{};
+            bool is_read{};
+        };
+
+        static constexpr size_t host_view_callback_limit = 512 * 1024 * 1024;
+
         icicle_emulator* emu_{};
+        icicle_emulator* host_view_{};
+        std::unique_ptr<icicle_vcpu> host_view_cpu_{};
+        mutable std::mutex host_view_mutex_{};
+        std::vector<std::function<void()>> host_view_callbacks_{};
+        std::exception_ptr host_view_callback_error_{};
+        size_t host_view_callback_bytes_{};
+        std::vector<host_view_hook_range> host_view_hook_ranges_{};
+        std::vector<std::pair<uint64_t, size_t>> mmio_ranges_{};
         std::vector<std::unique_ptr<icicle_vcpu>> vcpus_{};
+        const bool force_smp_memory_ = [] {
+            const char* value = std::getenv("SOGEN_ICICLE_FORCE_SMP_MEMORY");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        bool exec_write_wake_enabled_ = false;
+        const bool jit_profile_enabled_ = [] {
+            const char* value = std::getenv("SOGEN_ICICLE_JIT_PROFILE");
+            const char* origin = std::getenv("SOGEN_ICICLE_COMPILE_ORIGIN_PROFILE");
+            return (value && std::strcmp(value, "1") == 0) || (origin && std::strcmp(origin, "1") == 0);
+        }();
         const bool profile_enabled_ = [] {
             const char* value = std::getenv("SOGEN_SMP_PROFILE");
             return value && std::strcmp(value, "1") == 0;
@@ -1813,14 +2585,22 @@ namespace sogen::icicle
         struct pending_op
         {
             uint64_t seq{}; // issuer-local sequence number
+            uint64_t ticket{};
             std::function<void(icicle_emulator*)> apply{};
+            std::optional<std::pair<uint64_t, size_t>> unmap_range{};
+            // Page span is diagnostic metadata; it never changes queue order or execution.
+            std::optional<std::pair<uint64_t, uint64_t>> invalidate_page_span{};
         };
+
         std::vector<std::vector<pending_op>> pending_ops_{}; // [vm index] -> ops(handle)
         // Next sequence number per issuer vCPU index (monotonic).
-        std::vector<uint64_t> issuer_seq_{};
-        // SMP 6.7 RC#2: count of ops ever queued to peers. applied(mark) = issued - pending
-        // (per-target FIFO), so a host gate can wait for its earlier queued memory ops.
+        std::vector<std::atomic<uint64_t>> issuer_seq_{};
+        // A visibility mark passes only after every earlier queued op has finished applying.
+        // Drains remove ops from pending_ops_ before applying them, and different workers can
+        // finish their queues out of global ticket order.
         std::atomic<uint64_t> ops_issued_watermark_{0};
+        uint64_t ops_completed_watermark_{0};
+        std::deque<uint8_t> ops_completed_out_of_order_{};
 
         // 6.6: nonzero while ANY vCPU is between applying a cross-VM mutation to its own VM and
         // queueing it for peers. A peer faulting UNMAPPED with an empty queue can briefly wait for
@@ -1832,11 +2612,8 @@ namespace sogen::icicle
         // Simpler: external callers pass issuer = their own index sentinel via issuer_next().
         uint64_t issuer_next(const size_t issuer)
         {
-            if (issuer >= this->issuer_seq_.size())
-            {
-                this->issuer_seq_.resize(issuer + 1, 0);
-            }
-            return this->issuer_seq_[issuer]++;
+            assert(issuer < this->issuer_seq_.size());
+            return this->issuer_seq_[issuer].fetch_add(1, std::memory_order_acq_rel);
         }
 
         // RAII: marks a cross-VM fanout in flight (own-VM apply ... peer queueing window).
@@ -1849,28 +2626,126 @@ namespace sogen::icicle
             }
         };
 
-        void queue_op(const size_t target, const uint64_t seq, std::function<void(icicle_emulator*)> op)
+        void queue_op(const size_t target, const uint64_t seq, std::function<void(icicle_emulator*)> op,
+                      const std::optional<std::pair<uint64_t, size_t>> unmap_range = std::nullopt,
+                      const std::optional<std::pair<uint64_t, uint64_t>> invalidate_page_span = std::nullopt)
         {
             auto* self = this->mutation_owner();
             auto* profile = this->profile_enabled_ && self ? &self->smp_profile_ : nullptr;
+            auto* target_profile = this->profile_enabled_ && invalidate_page_span && target < this->vcpus_.size()
+                                       ? &this->vcpus_[target]->smp_profile_ : nullptr;
             const smp_profile_timer queue_timer{profile ? &profile->queue_nanos : nullptr};
-            // Push under the mutex FIRST, bump the issued watermark AFTER: smp_op_applied() reads
-            // issued then sums the queues under the same mutex, so a watermark bumped before the
-            // push could make an un-queued op count as applied (the gate opens early - the 6.7
-            // transient first-read race). This order errs the safe way: pending may briefly
-            // exceed issued, which only holds the visibility gate one drain longer.
+            const smp_profile_timer invalidate_queue_timer{
+                target_profile ? &target_profile->invalidate_queue_nanos : nullptr};
             {
                 std::lock_guard<std::mutex> lock(this->pending_mutex_);
                 if (target >= this->pending_ops_.size())
                 {
                     return;
                 }
-                this->pending_ops_[target].push_back(pending_op{seq, std::move(op)});
+                auto& pending = this->pending_ops_[target];
+                if (target_profile)
+                {
+                    target_profile->invalidate_queued.fetch_add(1, std::memory_order_relaxed);
+                    // An exact adjacent page-span match is a conservative duplicate candidate.
+                    // Keep every op and ticket until an ordering-preserving optimization is proven.
+                    if (!pending.empty() && pending.back().invalidate_page_span == invalidate_page_span)
+                    {
+                        target_profile->invalidate_adjacent_same_pages.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                const auto ticket = this->ops_issued_watermark_.load(std::memory_order_relaxed) + 1;
+                pending.push_back(pending_op{seq, ticket, std::move(op), unmap_range, invalidate_page_span});
+                this->ops_completed_out_of_order_.push_back(0);
+                this->ops_issued_watermark_.store(ticket, std::memory_order_release);
             }
-            this->ops_issued_watermark_.fetch_add(1, std::memory_order_acq_rel);
             if (profile)
             {
                 profile->queue_ops.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        void queue_invalidation(const size_t target, const uint64_t seq, const uint64_t address, const size_t size)
+        {
+            auto* profile = this->profile_enabled_ ? &this->vcpus_[target]->smp_profile_ : nullptr;
+            std::optional<std::pair<uint64_t, uint64_t>> page_span;
+            if (size)
+            {
+                constexpr uint64_t page_mask = ~uint64_t{0xfff};
+                const auto last = address + std::min<uint64_t>(
+                    static_cast<uint64_t>(size - 1), std::numeric_limits<uint64_t>::max() - address);
+                page_span = std::pair{address & page_mask, last & page_mask};
+            }
+            this->queue_op(target, seq, [address, size, profile](icicle_emulator* h) {
+                const smp_profile_timer apply_timer{profile ? &profile->invalidate_apply_nanos : nullptr};
+                const bool changed = icicle_invalidate_code_range(h, address, size) != 0;
+                if (profile)
+                {
+                    profile->invalidate_applied.fetch_add(1, std::memory_order_relaxed);
+                    if (!changed)
+                    {
+                        profile->invalidate_no_change.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }, std::nullopt, page_span);
+        }
+
+        void complete_op(const uint64_t ticket)
+        {
+            std::lock_guard<std::mutex> lock(this->pending_mutex_);
+            this->ops_completed_out_of_order_[ticket - this->ops_completed_watermark_ - 1] = 1;
+            while (!this->ops_completed_out_of_order_.empty() && this->ops_completed_out_of_order_.front())
+            {
+                this->ops_completed_out_of_order_.pop_front();
+                ++this->ops_completed_watermark_;
+            }
+        }
+
+        static bool ranges_overlap(const uint64_t left, const size_t left_size, const uint64_t right, const size_t right_size)
+        {
+            if (!left_size || !right_size)
+            {
+                return false;
+            }
+            return left <= right ? right - left < left_size : left - right < right_size;
+        }
+
+        void drain_pending_unmap_prefix_before_map(icicle_vcpu& v, const uint64_t address, const size_t size)
+        {
+            std::vector<pending_op> prefix;
+            {
+                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                auto& queue = this->pending_ops_[v.index()];
+                const auto last_unmap = std::find_if(queue.rbegin(), queue.rend(), [&](const pending_op& op) {
+                    return op.unmap_range && ranges_overlap(address, size, op.unmap_range->first, op.unmap_range->second);
+                });
+                if (last_unmap == queue.rend())
+                {
+                    return;
+                }
+                const auto end = last_unmap.base();
+                prefix.reserve(static_cast<size_t>(end - queue.begin()));
+                prefix.insert(prefix.end(), std::make_move_iterator(queue.begin()), std::make_move_iterator(end));
+                queue.erase(queue.begin(), end);
+            }
+
+            t_draining_own_queue = true;
+            const auto clear = utils::finally([] { t_draining_own_queue = false; });
+            size_t next = 0;
+            try
+            {
+                for (; next < prefix.size(); ++next)
+                {
+                    prefix[next].apply(v.handle());
+                    this->complete_op(prefix[next].ticket);
+                }
+            }
+            catch (...)
+            {
+                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                auto& queue = this->pending_ops_[v.index()];
+                queue.insert(queue.begin(), std::make_move_iterator(prefix.begin() + next), std::make_move_iterator(prefix.end()));
+                throw;
             }
         }
 
@@ -1893,14 +2768,20 @@ namespace sogen::icicle
                 fn();
                 return;
             }
+            assert(this->mutation_owner() == nullptr); // only external callers may wait while paused
             std::lock_guard<std::mutex> plock(this->pause_mutex_);
             this->run_with_vcpus_paused(std::forward<Fn>(fn));
         }
 
-        // A running vCPU or an explicitly bound scheduler worker may hold the kernel lock.
-        // Apply its own mutation now and queue peer work; external callers pause and apply
-        // synchronously to all VMs. Never wait for a peer while holding the kernel lock.
-        void route_to_all_vms(const std::function<void(size_t)>& per_vm_op)
+        // 6.5 routing rule: a mutation requested by a running vCPU or an explicitly bound
+        // scheduler worker (including host work between quanta that may hold the BEL) applies to
+        // its OWN VM now and queues the op for each peer, drained on the peer's thread at
+        // begin_run_quantum. An external/setup caller pauses peers instead — it holds no BEL, so a peer
+        // parked in a hook can always acquire the BEL, finish, exit run(), and become stoppable. Because
+        // vCPU threads never pause, the A-B/B-A hazard between partition_mutex_ and the quiesce wait
+        // cannot form.
+        void route_to_all_vms(const std::function<void(size_t)>& per_vm_op,
+                              const std::optional<std::pair<uint64_t, size_t>> unmap_range = std::nullopt)
         {
             if (this->vcpus_.size() == 1)
             {
@@ -1927,7 +2808,7 @@ namespace sogen::icicle
                 if (v->index() != own)
                 {
                     const auto i = v->index();
-                    this->queue_op(i, rseq, [this, i, per_vm_op](icicle_emulator*) { per_vm_op(i); });
+                    this->queue_op(i, rseq, [this, i, per_vm_op](icicle_emulator*) { per_vm_op(i); }, unmap_range);
                 }
             }
             // Bounded application latency: a peer mid-quantum must not keep executing (potentially
@@ -1999,7 +2880,119 @@ namespace sogen::icicle
                 reg->entries.emplace_back(i, id, std::move(object));
             });
 
+            if (this->host_view_)
+            {
+                this->install_host_view_memory_hook(hook, reg);
+            }
             return handle;
+        }
+
+        void install_host_view_memory_hook(const memory_access_hook& hook, const std::shared_ptr<hook_registration>& reg)
+        {
+            std::lock_guard view_lock(this->host_view_mutex_);
+            uint32_t id = 0;
+            std::unique_ptr<utils::object> object;
+            if (hook.observation)
+            {
+                auto shaped = [this, weak_reg = std::weak_ptr<hook_registration>{reg}, cb = hook.observation](
+                                  const uint64_t address, const void* data, const size_t length,
+                                  const uint64_t error, const int32_t host_write) {
+                    try
+                    {
+                        if (length > host_view_callback_limit - this->host_view_callback_bytes_)
+                        {
+                            throw std::length_error("Icicle host view hook data exceeds staging limit");
+                        }
+                        std::vector<std::byte> bytes(length);
+                        std::memcpy(bytes.data(), data, length);
+                        auto callback_reg = weak_reg.lock();
+                        if (!callback_reg)
+                        {
+                            return;
+                        }
+                        this->host_view_callbacks_.emplace_back(
+                            [this, reg = std::move(callback_reg), cb, address, bytes = std::move(bytes), error, host_write] {
+                                this->invoke_host_view_callback(reg, [&] {
+                                    cb(*this->host_view_cpu_, address, bytes.data(), bytes.size(),
+                                       {.outcome = error == 0 ? memory_access_outcome::completed : memory_access_outcome::failed,
+                                        .backend_error = error,
+                                        .origin = host_write != 0 ? memory_write_origin::host : memory_write_origin::guest});
+                                });
+                            });
+                        this->host_view_callback_bytes_ += length;
+                    }
+                    catch (...)
+                    {
+                        if (!this->host_view_callback_error_)
+                        {
+                            this->host_view_callback_error_ = std::current_exception();
+                        }
+                    }
+                };
+                auto obj = make_function_object(std::function<void(uint64_t, const void*, size_t, uint64_t, int32_t)>(std::move(shaped)));
+                auto* ptr = obj.get();
+                auto* wrapper = +[](void* user, uint64_t address, const void* data, size_t length, uint64_t error, int32_t host_write) {
+                    (*static_cast<decltype(ptr)>(user))(address, data, length, error, host_write);
+                };
+                id = icicle_add_write_observation_hook(this->host_view_, hook.address, hook.address + hook.size, wrapper, ptr);
+                object = std::move(obj);
+            }
+            else
+            {
+                auto shaped = [this, weak_reg = std::weak_ptr<hook_registration>{reg}, cb = hook.callback](
+                                  const uint64_t address, const void* data, const size_t length) {
+                    try
+                    {
+                        if (length > host_view_callback_limit - this->host_view_callback_bytes_)
+                        {
+                            throw std::length_error("Icicle host view hook data exceeds staging limit");
+                        }
+                        std::vector<std::byte> bytes(length);
+                        std::memcpy(bytes.data(), data, length);
+                        auto callback_reg = weak_reg.lock();
+                        if (!callback_reg)
+                        {
+                            return;
+                        }
+                        this->host_view_callbacks_.emplace_back(
+                            [this, reg = std::move(callback_reg), cb, address, bytes = std::move(bytes)] {
+                                this->invoke_host_view_callback(reg, [&] {
+                                    cb(*this->host_view_cpu_, address, bytes.data(), bytes.size());
+                                });
+                            });
+                        this->host_view_callback_bytes_ += length;
+                    }
+                    catch (...)
+                    {
+                        if (!this->host_view_callback_error_)
+                        {
+                            this->host_view_callback_error_ = std::current_exception();
+                        }
+                    }
+                };
+                auto obj = make_function_object(std::function<void(uint64_t, const void*, size_t)>(std::move(shaped)));
+                auto* ptr = obj.get();
+                auto* wrapper = +[](void* user, const uint64_t address, const void* data, const size_t length) {
+                    (*static_cast<decltype(ptr)>(user))(address, data, length);
+                };
+                auto* installer = hook.is_read ? &icicle_add_read_hook : &icicle_add_write_hook;
+                id = installer(this->host_view_, hook.address, hook.address + hook.size, wrapper, ptr);
+                object = std::move(obj);
+            }
+            if (id == 0)
+            {
+                throw std::runtime_error("Icicle host view memory hook registration failed");
+            }
+            std::unique_lock lock(this->partition_mutex_);
+            if (reg->deleted)
+            {
+                icicle_remove_hook(this->host_view_, id);
+            }
+            else
+            {
+                reg->entries.emplace_back(this->vcpus_.size(), id, std::move(object));
+                this->host_view_hook_ranges_.push_back({reg.get(), hook.address, static_cast<size_t>(hook.size), hook.is_read});
+            }
         }
 
         void delete_hook_internal(emulator_hook* hook)
@@ -2024,6 +3017,7 @@ namespace sogen::icicle
                 reg->deleted = true; // in-flight peer installs must not resurrect this hook
                 this->registrations_.erase(it);
             }
+            this->cancel_host_view_callback(reg, true);
 
             this->route_to_all_vms([this, reg](const size_t i) {
                 std::vector<uint32_t> ids;
@@ -2049,6 +3043,32 @@ namespace sogen::icicle
                     icicle_remove_hook(this->vcpus_[i]->handle(), id);
                 }
             });
+            if (this->host_view_)
+            {
+                std::lock_guard view_lock(this->host_view_mutex_);
+                std::vector<uint32_t> ids;
+                {
+                    std::unique_lock lock(this->partition_mutex_);
+                    for (auto it = reg->entries.begin(); it != reg->entries.end();)
+                    {
+                        if (std::get<0>(*it) == this->vcpus_.size())
+                        {
+                            ids.push_back(std::get<1>(*it));
+                            it = reg->entries.erase(it);
+                        }
+                        else
+                        {
+                            ++it;
+                        }
+                    }
+                }
+                for (const auto id : ids)
+                {
+                    icicle_remove_hook(this->host_view_, id);
+                }
+                std::erase_if(this->host_view_hook_ranges_,
+                              [owner = reg.get()](const host_view_hook_range& range) { return range.owner == owner; });
+            }
         }
 
         // Drains deferred memory-hook installs (read/write/observation). Safe from the
@@ -2199,6 +3219,7 @@ namespace sogen::icicle
             {
                 v.run_active_ = true;
                 this->drain_exec_hook_installs(); // self-kicked deferred installs drain outside run()
+                icicle_reconcile_exec_write_wake(v.handle());
                 return;
             }
             {
@@ -2212,6 +3233,7 @@ namespace sogen::icicle
             this->drain_pending_ops(v);
             this->drain_exec_hook_installs(); // outside run(): execution_hooks is not borrowed here
             this->dispatch_deferred_write_faults(v);
+            icicle_reconcile_exec_write_wake(v.handle());
         }
 
         // 6.6c'': surface between-quantum host-write perm failures as guest AVs at a REAL vCPU
@@ -2265,6 +3287,7 @@ namespace sogen::icicle
             for (auto& op : ops)
             {
                 op.apply(v.handle());
+                this->complete_op(op.ticket);
             }
         }
 
@@ -2272,6 +3295,12 @@ namespace sogen::icicle
         // bounded-wait for the in-flight op to land first (drain+retry's shared core).
         void drain_own_queue_with_inflight_wait(icicle_vcpu& v)
         {
+            if (t_draining_own_queue)
+            {
+                return;
+            }
+            t_draining_own_queue = true;
+            const auto clear = utils::finally([] { t_draining_own_queue = false; });
             std::vector<pending_op> ops;
             {
                 std::lock_guard<std::mutex> lock(this->pending_mutex_);
@@ -2289,6 +3318,7 @@ namespace sogen::icicle
             for (auto& op : ops)
             {
                 op.apply(v.handle());
+                this->complete_op(op.ticket);
             }
         }
 
@@ -2308,6 +3338,7 @@ namespace sogen::icicle
                 queue.erase(queue.begin());
             }
             op.apply(v.handle());
+            this->complete_op(op.ticket);
             return true;
         }
 
@@ -2364,9 +3395,19 @@ namespace sogen::icicle
                     this->quantum_kick_[v.index_] = 0;
                     return true;
                 }
+                if (!v.stop_requested_ && !v.pending_hook_exception_ && icicle_exec_write_pending(v.handle()))
+                {
+                    return true;
+                }
                 return false;
             }
+            // Read VM state while run_active_ still excludes an external pauser.
+            // start() reacquires the parked gate after the completion handoff.
+            const bool exec_write_pending = icicle_exec_write_pending(v.handle());
             std::unique_lock lock(this->quiesce_mutex_);
+            // Retire the active claim under the same mutex the external pauser
+            // uses to test it. All VM reads above are complete; start() takes
+            // the parked gate before its next VM read.
             v.run_active_ = false;
             this->quiesce_cv_.notify_all();
             if (v.stop_requested_ || v.pending_hook_exception_)
@@ -2387,7 +3428,7 @@ namespace sogen::icicle
                 this->quantum_kick_[v.index_] = 0;
                 return true;
             }
-            return false;
+            return !v.stop_requested_ && !v.pending_hook_exception_ && exec_write_pending;
         }
 
         // 6.5: after a vCPU queues cross-VM ops for peers (async map/protect/unmap), kick each RUNNING
@@ -2473,7 +3514,10 @@ namespace sogen::icicle
                 {
                     break;
                 }
-                if (smp_trace_enabled() && waited_s > 0 && waited_s % 2 == 0)
+                // Dedicated bounded pause probe avoids enabling the very verbose SMP trace.
+                const auto* pause_probe = std::getenv("SOGEN_SMP_PAUSE_PROBE");
+                if ((smp_trace_enabled() || (pause_probe && *pause_probe == '1')) &&
+                    waited_s > 0 && waited_s % 2 == 0)
                 {
                     std::fprintf(stderr, "[SMPTRC] pause still waiting (%ds) for: ", waited_s);
                     for (auto& vcpu : this->vcpus_)
@@ -2525,12 +3569,20 @@ namespace sogen::icicle
 
     inline void icicle_vcpu::start(const size_t count)
     {
+        if (this->host_view_only_)
+        {
+            throw std::logic_error("Icicle host-view callback has no running CPU context");
+        }
         auto* previous_worker = std::exchange(t_worker_vcpu, static_cast<void*>(this));
         auto* previous_running = std::exchange(t_running_vcpu, static_cast<void*>(this));
         const auto clear_current = utils::finally([previous_worker, previous_running] {
             t_running_vcpu = previous_running;
             t_worker_vcpu = previous_worker;
         });
+        // stop() may run after the scheduler releases its lock but before this
+        // quantum marks run_active_. Preserve that pending request until we have
+        // crossed the begin_run_quantum gate and can check it on the owner thread.
+        // perform_thread_switch() clears a consumed stop under the kernel lock.
         // start(count) must run at most `count` instructions in TOTAL. A kick-ended quantum resumes
         // here, and re-issuing the full count would extend the budget past the caller's contract
         // (caught by RangedExecHook...: the resumed vCPU ran off the end of its code). Track the
@@ -2553,14 +3605,13 @@ namespace sogen::icicle
                 remaining = count - executed;
             }
             parked_access.unlock(); // begin may wait for an external pause; never hold this gate then
-            auto retire_on_error = utils::finally([this] {
-                this->machine_.abort_run_quantum(*this);
-            });
+            auto retire_on_error = utils::finally([this] { this->machine_.abort_run_quantum(*this); });
             this->machine_.begin_run_quantum(*this);
             if (this->stop_requested_.load(std::memory_order_acquire))
             {
                 // A prestart switch or shutdown needs no guest instructions.
-                // Retire run_active_ before returning so an external pauser cannot wait forever.
+                // Retire run_active_ before returning so a peer waiting to
+                // mutate all VMs cannot deadlock on this worker.
                 (void)this->machine_.complete_run_quantum(*this);
                 retire_on_error.cancel();
                 parked_access.lock();
@@ -2575,9 +3626,12 @@ namespace sogen::icicle
             {
                 continue; // paused for a peer's cross-VM mutation — resume this quantum
             }
-            // A remote atomic interrupt can race the quantum-end decision. Resume
-            // unlimited runs that report an empty instruction-limit exit, bounded
-            // against a permanently asserted interrupt without guest progress.
+            // Unlimited SMP runs have no instruction budget to exhaust. A remote
+            // atomic interrupt can arrive as a kick is retired between the Rust VM
+            // exit and the C++ scheduler check. If neither a real stop nor a hook
+            // exception is pending, resume on this vCPU instead of terminating all
+            // workers. Bound zero-progress retries so a permanently asserted flag
+            // is still reported as a backend failure rather than spinning forever.
             if (count == 0 && !this->stop_requested_.load(std::memory_order_acquire) &&
                 !this->pending_hook_exception_)
             {
@@ -2592,6 +3646,25 @@ namespace sogen::icicle
                 }
             }
             break;
+        }
+        if (const char* probe = std::getenv("SOGEN_STOP_PROBE"); probe && *probe == '1')
+        {
+            static std::atomic<uint32_t> samples{0};
+            if (samples.fetch_add(1, std::memory_order_relaxed) < 4000)
+            {
+                icicle_stop_info info{};
+                (void)icicle_get_stop_info(this->emu_, &info);
+                std::string description;
+                icicle_get_vm_exit_description(this->emu_,
+                    [](void* data, const void* value, size_t size) {
+                        static_cast<std::string*>(data)->assign(static_cast<const char*>(value), size);
+                    }, &description);
+                std::fprintf(stderr, "[STOPPROBE] vcpu=%u kind=%u vm=%s stop_requested=%u hook_exception=%u icount=%llu\n",
+                             this->index_, info.kind, description.c_str(),
+                             static_cast<unsigned>(this->stop_requested_.load(std::memory_order_acquire)),
+                             static_cast<unsigned>(this->pending_hook_exception_ != nullptr),
+                             static_cast<unsigned long long>(icicle_get_icount(this->emu_)));
+            }
         }
         this->rethrow_deferred_hook_exception();
         this->throw_if_unhandled_stop();

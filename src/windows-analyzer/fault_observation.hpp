@@ -6,4 +6,5 @@ namespace sogen
 {
     struct analysis_context;
     void capture_memory_violation(const analysis_context& context, memory_violation_event& event, uint64_t actual_ip);
+    void capture_private_execute_memory(const analysis_context& context, memory_violation_event& event, uint64_t rip);
 }

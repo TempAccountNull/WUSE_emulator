@@ -194,6 +194,9 @@ pub struct Mmu {
     /// The parent snapshot for the MMU.
     parent_state: Snapshot,
 
+    /// Set at VM setup only, before any shared page is mapped.
+    exec_write_wake: Option<std::sync::Arc<physical::ExecWriteWake>>,
+
     /// Registed handlers for I/O memory
     io: Vec<Box<dyn IoMemoryAny>>,
 
@@ -235,6 +238,7 @@ impl Mmu {
             mapping: RangeMap::new(),
             physical: physical::PhysicalMemory::new(physical::MAX_PAGES),
             parent_state: Snapshot::new(SnapshotData::new()),
+            exec_write_wake: None,
             io: vec![],
 
             read_hooks: HookStore::new(),
@@ -524,6 +528,11 @@ impl Mmu {
     /// the shared bytes, so N per-vCPU MMUs mapping the same `Arc` share one coherent, full-speed
     /// guest page (coherency is the host CPU's). Per-byte permissions come from the shared PageData;
     /// the mapping's `shared_perm` is 0. False on a misaligned address or an overlap.
+    pub fn set_exec_write_wake(&mut self, wake: std::sync::Arc<physical::ExecWriteWake>) {
+        assert!(self.exec_write_wake.is_none(), "SMP executable-write wake configured twice");
+        self.exec_write_wake = Some(wake);
+    }
+
     pub fn map_smp_shared(&mut self, address: u64, data: std::sync::Arc<PageData>) -> bool {
         // SMP 6.6c'': a (re)map re-establishes this page's perms - bump so stale deferred
         // protects queued against the PREVIOUS mapping skip (see PageData::perm_epoch).
@@ -535,6 +544,9 @@ impl Mmu {
         let Some(last) = address.checked_add(page_size - 1) else { return false; };
         if self.mapping.get_range(address..=last).is_some() {
             return false;
+        }
+        if let Some(wake) = &self.exec_write_wake {
+            if !data.attach_exec_write_wake(wake) { return false; }
         }
         let Some(index) = self.physical.alloc_shared(data) else { return false; };
         let mapping = PhysicalMapping { addr: address, index, shared_perm: 0 };
@@ -563,6 +575,15 @@ impl Mmu {
     /// the successfully allocated prefix, as repeated `map_smp_shared` did.
     pub fn map_smp_shared_pages(&mut self, address: u64, pages: &[std::sync::Arc<PageData>]) -> bool {
         if !self.can_map_smp_page_range(address, pages.len()) {
+            let overlap = u64::try_from(pages.len())
+                .ok()
+                .and_then(|count| count.checked_mul(self.page_size()))
+                .and_then(|length| length.checked_sub(1).and_then(|last_offset| address.checked_add(last_offset)))
+                .and_then(|last| self.mapping.get_range(address..=last));
+            eprintln!(
+                "[SMPMAPFAIL] phase=shared-preflight address={address:#x} pages={} overlap={overlap:?} allocated={} capacity={}",
+                pages.len(), self.physical.allocated_pages(), self.physical.capacity()
+            );
             return false;
         }
 
@@ -574,7 +595,18 @@ impl Mmu {
             // The checked full-range preflight above proves these addresses cannot overflow.
             let start = address + offset as u64 * page_size;
             let last = start + page_size - 1;
+            if let Some(wake) = &self.exec_write_wake {
+                if !data.attach_exec_write_wake(wake) {
+                    eprintln!("[SMPMAPFAIL] phase=exec-write-wake address={start:#x} page={offset}");
+                    success = false;
+                    break;
+                }
+            }
             let Some(index) = self.physical.alloc_shared(std::sync::Arc::clone(data)) else {
+                eprintln!(
+                    "[SMPMAPFAIL] phase=physical-capacity address={start:#x} page={offset} allocated={} capacity={}",
+                    self.physical.allocated_pages(), self.physical.capacity()
+                );
                 success = false;
                 break;
             };
@@ -595,6 +627,15 @@ impl Mmu {
     /// Allocate and map a fresh contiguous SMP range using the same single-splice path.
     pub fn map_smp_shared_fresh_pages(&mut self, address: u64, count: usize, permissions: u8) -> bool {
         if count == 0 || !self.can_map_smp_page_range(address, count) {
+            let overlap = u64::try_from(count)
+                .ok()
+                .and_then(|count| count.checked_mul(self.page_size()))
+                .and_then(|length| length.checked_sub(1).and_then(|last_offset| address.checked_add(last_offset)))
+                .and_then(|last| self.mapping.get_range(address..=last));
+            eprintln!(
+                "[SMPMAPFAIL] phase=fresh-preflight address={address:#x} pages={count} overlap={overlap:?} allocated={} capacity={}",
+                self.physical.allocated_pages(), self.physical.capacity()
+            );
             return false;
         }
         let mut pages = Vec::with_capacity(count);
@@ -711,6 +752,14 @@ impl Mmu {
 
     /// Unmaps the region of memory between `start` and `start+len`
     pub fn unmap_memory_len(&mut self, start: u64, len: u64) -> bool {
+        static BATCH_UNMAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let batch_unmap = *BATCH_UNMAP.get_or_init(|| {
+            std::env::var("SOGEN_ICICLE_SMP_BATCH_UNMAP").as_deref() == Ok("1")
+        });
+        self.unmap_memory_len_with_bulk(start, len, batch_unmap)
+    }
+
+    fn unmap_memory_len_with_bulk(&mut self, start: u64, len: u64, bulk: bool) -> bool {
         if len == 0 {
             return false; // @todo: should unmapping nothing count as being valid?
         }
@@ -721,6 +770,9 @@ impl Mmu {
 
         debug!("unmap_memory: start={:#0x}, end={:#0x}", start, end);
         self.mapping_changed = true;
+        if bulk && self.try_unmap_full_physical_pages(start, end, len) {
+            return true;
+        }
 
         let physical = &mut self.physical;
         let tlb = &mut self.tlb;
@@ -765,6 +817,31 @@ impl Mmu {
         });
 
         !partially_unmapped
+    }
+
+    fn try_unmap_full_physical_pages(&mut self, start: u64, end: u64, len: u64) -> bool {
+        let page_size = self.page_size();
+        if len < page_size * 2 || start % page_size != 0 || len % page_size != 0 {
+            return false;
+        }
+
+        let mut page_count = 0;
+        for (address, segment_len, entry) in self.mapping.overlapping_iter(start..=end) {
+            if address % page_size != 0
+                || segment_len != page_size
+                || !matches!(entry, Some(MemoryMapping::Physical(_)))
+            {
+                return false;
+            }
+            page_count += 1;
+        }
+        if page_count != len / page_size {
+            return false;
+        }
+
+        self.tlb.remove_range(start, len);
+        self.mapping.remove_all(start..=end);
+        true
     }
 
     /// Reclaims removed-page candidates that have no remaining virtual mapping or cached code.
@@ -880,7 +957,9 @@ impl Mmu {
                     }
                     if page.smp_shared {
                         if perm & perm::EXEC != 0 {
-                            page.data().smp_code_seen.store(1, std::sync::atomic::Ordering::Release);
+                            page.data()
+                                .smp_code_seen
+                                .store(1, std::sync::atomic::Ordering::Release);
                         }
                         // SMP: never make_mut a shared page — the clone privatizes this VM's copy
                         // (protect_does_not_privatize_shared_page: the protecting VM loses all
@@ -1158,6 +1237,11 @@ impl Mmu {
                                 );
                             }
                         }
+                    }
+
+                    if page.smp_shared {
+                        page.data().mark_exec_code_slots(start, len);
+                        page.data().smp_translated.store(1, std::sync::atomic::Ordering::Release);
                     }
 
                     if mapping.shared_perm != 0 { tlb.clear_write(); }
@@ -1438,9 +1522,18 @@ impl Mmu {
                 || shared.smp_code_seen.load(std::sync::atomic::Ordering::Acquire) != 0
             {
                 shared.bump_code_epoch();
+                if perm & perm::WRITE != 0 {
+                    shared.notify_exec_write_guest(addr, N, physical::ExecWriteWakeSource::GuestMmu);
+                } else {
+                    shared.notify_exec_write(physical::ExecWriteWakeSource::Host);
+                }
             }
-            if !self.write_hooks.contains_address(addr, page_size) {
+            // Icicle's JIT writes directly to the host page on a write-TLB hit.
+            // That bypasses the code epoch, so shared stores must take this path.
+            if smp_fast_write_epoch_enabled() && !self.write_hooks.contains_address(addr, page_size) {
                 self.tlb.insert_write(page_start, unsafe { page.shared_write_ptr() });
+            } else {
+                self.tlb.remove_write(page_start);
             }
             return Ok(());
         }
@@ -1696,6 +1789,12 @@ impl Mmu {
     }
 }
 
+#[cold]
+fn smp_fast_write_epoch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SOGEN_SMP_FAST_WRITE_EPOCH").as_deref() == Ok("1"))
+}
+
 #[inline]
 fn smp_private_code_epoch_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1752,12 +1851,12 @@ impl_read_write!(read_u32, write_u32, u32);
 impl_read_write!(read_u64, write_u64, u64);
 
 #[cfg(test)]
-mod smp_code_epoch_contract_tests {
+mod smp_code_epoch_tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
     #[test]
-    fn promotion_to_exec_makes_tlb_writes_advance_shared_epoch() {
+    fn shared_data_starts_tracking_only_after_exec_and_remains_sticky() {
         const ADDRESS: u64 = 0x6000;
         let mut mem = Mmu::default();
         assert!(mem.map_smp_shared_fresh(ADDRESS, perm::READ | perm::WRITE));
@@ -1765,40 +1864,76 @@ mod smp_code_epoch_contract_tests {
         let initially_tracked = std::env::var("SOGEN_SMP_CODE_EPOCH_ONLY").as_deref() == Ok("0");
         assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), u8::from(initially_tracked));
 
+        mem.write(ADDRESS, [1_u8], perm::WRITE).unwrap();
+        let index = mem.get_physical_index(ADDRESS).unwrap();
+        let mut write_ptr = unsafe { mem.physical.get_mut(index).write_ptr() };
+        unsafe { write_ptr.write(ADDRESS + 1, [2_u8], perm::WRITE) }.unwrap();
+        assert_eq!(shared.code_epoch(), if initially_tracked { 2 } else { 0 });
+
         mem.update_perm(ADDRESS, 0x1000, perm::READ | perm::WRITE | perm::EXEC).unwrap();
         assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), 1);
         let before = shared.code_epoch();
-        let index = mem.get_physical_index(ADDRESS).unwrap();
-        let mut write_ptr = unsafe { mem.physical.get_mut(index).write_ptr() };
-        unsafe { write_ptr.write(ADDRESS, [0x90_u8], perm::WRITE) }.unwrap();
+        mem.write(ADDRESS + 2, [3_u8], perm::WRITE).unwrap();
         assert_eq!(shared.code_epoch(), before + 1);
 
         mem.update_perm(ADDRESS, 0x1000, perm::READ | perm::WRITE).unwrap();
         assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), 1);
+        let mut write_ptr = unsafe { mem.physical.get_mut(index).write_ptr() };
+        unsafe { write_ptr.write(ADDRESS + 3, [4_u8], perm::WRITE) }.unwrap();
+        assert_eq!(shared.code_epoch(), before + 2);
     }
 
     #[test]
-    fn executable_mapping_tracks_write_before_first_decode() {
+    fn executable_shared_page_remap_retains_epoch_tracking_and_changes_generation() {
         const ADDRESS: u64 = 0x7000;
+        let mut first = Mmu::default();
+        assert!(first.map_smp_shared_fresh(ADDRESS, perm::READ | perm::WRITE | perm::EXEC));
+        let shared = first.share_page(ADDRESS).unwrap();
+        let first_index = first.get_physical_index(ADDRESS).unwrap();
+        let first_generation = first.get_physical(first_index).smp_mapping_generation;
+        assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), 1);
+
+        assert!(first.unmap_memory_len(ADDRESS, 0x1000));
+        assert!(first.map_smp_shared(ADDRESS, shared.clone()));
+        let next_index = first.get_physical_index(ADDRESS).unwrap();
+        assert_ne!(first.get_physical(next_index).smp_mapping_generation, first_generation);
+        assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), 1);
+
+        let mut peer = Mmu::default();
+        assert!(peer.map_smp_shared(ADDRESS, shared.clone()));
+        let before = shared.code_epoch();
+        peer.write(ADDRESS, [0x90], perm::WRITE).unwrap();
+        assert_eq!(shared.code_epoch(), before + 1);
+    }
+
+    #[test]
+    fn mapped_executable_shared_page_tracks_write_before_first_decode() {
+        const ADDRESS: u64 = 0x3000;
         let mut mem = Mmu::default();
         assert!(mem.map_smp_shared_fresh(ADDRESS, perm::READ | perm::EXEC));
         let shared = mem.share_page(ADDRESS).unwrap();
         assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), 1);
-        mem.write(ADDRESS, [0x90_u8], perm::NONE).unwrap();
+
+        mem.write(ADDRESS, [0x90], perm::NONE).unwrap();
         assert_eq!(shared.code_epoch(), 1);
         let index = mem.get_physical_index(ADDRESS).unwrap();
         assert!(!mem.get_physical(index).executed);
     }
 
     #[test]
-    fn successful_ensure_exec_reasserts_marker() {
-        const ADDRESS: u64 = 0x8000;
+    fn executable_protection_promotion_tracks_write_before_first_decode() {
+        const ADDRESS: u64 = 0x4000;
         let mut mem = Mmu::default();
-        assert!(mem.map_smp_shared_fresh(ADDRESS, perm::READ | perm::WRITE | perm::EXEC));
+        assert!(mem.map_smp_shared_fresh(ADDRESS, perm::READ | perm::WRITE));
         let shared = mem.share_page(ADDRESS).unwrap();
         shared.smp_code_seen.store(0, Ordering::Release);
-        assert!(mem.ensure_executable(ADDRESS, 1));
+
+        mem.update_perm(ADDRESS, 0x1000, perm::READ | perm::EXEC).unwrap();
         assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), 1);
+        mem.write(ADDRESS, [0x90], perm::NONE).unwrap();
+        assert_eq!(shared.code_epoch(), 1);
+        let index = mem.get_physical_index(ADDRESS).unwrap();
+        assert!(!mem.get_physical(index).executed);
     }
 
     #[test]
@@ -1835,11 +1970,25 @@ mod smp_code_epoch_contract_tests {
         assert_eq!(shared.code_epoch(), before + 1);
     }
 
-}
+    #[test]
+    fn shared_direct_writes_start_bumping_epoch_before_executable_marking() {
+        const ADDRESS: u64 = 0x2000;
+        let mut mem = Mmu::default();
+        assert!(mem.map_smp_shared_fresh(ADDRESS, perm::READ | perm::WRITE | perm::EXEC));
+        let shared = mem.share_page(ADDRESS).unwrap();
+        shared.smp_code_seen.store(0, Ordering::Release);
+        let index = mem.get_physical_index(ADDRESS).unwrap();
 
-#[cfg(test)]
-mod smp_batch_tests {
-    use super::*;
+        let mut write_ptr = unsafe { mem.physical.get_mut(index).write_ptr() };
+        unsafe { write_ptr.write(ADDRESS, [1_u8], perm::WRITE) }.unwrap();
+        assert_eq!(shared.code_epoch(), 0);
+
+        assert!(mem.ensure_executable(ADDRESS, 1));
+        assert_eq!(shared.smp_code_seen.load(Ordering::Acquire), 1);
+        let mut write_ptr = unsafe { mem.physical.get_mut(index).write_ptr() };
+        unsafe { write_ptr.write(ADDRESS, [2_u8], perm::WRITE) }.unwrap();
+        assert_eq!(shared.code_epoch(), 1);
+    }
 
     #[test]
     fn captured_batch_keeps_noncontiguous_neighbors_and_shares_page_bytes() {
@@ -1966,6 +2115,146 @@ mod smp_batch_tests {
         assert_eq!(serial.mapping.len(), batch.mapping.len());
         assert_eq!(batch.mapping.len(), (EXISTING + CAPTURED) as usize);
         eprintln!("middle insert: existing={EXISTING} captured={CAPTURED} mappings={} serial={serial_time:?} batch={batch_time:?}", batch.mapping.len());
+    }
+}
+
+#[cfg(test)]
+mod smp_bulk_unmap_tests {
+    use super::*;
+
+    #[test]
+    fn empty_batch_map_preserves_noop_and_rejects_bad_range_without_panicking() {
+        let mut mem = Mmu::default();
+        assert!(mem.map_smp_shared_pages(0x1000, &[]));
+        assert!(!mem.map_smp_shared_pages(0x1001, &[]));
+        assert!(!mem.map_smp_shared_fresh_pages(0x1000, 0, perm::READ));
+    }
+
+    fn layout(mem: &Mmu) -> Vec<(u64, u64, MemoryMapping)> {
+        mem.mapping.iter().map(|(start, end, entry)| (start, end, entry.clone())).collect()
+    }
+
+    fn mapped_pair(addresses: &[u64]) -> (Mmu, Mmu) {
+        let mut serial = Mmu::default();
+        let mut bulk = Mmu::default();
+        for &address in addresses {
+            assert!(serial.map_smp_shared_fresh(address, perm::READ | perm::WRITE));
+            assert!(bulk.map_smp_shared_fresh(address, perm::READ | perm::WRITE));
+        }
+        (serial, bulk)
+    }
+
+    #[test]
+    fn full_page_middle_unmap_matches_serial_and_invalidates_warm_tlb() {
+        let addresses = std::iter::once(0x1000)
+            .chain((0..512).map(|page| 0x4000 + page * 0x1000))
+            .chain(std::iter::once(0x20_5000))
+            .collect::<Vec<_>>();
+        let (mut serial, mut bulk) = mapped_pair(&addresses);
+        for mem in [&mut serial, &mut bulk] {
+            mem.write(0x1000, [0x11], perm::WRITE).unwrap();
+            mem.write(0x4000, [0x22], perm::WRITE).unwrap();
+            mem.write(0x20_5000, [0x33], perm::WRITE).unwrap();
+            assert_eq!(mem.read_u8(0x4000, perm::READ).unwrap(), 0x22);
+            assert!(mem.tlb.translate_read(0x4000).is_some());
+        }
+
+        assert!(serial.unmap_memory_len_with_bulk(0x4000, 512 * 0x1000, false));
+        assert!(bulk.try_unmap_full_physical_pages(0x4000, 0x4000 + 512 * 0x1000 - 1, 512 * 0x1000));
+        assert_eq!(layout(&serial), layout(&bulk));
+        for mem in [&mut serial, &mut bulk] {
+            assert!(mem.tlb.translate_read(0x4000).is_none());
+            assert!(mem.read_u8(0x4000, perm::READ).is_err());
+            assert_eq!(mem.read_u8(0x1000, perm::READ).unwrap(), 0x11);
+            assert_eq!(mem.read_u8(0x20_5000, perm::READ).unwrap(), 0x33);
+        }
+    }
+
+    #[test]
+    fn full_page_unmap_leaves_peer_shared_bytes_and_permissions_intact() {
+        let mut source = Mmu::default();
+        let mut peer = Mmu::default();
+        for address in [0x4000, 0x5000, 0x6000] {
+            assert!(source.map_smp_shared_fresh(address, perm::READ | perm::WRITE));
+            assert!(peer.map_smp_shared(address, source.share_page(address).unwrap()));
+        }
+        let shared = source.share_page(0x5000).unwrap();
+        assert!(source.unmap_memory_len_with_bulk(0x4000, 0x2000, true));
+        assert!(source.share_page(0x5000).is_none());
+        assert!(std::sync::Arc::ptr_eq(&shared, &peer.share_page(0x5000).unwrap()));
+        peer.write(0x5000, [0x5a], perm::WRITE).unwrap();
+        assert_eq!(peer.read_u8(0x5000, perm::READ).unwrap(), 0x5a);
+        assert_eq!(shared.perm[0] & (perm::READ | perm::WRITE), perm::READ | perm::WRITE);
+        assert!(source.share_page(0x6000).is_some());
+    }
+
+    #[test]
+    fn gaps_and_partial_pages_fall_back_with_serial_failure_semantics() {
+        for (addresses, start, len, expected) in [
+            (vec![0x3000, 0x5000, 0x7000], 0x3000, 0x3000, false),
+            (vec![0x1000, 0x2000, 0x4000], 0x1800, 0x1000, true),
+        ] {
+            let (mut serial, mut bulk) = mapped_pair(&addresses);
+            assert_eq!(serial.unmap_memory_len_with_bulk(start, len, false), expected);
+            assert_eq!(bulk.unmap_memory_len_with_bulk(start, len, true), expected);
+            assert_eq!(layout(&serial), layout(&bulk));
+        }
+    }
+
+    #[test]
+    fn overflow_and_zero_length_preserve_mapping() {
+        let (mut serial, mut bulk) = mapped_pair(&[0x4000, 0x5000]);
+        let before = layout(&serial);
+        for (start, len) in [(0x4000, 0), (u64::MAX - 0xff, 0x200)] {
+            assert!(!serial.unmap_memory_len_with_bulk(start, len, false));
+            assert!(!bulk.unmap_memory_len_with_bulk(start, len, true));
+            assert_eq!(layout(&serial), before);
+            assert_eq!(layout(&bulk), before);
+        }
+    }
+
+    #[test]
+    fn io_mapping_falls_back_to_serial_path() {
+        let (mut serial, mut bulk) = mapped_pair(&[0x3000, 0x5000]);
+        for mem in [&mut serial, &mut bulk] {
+            assert!(mem.map_memory_len(0x4000, 0x1000, MemoryMapping::Io(0)));
+        }
+        assert!(serial.unmap_memory_len_with_bulk(0x3000, 0x3000, false));
+        assert!(bulk.unmap_memory_len_with_bulk(0x3000, 0x3000, true));
+        assert_eq!(layout(&serial), layout(&bulk));
+    }
+
+    #[test]
+    #[ignore = "manual Release microbenchmark; timing is host-dependent"]
+    fn full_page_middle_unmap_benchmark() {
+        const EXISTING: usize = 4096;
+        const REMOVE: usize = 2048;
+        const MIDDLE: u64 = 0x4000_0000;
+        const HIGH: u64 = 0x8000_0000;
+        let prepare = || {
+            let mut mem = Mmu::default();
+            assert!(mem.map_smp_shared_fresh_pages(HIGH, EXISTING, perm::READ | perm::WRITE));
+            assert!(mem.map_smp_shared_fresh_pages(MIDDLE, REMOVE, perm::READ | perm::WRITE));
+            mem
+        };
+
+        let mut serial = prepare();
+        let started = std::time::Instant::now();
+        assert!(serial.unmap_memory_len_with_bulk(MIDDLE, REMOVE as u64 * 0x1000, false));
+        let serial_time = started.elapsed();
+        let expected = layout(&serial);
+        drop(serial);
+
+        let mut bulk = prepare();
+        let started = std::time::Instant::now();
+        assert!(bulk.try_unmap_full_physical_pages(
+            MIDDLE,
+            MIDDLE + REMOVE as u64 * 0x1000 - 1,
+            REMOVE as u64 * 0x1000,
+        ));
+        let bulk_time = started.elapsed();
+        assert_eq!(layout(&bulk), expected);
+        eprintln!("middle unmap: existing={EXISTING} removed={REMOVE} serial={serial_time:?} bulk={bulk_time:?}");
     }
 }
 

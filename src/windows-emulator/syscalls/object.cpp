@@ -79,8 +79,28 @@ namespace sogen
                 }
             }
 
+            const bool trace_thread = value.type == handle_types::thread && c.proc.thread_handle_events.enabled();
+            const auto caller_tid = trace_thread ? c.thread().id : 0;
+            const auto caller_rip = trace_thread ? c.emu.reg(x86_register::rip) : 0;
+            const auto* thread_before = trace_thread ? c.proc.threads.get(h) : nullptr;
+            const auto target_tid = thread_before ? thread_before->id : 0;
+            const auto refs_before = thread_before ? thread_before->ref_count : 0;
             auto* handle_store = c.proc.get_handle_store(h);
-            if (handle_store && handle_store->erase(h))
+            const bool closed = handle_store && handle_store->erase(h);
+            if (trace_thread && closed)
+            {
+                const auto* thread_after = c.proc.threads.get(h);
+                c.proc.thread_handle_events.record({.action = thread_handle_journal::operation::close,
+                                                    .value = h,
+                                                    .target_tid = target_tid,
+                                                    .caller_tid = caller_tid,
+                                                    .caller_rip = caller_rip,
+                                                    .refs_before = refs_before,
+                                                    .refs_after = thread_after ? thread_after->ref_count : 0,
+                                                    .removed = closed && !thread_after});
+            }
+
+            if (closed)
             {
                 if (section_backing_address != 0 && !c.win_emu.memory.has_shared_views(section_backing_address))
                 {
@@ -115,10 +135,26 @@ namespace sogen
                 return STATUS_NOT_SUPPORTED;
             }
 
+            const bool trace_thread = resolved_source_handle.value.type == handle_types::thread && c.proc.thread_handle_events.enabled();
+            const auto* thread_before = trace_thread ? c.proc.threads.get(resolved_source_handle) : nullptr;
+            const auto target_tid = thread_before ? thread_before->id : 0;
+            const auto refs_before = thread_before ? thread_before->ref_count : 0;
             const auto new_handle = store->duplicate(resolved_source_handle);
             if (!new_handle)
             {
                 return STATUS_INVALID_HANDLE;
+            }
+
+            if (trace_thread)
+            {
+                const auto* thread_after = c.proc.threads.get(resolved_source_handle);
+                c.proc.thread_handle_events.record({.action = thread_handle_journal::operation::duplicate,
+                                                    .value = resolved_source_handle,
+                                                    .target_tid = target_tid,
+                                                    .caller_tid = c.thread().id,
+                                                    .caller_rip = c.emu.reg(x86_register::rip),
+                                                    .refs_before = refs_before,
+                                                    .refs_after = thread_after ? thread_after->ref_count : 0});
             }
 
             target_handle.write(*new_handle);
@@ -744,6 +780,47 @@ namespace sogen
             const auto validation_status = validate_wait_handle(c, resolved_handle);
             if (!NT_SUCCESS(validation_status))
             {
+                if (c.proc.thread_handle_events.enabled())
+                {
+                    const bool typed_thread = h.value.type == handle_types::thread ||
+                                              resolved_handle.value.type == handle_types::thread;
+                    const bool raw_slot = !typed_thread && h.value.type == handle_types::reserved && h.value.id != 0;
+                    const auto history = typed_thread ? c.proc.thread_handle_events.recent(resolved_handle) :
+                                         raw_slot ? c.proc.thread_handle_events.recent_by_id(static_cast<uint32_t>(h.value.id)) :
+                                                    std::vector<thread_handle_journal::entry>{};
+                    if ((typed_thread || !history.empty()) && c.proc.thread_handle_events.claim_failure_sample())
+                    {
+                        const auto* thread = c.proc.threads.get(resolved_handle);
+                        uint32_t cached_tid{};
+                        for (const auto& [tid, cached_handle] : c.proc.thread_handles_by_id)
+                        {
+                            if (cached_handle == resolved_handle)
+                            {
+                                cached_tid = tid;
+                                break;
+                            }
+                        }
+                        c.win_emu.log.error("[GUESTTHREADWAITFAIL] tid=%u vcpu=%zu raw=%#llx raw_type=%u "
+                                            "resolved=%#llx resolved_type=%u status=0x%08X rip=%#llx "
+                                            "store=%u target_tid=%u cached_tid=%u refs=%u history=%zu raw_slot=%u\n",
+                                            c.thread().id, c.vcpu.cpu.index(), static_cast<unsigned long long>(h.bits),
+                                            static_cast<unsigned>(h.value.type), static_cast<unsigned long long>(resolved_handle.bits),
+                                            static_cast<unsigned>(resolved_handle.value.type), static_cast<unsigned>(validation_status),
+                                            static_cast<unsigned long long>(c.emu.reg(x86_register::rip)),
+                                            static_cast<unsigned>(thread != nullptr), thread ? thread->id : 0, cached_tid,
+                                            thread ? thread->ref_count : 0, history.size(), static_cast<unsigned>(raw_slot));
+                        for (const auto& event : history)
+                        {
+                            c.win_emu.log.error("[GUESTTHREADHANDLE] seq=%llu op=%s handle=%#llx target_tid=%u "
+                                                "caller_tid=%u caller_rip=%#llx detail=%#llx refs=%u->%u removed=%u\n",
+                                                static_cast<unsigned long long>(event.sequence), thread_handle_journal::name(event.action),
+                                                static_cast<unsigned long long>(event.value.bits), event.target_tid, event.caller_tid,
+                                                static_cast<unsigned long long>(event.caller_rip),
+                                                static_cast<unsigned long long>(event.detail), event.refs_before, event.refs_after,
+                                                static_cast<unsigned>(event.removed));
+                        }
+                    }
+                }
                 return validation_status;
             }
 

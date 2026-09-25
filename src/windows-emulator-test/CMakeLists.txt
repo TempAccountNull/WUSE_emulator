@@ -10,6 +10,10 @@ add_executable(windows-emulator-test ${SRC_FILES})
 
 sogen_assign_source_group(${SRC_FILES})
 
+set_property(SOURCE analyzer_raw_hook_dispatch_test.cpp APPEND PROPERTY INCLUDE_DIRECTORIES
+  "${PROJECT_SOURCE_DIR}/deps/reflect"
+)
+
 target_link_libraries(windows-emulator-test PRIVATE
   gtest
   gtest_main

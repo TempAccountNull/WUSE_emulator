@@ -20,6 +20,9 @@
 #include <utils/finally.hpp>
 #include <utils/interupt_handler.hpp>
 
+#include <cstdlib>
+#include <cstdio>
+
 #if defined(OS_EMSCRIPTEN) && !defined(SOGEN_EMSCRIPTEN_SUPPORT_NODEJS)
 #include <event_handler.hpp>
 #endif
@@ -36,6 +39,122 @@ namespace sogen
 {
     namespace
     {
+#ifdef _WIN32
+        // The first-chance packet is deliberately bounded: handled access violations can be
+        // common, and this callback must not change Windows exception dispatch.
+        uint64_t analyzer_image_base{};
+
+        struct native_fault_packet
+        {
+            char bytes[384]{};
+            size_t length{};
+
+            void append(const char* value) noexcept
+            {
+                while (*value && length < sizeof(bytes))
+                {
+                    bytes[length++] = *value++;
+                }
+            }
+
+            void hex(const uint64_t value, const unsigned digits) noexcept
+            {
+                static constexpr char alphabet[] = "0123456789abcdef";
+                append("0x");
+                for (unsigned i = 0; i < digits && length < sizeof(bytes); ++i)
+                {
+                    bytes[length++] = alphabet[(value >> ((digits - i - 1) * 4)) & 15];
+                }
+            }
+
+            void write() const noexcept
+            {
+                const auto output = GetStdHandle(STD_ERROR_HANDLE);
+                if (output && output != INVALID_HANDLE_VALUE)
+                {
+                    DWORD written{};
+                    WriteFile(output, bytes, static_cast<DWORD>(length), &written, nullptr);
+                }
+            }
+        };
+
+        void write_native_fault_packet(const char* label, const EXCEPTION_POINTERS* pointers) noexcept
+        {
+            if (!pointers || !pointers->ExceptionRecord)
+            {
+                return;
+            }
+            const auto* exception = pointers->ExceptionRecord;
+            const auto* context = pointers->ContextRecord;
+            const bool has_fault = exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && exception->NumberParameters >= 2;
+            constexpr unsigned pointer_digits = sizeof(void*) * 2;
+            native_fault_packet packet{};
+            packet.append(label);
+            packet.append(" code=");
+            packet.hex(exception->ExceptionCode, 8);
+            packet.append(" at=");
+            packet.hex(reinterpret_cast<uint64_t>(exception->ExceptionAddress), pointer_digits);
+            packet.append(" exe_base=");
+            packet.hex(analyzer_image_base, pointer_digits);
+            packet.append(" fault=");
+            packet.hex(has_fault ? exception->ExceptionInformation[1] : 0, pointer_digits);
+            packet.append(" access=");
+            packet.hex(has_fault ? exception->ExceptionInformation[0] : 0, 2);
+            packet.append(" tid=");
+            packet.hex(GetCurrentThreadId(), 8);
+#if defined(_M_X64) || defined(__x86_64__)
+            packet.append(" rip=");
+            packet.hex(context ? context->Rip : 0, 16);
+            packet.append(" rsp=");
+            packet.hex(context ? context->Rsp : 0, 16);
+            packet.append(" rbp=");
+            packet.hex(context ? context->Rbp : 0, 16);
+#else
+            packet.append(" eip=");
+            packet.hex(context ? context->Eip : 0, 8);
+            packet.append(" esp=");
+            packet.hex(context ? context->Esp : 0, 8);
+            packet.append(" ebp=");
+            packet.hex(context ? context->Ebp : 0, 8);
+#endif
+            packet.append("\n");
+            packet.write();
+        }
+
+        LONG CALLBACK report_first_chance_host_av(EXCEPTION_POINTERS* pointers) noexcept
+        {
+            if (!pointers || !pointers->ExceptionRecord || pointers->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+            {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+
+            static volatile LONG packets = 0;
+            LONG current{};
+            do
+            {
+                current = InterlockedCompareExchange(&packets, 0, 0);
+                if (current >= 32)
+                {
+                    return EXCEPTION_CONTINUE_SEARCH;
+                }
+            } while (InterlockedCompareExchange(&packets, current + 1, current) != current);
+            write_native_fault_packet("[HOSTAV1] first_chance=1", pointers);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        // A final packet for faults that escape the emulator. This intentionally suppresses a
+        // hanging Windows application-error dialog after writing the failure to captured stderr.
+        LONG WINAPI report_unhandled_host_exception(EXCEPTION_POINTERS* pointers) noexcept
+        {
+            static volatile LONG reported = 0;
+            if (InterlockedExchange(&reported, 1) == 0)
+            {
+                write_native_fault_packet("[HOSTCRASH] unhandled=1", pointers);
+            }
+            return EXCEPTION_EXECUTE_HANDLER;
+        }
+#endif
+
         std::filesystem::path get_current_binary_dir()
         {
 #ifdef _WIN32
@@ -84,7 +203,7 @@ namespace sogen
             std::optional<uint64_t> break_call{};
             std::filesystem::path dump{};
             std::filesystem::path snapshot_output{};
-            std::filesystem::path checkpoint_request{};  // poll-file: write a snapshot to the path inside it, then keep running
+            std::filesystem::path checkpoint_request{}; // poll-file: write a snapshot to the path inside it, then keep running
             std::filesystem::path minidump_path{};
             std::filesystem::path report_path{};
             std::filesystem::path stdout_path{};
@@ -221,6 +340,8 @@ namespace sogen
                 }
 
                 auto hook_handler = [state, env_ptr](cpu_interface& cpu, const uint64_t address, const void*, const size_t size) {
+                    auto& profile = state->context_.hook_profile;
+                    sampled_analysis_timer<analysis_profile_channel::environment_callback> timer{&profile, &profile.environment_callback};
                     state->win_emu_.dispatch_on_cpu(cpu, [&] {
                         const auto rip = state->win_emu_.active_cpu().read_instruction_pointer();
                         const auto* mod = state->win_emu_.mod_manager.find_by_address(rip);
@@ -257,15 +378,17 @@ namespace sogen
             auto& win_emu = state->win_emu_;
             return state->win_emu_.emu().hook_memory_write(
                 process_params.value() + offsetof(RTL_USER_PROCESS_PARAMETERS64, Environment), 0x8,
-                [&win_emu, install = std::move(install_env_access_hook)](cpu_interface&, const uint64_t address, const void*, size_t) {
-                    const auto new_process_params = get_process_params(win_emu);
+                [&win_emu, install = std::move(install_env_access_hook)](cpu_interface& cpu, const uint64_t address, const void*, size_t) {
+                    win_emu.dispatch_on_cpu(cpu, [&] {
+                        const auto new_process_params = get_process_params(win_emu);
 
-                    const auto target_address = new_process_params.value() + offsetof(RTL_USER_PROCESS_PARAMETERS64, Environment);
+                        const auto target_address = new_process_params.value() + offsetof(RTL_USER_PROCESS_PARAMETERS64, Environment);
 
-                    if (address == target_address)
-                    {
-                        install();
-                    }
+                        if (address == target_address)
+                        {
+                            install();
+                        }
+                    });
                 });
         }
 
@@ -285,16 +408,16 @@ namespace sogen
                 });
             };
 
-            watch_object(win_emu, modules, *win_emu.current_thread().teb64, verbose, emit_object_access);
-            watch_object(win_emu, modules, win_emu.process.peb64, verbose, emit_object_access);
-            watch_object<KUSER_SHARED_DATA64>(win_emu, modules, kusd_mmio::address(), verbose, emit_object_access);
+            watch_object(win_emu, modules, *win_emu.current_thread().teb64, verbose, emit_object_access, &c.hook_profile);
+            watch_object(win_emu, modules, win_emu.process.peb64, verbose, emit_object_access, &c.hook_profile);
+            watch_object<KUSER_SHARED_DATA64>(win_emu, modules, kusd_mmio::address(), verbose, emit_object_access, &c.hook_profile);
 
             auto state = std::make_shared<analysis_state>(c, modules, verbose, concise);
 
-            state->params_hook_ =
-                watch_object(win_emu, modules, win_emu.process.process_params64, verbose, emit_object_access, state->params_state_);
+            state->params_hook_ = watch_object(win_emu, modules, win_emu.process.process_params64, verbose, emit_object_access,
+                                               &c.hook_profile, state->params_state_);
             state->ldr_hook_ = watch_object<PEB_LDR_DATA64>(win_emu, modules, win_emu.process.peb64.read().Ldr, verbose, emit_object_access,
-                                                            state->ldr_state_);
+                                                            &c.hook_profile, state->ldr_state_);
 
             const auto update_env_hook = [state] {
                 state->env_ptr_hook_ = install_env_hook(state); //
@@ -302,21 +425,26 @@ namespace sogen
 
             update_env_hook();
 
-            win_emu.emu().hook_memory_write(
-                win_emu.process.peb64.value() + offsetof(PEB64, ProcessParameters), 0x8,
-                [state, emit_object_access, update_env = std::move(update_env_hook)](cpu_interface&, const uint64_t, const void*, size_t) {
-                    const auto new_ptr = state->win_emu_.process.peb64.read().ProcessParameters;
-                    state->params_hook_ = watch_object<RTL_USER_PROCESS_PARAMETERS64>(
-                        state->win_emu_, state->modules_, new_ptr, state->verbose_, emit_object_access, state->params_state_);
-                    update_env();
-                });
+            win_emu.emu().hook_memory_write(win_emu.process.peb64.value() + offsetof(PEB64, ProcessParameters), 0x8,
+                                            [state, emit_object_access, update_env = std::move(update_env_hook)](
+                                                cpu_interface& cpu, const uint64_t, const void*, size_t) {
+                                                state->win_emu_.dispatch_on_cpu(cpu, [&] {
+                                                    const auto new_ptr = state->win_emu_.process.peb64.read().ProcessParameters;
+                                                    state->params_hook_ = watch_object<RTL_USER_PROCESS_PARAMETERS64>(
+                                                        state->win_emu_, state->modules_, new_ptr, state->verbose_, emit_object_access,
+                                                        &state->context_.hook_profile, state->params_state_);
+                                                    update_env();
+                                                });
+                                            });
 
             win_emu.emu().hook_memory_write(win_emu.process.peb64.value() + offsetof(PEB64, Ldr), 0x8,
-                                            [state, emit_object_access](cpu_interface&, const uint64_t, const void*, size_t) {
-                                                const auto new_ptr = state->win_emu_.process.peb64.read().Ldr;
-                                                state->ldr_hook_ =
-                                                    watch_object<PEB_LDR_DATA64>(state->win_emu_, state->modules_, new_ptr, state->verbose_,
-                                                                                 emit_object_access, state->ldr_state_);
+                                            [state, emit_object_access](cpu_interface& cpu, const uint64_t, const void*, size_t) {
+                                                state->win_emu_.dispatch_on_cpu(cpu, [&] {
+                                                    const auto new_ptr = state->win_emu_.process.peb64.read().Ldr;
+                                                    state->ldr_hook_ = watch_object<PEB_LDR_DATA64>(
+                                                        state->win_emu_, state->modules_, new_ptr, state->verbose_, emit_object_access,
+                                                        &state->context_.hook_profile, state->ldr_state_);
+                                                });
                                             });
         }
 
@@ -568,7 +696,7 @@ namespace sogen
                         win_emu.start();
                         if (!checkpoint_pending.exchange(false) || win_emu.process.exit_status.has_value())
                         {
-                            break;  // stopped by a signal, a fault, or a clean guest exit - not a live checkpoint
+                            break; // stopped by a signal, a fault, or a clean guest exit - not a live checkpoint
                         }
                         std::filesystem::path checkpoint_path;
                         {
@@ -581,7 +709,7 @@ namespace sogen
                         if (checkpoint_path.empty() || signals_received > 0 ||
                             !snapshot::is_resumable_checkpoint_stop(win_emu.last_stop_reason()))
                         {
-                            std::filesystem::remove(options.checkpoint_request, ec);  // consume the request without snapshotting
+                            std::filesystem::remove(options.checkpoint_request, ec); // consume the request without snapshotting
                             break;
                         }
                         snapshot_saving = true;
@@ -649,8 +777,8 @@ namespace sogen
                     flush_reporters(c);
                     return exit_code_success;
                 }
-                return emit_failure(win_emu.last_stop_reason() == stop_reason::backend_error ? win_emu.last_stop_detail()
-                                                                                             : "Emulation terminated without status");
+                return emit_failure(win_emu.last_stop_detail().empty() ? "Emulation terminated without status"
+                                                                       : win_emu.last_stop_detail());
             }
 
             const auto success = *exit_status == STATUS_SUCCESS;
@@ -798,6 +926,8 @@ namespace sogen
                 .settings = &options,
                 .auto_break_before_call = options.break_call,
             };
+            const auto* hook_profile_value = std::getenv("SOGEN_ANALYZER_HOOK_PROFILE");
+            context.hook_profile.enabled = hook_profile_value && std::string_view(hook_profile_value) == "1";
 
             const auto concise_logging = options.concise_logging;
             const auto win_emu = setup_emulator(options, args);
@@ -831,9 +961,11 @@ namespace sogen
                                                                              .hidden_event_types = hidden_event_types,
                                                                          }));
 
-            if (!options.report_path.empty())
+            const auto* telemetry_value = std::getenv("SOGEN_TELEMETRY_SHM");
+            const bool telemetry_shared_memory = telemetry_value && std::string_view(telemetry_value) == "1";
+            if (!options.report_path.empty() || telemetry_shared_memory)
             {
-                if (options.report_format != "jsonl")
+                if (!options.report_path.empty() && options.report_format != "jsonl")
                 {
                     throw std::runtime_error("Unsupported report format: " + options.report_format);
                 }
@@ -845,7 +977,11 @@ namespace sogen
                 report_settings.hidden_modules = hidden_modules;
                 report_settings.hidden_event_types = hidden_event_types;
                 // Live counters and the last guest location for panels/MCP readers, next to the report.
-                report_settings.status_path = options.report_path.parent_path() / "report-status.json";
+                if (!options.report_path.empty())
+                {
+                    report_settings.status_path = options.report_path.parent_path() / "report-status.json";
+                }
+                report_settings.hook_profile = &context.hook_profile;
                 reporters.emplace_back(create_jsonl_reporter(options.report_path, report_settings));
             }
 
@@ -1032,57 +1168,65 @@ namespace sogen
                     const auto read_count = std::make_shared<uint64_t>(0);
                     const auto write_count = std::make_shared<uint64_t>(0);
 
-                    auto read_handler = [&, section, concise_logging, read_count](cpu_interface&, const uint64_t address, const void*,
+                    auto read_handler = [&, section, concise_logging, read_count](cpu_interface& cpu, const uint64_t address, const void*,
                                                                                   size_t size) {
-                        const auto rip = win_emu->emu().read_instruction_pointer();
-                        const auto accessor = get_module_if_interesting(win_emu->mod_manager, options.modules, rip);
+                        win_emu->dispatch_on_cpu(cpu, [&] {
+                            const auto rip = win_emu->active_cpu().read_instruction_pointer();
+                            const auto accessor = get_module_if_interesting(win_emu->mod_manager, options.modules, rip);
 
-                        if (!accessor.has_value())
-                        {
-                            return;
-                        }
-
-                        if (concise_logging)
-                        {
-                            const auto count = ++*read_count;
-                            if (count > 20 && count % 100000 != 0)
+                            if (!accessor.has_value())
                             {
                                 return;
                             }
-                        }
 
-                        context.emit_observation<executable_read_event>([&](auto& event) {
-                            event.address = address;
-                            event.size = size;
-                            event.section_name = section.name;
+                            if (concise_logging)
+                            {
+                                const auto count = ++*read_count;
+                                if (count > 20 && count % 100000 != 0)
+                                {
+                                    return;
+                                }
+                            }
+
+                            context.emit_observation<executable_read_event>([&](auto& event) {
+                                event.address = address;
+                                event.size = size;
+                                event.section_name = section.name;
+                            });
                         });
                     };
 
-                    auto write_handler = [&, section, concise_logging, write_count](cpu_interface&, const uint64_t address,
+                    auto write_handler = [&, section, concise_logging, write_count](cpu_interface& cpu, const uint64_t address,
                                                                                     const void* value, size_t size) {
-                        if (concise_logging)
-                        {
-                            const auto count = ++*write_count;
-                            if (count > 30 && count % 100000 != 0)
+                        win_emu->dispatch_on_cpu(cpu, [&] {
+                            if (concise_logging)
                             {
-                                return;
+                                const auto count = ++*write_count;
+                                if (count > 30 && count % 100000 != 0)
+                                {
+                                    return;
+                                }
                             }
-                        }
 
-                        uint64_t int_value{};
-                        memcpy(&int_value, value, std::min(size, sizeof(int_value)));
-                        context.emit_observation<executable_write_event>([&](auto& event) {
-                            event.address = address;
-                            event.size = size;
-                            event.value = int_value;
-                            event.section_name = section.name;
+                            uint64_t int_value{};
+                            memcpy(&int_value, value, std::min(size, sizeof(int_value)));
+                            context.emit_observation<executable_write_event>([&](auto& event) {
+                                event.address = address;
+                                event.size = size;
+                                event.value = int_value;
+                                event.section_name = section.name;
+                            });
                         });
                     };
 
                     if (exec_read)
+                    {
                         win_emu->emu().hook_memory_read(section.region.start, section.region.length, std::move(read_handler));
+                    }
                     if (exec_write)
+                    {
                         win_emu->emu().hook_memory_write(section.region.start, section.region.length, std::move(write_handler));
+                    }
                 }
             }
 
@@ -1268,6 +1412,11 @@ namespace sogen
 
     int windows_main(const int argc, char** argv)
     {
+#ifdef _WIN32
+        analyzer_image_base = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+        AddVectoredExceptionHandler(1, report_first_chance_host_av);
+        SetUnhandledExceptionFilter(report_unhandled_host_exception);
+#endif
         return run_main(argc, argv);
     }
 }

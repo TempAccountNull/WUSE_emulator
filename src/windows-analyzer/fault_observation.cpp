@@ -341,6 +341,42 @@ namespace sogen
         }
     }
 
+    void capture_private_execute_memory(const analysis_context& context, memory_violation_event& event, const uint64_t rip)
+    {
+        constexpr size_t row_size = 16;
+        constexpr size_t row_count = 8;
+        constexpr std::string_view hex = "0123456789abcdef";
+        const auto start = (rip >= 64 ? rip - 64 : 0) & ~uint64_t{0xF};
+        event.private_execute_vcpu = context.win_emu->active_cpu().index();
+        event.private_execute_memory.reserve(row_count);
+        for (size_t row_index = 0; row_index < row_count; ++row_index)
+        {
+            auto& row = event.private_execute_memory.emplace_back();
+            row.address = start + row_index * row_size;
+            row.bytes_hex.reserve(row_size * 3 - 1);
+            for (size_t byte_index = 0; byte_index < row_size; ++byte_index)
+            {
+                if (byte_index != 0)
+                {
+                    row.bytes_hex.push_back(' ');
+                }
+                uint8_t byte{};
+                std::string error;
+                if (row.address <= UINT64_MAX - byte_index &&
+                    passive_read(context.win_emu->memory, row.address + byte_index, &byte, 1, error))
+                {
+                    row.bytes_hex.push_back(hex[byte >> 4]);
+                    row.bytes_hex.push_back(hex[byte & 15]);
+                    ++row.readable_bytes;
+                }
+                else
+                {
+                    row.bytes_hex += "??";
+                }
+            }
+        }
+    }
+
     void capture_memory_violation(const analysis_context& context, memory_violation_event& event, const uint64_t actual_ip)
     {
         auto& win = *context.win_emu;

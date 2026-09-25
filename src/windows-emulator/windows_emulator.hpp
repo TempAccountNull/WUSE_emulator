@@ -295,6 +295,10 @@ namespace sogen
         template <typename Function>
         auto dispatch_on_cpu(cpu_interface& cpu, Function&& fn)
         {
+            if (!cpu.has_guest_cpu_context())
+            {
+                throw std::logic_error("A host memory callback has no guest CPU context");
+            }
             const std::scoped_lock lock(this->kernel_lock_);
             const scoped_dispatch dispatch(*this, this->vcpu(cpu.index()));
             return std::forward<Function>(fn)();
@@ -365,6 +369,15 @@ namespace sogen
 
         uint64_t get_executed_instructions() const
         {
+            // Lean, stop-safe backends have no instruction or block hook. Their own retired
+            // count is the live delta; executed_instructions_ is the checkpoint base after
+            // restore (the regular backend restore resets Icicle's volatile icount).
+            if (!this->instruction_precision_ && this->emu_->is_stop_thread_safe() &&
+                this->emu_->has_deterministic_instruction_count())
+            {
+                return this->executed_instructions_ + this->emu_->executed_instructions_total();
+            }
+
             return this->executed_instructions_;
         }
 
@@ -506,17 +519,9 @@ namespace sogen
         std::chrono::steady_clock::time_point activity_status_last_{};
         std::vector<uint64_t> activity_status_prev_instructions_{};
         std::vector<x86_64_emulator::smp_profile_snapshot> activity_status_prev_smp_profile_{};
+        std::vector<x86_64_emulator::jit_profile_snapshot> activity_status_prev_jit_profile_{};
 
-        // Guest-visible timestamp counter. In relative mode the tick clock is already
-        // instruction-driven. In wall-clock mode (forced at N>1 - relative mode's counter is not
-        // maintained on lean paths) the default would be the HOST __rdtsc(), whose deltas carry
-        // host-scheduling jitter of the emulated section; Destiny's anti-tamper measures RDTSC
-        // pairs around its own code and that jitter (orders of magnitude between reads, worse
-        // with vCPU contention/migration) trips its timing gate -> deliberate FAST_FAIL.
-        // When the backend always knows the retired-instruction count (icicle: fuel-maintained
-        // icount), derive a deterministic virtual TSC from it instead: it only advances with
-        // guest execution, so deltas equal instruction counts - smooth, monotonic, and
-        // migration-immune. System/QPC-style time stays on the real clock.
+        // Use the configured guest clock for both timestamp instructions and other guest time sources.
         uint64_t timestamp_counter_for_guest();
 
 

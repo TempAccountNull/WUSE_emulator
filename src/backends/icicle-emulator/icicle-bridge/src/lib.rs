@@ -9,14 +9,68 @@ mod reciprocal_sqrt;
 mod registers;
 mod xstate;
 
-use icicle::{IcicleEmulator, IcicleStopInfo};
+use icicle::{IcicleEmulator, IcicleJitProfile, IcicleStopInfo, InvalidationProfile};
 use registers::X86Register;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use icicle_cpu::mem::physical::ExecWriteWake;
+
+// A running Icicle VM belongs to its worker thread. The stop path only touches
+// an independently synchronized control flag; it never borrows the VM.
+fn invalidation_profiles() -> &'static Mutex<HashMap<usize, Arc<InvalidationProfile>>> {
+    static PROFILES: OnceLock<Mutex<HashMap<usize, Arc<InvalidationProfile>>>> = OnceLock::new();
+    PROFILES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn wake_profiles() -> &'static Mutex<HashMap<usize, (Arc<ExecWriteWake>, Arc<AtomicU64>)>> {
+    static PROFILES: OnceLock<Mutex<HashMap<usize, (Arc<ExecWriteWake>, Arc<AtomicU64>)>>> = OnceLock::new();
+    PROFILES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[repr(C)]
+pub struct IcicleExecWriteWakeProfile {
+    pub wake_events: u64,
+    pub guest_jit_writes: u64,
+    pub guest_mmu_writes: u64,
+    pub host_writes: u64,
+    pub owner_flushes: u64,
+}
+
+#[repr(C)]
+pub struct IcicleExecWriteFilterProfile {
+    pub filtered_noncode: u64,
+    pub notified_overlap: u64,
+    pub notified_concurrent: u64,
+}
+
+#[repr(C)]
+pub struct IcicleInvalidationProfile {
+    pub epoch_mismatches: u64,
+    pub jit_resets: u64,
+    pub epoch_resets: u64,
+    pub wake_resets: u64,
+    pub manual_resets: u64,
+    pub mixed_resets: u64,
+    pub unknown_resets: u64,
+}
+
+#[repr(C)]
+pub struct IcicleManualInvalidationProfile {
+    pub total: u64,
+    pub peer_protection: u64,
+    pub public_invalidate: u64,
+    pub self_modifying: u64,
+    pub host_cache: u64,
+    pub unmap: u64,
+    pub protect: u64,
+    pub host_write: u64,
+    pub multiple_origins: u64,
+    pub unknown_origin: u64,
+}
 
 fn stop_flags() -> &'static Mutex<HashMap<usize, Arc<AtomicBool>>> {
     static FLAGS: OnceLock<Mutex<HashMap<usize, Arc<AtomicBool>>>> = OnceLock::new();
@@ -64,7 +118,134 @@ pub fn icicle_create_emulator(memory_limit_mib: u64) -> *mut c_void {
     let stop_flag = emulator.stop_flag();
     let ptr = Box::into_raw(emulator) as *mut c_void;
     stop_flags().lock().unwrap().insert(ptr as usize, stop_flag);
+    let profile = unsafe { (&*(ptr as *const IcicleEmulator)).invalidation_profile_flag() };
+    if let Some(profile) = profile {
+        invalidation_profiles().lock().unwrap().insert(ptr as usize, profile);
+    }
     return ptr;
+}
+
+/// Machine-setup-only opt-in. All handles must belong to the same shared address space.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn icicle_link_exec_write_wake(handles: *const *mut c_void, count: usize) -> i32 {
+    if handles.is_null() || count < 2 { return 0; }
+    let handles = unsafe { std::slice::from_raw_parts(handles, count) };
+    if handles.iter().any(|handle| handle.is_null())
+        || handles.iter().enumerate().any(|(i, handle)| handles[..i].contains(handle))
+    {
+        return 0;
+    }
+    let peers = handles.iter().map(|handle| {
+        let emulator = unsafe { &*(*handle as *const IcicleEmulator) };
+        (emulator.exec_write_pending_flag(), emulator.stop_flag())
+    }).collect();
+    let wake = Arc::new(ExecWriteWake::new(peers));
+    for handle in handles {
+        let emulator = unsafe { &mut *(*handle as *mut IcicleEmulator) };
+        let flushes = emulator.exec_write_flushes_flag();
+        emulator.link_exec_write_wake(Arc::clone(&wake));
+        wake_profiles().lock().unwrap().insert(*handle as usize, (Arc::clone(&wake), flushes));
+    }
+    1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn icicle_get_exec_write_wake_profile(
+    ptr: *mut c_void,
+    out: *mut IcicleExecWriteWakeProfile,
+) -> i32 {
+    if ptr.is_null() || out.is_null() { return 0; }
+    let profile = wake_profiles().lock().unwrap().get(&(ptr as usize)).cloned();
+    let Some((wake, flushes)) = profile else { return 0; };
+    let (guest_jit_writes, guest_mmu_writes, host_writes) = wake.write_counts();
+    unsafe {
+        *out = IcicleExecWriteWakeProfile {
+            wake_events: guest_jit_writes.saturating_add(guest_mmu_writes).saturating_add(host_writes),
+            guest_jit_writes,
+            guest_mmu_writes,
+            host_writes,
+            owner_flushes: flushes.load(Ordering::Relaxed),
+        };
+    }
+    1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn icicle_get_exec_write_filter_profile(
+    ptr: *mut c_void,
+    out: *mut IcicleExecWriteFilterProfile,
+) -> i32 {
+    if ptr.is_null() || out.is_null() { return 0; }
+    let profile = wake_profiles().lock().unwrap().get(&(ptr as usize)).cloned();
+    let Some((wake, _)) = profile else { return 0; };
+    let (filtered_noncode, notified_overlap, notified_concurrent) = wake.filter_counts();
+    unsafe {
+        *out = IcicleExecWriteFilterProfile {
+            filtered_noncode,
+            notified_overlap,
+            notified_concurrent,
+        };
+    }
+    1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn icicle_get_invalidation_profile(
+    ptr: *mut c_void,
+    out: *mut IcicleInvalidationProfile,
+) -> i32 {
+    if ptr.is_null() || out.is_null() { return 0; }
+    let profile = invalidation_profiles().lock().unwrap().get(&(ptr as usize)).cloned();
+    let Some(profile) = profile else { return 0; };
+    unsafe {
+        *out = IcicleInvalidationProfile {
+            epoch_mismatches: profile.epoch_mismatches.load(Ordering::Relaxed),
+            jit_resets: profile.jit_resets.load(Ordering::Relaxed),
+            epoch_resets: profile.epoch_resets.load(Ordering::Relaxed),
+            wake_resets: profile.wake_resets.load(Ordering::Relaxed),
+            manual_resets: profile.manual_resets.load(Ordering::Relaxed),
+            mixed_resets: profile.mixed_resets.load(Ordering::Relaxed),
+            unknown_resets: profile.unknown_resets.load(Ordering::Relaxed),
+        };
+    }
+    1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn icicle_get_manual_invalidation_profile(
+    ptr: *mut c_void,
+    out: *mut IcicleManualInvalidationProfile,
+) -> i32 {
+    if ptr.is_null() || out.is_null() { return 0; }
+    let profile = invalidation_profiles().lock().unwrap().get(&(ptr as usize)).cloned();
+    let Some(profile) = profile else { return 0; };
+    unsafe {
+        *out = IcicleManualInvalidationProfile {
+            total: profile.manual_origin_resets.load(Ordering::Relaxed),
+            peer_protection: profile.manual_peer_protection.load(Ordering::Relaxed),
+            public_invalidate: profile.manual_public_invalidate.load(Ordering::Relaxed),
+            self_modifying: profile.manual_self_modifying.load(Ordering::Relaxed),
+            host_cache: profile.manual_host_cache.load(Ordering::Relaxed),
+            unmap: profile.manual_unmap.load(Ordering::Relaxed),
+            protect: profile.manual_protect.load(Ordering::Relaxed),
+            host_write: profile.manual_host_write.load(Ordering::Relaxed),
+            multiple_origins: profile.manual_multiple_origins.load(Ordering::Relaxed),
+            unknown_origin: profile.manual_unknown_origin.load(Ordering::Relaxed),
+        };
+    }
+    1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn icicle_exec_write_pending(ptr: *mut c_void) -> i32 {
+    if ptr.is_null() { return 0; }
+    to_cbool(unsafe { (&*(ptr as *const IcicleEmulator)).exec_write_pending() })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn icicle_reconcile_exec_write_wake(ptr: *mut c_void) {
+    if ptr.is_null() { return; }
+    unsafe { (&mut *(ptr as *mut IcicleEmulator)).reconcile_exec_write_wake(); }
 }
 
 #[unsafe(no_mangle)]
@@ -99,10 +280,27 @@ pub fn icicle_get_icount(ptr: *mut c_void) -> u64 {
 }
 
 #[unsafe(no_mangle)]
+pub fn icicle_get_jit_profile(ptr: *mut c_void, out: *mut IcicleJitProfile) -> i32 {
+    if ptr.is_null() || out.is_null() {
+        return 0;
+    }
+    unsafe { *out = (&*(ptr as *mut IcicleEmulator)).jit_profile(); }
+    1
+}
+
+#[unsafe(no_mangle)]
 pub fn icicle_invalidate_code_range(ptr: *mut c_void, address: u64, length: u64) -> i32 {
     unsafe {
         let emulator = &mut *(ptr as *mut IcicleEmulator);
         return if emulator.invalidate_code_range_public(address, length) { 1 } else { 0 };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn icicle_refresh_peer_protection(ptr: *mut c_void, address: u64, length: u64) {
+    unsafe {
+        let emulator = &mut *(ptr as *mut IcicleEmulator);
+        emulator.refresh_peer_protection(address, length);
     }
 }
 
@@ -119,6 +317,14 @@ pub fn icicle_code_range_is_cached(ptr: *mut c_void, address: u64, length: u64) 
     unsafe {
         let emulator = &*(ptr as *mut IcicleEmulator);
         return if emulator.code_range_is_cached(address, length) { 1 } else { 0 };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn icicle_host_view_code_may_be_cached(ptr: *mut c_void, address: u64, length: u64) -> i32 {
+    unsafe {
+        let emulator = &*(ptr as *mut IcicleEmulator);
+        to_cbool(emulator.host_view_code_may_be_cached(address, length))
     }
 }
 
@@ -645,6 +851,8 @@ pub fn icicle_destroy_emulator(ptr: *mut c_void) {
     }
 
     stop_flags().lock().unwrap().remove(&(ptr as usize));
+    wake_profiles().lock().unwrap().remove(&(ptr as usize));
+    invalidation_profiles().lock().unwrap().remove(&(ptr as usize));
     unsafe {
         let _ = Box::from_raw(ptr as *mut IcicleEmulator);
     }

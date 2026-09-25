@@ -1,6 +1,7 @@
 #pragma once
 
 #include <serialization.hpp>
+#include <map>
 
 // NOLINTBEGIN(cppcoreguidelines-use-enum-class)
 

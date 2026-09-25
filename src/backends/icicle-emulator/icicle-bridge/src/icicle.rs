@@ -55,6 +55,12 @@ fn create_x64_vm() -> icicle_vm::Vm {
     cpu_config.optimize_block = false;
 
     let mut vm = icicle_vm::build(&cpu_config).unwrap();
+    vm.lifter.settings.max_instructions_per_block =
+        if std::env::var("SOGEN_ICICLE_MAX_BLOCK_INSTRUCTIONS").as_deref() == Ok("32") {
+            32
+        } else {
+            128
+        };
     // Upstream builder only copies enable_jit from Config. Propagate this bridge flag to the
     // field actually checked by Vm::run() before its periodic recompilation.
     vm.enable_recompilation = cpu_config.enable_recompilation;
@@ -113,6 +119,31 @@ pub struct IcicleStopInfo {
     pub kind: u32,
     pub code: u32,
     pub value: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct IcicleJitProfile {
+    pub compile_calls: u64,
+    pub compile_nanos: u64,
+    pub reset_calls: u64,
+    pub recompile_calls: u64,
+    pub recompile_nanos: u64,
+    pub recompile_compile_calls: u64,
+    pub recompile_compile_nanos: u64,
+    pub reset_generation: u64,
+    pub reset_cause_flags: u64,
+    pub reset_manual_origin_flags: u64,
+    pub flush_code_nanos: u64,
+    pub jit_reset_nanos: u64,
+    pub generation_compile_calls: u64,
+    pub generation_compile_nanos: u64,
+    pub origin_first_address_compiles: u64,
+    pub origin_repeat_after_reset_compiles: u64,
+    pub origin_repeat_in_generation_compiles: u64,
+    pub origin_periodic_recompile_compiles: u64,
+    pub origin_unclassified_compiles: u64,
+    pub origin_generation_number: u64,
 }
 
 impl IcicleStopInfo {
@@ -327,7 +358,9 @@ impl<Func: ?Sized> HookContainer<Func> {
 struct InstructionHookInjector {
     inst_hook: pcode::HookId,
     block_hook: pcode::HookId,
-    /// LEANDIAG: block-only mode (per-instruction hooks disabled, block breadcrumb wanted).
+    page_hook: pcode::HookId,
+    emit_block_hook: bool,
+    check_page_transitions: bool,
     block_only: bool,
 }
 
@@ -355,6 +388,7 @@ impl icicle_vm::CodeInjector for InstructionHookInjector {
             tmp_block.next_tmp = block.pcode.next_tmp;
 
             let mut is_first_inst = true;
+            let mut previous_page = None;
             let inst_count = count_instructions(&block);
 
             let mut replace_instruction = false;
@@ -366,11 +400,17 @@ impl icicle_vm::CodeInjector for InstructionHookInjector {
                 }
                 tmp_block.push(stmt);
                 if let pcode::Op::InstructionMarker = stmt.op {
+                    let page = cpu.mem.page_aligned(stmt.inputs.first().as_u64());
                     if is_first_inst {
                         is_first_inst = false;
-                        tmp_block.push((pcode::Op::Arg(0), pcode::Inputs::one(inst_count)));
-                        tmp_block.push(pcode::Op::Hook(self.block_hook));
+                        if self.emit_block_hook {
+                            tmp_block.push((pcode::Op::Arg(0), pcode::Inputs::one(inst_count)));
+                            tmp_block.push(pcode::Op::Hook(self.block_hook));
+                        }
+                    } else if self.check_page_transitions && previous_page != Some(page) {
+                        tmp_block.push(pcode::Op::Hook(self.page_hook));
                     }
+                    previous_page = Some(page);
 
                     if !self.block_only {
                         tmp_block.push(pcode::Op::Hook(self.inst_hook));
@@ -436,6 +476,20 @@ fn smp_dbg(msg: &str) {
     }
 }
 
+fn smp_lean_epoch_hook_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SOGEN_SMP_LEAN_EPOCH_HOOK").as_deref() == Ok("1"))
+}
+
+fn smp_prelift_epoch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SOGEN_SMP_PRELIFT_EPOCH").as_deref() == Ok("1"))
+}
+
+fn range_invalidation_enabled() -> bool {
+    std::env::var("SOGEN_ICICLE_RANGE_INVALIDATE").as_deref() == Ok("1")
+}
+
 /// SMP 6.6a epoch mode: 1 = smp_shared pages only (DEFAULT - production), 2 = all pages
 /// (A/B experiment), 0 = off. The earlier "recovery fault" was a bad TEST writing the VALUE 0x2222
 /// over the B8 opcode (re-lifted garbage read [0]); the mechanism itself is proven on private
@@ -448,17 +502,83 @@ fn smp_epoch_mode() -> u8 {
     })
 }
 
+const INVALIDATION_EPOCH: u8 = 1;
+const INVALIDATION_WAKE: u8 = 2;
+const INVALIDATION_MANUAL: u8 = 4;
+const MANUAL_PEER_PROTECTION: u16 = 1 << 0;
+const MANUAL_PUBLIC_INVALIDATE: u16 = 1 << 1;
+const MANUAL_SELF_MODIFYING: u16 = 1 << 2;
+const MANUAL_HOST_CACHE: u16 = 1 << 3;
+const MANUAL_UNMAP: u16 = 1 << 4;
+const MANUAL_PROTECT: u16 = 1 << 5;
+const MANUAL_HOST_WRITE: u16 = 1 << 6;
+
+#[derive(Default)]
+pub(crate) struct InvalidationProfile {
+    pub epoch_mismatches: std::sync::atomic::AtomicU64,
+    pub jit_resets: std::sync::atomic::AtomicU64,
+    pub epoch_resets: std::sync::atomic::AtomicU64,
+    pub wake_resets: std::sync::atomic::AtomicU64,
+    pub manual_resets: std::sync::atomic::AtomicU64,
+    pub mixed_resets: std::sync::atomic::AtomicU64,
+    pub unknown_resets: std::sync::atomic::AtomicU64,
+    pub manual_origin_resets: std::sync::atomic::AtomicU64,
+    pub manual_peer_protection: std::sync::atomic::AtomicU64,
+    pub manual_public_invalidate: std::sync::atomic::AtomicU64,
+    pub manual_self_modifying: std::sync::atomic::AtomicU64,
+    pub manual_host_cache: std::sync::atomic::AtomicU64,
+    pub manual_unmap: std::sync::atomic::AtomicU64,
+    pub manual_protect: std::sync::atomic::AtomicU64,
+    pub manual_host_write: std::sync::atomic::AtomicU64,
+    pub manual_multiple_origins: std::sync::atomic::AtomicU64,
+    pub manual_unknown_origin: std::sync::atomic::AtomicU64,
+}
+
+impl InvalidationProfile {
+    fn record_reset(&self, causes: u8, manual_origins: u16) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.jit_resets.fetch_add(1, Relaxed);
+        let bucket = match causes {
+            INVALIDATION_EPOCH => &self.epoch_resets,
+            INVALIDATION_WAKE => &self.wake_resets,
+            INVALIDATION_MANUAL => &self.manual_resets,
+            0 => &self.unknown_resets,
+            _ => &self.mixed_resets,
+        };
+        bucket.fetch_add(1, Relaxed);
+        if causes & INVALIDATION_MANUAL != 0 {
+            self.manual_origin_resets.fetch_add(1, Relaxed);
+            let origin_bucket = match manual_origins {
+                MANUAL_PEER_PROTECTION => &self.manual_peer_protection,
+                MANUAL_PUBLIC_INVALIDATE => &self.manual_public_invalidate,
+                MANUAL_SELF_MODIFYING => &self.manual_self_modifying,
+                MANUAL_HOST_CACHE => &self.manual_host_cache,
+                MANUAL_UNMAP => &self.manual_unmap,
+                MANUAL_PROTECT => &self.manual_protect,
+                MANUAL_HOST_WRITE => &self.manual_host_write,
+                0 => &self.manual_unknown_origin,
+                _ => &self.manual_multiple_origins,
+            };
+            origin_bucket.fetch_add(1, Relaxed);
+        }
+    }
+}
+
 struct ExecutionHooks {
     stop: Rc<RefCell<bool>>,
-    /// SMP 6.6a: page address -> code_epoch this VM last executed that shared page at.
-    shared_code_epochs: std::collections::HashMap<u64, u64>,
+    /// Guest page -> this VM's mapping generation and last observed code epoch.
+    shared_code_epochs: std::collections::HashMap<u64, (u64, u64)>,
     invalidate_code: Rc<Cell<bool>>,
+    invalidation_causes: Option<Rc<Cell<u8>>>,
+    invalidation_profile: Option<std::sync::Arc<InvalidationProfile>>,
     generic_hooks: HookContainer<dyn Fn(u64)>,
     ranged_hooks: HookContainer<dyn Fn(u64)>,
     specific_hooks: HookContainer<dyn Fn(u64)>,
     block_hooks: HookContainer<dyn Fn(u64, u64)>,
     address_mapping: BTreeMap<u64, Vec<u32>>,
     address_filter: [u64; 4],
+    // Opt-in lean diagnostic: reject non-candidate exact addresses without borrowing the table.
+    lean_exact_filter: Option<Rc<Cell<[u64; 4]>>>,
     one_time_callbacks: Vec<Box<dyn Fn()>>,
 }
 
@@ -468,12 +588,15 @@ impl ExecutionHooks {
             stop: stop_value,
             shared_code_epochs: std::collections::HashMap::new(),
             invalidate_code,
+            invalidation_causes: None,
+            invalidation_profile: None,
             generic_hooks: HookContainer::new(),
             ranged_hooks: HookContainer::new(),
             specific_hooks: HookContainer::new(),
             block_hooks: HookContainer::new(),
             address_mapping: BTreeMap::new(),
             address_filter: [0; 4],
+            lean_exact_filter: None,
             one_time_callbacks: Vec::new(),
         }
     }
@@ -539,41 +662,54 @@ impl ExecutionHooks {
         });
     }
 
+    fn check_code_epoch(&mut self, cpu: &mut icicle_cpu::Cpu, address: u64) {
+        // The map-time baseline is experimental because loader writes before first lift can
+        // otherwise cause one full code-cache flush per DLL page.
+        {
+            let mem = &cpu.mem;
+            let page_start = mem.page_aligned(address);
+            if let Some(index) = mem.get_physical_index(page_start) {
+                let page = mem.get_physical(index);
+                if (page.smp_shared || smp_epoch_mode() == 2) && smp_epoch_mode() != 0 {
+                    let current = page.data().code_epoch();
+                    let generation = page.smp_mapping_generation;
+                    let baseline = if page.smp_shared && smp_prelift_epoch_enabled() {
+                        page.smp_mapping_epoch
+                    } else {
+                        current
+                    };
+                    let seen = self
+                        .shared_code_epochs
+                        .entry(page_start)
+                        .or_insert((generation, baseline));
+                    if seen.0 != generation || seen.1 != current {
+                        smp_dbg(&format!(
+                            "epoch mismatch page={page_start:#x} seen={} current={current} pc={address:#x}",
+                            seen.1
+                        ));
+                        *seen = (generation, current);
+                        if let Some(causes) = &self.invalidation_causes {
+                            causes.set(causes.get() | INVALIDATION_EPOCH);
+                        }
+                        if let Some(profile) = &self.invalidation_profile {
+                            profile.epoch_mismatches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        self.invalidate_code.set(true);
+                        // Full hooks raise after callbacks because an earlier raise broke refetch
+                        // after flushing the code cache.
+                    }
+                }
+            }
+        }
+    }
+
     pub fn execute(&mut self, cpu: &mut icicle_cpu::Cpu, address: u64) {
         if self.invalidate_code.get() {
             cpu.exception =
                 icicle_cpu::Exception::new(ExceptionCode::Environment, CACHE_INVALIDATED);
             return;
         }
-        // SMP 6.6a: cross-VM self-modifying code. GUEST stores through a peer's TLB write pointer
-        // land in the shared bytes without any host-side fan-out; each sharing page's PageData
-        // carries a cross-VM `code_epoch` bumped on writes to translated bytes. This VM records the
-        // epoch it first executed each SHARED page at and re-checks it per block execution: a bump
-        // means someone (peer or self) rewrote translated code -> raise CACHE_INVALIDATED, which
-        // icicle handles by flushing this VM's code cache and retranslating (fresh bytes).
-        {
-            let mem = &cpu.mem;
-            let page_start = mem.page_aligned(address);
-            if let Some(index) = mem.get_physical_index(page_start) {
-                let page = mem.get_physical(index);
-                static EPOCH_CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                if (page.smp_shared || smp_epoch_mode() == 2) && smp_epoch_mode() != 0 {
-                    let current = page.data().code_epoch();
-                    let seen = self
-                        .shared_code_epochs
-                        .entry(page_start)
-                        .or_insert(current);
-                    if *seen != current {
-                        smp_dbg(&format!("epoch mismatch page={page_start:#x} seen={seen} current={current} pc={address:#x}"));
-                        *seen = current;
-                        self.invalidate_code.set(true);
-                        // Fall through to run_hooks + the TAIL raise below — the exact shape of the
-                        // working mid-run invalidate_code path (raising EARLY here, before run_hooks,
-                        // got mangled into ReadUnmapped(value=0) in the re-fetch after the flush).
-                    }
-                }
-            }
-        }
+        self.check_code_epoch(cpu, address);
         self.run_hooks(address);
 
         if *self.stop.borrow() {
@@ -583,6 +719,23 @@ impl ExecutionHooks {
             cpu.exception =
                 icicle_cpu::Exception::new(ExceptionCode::Environment, CACHE_INVALIDATED);
         }
+    }
+
+    fn execute_lean_block(&mut self, cpu: &mut icicle_cpu::Cpu, address: u64) -> bool {
+        if !self.invalidate_code.get() {
+            self.check_code_epoch(cpu, address);
+        }
+        if *self.stop.borrow() {
+            cpu.exception.code = ExceptionCode::InstructionLimit as u32;
+            cpu.exception.value = address;
+            return false;
+        }
+        if self.invalidate_code.get() {
+            cpu.exception =
+                icicle_cpu::Exception::new(ExceptionCode::Environment, CACHE_INVALIDATED);
+            return false;
+        }
+        true
     }
 
     pub fn add_block_hook(&mut self, callback: Box<dyn Fn(u64, u64)>) -> u32 {
@@ -611,6 +764,9 @@ impl ExecutionHooks {
         mapping.push(id);
         let (word, bit) = Self::address_filter_bit(address);
         self.address_filter[word] |= bit;
+        if let Some(filter) = &self.lean_exact_filter {
+            filter.set(self.address_filter);
+        }
 
         return id;
     }
@@ -639,6 +795,9 @@ impl ExecutionHooks {
             let (word, bit) = Self::address_filter_bit(address);
             self.address_filter[word] |= bit;
         }
+        if let Some(filter) = &self.lean_exact_filter {
+            filter.set(self.address_filter);
+        }
     }
 }
 
@@ -658,6 +817,27 @@ pub struct IcicleEmulator {
     execution_hooks: Rc<RefCell<ExecutionHooks>>,
     stop: Rc<RefCell<bool>>,
     vm_running: bool,
+    exec_write_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    exec_write_flushes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    exec_write_wake: Option<std::sync::Arc<icicle_cpu::mem::physical::ExecWriteWake>>,
+    invalidation_causes: Rc<Cell<u8>>,
+    manual_origins: Cell<u16>,
+    range_invalidation_enabled: bool,
+    pending_manual_pages: std::collections::HashSet<u64>,
+    manual_range_overflow: bool,
+    invalidation_profile: Option<std::sync::Arc<InvalidationProfile>>,
+    jit_profile_enabled: bool,
+    jit_recompile_calls: u64,
+    jit_recompile_nanos: u64,
+    jit_recompile_compile_calls: u64,
+    jit_recompile_compile_nanos: u64,
+    jit_reset_generation: u64,
+    jit_reset_cause_flags: u64,
+    jit_reset_manual_origin_flags: u64,
+    jit_flush_code_nanos: u64,
+    jit_reset_nanos: u64,
+    jit_generation_compile_calls_baseline: u64,
+    jit_generation_compile_nanos_baseline: u64,
     pending_free_pages: Vec<icicle_cpu::mem::physical::Index>,
     snapshots: Vec<(
         Box<icicle_vm::Snapshot>,
@@ -758,7 +938,26 @@ impl icicle_cpu::mem::IoMemory for MmioHandler {
 
 impl IcicleEmulator {
     pub fn new() -> Self {
+        let install_instruction_hooks =
+            std::env::var("SOGEN_ICICLE_INSTRUCTION_HOOK").map(|v| v != "0").unwrap_or(true);
+        Self::new_with_instruction_hooks(install_instruction_hooks)
+    }
+
+    fn new_with_instruction_hooks(install_instruction_hooks: bool) -> Self {
+        let lean_exact_probe = std::env::var("SOGEN_GUEST_CXX_THROW_PROBE").as_deref() == Ok("1");
+        Self::new_with_hook_modes(install_instruction_hooks, lean_exact_probe)
+    }
+
+    fn new_with_hook_modes(install_instruction_hooks: bool, lean_exact_probe: bool) -> Self {
+        let lean_exact_hooks = lean_exact_probe && !install_instruction_hooks;
+        if lean_exact_hooks {
+            static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[SOGEN_ICICLE_LEAN_EXACT_HOOKS_V1] enabled");
+            }
+        }
         let mut virtual_machine = create_x64_vm();
+
         let capacity_400mb = 50_000;
 
         let mut capacity = 8 * 2 * capacity_400mb; // ~8gb
@@ -770,10 +969,15 @@ impl IcicleEmulator {
 
         let stop_value = Rc::new(RefCell::new(false));
         let invalidate_code = Rc::new(Cell::new(false));
-        let exec_hooks = Rc::new(RefCell::new(ExecutionHooks::new(
-            stop_value.clone(),
-            invalidate_code.clone(),
-        )));
+        let invalidation_causes = Rc::new(Cell::new(0));
+        let invalidation_profile = (std::env::var("SOGEN_SMP_PROFILE").as_deref() == Ok("1"))
+            .then(|| std::sync::Arc::new(InvalidationProfile::default()));
+        let mut hook_state = ExecutionHooks::new(stop_value.clone(), invalidate_code.clone());
+        let lean_exact_filter = lean_exact_hooks.then(|| Rc::new(Cell::new([0; 4])));
+        hook_state.lean_exact_filter = lean_exact_filter.clone();
+        hook_state.invalidation_causes = Some(Rc::clone(&invalidation_causes));
+        hook_state.invalidation_profile = invalidation_profile.clone();
+        let exec_hooks = Rc::new(RefCell::new(hook_state));
 
         // The per-instruction/per-block hooks drive all instrumentation (call-count, first-exec,
         // execution-progress, coverage, import tracking) but the JIT compiles them as a call on
@@ -783,11 +987,7 @@ impl IcicleEmulator {
         // observation). Default on; SOGEN_ICICLE_INSTRUCTION_HOOK=0 opts into the fast path
         // (panel: "Instrumentation hooks" -> disabled). Skipping injection also disables
         // per-instruction breakpoints, so the panel pairs this with the debugger being off.
-        let install_instruction_hooks =
-            std::env::var("SOGEN_ICICLE_INSTRUCTION_HOOK").map(|v| v != "0").unwrap_or(true);
-        // LEANDIAG: with per-instruction hooks off (lean), the block hook was not installed
-        // either - so a block-level execution breadcrumb was impossible exactly where it is
-        // needed. The trace envs install the block hook alone (cheap: one op per block).
+        // Lean epoch hooks require SOGEN_SMP_LEAN_EPOCH_HOOK=1 because their JIT call cost is significant.
         let trace_blocks = ["SOGEN_LEANDIAG_BLOCKTRACE", "SOGEN_LEANDIAG_FULLTRACE"]
             .iter()
             .any(|key| std::env::var(key).map(|v| v == "1").unwrap_or(false));
@@ -800,7 +1000,8 @@ impl IcicleEmulator {
         // native RDTSC returns a constant 0).
         let lean_barrier =
             std::env::var("SOGEN_ICICLE_LEAN_BARRIER").map(|v| v != "0").unwrap_or(true);
-        if install_instruction_hooks || trace_blocks || lean_barrier {
+        let lean_epoch_hook = smp_lean_epoch_hook_enabled();
+        if install_instruction_hooks || trace_blocks || lean_barrier || lean_epoch_hook || lean_exact_hooks {
             let inst_exec_hooks = Rc::clone(&exec_hooks);
 
             let inst_hook = icicle_cpu::InstHook::new(move |cpu: &mut icicle_cpu::Cpu, addr: u64| {
@@ -808,33 +1009,63 @@ impl IcicleEmulator {
             });
             // no-op per-instruction hook for lean mode: pure compiler barrier, empty body
             let noop_hook = icicle_cpu::InstHook::new(|_cpu: &mut icicle_cpu::Cpu, _addr: u64| {});
+            // Diagnostic-only lean path: preserve the opaque compiler barrier and dispatch only
+            // exact-address hooks. Most instructions reject against a VM-local Bloom filter
+            // without borrowing ExecutionHooks or running generic/ranged instrumentation.
+            let exact_exec_hooks = Rc::clone(&exec_hooks);
+            let exact_filter = lean_exact_filter.clone();
+            let lean_exact_hook = icicle_cpu::InstHook::new(move |_cpu: &mut icicle_cpu::Cpu, addr: u64| {
+                if let Some(filter) = &exact_filter {
+                    let (word, bit) = ExecutionHooks::address_filter_bit(addr);
+                    if filter.get()[word] & bit != 0 {
+                        exact_exec_hooks.borrow_mut().run_specific_hooks(addr);
+                    }
+                }
+            });
 
             let block_exec_hooks = Rc::clone(&exec_hooks);
 
             let block_hook = icicle_cpu::InstHook::new(move |cpu: &mut icicle_cpu::Cpu, addr: u64| {
                 let instructions = cpu.args[0] as u64;
-                block_exec_hooks.borrow_mut().on_block(addr, instructions);
+                let mut hooks = block_exec_hooks.borrow_mut();
+                if install_instruction_hooks || !lean_epoch_hook || hooks.execute_lean_block(cpu, addr) {
+                    hooks.on_block(addr, instructions);
+                }
+            });
+
+            let page_exec_hooks = Rc::clone(&exec_hooks);
+            let page_hook = icicle_cpu::InstHook::new(move |cpu: &mut icicle_cpu::Cpu, addr: u64| {
+                page_exec_hooks.borrow_mut().execute_lean_block(cpu, addr);
             });
 
             let inst_hook_id = if install_instruction_hooks {
                 virtual_machine.cpu.add_hook(inst_hook)
+            } else if lean_exact_hooks {
+                virtual_machine.cpu.add_hook(lean_exact_hook)
             } else {
                 // lean: noop barrier (also when trace_blocks set the block-only mode ran
                 // before; the barrier covers it - the RDTSC rewrite stays identical)
                 virtual_machine.cpu.add_hook(noop_hook)
             };
-            let block_hook_id = if install_instruction_hooks || trace_blocks {
-                virtual_machine.cpu.add_hook(block_hook)
-            } else {
-                inst_hook_id
-            };
-            // block_only=true ONLY for trace-only mode (per-instr hooks off AND barrier off):
-            // there the injector pushes just the block hook + RDTSC rewrite. With the lean
-            // barrier (or full hooks) per-instruction ops are pushed.
-            let block_only = !install_instruction_hooks && !lean_barrier;
+            // Opt-in: keep the lean fence but lower this proven-empty hook to a direct
+            // opaque JIT call without hook-table loads; keep the exception check.
+            if !install_instruction_hooks
+                && !lean_exact_hooks
+                && lean_barrier
+                && std::env::var("SOGEN_ICICLE_FAST_NOOP_BARRIER").as_deref() == Ok("1")
+            {
+                virtual_machine.jit.set_noop_barrier_hook(inst_hook_id);
+            }
+            let block_hook_id = virtual_machine.cpu.add_hook(block_hook);
+            let page_hook_id = virtual_machine.cpu.add_hook(page_hook);
+            // Without the lean barrier, epoch checks run at block starts and page transitions.
+            let block_only = !install_instruction_hooks && !lean_barrier && !lean_exact_hooks;
             virtual_machine.add_injector(InstructionHookInjector {
                 inst_hook: inst_hook_id,
                 block_hook: block_hook_id,
+                page_hook: page_hook_id,
+                emit_block_hook: install_instruction_hooks || trace_blocks || lean_epoch_hook,
+                check_page_transitions: !install_instruction_hooks && lean_epoch_hook,
                 block_only,
             });
         }
@@ -855,6 +1086,28 @@ impl IcicleEmulator {
             violation_hooks: HookContainer::new(),
             execution_hooks: exec_hooks,
             vm_running: false,
+            exec_write_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            exec_write_flushes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            exec_write_wake: None,
+            invalidation_causes,
+            manual_origins: Cell::new(0),
+            range_invalidation_enabled: range_invalidation_enabled(),
+            pending_manual_pages: std::collections::HashSet::new(),
+            manual_range_overflow: false,
+            invalidation_profile,
+            jit_profile_enabled: std::env::var("SOGEN_ICICLE_JIT_PROFILE").as_deref() == Ok("1")
+                || std::env::var("SOGEN_ICICLE_COMPILE_ORIGIN_PROFILE").as_deref() == Ok("1"),
+            jit_recompile_calls: 0,
+            jit_recompile_nanos: 0,
+            jit_recompile_compile_calls: 0,
+            jit_recompile_compile_nanos: 0,
+            jit_reset_generation: 0,
+            jit_reset_cause_flags: 0,
+            jit_reset_manual_origin_flags: 0,
+            jit_flush_code_nanos: 0,
+            jit_reset_nanos: 0,
+            jit_generation_compile_calls_baseline: 0,
+            jit_generation_compile_nanos_baseline: 0,
             pending_free_pages: Vec::new(),
             snapshots: Vec::new(),
         }
@@ -877,12 +1130,85 @@ impl IcicleEmulator {
         return &mut self.vm.cpu.mem;
     }
 
+    pub(crate) fn stop_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.vm.interrupt_flag)
+    }
+
+    pub(crate) fn exec_write_flushes_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.exec_write_flushes)
+    }
+
+    pub(crate) fn exec_write_pending_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.exec_write_pending)
+    }
+
+    /// Called only during machine setup, before shared pages or worker threads exist.
+    pub(crate) fn link_exec_write_wake(
+        &mut self,
+        wake: std::sync::Arc<icicle_cpu::mem::physical::ExecWriteWake>,
+    ) {
+        self.vm.cpu.mem.set_exec_write_wake(std::sync::Arc::clone(&wake));
+        self.exec_write_wake = Some(wake);
+    }
+
+    pub(crate) fn invalidation_profile_flag(&self) -> Option<std::sync::Arc<InvalidationProfile>> {
+        self.invalidation_profile.clone()
+    }
+
+    fn mark_invalidation_cause(&self, cause: u8) {
+        self.invalidation_causes.set(self.invalidation_causes.get() | cause);
+    }
+
+    fn mark_manual_origin(&self, origin: u16) {
+        self.invalidation_causes.set(self.invalidation_causes.get() | INVALIDATION_MANUAL);
+        self.manual_origins.set(self.manual_origins.get() | origin);
+    }
+
+    fn record_manual_page(&mut self, address: u64) {
+        const MAX_PENDING_PAGES: usize = 1024;
+        if !self.range_invalidation_enabled {
+            return;
+        }
+        if self.pending_manual_pages.len() < MAX_PENDING_PAGES {
+            self.pending_manual_pages.insert(address);
+        } else if !self.pending_manual_pages.contains(&address) {
+            self.manual_range_overflow = true;
+        }
+    }
+
+    pub(crate) fn exec_write_pending(&self) -> bool {
+        self.exec_write_pending.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Owner thread only, after a JIT exit and before guest execution resumes.
+    pub(crate) fn reconcile_exec_write_wake(&mut self) {
+        if self.exec_write_pending.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            self.resume_pcode = false;
+            self.mark_invalidation_cause(INVALIDATION_WAKE);
+            self.invalidate_code.set(true);
+            self.flush_pending_code();
+            self.exec_write_flushes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn owner_stop_cell(&self) -> Rc<RefCell<bool>> {
+        Rc::clone(&self.stop)
+    }
+
     pub fn start(&mut self, count: u64) {
         self.executing_thread = std::thread::current().id();
+        if self.range_invalidation_enabled {
+
+            // Reclaim retained dead code at a parked owner boundary. Never free a JIT module
+            // while a generated-code frame or resumed p-code operation can still refer to it.
+            if !self.resume_pcode && self.range_cache_over_limit() {
+                self.invalidate_code.set(true);
+            }
+        }
         self.last_stop = IcicleStopInfo::none();
         self.last_vm_exit = icicle_vm::VmExit::Running;
-        // Consume a stop delivered after the scheduler marked this VM active
-        // but before vm.run() entered generated code.
+        // A peer may stop us after the scheduler marked this VM active but before
+        // vm.run(). Consume that request instead of clearing and losing it.
         if self.vm.interrupt_flag.swap(false, std::sync::atomic::Ordering::AcqRel) {
             self.last_vm_exit = icicle_vm::VmExit::Interrupted;
             self.last_stop = IcicleStopInfo::instruction_limit();
@@ -905,8 +1231,26 @@ impl IcicleEmulator {
             self.vm.cpu.exception.clear();
             *self.stop.borrow_mut() = false;
 
+            // Vm::run() normally recompiles as its first action. Time that same
+            // boundary only when profiling, leaving the default path unchanged.
+            if self.jit_profile_enabled && self.vm.enable_recompilation && self.vm.should_recompile() {
+                let compile_calls = self.vm.jit.profile_compile_calls;
+                let compile_nanos = self.vm.jit.profile_compile_nanos;
+                let start = Instant::now();
+                self.vm.jit.compile_origin_recompile_active = true;
+                self.vm.recompile();
+                self.vm.jit.compile_origin_recompile_active = false;
+                self.jit_recompile_calls += 1;
+                self.jit_recompile_nanos = self.jit_recompile_nanos.saturating_add(
+                    start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+                self.jit_recompile_compile_calls += self.vm.jit.profile_compile_calls - compile_calls;
+                self.jit_recompile_compile_nanos += self.vm.jit.profile_compile_nanos - compile_nanos;
+            }
             self.vm_running = true;
+            let wake_guard = self.exec_write_wake.as_ref().map(|wake| wake.run_guard());
             let reason = self.vm.run();
+            drop(wake_guard);
             self.vm_running = false;
             self.last_vm_exit = reason;
 
@@ -926,8 +1270,9 @@ impl IcicleEmulator {
                 }
                 icicle_vm::VmExit::UnhandledException((code, value)) => {
                     let continue_execution = self.handle_exception(code, value);
-                    // Honor an owner-thread stop requested by the exception hook
-                    // before the next iteration clears the hook stop cell.
+                    // An interrupt or exception hook can request a stop on this
+                    // owner thread. Honor it before the next loop iteration clears
+                    // the hook stop cell; otherwise an int29 fast-fail repeats forever.
                     if *self.stop.borrow() {
                         self.last_stop = IcicleStopInfo::instruction_limit();
                         break;
@@ -946,7 +1291,9 @@ impl IcicleEmulator {
                 }
             };
         }
-        // A late remote stop must not leak into the following quantum.
+        // The VM is parked. A remote stop may have arrived alongside another
+        // exit; C++ retains the matching quiesce, kick, or real-stop state.
+        // Do not let that interrupt leak into the next run quantum.
         self.vm.interrupt_flag.store(false, std::sync::atomic::Ordering::Release);
     }
 
@@ -1001,11 +1348,44 @@ impl IcicleEmulator {
     /// SMP 6.6: drop this VM's translations/TLB for [address, address+length). Returns whether
     /// anything was actually invalidated (an executed page was touched). No-op for uncached ranges.
     pub fn invalidate_code_range_public(&mut self, address: u64, length: u64) -> bool {
-        let changed = self.invalidate_code_range(address, length);
+        let changed = self.invalidate_code_range(address, length, MANUAL_PUBLIC_INVALIDATE);
         if changed {
             // invalidate_code_range already cleared the TLB and set the flag; nothing extra needed.
         }
         return changed;
+    }
+
+    /// A peer's shared PageData permissions were already changed by the issuing VM. Its own
+    /// translated code and data TLB can still cache the old access rights. Refresh local state
+    /// without touching shared permission bytes or their global IN_CODE_CACHE marker: another
+    /// vCPU may still be executing translated code from the same page.
+    pub fn refresh_peer_protection(&mut self, address: u64, length: u64) {
+        if length == 0 {
+            return;
+        }
+        let last = address.saturating_add(length - 1);
+        let page_size = self.vm.cpu.mem.page_size();
+        let mut page_address = self.vm.cpu.mem.page_aligned(address);
+        let mut code_changed = false;
+        loop {
+            if let Some(index) = self.vm.cpu.mem.get_physical_index(page_address) {
+                let page = self.vm.cpu.mem.get_physical_mut(index);
+                if page.executed {
+                    page.executed = false;
+                    code_changed = true;
+                    self.record_manual_page(page_address);
+                }
+            }
+            if last - page_address < page_size {
+                break;
+            }
+            page_address += page_size;
+        }
+        self.vm.cpu.mem.clear_tlb();
+        if code_changed {
+            self.mark_manual_origin(MANUAL_PEER_PROTECTION);
+            self.invalidate_code.set(true);
+        }
     }
 
     /// SMP 6.6: read-only query — does [address, address+length) overlap an EXECUTED (translated)
@@ -1075,7 +1455,37 @@ impl IcicleEmulator {
         return false;
     }
 
-    fn invalidate_code_range(&mut self, address: u64, length: u64) -> bool {
+    pub fn host_view_code_may_be_cached(&self, address: u64, length: u64) -> bool {
+        use icicle_vm::cpu::mem::perm;
+        use std::sync::atomic::Ordering;
+
+        if length == 0 {
+            return false;
+        }
+        let last = address.saturating_add(length - 1);
+        let mem = &self.vm.cpu.mem;
+        let page_size = mem.page_size();
+        let mut page_address = mem.page_aligned(address);
+        loop {
+            if let Some(index) = mem.get_physical_index(page_address) {
+                let page = mem.get_physical(index);
+                if page.smp_shared {
+                    if page.data().smp_translated.load(Ordering::Acquire) != 0 {
+                        return true;
+                    }
+                } else if mem.get_perm(page_address) & perm::EXEC != 0 {
+                    return true;
+                }
+            }
+            if last - page_address < page_size {
+                break;
+            }
+            page_address += page_size;
+        }
+        false
+    }
+
+    fn invalidate_code_range(&mut self, address: u64, length: u64, origin: u16) -> bool {
         if length == 0 {
             return false;
         }
@@ -1084,19 +1494,18 @@ impl IcicleEmulator {
         let mut page_address = self.vm.cpu.mem.page_aligned(address);
         let mut changed = false;
         loop {
-            if let Some(index) = self.vm.cpu.mem.get_physical_index(page_address) {
+            if let Some(index) = self.vm.cpu.mem.get_physical_index(page_address.max(address)) {
                 let page = self.vm.cpu.mem.get_physical_mut(index);
                 if page.executed {
                     page.executed = false;
-                    if page.smp_shared {
-                        // Other VMs may still execute this backing page. Their shared cache
-                        // marker remains set while this VM invalidates its own translation.
-                    } else {
+                    if !page.smp_shared {
                         for permission in &mut page.data_mut().perm {
                             *permission &= !icicle_cpu::mem::perm::IN_CODE_CACHE;
                         }
                     }
+                    // A peer may still have translated shared code; keep its marker.
                     changed = true;
+                    self.record_manual_page(page_address);
                 }
             }
             if last - page_address < page_size {
@@ -1106,18 +1515,107 @@ impl IcicleEmulator {
         }
         if changed {
             self.vm.cpu.mem.clear_tlb();
+            self.mark_manual_origin(origin);
             self.invalidate_code.set(true);
         }
         changed
     }
 
+    fn range_cache_over_limit(&self) -> bool {
+        const MAX_RETAINED_HOST_CODE: u64 = 256 * 1024 * 1024;
+        const MAX_LIFTED_BLOCKS: usize = 250_000;
+        self.vm.jit.generated_code_bytes() >= MAX_RETAINED_HOST_CODE
+            || self.vm.code.blocks.len() >= MAX_LIFTED_BLOCKS
+    }
+
+    /// Remove lifted groups that touch a dirty guest page. Retain the generated-code module:
+    /// old pointers remain allocated until the owning VM is parked for a later full purge.
+    fn invalidate_pending_manual_pages(&mut self) {
+        let pages = std::mem::take(&mut self.pending_manual_pages);
+        let page_size = self.vm.cpu.mem.page_size();
+        let blocks = &self.vm.code.blocks;
+        let mut invalidated = std::collections::HashSet::new();
+        self.vm.code.map.retain(|_, group| {
+            let overlaps = group.range().any(|id| {
+                let block = &blocks[id];
+                let mut page = block.start & !(page_size - 1);
+                let last = block.end.saturating_sub(1).max(block.start) & !(page_size - 1);
+                loop {
+                    if pages.contains(&page) {
+                        return true;
+                    }
+                    if page >= last {
+                        return false;
+                    }
+                    page = match page.checked_add(page_size) {
+                        Some(next) => next,
+                        None => return false,
+                    };
+                }
+            });
+            if overlaps {
+                invalidated.extend(group.range());
+            }
+            !overlaps
+        });
+        // A lifted group can start on a clean page and extend into a dirty one. The
+        // disassembly cache has no reverse group index, so clear its diagnostic strings.
+        self.vm.code.disasm.clear();
+        self.vm.code.modified.retain(|id| !invalidated.contains(id));
+        // Vm::recompile seeds its traversal from every retained block with an entry.
+        // Removing the group from code.map alone lets an old entry recompile stale p-code.
+        // Tombstone every block in the removed group, including any internal entry, while
+        // retaining its storage until the bounded full reset. External edges from live
+        // groups resolve through code.map; their internal edges remain group-local.
+        for id in invalidated {
+            self.vm.code.blocks[id].entry = None;
+            self.vm.jit.invalidate(id);
+        }
+        self.vm.cpu.block_id = u64::MAX;
+        self.vm.cpu.block_offset = 0;
+    }
+
     fn flush_pending_code(&mut self) {
         if self.invalidate_code.replace(false) {
-            smp_dbg("flush_pending_code: flushing code+vising jit");
             assert!(!self.vm_running);
+            let causes = self.invalidation_causes.replace(0);
+            let manual_origins = self.manual_origins.replace(0);
+            if self.range_invalidation_enabled
+                && causes == INVALIDATION_MANUAL
+                && !self.pending_manual_pages.is_empty()
+                && !self.manual_range_overflow
+                && !self.resume_pcode
+                && !self.range_cache_over_limit()
+            {
+                self.invalidate_pending_manual_pages();
+                return;
+            }
+            self.pending_manual_pages.clear();
+            self.manual_range_overflow = false;
+            smp_dbg("flush_pending_code: flushing code+vising jit");
+            if let Some(profile) = &self.invalidation_profile {
+                profile.record_reset(causes, manual_origins);
+            }
+            let flush_start = self.jit_profile_enabled.then(Instant::now);
             self.vm.code.flush_code();
+            let reset_start = flush_start.map(|start| {
+                self.jit_flush_code_nanos = self.jit_flush_code_nanos.saturating_add(
+                    start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+                Instant::now()
+            });
             // Vm::run has returned, so no generated-code frame still references this module.
             unsafe { self.vm.jit.reset() };
+            if let Some(start) = reset_start {
+                self.jit_reset_nanos = self.jit_reset_nanos.saturating_add(
+                    start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                );
+                self.jit_reset_generation = self.jit_reset_generation.saturating_add(1);
+                self.jit_reset_cause_flags = causes as u64;
+                self.jit_reset_manual_origin_flags = manual_origins as u64;
+                self.jit_generation_compile_calls_baseline = self.vm.jit.profile_compile_calls;
+                self.jit_generation_compile_nanos_baseline = self.vm.jit.profile_compile_nanos;
+            }
             self.vm.cpu.block_id = u64::MAX;
             self.vm.cpu.block_offset = 0;
         }
@@ -1137,7 +1635,7 @@ impl IcicleEmulator {
             })
             .filter(|instruction| matches!(instruction.op, pcode::Op::Store(_)))
             .map_or(1, |instruction| instruction.inputs.second().size() as u64);
-        if !self.invalidate_code_range(address, length) {
+        if !self.invalidate_code_range(address, length, MANUAL_SELF_MODIFYING) {
             return false;
         }
         // Preserve the failed p-code operation: replaying the x86 instruction can duplicate earlier stores or stack updates.
@@ -1241,6 +1739,42 @@ impl IcicleEmulator {
             return self.handle_interrupt(value as i32);
         }
 
+        // Opt-in, bounded diagnostic for a syscall exit whose reported PC may
+        // be stale after JIT execution. The instruction marker comes from the
+        // pcode block that actually raised the exception.
+        static SOURCE_PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *SOURCE_PROBE.get_or_init(|| std::env::var("SOGEN_SYSCALL_SOURCE_PROBE").as_deref() == Ok("1")) {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static FIRST_SAMPLES: AtomicUsize = AtomicUsize::new(0);
+            static MISMATCH_SAMPLES: AtomicUsize = AtomicUsize::new(0);
+            static POWER_ID_SAMPLES: AtomicUsize = AtomicUsize::new(0);
+
+            let pc = self.vm.cpu.read_pc();
+            let block_id = self.vm.cpu.block_id;
+            let block_offset = self.vm.cpu.block_offset;
+            let marker = self.vm.code.blocks.get(block_id as usize).and_then(|block| {
+                block.pcode.instructions.get(..=block_offset as usize)?.iter().rev()
+                    .find(|stmt| matches!(stmt.op, pcode::Op::InstructionMarker))
+                    .map(|stmt| stmt.inputs.first().as_u64())
+            });
+            let mut eax_bytes = [0u8; 4];
+            self.read_register(registers::X86Register::Eax, &mut eax_bytes);
+            let eax = u32::from_le_bytes(eax_bytes);
+            let first = FIRST_SAMPLES.fetch_add(1, Ordering::Relaxed) < 8;
+            let mismatch = marker.is_some_and(|address| address != pc)
+                && MISMATCH_SAMPLES.fetch_add(1, Ordering::Relaxed) < 32;
+            // 0x102 is both NtInitiatePowerAction's ID in this ntdll and the
+            // Win32 WAIT_TIMEOUT result seen after WaitForMultipleObjectsEx.
+            let power_id = eax == 0x102 && POWER_ID_SAMPLES.fetch_add(1, Ordering::Relaxed) < 8;
+            if first || mismatch || power_id {
+                eprintln!(
+                    "[SYSCALL_SOURCE] code={:#x} value={value:#x} pc={pc:#x} block={block_id:#x} offset={block_offset:#x} marker={marker:?} eax={eax:#x} host_thread={:?}",
+                    self.vm.cpu.exception.code,
+                    std::thread::current().id()
+                );
+            }
+        }
+
         self.syscall_hooks.for_each_hook(|func| {
             func();
         });
@@ -1253,12 +1787,31 @@ impl IcicleEmulator {
         return self.vm.cpu.icount;
     }
 
-    pub(crate) fn stop_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        std::sync::Arc::clone(&self.vm.interrupt_flag)
-    }
-
-    pub(crate) fn owner_stop_cell(&self) -> Rc<RefCell<bool>> {
-        Rc::clone(&self.stop)
+    pub fn jit_profile(&self) -> IcicleJitProfile {
+        IcicleJitProfile {
+            compile_calls: self.vm.jit.profile_compile_calls,
+            compile_nanos: self.vm.jit.profile_compile_nanos,
+            reset_calls: self.vm.jit.profile_reset_calls,
+            recompile_calls: self.jit_recompile_calls,
+            recompile_nanos: self.jit_recompile_nanos,
+            recompile_compile_calls: self.jit_recompile_compile_calls,
+            recompile_compile_nanos: self.jit_recompile_compile_nanos,
+            reset_generation: self.jit_reset_generation,
+            reset_cause_flags: self.jit_reset_cause_flags,
+            reset_manual_origin_flags: self.jit_reset_manual_origin_flags,
+            flush_code_nanos: self.jit_flush_code_nanos,
+            jit_reset_nanos: self.jit_reset_nanos,
+            generation_compile_calls: self.vm.jit.profile_compile_calls
+                .saturating_sub(self.jit_generation_compile_calls_baseline),
+            generation_compile_nanos: self.vm.jit.profile_compile_nanos
+                .saturating_sub(self.jit_generation_compile_nanos_baseline),
+            origin_first_address_compiles: self.vm.jit.compile_origin.first_address_compiles,
+            origin_repeat_after_reset_compiles: self.vm.jit.compile_origin.repeat_after_reset_compiles,
+            origin_repeat_in_generation_compiles: self.vm.jit.compile_origin.repeat_in_generation_compiles,
+            origin_periodic_recompile_compiles: self.vm.jit.compile_origin.periodic_recompile_compiles,
+            origin_unclassified_compiles: self.vm.jit.compile_origin.unclassified_compiles,
+            origin_generation_number: self.vm.jit.compile_origin.generation_number,
+        }
     }
 
     pub fn add_block_hook(&mut self, callback: Box<dyn Fn(u64, u64)>) -> u32 {
@@ -1413,7 +1966,7 @@ impl IcicleEmulator {
 
     pub fn flush_host_memory_cache(&mut self, pointer: usize, length: usize) {
         for (address, size) in self.vm.cpu.mem.host_mapping_aliases(pointer, length) {
-            self.invalidate_code_range(address, size);
+            self.invalidate_code_range(address, size, MANUAL_HOST_CACHE);
         }
     }
 
@@ -1550,7 +2103,7 @@ impl IcicleEmulator {
         else {
             return false;
         };
-        self.invalidate_code_range(address, length);
+        self.invalidate_code_range(address, length, MANUAL_UNMAP);
         let mem = &mut self.vm.cpu.mem;
         for (_, _, entry) in mem.mapping.overlapping_iter(address..=last) {
             if let Some(icicle_cpu::mem::MemoryMapping::Physical(page)) = entry {
@@ -1565,7 +2118,7 @@ impl IcicleEmulator {
     }
 
     pub fn protect_memory(&mut self, address: u64, length: u64, permissions: u8) -> bool {
-        self.invalidate_code_range(address, length);
+        self.invalidate_code_range(address, length, MANUAL_PROTECT);
         let native_permissions = map_permissions(permissions);
         let res = self
             .get_mem()
@@ -1577,7 +2130,7 @@ impl IcicleEmulator {
         let Some(end) = address.checked_add(data.len() as u64) else {
             return false;
         };
-        self.invalidate_code_range(address, data.len() as u64);
+        self.invalidate_code_range(address, data.len() as u64, MANUAL_HOST_WRITE);
         let mem = self.get_mem();
         let mut page = mem.page_aligned(address);
         while page < end {
@@ -1605,6 +2158,31 @@ impl IcicleEmulator {
                     mem.total_pages(),
                     mem.capacity()
                 );
+                // Large host-write failures are rare. Bound the extra map query and log so
+                // a bad guest loop cannot flood the capture. Reservations live in the C++
+                // memory manager; this records the backing MMU's actual map state.
+                static LARGE_WRITE_DIAGNOSTICS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if data.len() >= 4096
+                    && LARGE_WRITE_DIAGNOSTICS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8
+                {
+                    let last = end - 1;
+                    let first_mapping = mem.mapping.get_with_range(address);
+                    let last_mapping = mem.mapping.get_with_range(last);
+                    let mut previous = None;
+                    let mut following = None;
+                    for (start, finish, _) in mem.mapping.iter() {
+                        if finish < address {
+                            previous = Some((start, finish));
+                        } else if start > last {
+                            following = Some((start, finish));
+                            break;
+                        }
+                    }
+                    eprintln!(
+                        "[ICWRITE] start_map={first_mapping:?} end_map={last_mapping:?} previous={previous:?} following={following:?}"
+                    );
+                }
                 false
             }
         }
@@ -1809,6 +2387,19 @@ mod page_reclamation_tests {
             assert!(emu.unmap_memory(ADDRESS + 2048, 2048));
             assert_eq!(emu.vm.cpu.mem.total_pages(), 2);
         }
+    }
+
+    #[test]
+    fn split_executed_shared_page_reclaims_after_final_unmap() {
+        let mut emu = emulator(16);
+        assert!(emu.map_smp_shared_fresh_range(ADDRESS, 4096, FOREIGN_READ | FOREIGN_EXEC));
+        assert!(emu.unmap_memory(ADDRESS, 2048));
+
+        let index = emu.vm.cpu.mem.get_physical_index(ADDRESS + 2048).unwrap();
+        emu.vm.cpu.mem.get_physical_mut(index).executed = true;
+
+        assert!(emu.unmap_memory(ADDRESS + 2048, 2048));
+        assert_eq!(emu.vm.cpu.mem.total_pages(), 2);
     }
 
     #[test]
@@ -2386,12 +2977,337 @@ mod hook_hotpath_tests {
 }
 
 #[cfg(test)]
+mod lean_exact_execution_hook_tests {
+    use super::*;
+
+    const ADDRESS: u64 = 0x9a000;
+
+    fn vm(probe: bool) -> IcicleEmulator {
+        let mut emu = IcicleEmulator::new_with_hook_modes(false, probe);
+        emu.vm.enable_jit = true;
+        assert!(emu.map_memory(ADDRESS, 0x1000, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+        assert!(emu.write_memory(ADDRESS, &[0x90, 0x90, 0xeb, 0xfe]));
+        emu
+    }
+
+    #[test]
+    fn lean_probe_delivers_late_exact_hook_without_full_instrumentation() {
+        let mut emu = vm(true);
+        // Compile the block before registration: DXVK hooks are installed at module load.
+        emu.vm.cpu.write_pc(ADDRESS);
+        emu.start(2);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&seen);
+        let exact = emu.add_execution_hook(
+            ADDRESS + 1,
+            Box::new(move |addr| observed.borrow_mut().push(addr)),
+        );
+        let generic_calls = Rc::new(Cell::new(0));
+        let generic_observed = Rc::clone(&generic_calls);
+        let generic = emu.add_generic_execution_hook(Box::new(move |_| {
+            generic_observed.set(generic_observed.get() + 1);
+        }));
+        emu.vm.cpu.write_pc(ADDRESS);
+        emu.start(2);
+        assert_eq!(*seen.borrow(), vec![ADDRESS + 1]);
+        assert_eq!(generic_calls.get(), 0, "lean probe enabled broad instrumentation");
+
+        emu.remove_hook(exact);
+        emu.vm.cpu.write_pc(ADDRESS);
+        emu.start(2);
+        assert_eq!(*seen.borrow(), vec![ADDRESS + 1], "removed exact hook still ran");
+        emu.remove_hook(generic);
+    }
+
+    #[test]
+    fn probe_off_preserves_lean_noop_barrier_behavior() {
+        let mut emu = vm(false);
+        let called = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&called);
+        emu.add_execution_hook(ADDRESS + 1, Box::new(move |_| observed.set(true)));
+        emu.vm.cpu.write_pc(ADDRESS);
+        emu.start(2);
+        assert!(!called.get(), "probe-off lean mode unexpectedly delivered exact hooks");
+    }
+}
+
+#[cfg(test)]
+mod fast_noop_barrier_tests {
+    use super::*;
+
+    struct InvalidRegisterBeforeNextMarker {
+        address: u64,
+        inserted: Rc<Cell<bool>>,
+    }
+
+    impl icicle_vm::CodeInjector for InvalidRegisterBeforeNextMarker {
+        fn inject(&mut self, _cpu: &mut icicle_vm::cpu::Cpu,
+            group: &icicle_vm::cpu::BlockGroup, code: &mut icicle_vm::BlockTable) {
+            if group.start != self.address || self.inserted.get() {
+                return;
+            }
+            for id in group.range() {
+                let instructions = &mut code.blocks[id].pcode.instructions;
+                let Some(second_marker) = instructions.iter().enumerate()
+                    .filter(|(_, stmt)| matches!(stmt.op, pcode::Op::InstructionMarker))
+                    .nth(1).map(|(index, _)| index) else { continue };
+                assert!(matches!(instructions[second_marker + 1].op, pcode::Op::Hook(_)));
+                // Interpreter fallback sets UnmappedRegister here. The next lean barrier must
+                // observe it before the second guest instruction changes RAX.
+                instructions.insert(second_marker, pcode::Instruction {
+                    op: pcode::Op::Store(pcode::REGISTER_SPACE),
+                    inputs: pcode::Inputs::new(
+                        pcode::Value::Const(0xffff_fffe, 8),
+                        pcode::Value::Const(0x5a, 1),
+                    ),
+                    output: pcode::VarNode::NONE,
+                });
+                self.inserted.set(true);
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn fast_noop_barrier_preserves_prior_dynamic_register_exception() {
+        if std::env::var("SOGEN_ICICLE_FAST_NOOP_BARRIER").as_deref() != Ok("1")
+            || std::env::var("SOGEN_ICICLE_LEAN_BARRIER").as_deref() == Ok("0") {
+            return;
+        }
+        const ADDRESS: u64 = 0x8f000;
+        let mut emu = IcicleEmulator::new_with_instruction_hooks(false);
+        emu.vm.enable_jit = true;
+        assert!(emu.map_memory(ADDRESS, 0x1000, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+        assert!(emu.write_memory(ADDRESS, &[0x90, 0xb8, 0x78, 0x56, 0x34, 0x12, 0xeb, 0xfe]));
+        let inserted = Rc::new(Cell::new(false));
+        emu.vm.add_injector(InvalidRegisterBeforeNextMarker {
+            address: ADDRESS, inserted: Rc::clone(&inserted),
+        });
+        emu.vm.cpu.write_pc(ADDRESS);
+        emu.start(8);
+        assert!(inserted.get());
+        assert!(matches!(emu.last_vm_exit,
+            icicle_vm::VmExit::UnhandledException((ExceptionCode::UnmappedRegister, 0xffff_fffe))));
+        let mut rax = [0u8; 8];
+        emu.read_register(registers::X86Register::Rax, &mut rax);
+        assert_eq!(u64::from_le_bytes(rax), 0, "second instruction ran after the exception");
+    }
+}
+
+#[cfg(test)]
 mod shared_memory_smp {
     //! P1 foundation for multi-vCPU SMP: can N Icicle VMs share ONE guest address space coherently?
     //! Maps the same host buffer into two VMs and checks a write through one is visible via the
     //! other. Host-memory backing (host hardware keeps it coherent) is a candidate shared-RAM path
     //! for per-vCPU VMs that avoids rewriting PhysicalMemory. Runs under plain `cargo test`.
     use super::*;
+
+    struct RewriteAfterLift {
+        address: u64,
+        write_address: u64,
+        cross_page_marker: Option<u64>,
+        writer: Rc<RefCell<IcicleEmulator>>,
+        fired: Rc<Cell<bool>>,
+    }
+
+    impl icicle_vm::CodeInjector for RewriteAfterLift {
+        fn inject(
+            &mut self,
+            _cpu: &mut icicle_vm::cpu::Cpu,
+            group: &icicle_vm::cpu::BlockGroup,
+            code: &mut icicle_vm::BlockTable,
+        ) {
+            if group.start == self.address && !self.fired.replace(true) {
+                if let Some(other_page) = self.cross_page_marker {
+                    assert!(code.blocks[group.range()].iter().any(|block| {
+                        let markers: Vec<_> = block
+                            .pcode
+                            .instructions
+                            .iter()
+                            .filter(|stmt| matches!(stmt.op, pcode::Op::InstructionMarker))
+                            .map(|stmt| stmt.inputs.first().as_u64())
+                            .collect();
+                        markers.contains(&self.address) && markers.contains(&other_page)
+                    }));
+                }
+                assert!(self.writer.borrow_mut().write_memory(
+                    self.write_address,
+                    &[0xB8, 0x22, 0x22, 0x00, 0x00, 0xEB, 0xF9],
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn peer_write_after_first_lift_is_seen_with_full_and_lean_hooks() {
+        if !smp_prelift_epoch_enabled() || !smp_lean_epoch_hook_enabled() {
+            return;
+        }
+        use icicle_vm::cpu::mem::perm;
+
+        const ADDRESS: u64 = 0x40000;
+        for instruction_hooks in [true, false] {
+            let writer = Rc::new(RefCell::new(IcicleEmulator::new()));
+            let mut reader = IcicleEmulator::new_with_instruction_hooks(instruction_hooks);
+            assert!(writer.borrow_mut().vm.cpu.mem.map_smp_shared_fresh(
+                ADDRESS,
+                perm::READ | perm::WRITE | perm::EXEC,
+            ));
+            assert!(writer.borrow_mut().write_memory(
+                ADDRESS,
+                &[0xB8, 0x11, 0x11, 0x00, 0x00, 0xEB, 0xF9],
+            ));
+            let shared = writer.borrow().vm.cpu.mem.share_page(ADDRESS).unwrap();
+            assert!(reader.vm.cpu.mem.map_smp_shared(ADDRESS, shared.clone()));
+
+            let fired = Rc::new(Cell::new(false));
+            reader.vm.add_injector(RewriteAfterLift {
+                address: ADDRESS,
+                write_address: ADDRESS,
+                cross_page_marker: None,
+                writer: Rc::clone(&writer),
+                fired: Rc::clone(&fired),
+            });
+            reader.vm.cpu.write_pc(ADDRESS);
+            reader.start(10);
+
+            let mut result = [0u8; 8];
+            reader.read_register(registers::X86Register::Rax, &mut result);
+            let index = reader.vm.cpu.mem.get_physical_index(ADDRESS).unwrap();
+            assert!(fired.get());
+            assert!(shared.code_epoch() > reader.vm.cpu.mem.get_physical(index).smp_mapping_epoch);
+            assert_eq!(u64::from_le_bytes(result), 0x2222, "instruction_hooks={instruction_hooks}");
+        }
+    }
+
+    #[test]
+    #[ignore = "expected failure until default lean handles peer writes to translated code"]
+    fn default_lean_peer_write_after_lift_needs_invalidation() {
+        use icicle_vm::cpu::mem::perm;
+
+        assert!(!smp_lean_epoch_hook_enabled());
+        const ADDRESS: u64 = 0x48000;
+        let writer = Rc::new(RefCell::new(IcicleEmulator::new()));
+        let mut reader = IcicleEmulator::new_with_instruction_hooks(false);
+        assert!(writer.borrow_mut().vm.cpu.mem.map_smp_shared_fresh(
+            ADDRESS,
+            perm::READ | perm::WRITE | perm::EXEC,
+        ));
+        assert!(writer.borrow_mut().write_memory(
+            ADDRESS,
+            &[0xB8, 0x11, 0x11, 0x00, 0x00, 0xEB, 0xF9],
+        ));
+        let shared = writer.borrow().vm.cpu.mem.share_page(ADDRESS).unwrap();
+        assert!(reader.vm.cpu.mem.map_smp_shared(ADDRESS, shared.clone()));
+
+        let fired = Rc::new(Cell::new(false));
+        reader.vm.add_injector(RewriteAfterLift {
+            address: ADDRESS,
+            write_address: ADDRESS,
+            cross_page_marker: None,
+            writer: Rc::clone(&writer),
+            fired: Rc::clone(&fired),
+        });
+        reader.vm.cpu.write_pc(ADDRESS);
+        reader.start(10);
+
+        let mut result = [0u8; 8];
+        reader.read_register(registers::X86Register::Rax, &mut result);
+        assert!(fired.get());
+        assert!(shared.code_epoch() > 0);
+        assert_eq!(u64::from_le_bytes(result), 0x2222);
+    }
+
+    #[test]
+    fn peer_write_to_later_page_after_lift_is_seen_by_lean_hooks() {
+        if !smp_prelift_epoch_enabled() || !smp_lean_epoch_hook_enabled() {
+            return;
+        }
+        use icicle_vm::cpu::mem::perm;
+
+        const FIRST_PAGE: u64 = 0x60000;
+        const SECOND_PAGE: u64 = FIRST_PAGE + 0x1000;
+        const START: u64 = SECOND_PAGE - 2;
+        let writer = Rc::new(RefCell::new(IcicleEmulator::new()));
+        let mut reader = IcicleEmulator::new_with_instruction_hooks(false);
+        for page in [FIRST_PAGE, SECOND_PAGE] {
+            assert!(writer.borrow_mut().vm.cpu.mem.map_smp_shared_fresh(
+                page,
+                perm::READ | perm::WRITE | perm::EXEC,
+            ));
+        }
+        assert!(writer.borrow_mut().write_memory(START, &[0x90, 0x90]));
+        assert!(writer.borrow_mut().write_memory(
+            SECOND_PAGE,
+            &[0xB8, 0x11, 0x11, 0x00, 0x00, 0xEB, 0xF9],
+        ));
+        for page in [FIRST_PAGE, SECOND_PAGE] {
+            let shared = writer.borrow().vm.cpu.mem.share_page(page).unwrap();
+            assert!(reader.vm.cpu.mem.map_smp_shared(page, shared));
+        }
+
+        let fired = Rc::new(Cell::new(false));
+        reader.vm.add_injector(RewriteAfterLift {
+            address: START,
+            write_address: SECOND_PAGE,
+            cross_page_marker: Some(SECOND_PAGE),
+            writer: Rc::clone(&writer),
+            fired: Rc::clone(&fired),
+        });
+        reader.vm.cpu.write_pc(START);
+        reader.start(10);
+
+        let mut result = [0u8; 8];
+        reader.read_register(registers::X86Register::Rax, &mut result);
+        assert!(fired.get());
+        assert_eq!(u64::from_le_bytes(result), 0x2222);
+    }
+
+    #[test]
+    fn default_first_use_ignores_loader_writes_but_checks_warm_page() {
+        if smp_prelift_epoch_enabled() {
+            return;
+        }
+        use icicle_vm::cpu::mem::perm;
+
+        const ADDRESS: u64 = 0x70000;
+        let mut vm = create_x64_vm();
+        assert!(vm.cpu.mem.map_smp_shared_fresh(
+            ADDRESS,
+            perm::READ | perm::WRITE | perm::EXEC,
+        ));
+        vm.cpu.mem.write_bytes(ADDRESS, &[0x90; 256], perm::NONE).unwrap();
+        let invalidated = Rc::new(Cell::new(false));
+        let mut hooks = ExecutionHooks::new(Rc::new(RefCell::new(false)), invalidated.clone());
+
+        hooks.execute(&mut vm.cpu, ADDRESS);
+        assert!(!invalidated.get());
+
+        vm.cpu.mem.write(ADDRESS, [0xCC], perm::NONE).unwrap();
+        hooks.execute(&mut vm.cpu, ADDRESS);
+        assert!(invalidated.get());
+        assert_eq!(vm.cpu.exception.value, CACHE_INVALIDATED);
+    }
+
+    #[test]
+    fn remapped_shared_page_changes_epoch_identity() {
+        use icicle_vm::cpu::mem::perm;
+
+        const ADDRESS: u64 = 0x50000;
+        let mut vm = create_x64_vm();
+        let invalidated = Rc::new(Cell::new(false));
+        let mut hooks = ExecutionHooks::new(Rc::new(RefCell::new(false)), invalidated.clone());
+        assert!(vm.cpu.mem.map_smp_shared_fresh(ADDRESS, perm::READ | perm::EXEC));
+        hooks.execute(&mut vm.cpu, ADDRESS);
+        assert!(!invalidated.get());
+
+        assert!(vm.cpu.mem.unmap_memory_len(ADDRESS, 0x1000));
+        assert!(vm.cpu.mem.map_smp_shared_fresh(ADDRESS, perm::READ | perm::EXEC));
+        hooks.execute(&mut vm.cpu, ADDRESS);
+        assert!(invalidated.get());
+        assert_eq!(vm.cpu.exception.code, ExceptionCode::Environment as u32);
+        assert_eq!(vm.cpu.exception.value, CACHE_INVALIDATED);
+    }
 
     #[test]
     fn two_vms_share_one_host_backed_region() {
@@ -2479,11 +3395,14 @@ mod shared_memory_smp {
         let shared = a.vm.cpu.mem.share_page(addr).expect("shared arc");
         assert!(b.vm.cpu.mem.map_smp_shared(addr, shared));
 
-        // Guest code ON THE SHARED PAGE at +0x00: mov rax, [TARGET]; then a jmp-self pad is not needed
-        // (icount-limited). TARGET at +0x100.
-        // 48 B8 is mov rax, imm64 -- we need a LOAD: mov rax, [abs] = REX.W A1 imm64 (moffs).
-        let code: [u8; 10] = [0x48, 0xA1, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]; // mov rax,[0x40000+0x100]
+        // Code and TARGET (+0x100) share the executable page. The backward jump keeps
+        // execution in known bytes when the instruction budget advances past the load.
+        let code: [u8; 12] = [
+            0x48, 0xA1, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, [0x40100]
+            0xEB, 0xF4, // jmp back to the load
+        ];
         assert!(a.write_memory(addr, &code));
+        assert!(a.write_memory(addr + 0x100, &0x1122334455667788u64.to_le_bytes()));
         b.vm.cpu.write_pc(addr);
 
         let read_rax = |emu: &mut IcicleEmulator| -> u64 {
@@ -2492,10 +3411,11 @@ mod shared_memory_smp {
             u64::from_le_bytes(buf)
         };
 
-        // 1) B executes the load once with TARGET = 0 (page becomes executed / translated).
-        unsafe { b.vm.cpu.regs.write_at(0, 0u64.to_le_bytes()) }; // zero rax (Rax is regs slot 0)
-        b.start(1);
-        assert_eq!(read_rax(&mut b), 0, "initial load must read 0");
+        // A nonzero first value proves the guest load actually ran. One instruction
+        // credit stops at Icicle's marker before executing the load body.
+        b.write_register(registers::X86Register::Rax, &0u64.to_le_bytes());
+        b.start(2);
+        assert_eq!(read_rax(&mut b), 0x1122334455667788, "initial load must execute");
 
         // 2) A host-writes TARGET (the failing path: invalidate_code_range + write_bytes on VM A).
         assert!(a.write_memory(addr + 0x100, &0xfeedfacefeedfaceu64.to_le_bytes()));
@@ -2507,10 +3427,9 @@ mod shared_memory_smp {
         assert!(b.read_memory(addr + 0x100, &mut buf));
         assert_eq!(u64::from_le_bytes(buf), 0xfeedfacefeedface, "B host-read (shared bytes)");
 
-        // 4) THE assertion that failed in C++: B's GUEST load must observe the peer's write.
-        //    (Re-point PC at the load: start(1) advanced PC past it — the C++ test polls in a loop.)
+        // Repeat the guest load from the already translated page after the peer write.
         b.vm.cpu.write_pc(addr);
-        b.start(1);
+        b.start(2);
         assert_eq!(read_rax(&mut b), 0xfeedfacefeedface, "B's guest load must see A's write");
     }
 
@@ -2668,6 +3587,57 @@ mod shared_memory_smp {
     }
 
     #[test]
+    fn warmed_data_write_tlb_survives_exec_promotion_and_repeated_smc() {
+        use icicle_vm::cpu::mem::perm;
+
+        const TARGET: u64 = 0x50000;
+        const WRITER: u64 = 0x60000;
+        let mut reader = IcicleEmulator::new();
+        let mut writer = IcicleEmulator::new();
+        assert!(reader.vm.cpu.mem.map_smp_shared_fresh(TARGET, perm::READ | perm::WRITE));
+        let shared = reader.vm.cpu.mem.share_page(TARGET).unwrap();
+        assert!(writer.vm.cpu.mem.map_smp_shared(TARGET, shared.clone()));
+        assert!(writer.map_memory(WRITER, 0x1000, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+
+        let mut code = [0u8; 25];
+        code[..2].copy_from_slice(&[0x48, 0xB8]);
+        code[2..10].copy_from_slice(&TARGET.to_le_bytes());
+        code[10..12].copy_from_slice(&[0x48, 0xB9]);
+        code[12..20].copy_from_slice(&0x90F9EB00001111B8u64.to_le_bytes());
+        code[20..].copy_from_slice(&[0x48, 0x89, 0x08, 0xEB, 0xFE]);
+        assert!(writer.write_memory(WRITER, &code));
+        writer.vm.cpu.write_pc(WRITER);
+        writer.start(4);
+
+        let fast = std::env::var("SOGEN_SMP_FAST_WRITE_EPOCH").as_deref() == Ok("1");
+        assert_eq!(writer.vm.cpu.mem.tlb.translate_write(TARGET).is_some(), fast);
+        assert!(reader.vm.cpu.mem.update_perm(TARGET, 0x1000, perm::READ | perm::WRITE | perm::EXEC).is_ok());
+        assert_eq!(writer.vm.cpu.mem.tlb.translate_write(TARGET).is_some(), fast);
+
+        let read_eax = |emu: &mut IcicleEmulator| {
+            let mut buf = [0u8; 8];
+            emu.read_register(registers::X86Register::Rax, &mut buf);
+            u64::from_le_bytes(buf)
+        };
+        reader.vm.cpu.write_pc(TARGET);
+        reader.start(10);
+        assert_eq!(read_eax(&mut reader), 0x1111);
+
+        for value in [0x2222u64, 0x3333u64] {
+            let epoch_before = shared.code_epoch();
+            let instruction = 0x90F9EB00000000B8u64 | (value << 8);
+            writer.write_register(registers::X86Register::Rax, &TARGET.to_le_bytes());
+            writer.write_register(registers::X86Register::Rcx, &instruction.to_le_bytes());
+            writer.vm.cpu.write_pc(WRITER + 20);
+            writer.start(3);
+            assert!(shared.code_epoch() > epoch_before);
+            reader.vm.cpu.write_pc(TARGET);
+            reader.start(10);
+            assert_eq!(read_eax(&mut reader), value);
+        }
+    }
+
+    #[test]
     fn two_vms_share_fast_smp_page() {
         use icicle_vm::cpu::mem::perm;
         let mut a = IcicleEmulator::new();
@@ -2687,6 +3657,208 @@ mod shared_memory_smp {
         let mut buf2 = [0u8; 4];
         assert!(a.read_memory(addr + 8, &mut buf2));
         assert_eq!(u32::from_le_bytes(buf2), 0x55667788, "SMP write via B must be visible via A");
+    }
+
+    #[test]
+    fn warmed_peer_write_tlb_is_retired_before_first_decode() {
+        use icicle_vm::cpu::mem::perm;
+        use std::sync::mpsc;
+
+        if std::env::var("SOGEN_SMP_PROMOTION_RACE_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        assert_eq!(std::env::var("SOGEN_ICICLE_JIT").as_deref(), Ok("1"));
+
+        const TARGET: u64 = 0x50000;
+        const WRITER: u64 = 0x60000;
+        let mut reader = IcicleEmulator::new_with_instruction_hooks(false);
+        assert!(reader.vm.cpu.mem.map_smp_shared_fresh(TARGET, perm::READ | perm::WRITE));
+        assert!(reader.write_memory(TARGET, &[0xB8, 0x11, 0x11, 0, 0, 0xEB, 0xFE]));
+        let shared = reader.vm.cpu.mem.share_page(TARGET).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut writer = IcicleEmulator::new_with_instruction_hooks(false);
+            assert!(writer.map_memory(WRITER, 0x1000, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+            let mut code = [0u8; 16];
+            code[..2].copy_from_slice(&[0x48, 0xB8]);
+            code[2..10].copy_from_slice(&(TARGET + 0x80).to_le_bytes());
+            code[10..].copy_from_slice(&[0xC7, 0x00, 0x78, 0x56, 0x34, 0x12]);
+            assert!(writer.write_memory(WRITER, &code));
+            assert!(writer.vm.cpu.mem.map_smp_shared(TARGET, shared));
+            writer.vm.cpu.write_pc(WRITER);
+            writer.start(2);
+            let warmed = writer.vm.cpu.mem.tlb.translate_write(TARGET + 0x80).is_some();
+            ready_tx.send(warmed).unwrap();
+            proceed_rx.recv().unwrap();
+            writer.vm.cpu.mem.tlb.translate_write(TARGET + 0x80).is_some()
+        });
+
+        let warmed = ready_rx.recv().unwrap();
+        let fast_write = std::env::var("SOGEN_SMP_FAST_WRITE_EPOCH").as_deref() == Ok("1");
+        assert_eq!(warmed, fast_write);
+        let index = reader.vm.cpu.mem.get_physical_index(TARGET).unwrap();
+        assert!(!reader.vm.cpu.mem.get_physical(index).executed);
+        reader.vm.cpu.mem.update_perm(TARGET, 0x1000, perm::READ | perm::WRITE | perm::EXEC).unwrap();
+        proceed_tx.send(()).unwrap();
+        let peer_write_tlb = worker.join().unwrap();
+
+        reader.vm.cpu.write_pc(TARGET);
+        reader.start(2);
+        let mut rax = [0u8; 8];
+        reader.read_register(registers::X86Register::Rax, &mut rax);
+        assert_eq!(u64::from_le_bytes(rax), 0x1111);
+        println!("first_decode_peer_write_tlb={} fast_write={}", u8::from(peer_write_tlb), u8::from(fast_write));
+        assert!(!peer_write_tlb, "peer can directly write shared executable bytes before first decode");
+    }
+
+    #[cfg(windows)]
+    fn smp_store_bench_thread_cpu_seconds() -> f64 {
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct FileTime {
+            low: u32,
+            high: u32,
+        }
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn GetThreadTimes(
+                thread: *mut std::ffi::c_void,
+                creation: *mut FileTime,
+                exit: *mut FileTime,
+                kernel: *mut FileTime,
+                user: *mut FileTime,
+            ) -> i32;
+        }
+
+        let mut creation = FileTime::default();
+        let mut exit = FileTime::default();
+        let mut kernel = FileTime::default();
+        let mut user = FileTime::default();
+        let ok = unsafe {
+            GetThreadTimes(
+                GetCurrentThread(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        assert_ne!(ok, 0);
+        let ticks = |time: FileTime| ((time.high as u64) << 32) | time.low as u64;
+        (ticks(kernel) + ticks(user)) as f64 / 10_000_000.0
+    }
+
+    #[cfg(not(windows))]
+    fn smp_store_bench_thread_cpu_seconds() -> f64 {
+        f64::NAN
+    }
+
+    #[test]
+    fn smp_shared_data_store_epoch_bench() {
+        use icicle_vm::cpu::mem::perm;
+        use std::sync::{Arc, Barrier};
+        use std::time::Instant;
+
+        if std::env::var("SOGEN_SMP_STORE_BENCH").as_deref() != Ok("1") {
+            return;
+        }
+        assert_eq!(std::env::var("SOGEN_ICICLE_JIT").as_deref(), Ok("1"));
+        let fast_write = match std::env::var("SOGEN_SMP_FAST_WRITE_EPOCH").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => panic!("set SOGEN_SMP_FAST_WRITE_EPOCH to 0 or 1"),
+        };
+        assert!(!smp_lean_epoch_hook_enabled());
+        let measured_icount = std::env::var("SOGEN_SMP_STORE_BENCH_ICOUNT")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(100_000_000);
+        assert!(measured_icount >= 3_000_000);
+
+        const CODE: u64 = 0x10000;
+        const DATA: u64 = 0x50000;
+        let shared = {
+            let mut seed = IcicleEmulator::new_with_instruction_hooks(false);
+            assert!(seed.vm.cpu.mem.map_smp_shared_fresh(DATA, perm::READ | perm::WRITE));
+            seed.vm.cpu.mem.share_page(DATA).unwrap()
+        };
+        let epoch_mode = std::env::var("SOGEN_SMP_CODE_EPOCH_ONLY").expect("set SOGEN_SMP_CODE_EPOCH_ONLY to 0 or 1");
+        assert!(epoch_mode == "0" || epoch_mode == "1");
+        let epoch_only = epoch_mode == "1";
+        assert_eq!(
+            shared.smp_code_seen.load(std::sync::atomic::Ordering::Acquire),
+            u8::from(!epoch_only),
+        );
+
+        let ready = Arc::new(Barrier::new(3));
+        let go = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = (0usize..2).map(|index| {
+            let page = Arc::clone(&shared);
+            let ready = Arc::clone(&ready);
+            let go = Arc::clone(&go);
+            std::thread::spawn(move || {
+                let mut emu = IcicleEmulator::new_with_instruction_hooks(false);
+                assert!(emu.map_memory(CODE, 0x1000, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+                assert!(emu.write_memory(CODE, &[0x89, 0x08, 0xFF, 0xC1, 0xEB, 0xFA]));
+                assert!(emu.vm.cpu.mem.map_smp_shared(DATA, page));
+                let slot = DATA + (index as u64) * 256;
+                emu.write_register(registers::X86Register::Rax, &slot.to_le_bytes());
+                emu.vm.cpu.write_pc(CODE);
+                emu.start(3_000_000);
+                let fast_tlb = emu.vm.cpu.mem.tlb.translate_write(slot).is_some();
+                ready.wait();
+                go.wait();
+
+                let before_icount = emu.vm.cpu.icount;
+                let before_misses = emu.vm.cpu.mem.tlb_miss_count;
+                let before_cpu = smp_store_bench_thread_cpu_seconds();
+                let start = Instant::now();
+                emu.start(measured_icount);
+                (
+                    emu.vm.cpu.icount - before_icount,
+                    start.elapsed().as_secs_f64(),
+                    smp_store_bench_thread_cpu_seconds() - before_cpu,
+                    fast_tlb,
+                    emu.vm.cpu.mem.tlb_miss_count - before_misses,
+                )
+            })
+        }).collect();
+
+        ready.wait();
+        let epoch_before = shared.code_epoch();
+        let start = Instant::now();
+        go.wait();
+        let results: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+        let wall = start.elapsed().as_secs_f64();
+        let epoch_delta = shared.code_epoch() - epoch_before;
+        for index in 0..2 {
+            let offset = index * 256;
+            let value = u32::from_le_bytes(shared.data[offset..offset + 4].try_into().unwrap());
+            assert!(value > 0);
+            assert_eq!(results[index].3, fast_write);
+        }
+        if epoch_only {
+            assert_eq!(epoch_delta, 0);
+        } else {
+            assert!(epoch_delta > 0);
+        }
+
+        let retired: u64 = results.iter().map(|result| result.0).sum();
+        let worker_cpu: f64 = results.iter().map(|result| result.2).sum();
+        let tlb_misses: u64 = results.iter().map(|result| result.4).sum();
+        println!(
+            "mode={} fast_write={} wall={wall:.6}s worker_cpu={worker_cpu:.6}s retired={retired} epoch_delta={epoch_delta} tlb_misses={tlb_misses} aggregate_mips={:.3} per_vcpu_mips={:.3} store_mops={:.3} worker_wall=[{:.6},{:.6}]",
+            if epoch_only { "exec_only" } else { "all_shared" },
+            u8::from(fast_write),
+            retired as f64 / wall / 1e6,
+            retired as f64 / wall / 2e6,
+            (retired / 3) as f64 / wall / 1e6,
+            results[0].1,
+            results[1].1,
+        );
     }
 
     /// The multi-core payoff: N per-vCPU VMs execute concurrently on ONE shared page (each writing
@@ -2749,6 +3921,151 @@ mod shared_memory_smp {
         print!("\n{}", report);
         if let Some(parent) = std::path::Path::new(&out).parent() { let _ = std::fs::create_dir_all(parent); }
         std::fs::write(&out, &report).expect("write bench results");
+    }
+}
+
+#[cfg(test)]
+mod invalidation_profile_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn jit_profile_attributes_compiles_to_full_reset_generations() {
+        const PAGE: u64 = 0x76000;
+        let mut emu = IcicleEmulator::new_with_instruction_hooks(false);
+        emu.jit_profile_enabled = true;
+        emu.vm.jit.profile_enabled = true;
+        emu.vm.enable_jit = true;
+        assert!(emu.map_memory(PAGE, 0x1000, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+        assert!(emu.write_memory(PAGE, &[0x90, 0xeb, 0xfe]));
+        emu.vm.cpu.write_pc(PAGE);
+        emu.start(8);
+        let first = emu.jit_profile();
+        assert_eq!(first.reset_generation, 0);
+        assert!(first.generation_compile_calls > 0);
+        assert_eq!(first.generation_compile_calls, first.compile_calls);
+
+        emu.mark_manual_origin(MANUAL_SELF_MODIFYING);
+        emu.invalidate_code.set(true);
+        emu.flush_pending_code();
+        let reset = emu.jit_profile();
+        assert_eq!(reset.reset_generation, 1);
+        assert_eq!(reset.reset_cause_flags, INVALIDATION_MANUAL as u64);
+        assert_eq!(reset.reset_manual_origin_flags, MANUAL_SELF_MODIFYING as u64);
+        assert_eq!(reset.generation_compile_calls, 0);
+        assert_eq!(reset.generation_compile_nanos, 0);
+        assert_eq!(reset.reset_calls, 1);
+
+        emu.start(8);
+        let second = emu.jit_profile();
+        assert_eq!(second.reset_generation, 1);
+        assert!(second.generation_compile_calls > 0);
+        assert_eq!(second.generation_compile_calls, second.compile_calls - first.compile_calls);
+    }
+
+    #[test]
+    fn distinguishes_epoch_wake_manual_and_coalesced_jit_resets() {
+        if smp_epoch_mode() == 0 {
+            return;
+        }
+        use icicle_vm::cpu::mem::perm;
+
+        const PAGE: u64 = 0x75000;
+        let mut emu = IcicleEmulator::new_with_instruction_hooks(false);
+        let profile = std::sync::Arc::new(InvalidationProfile::default());
+        let causes = Rc::new(Cell::new(0));
+        emu.invalidation_profile = Some(profile.clone());
+        emu.invalidation_causes = Rc::clone(&causes);
+        {
+            let mut hooks = emu.execution_hooks.borrow_mut();
+            hooks.invalidation_profile = Some(profile.clone());
+            hooks.invalidation_causes = Some(Rc::clone(&causes));
+        }
+        assert!(emu.vm.cpu.mem.map_smp_shared_fresh(PAGE, perm::READ | perm::WRITE | perm::EXEC));
+        let shared = emu.vm.cpu.mem.share_page(PAGE).unwrap();
+
+        // Seed the normal first-page epoch, then change it as a peer store would.
+        emu.execution_hooks.borrow_mut().check_code_epoch(&mut emu.vm.cpu, PAGE);
+        shared.bump_code_epoch();
+        emu.execution_hooks.borrow_mut().check_code_epoch(&mut emu.vm.cpu, PAGE);
+        assert_eq!(profile.epoch_mismatches.load(Ordering::Relaxed), 1);
+        emu.flush_pending_code();
+        assert_eq!(profile.epoch_resets.load(Ordering::Relaxed), 1);
+
+        emu.exec_write_pending.store(true, Ordering::Release);
+        emu.reconcile_exec_write_wake();
+        assert_eq!(profile.wake_resets.load(Ordering::Relaxed), 1);
+
+        assert!(emu.vm.cpu.mem.ensure_executable(PAGE, 1));
+        assert!(emu.invalidate_code_range(PAGE, 1, MANUAL_PUBLIC_INVALIDATE));
+        emu.flush_pending_code();
+        assert_eq!(profile.manual_resets.load(Ordering::Relaxed), 1);
+        assert_eq!(profile.manual_origin_resets.load(Ordering::Relaxed), 1);
+        assert_eq!(profile.manual_public_invalidate.load(Ordering::Relaxed), 1);
+
+        assert!(emu.vm.cpu.mem.ensure_executable(PAGE, 1));
+        assert!(emu.invalidate_code_range(PAGE, 1, MANUAL_PUBLIC_INVALIDATE));
+        emu.exec_write_pending.store(true, Ordering::Release);
+        emu.reconcile_exec_write_wake();
+        assert_eq!(profile.mixed_resets.load(Ordering::Relaxed), 1);
+        assert_eq!(profile.manual_origin_resets.load(Ordering::Relaxed), 2);
+        assert_eq!(profile.manual_public_invalidate.load(Ordering::Relaxed), 2);
+
+        assert!(emu.vm.cpu.mem.ensure_executable(PAGE, 1));
+        emu.refresh_peer_protection(PAGE, 1);
+        emu.flush_pending_code();
+        assert_eq!(profile.manual_peer_protection.load(Ordering::Relaxed), 1);
+
+        assert!(emu.vm.cpu.mem.ensure_executable(PAGE, 1));
+        assert!(emu.invalidate_code_range(PAGE, 1, MANUAL_PUBLIC_INVALIDATE));
+        assert!(emu.vm.cpu.mem.ensure_executable(PAGE, 1));
+        emu.refresh_peer_protection(PAGE, 1);
+        emu.flush_pending_code();
+        assert_eq!(profile.manual_multiple_origins.load(Ordering::Relaxed), 1);
+
+        emu.invalidate_code.set(true);
+        emu.flush_pending_code();
+        assert_eq!(profile.unknown_resets.load(Ordering::Relaxed), 1);
+        assert_eq!(profile.jit_resets.load(Ordering::Relaxed), 7);
+        assert_eq!(profile.manual_resets.load(Ordering::Relaxed), 3);
+        assert_eq!(profile.manual_origin_resets.load(Ordering::Relaxed), 4);
+        assert_eq!(profile.manual_unknown_origin.load(Ordering::Relaxed), 0);
+        assert_eq!(emu.exec_write_flushes.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn manual_origin_buckets_are_exclusive_and_bounded() {
+        let profile = InvalidationProfile::default();
+        for origin in [
+            MANUAL_PEER_PROTECTION,
+            MANUAL_PUBLIC_INVALIDATE,
+            MANUAL_SELF_MODIFYING,
+            MANUAL_HOST_CACHE,
+            MANUAL_UNMAP,
+            MANUAL_PROTECT,
+            MANUAL_HOST_WRITE,
+            MANUAL_PUBLIC_INVALIDATE | MANUAL_PROTECT,
+            0,
+        ] {
+            profile.record_reset(INVALIDATION_MANUAL, origin);
+        }
+        assert_eq!(profile.manual_origin_resets.load(Ordering::Relaxed), 9);
+        for count in [
+            &profile.manual_peer_protection,
+            &profile.manual_public_invalidate,
+            &profile.manual_self_modifying,
+            &profile.manual_host_cache,
+            &profile.manual_unmap,
+            &profile.manual_protect,
+            &profile.manual_host_write,
+            &profile.manual_multiple_origins,
+            &profile.manual_unknown_origin,
+        ] {
+            assert_eq!(count.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(profile.manual_resets.load(Ordering::Relaxed), 9);
+        profile.record_reset(INVALIDATION_EPOCH, 0);
+        assert_eq!(profile.manual_origin_resets.load(Ordering::Relaxed), 9);
     }
 }
 
@@ -2922,6 +4239,7 @@ mod recompilation_flag_tests {
     use std::process::Command;
 
     const TEST_NAME: &str = "icicle::recompilation_flag_tests::environment_flag_reaches_vm";
+    const PERIODIC_TEST_NAME: &str = "icicle::recompilation_flag_tests::periodic_recompile_honors_flag";
 
     #[test]
     fn environment_flag_reaches_vm() {
@@ -2945,26 +4263,267 @@ mod recompilation_flag_tests {
                 String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
         }
     }
+
+    #[test]
+    #[ignore = "waits for Icicle's 60-second recompile threshold; run explicitly"]
+    fn periodic_recompile_honors_flag() {
+        if std::env::var_os("SOGEN_RECOMP_PERIODIC_TEST_CHILD").is_some() {
+            let enabled = std::env::var("SOGEN_ICICLE_RECOMP").as_deref() != Ok("0");
+            let mut vm = create_x64_vm();
+            assert_eq!(vm.enable_recompilation, enabled);
+            vm.compiled_blocks = 11;
+            std::thread::sleep(std::time::Duration::from_secs(61));
+            assert!(vm.should_recompile());
+            vm.icount_limit = 0;
+            assert!(matches!(vm.run(), icicle_vm::VmExit::InstructionLimit));
+            assert_eq!(vm.compiled_blocks, if enabled { 0 } else { 11 });
+            return;
+        }
+
+        let mut children = Vec::new();
+        for flag in ["0", "1"] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--ignored", "--exact", PERIODIC_TEST_NAME, "--nocapture"]);
+            command.env("SOGEN_RECOMP_PERIODIC_TEST_CHILD", "1");
+            command.env("SOGEN_ICICLE_RECOMP", flag);
+            children.push((flag, command.spawn().unwrap()));
+        }
+        for (flag, child) in &mut children {
+            assert!(child.wait().unwrap().success(), "periodic recompile flag={flag} failed");
+        }
+    }
 }
 
 #[cfg(test)]
-mod shared_permission_bridge_tests {
+mod range_invalidation_tests {
     use super::*;
-    use icicle_vm::cpu::mem::perm;
+
+    fn code(value: u32) -> Vec<u8> {
+        let mut bytes = vec![0xb8]; // mov eax, imm32
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes.extend_from_slice(&[0xeb, 0xfe]); // jmp $ (bounded by the test's instruction limit)
+        bytes
+    }
+
+    fn read_rax(emu: &mut IcicleEmulator) -> u64 {
+        let mut bytes = [0; 8];
+        emu.read_register(registers::X86Register::Rax, &mut bytes);
+        u64::from_le_bytes(bytes)
+    }
+
+    fn group_at(emu: &IcicleEmulator, address: u64) -> Option<icicle_cpu::BlockGroup> {
+        emu.vm.code.map.iter().find_map(|(key, group)| (key.vaddr == address).then_some(*group))
+    }
 
     #[test]
-    fn local_invalidation_keeps_peer_shared_cache_marker() {
-        const PAGE: u64 = 0x42000;
-        let mut local = IcicleEmulator::new();
-        let mut peer = IcicleEmulator::new();
-        assert!(local.vm.cpu.mem.map_smp_shared_fresh(PAGE, perm::READ | perm::WRITE | perm::EXEC));
-        let shared = local.vm.cpu.mem.share_page(PAGE).expect("shared page");
-        assert!(peer.vm.cpu.mem.map_smp_shared(PAGE, shared.clone()));
-        assert!(local.vm.cpu.mem.ensure_executable(PAGE, 1));
-        assert!(peer.vm.cpu.mem.ensure_executable(PAGE, 1));
-        shared.add_shared_perm_bits(0, 1, perm::IN_CODE_CACHE);
-        assert!(local.invalidate_code_range(PAGE, 1));
-        assert!(shared.any_perm_bit(0, 1, perm::IN_CODE_CACHE));
-        assert!(local.code_range_is_cached(PAGE, 1));
+    fn manual_range_preserves_other_jit_entry_and_recompiles_changed_page() {
+        const A: u64 = 0x10000;
+        const B: u64 = 0x20000;
+        let mut emu = IcicleEmulator::new_with_instruction_hooks(false);
+        emu.range_invalidation_enabled = true;
+        emu.vm.enable_jit = true;
+        assert!(emu.vm.enable_recompilation);
+        for (address, value) in [(A, 1), (B, 2)] {
+            assert!(emu.map_memory(address, 4096, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+            assert!(emu.write_memory(address, &code(value)));
+            emu.vm.cpu.write_pc(address);
+            emu.start(100);
+            assert_eq!(read_rax(&mut emu), value as u64);
+        }
+        assert!(emu.vm.enable_recompilation);
+        let a_group = group_at(&emu, A).expect("A was lifted");
+        let b_group = group_at(&emu, B).expect("B was lifted");
+        let a_func = emu.vm.jit.entry_points[&A];
+        assert!(emu.vm.jit.entry_points.contains_key(&B));
+
+        assert!(emu.write_memory(B + 1, &3u32.to_le_bytes()));
+        emu.flush_pending_code();
+        assert!(emu.vm.enable_recompilation);
+        assert_eq!(group_at(&emu, A).unwrap().blocks, a_group.blocks);
+        assert!(emu.vm.code.blocks[a_group.blocks.0].entry.is_some());
+        assert!(b_group.range().all(|id| emu.vm.code.blocks[id].entry.is_none()));
+        assert!(group_at(&emu, B).is_none());
+        assert!(std::ptr::fn_addr_eq(emu.vm.jit.entry_points[&A], a_func));
+        assert!(!emu.vm.jit.entry_points.contains_key(&B));
+
+        // Force the upstream recompile path, including its purge/reset branch. A removed
+        // block must not be reintroduced from the append-only code.blocks array.
+        emu.vm.recompile();
+        assert!(!emu.vm.jit.entry_points.contains_key(&B));
+        emu.vm.cpu.write_pc(A);
+        emu.start(100);
+        assert_eq!(read_rax(&mut emu), 1);
+        emu.vm.cpu.write_pc(B);
+        emu.start(100);
+        assert_eq!(read_rax(&mut emu), 3);
+        assert!(group_at(&emu, B).unwrap().blocks.0 > b_group.blocks.0);
+        let replacement = emu.vm.jit.entry_points[&B];
+        for id in b_group.range() {
+            emu.vm.jit.invalidate(id);
+        }
+        assert!(std::ptr::fn_addr_eq(emu.vm.jit.entry_points[&B], replacement));
+    }
+
+    #[test]
+    fn manual_range_invalidates_group_crossing_page_boundary() {
+        const PAGE: u64 = 0x30000;
+        let entry = PAGE + 4094;
+        let mut emu = IcicleEmulator::new_with_instruction_hooks(false);
+        emu.range_invalidation_enabled = true;
+        assert!(emu.map_memory(PAGE, 8192, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+        assert!(emu.write_memory(entry, &code(7)));
+        let group = emu.vm.lift(entry).expect("lift across boundary");
+        assert!(emu.vm.cpu.mem.ensure_executable(PAGE + 4096, 1));
+        assert!(group.range().any(|id| {
+            let block = &emu.vm.code.blocks[id];
+            block.start < PAGE + 4096 && block.end > PAGE + 4096
+        }));
+        assert!(emu.invalidate_code_range(PAGE + 4096, 1, MANUAL_PROTECT));
+        emu.flush_pending_code();
+        assert!(group_at(&emu, entry).is_none());
+        assert!(group.range().all(|id| emu.vm.code.blocks[id].entry.is_none()));
+        emu.vm.recompile();
+        assert!(!emu.vm.jit.entry_points.contains_key(&entry));
+        emu.vm.enable_jit = true;
+        emu.vm.cpu.write_pc(entry);
+        emu.start(100);
+        assert_eq!(read_rax(&mut emu), 7);
+        assert!(group_at(&emu, entry).unwrap().blocks.0 > group.blocks.0);
+    }
+
+    #[test]
+    fn live_group_external_jump_reaches_replacement_after_recompile() {
+        const A: u64 = 0x60000;
+        const B: u64 = 0x70000;
+        let mut emu = IcicleEmulator::new_with_instruction_hooks(false);
+        emu.range_invalidation_enabled = true;
+        emu.vm.enable_jit = true;
+        for address in [A, B] {
+            assert!(emu.map_memory(address, 4096, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+        }
+        let displacement = (B as i64 - (A as i64 + 5)) as i32;
+        let mut jump = vec![0xe9];
+        jump.extend_from_slice(&displacement.to_le_bytes());
+        assert!(emu.write_memory(A, &jump));
+        assert!(emu.write_memory(B, &code(2)));
+        emu.vm.cpu.write_pc(A);
+        emu.start(100);
+        assert_eq!(read_rax(&mut emu), 2);
+        let a_group = group_at(&emu, A).expect("live caller");
+        let b_group = group_at(&emu, B).expect("old callee");
+        assert!(emu.write_memory(B + 1, &3u32.to_le_bytes()));
+        emu.flush_pending_code();
+        assert_eq!(group_at(&emu, A).unwrap().blocks, a_group.blocks);
+        assert!(group_at(&emu, B).is_none());
+        assert!(b_group.range().all(|id| emu.vm.code.blocks[id].entry.is_none()));
+        emu.vm.recompile();
+        assert!(!emu.vm.jit.entry_points.contains_key(&B));
+        emu.vm.cpu.write_pc(A);
+        emu.start(100);
+        assert_eq!(read_rax(&mut emu), 3);
+        assert_eq!(group_at(&emu, A).unwrap().blocks, a_group.blocks);
+        assert!(group_at(&emu, B).unwrap().blocks.0 > b_group.blocks.0);
+    }
+
+    #[test]
+    fn merged_superblock_retires_both_entries_without_purging_live_groups() {
+        const A: u64 = 0x80000;
+        const B: u64 = 0x90000;
+        let mut emu = IcicleEmulator::new_with_instruction_hooks(false);
+        emu.range_invalidation_enabled = true;
+        emu.vm.enable_jit = true;
+        emu.vm.jit.profile_enabled = true;
+
+        // Keep ten unrelated entrypoints alive. Retiring merged A/B must not cross
+        // the JIT's dead-entry purge threshold, so this exercises the retained module.
+        let clean: Vec<u64> = (0..10).map(|i| 0xa0000 + i * 0x10000).collect();
+        for address in std::iter::once(A).chain(std::iter::once(B)).chain(clean.iter().copied()) {
+            assert!(emu.map_memory(address, 4096, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+        }
+        let displacement = (B as i64 - (A as i64 + 5)) as i32;
+        let mut jump = vec![0xe9];
+        jump.extend_from_slice(&displacement.to_le_bytes());
+        assert!(emu.write_memory(A, &jump));
+        let mut b_loop = code(2);
+        b_loop[6] = 0xf9; // jmp B, so the loop creates no separate B+5 entrypoint
+        assert!(emu.write_memory(B, &b_loop));
+        for (index, address) in clean.iter().copied().enumerate() {
+            assert!(emu.write_memory(address, &code(10 + index as u32)));
+        }
+        for address in std::iter::once(A).chain(std::iter::once(B)).chain(clean.iter().copied()) {
+            emu.vm.lift(address).expect("lift each independent group");
+        }
+        let a_group = group_at(&emu, A).unwrap();
+        let old_b_group = group_at(&emu, B).unwrap();
+        emu.vm.recompile();
+        assert!(std::ptr::fn_addr_eq(emu.vm.jit.entry_points[&A], emu.vm.jit.entry_points[&B]),
+            "upstream recompile must merge A->B for this regression");
+        assert_eq!(emu.vm.jit.entry_points.len(), clean.len() + 2);
+        let resets = emu.vm.jit.profile_reset_calls;
+        emu.vm.cpu.write_pc(A);
+        emu.start(100);
+        assert_eq!(read_rax(&mut emu), 2);
+
+        assert!(emu.write_memory(B + 1, &3u32.to_le_bytes()));
+        emu.flush_pending_code();
+        assert!(old_b_group.range().all(|id| emu.vm.code.blocks[id].entry.is_none()));
+        assert!(!emu.vm.jit.entry_points.contains_key(&A), "merged caller must be retired");
+        assert!(!emu.vm.jit.entry_points.contains_key(&B), "old callee must be retired");
+        assert_eq!(group_at(&emu, A).unwrap().blocks, a_group.blocks);
+        assert!(group_at(&emu, B).is_none());
+        assert!(clean.iter().all(|address| emu.vm.jit.entry_points.contains_key(address)));
+        assert!(!emu.vm.jit.should_purge());
+        assert_eq!(emu.vm.jit.profile_reset_calls, resets);
+        emu.vm.recompile();
+        assert!(!emu.vm.jit.entry_points.contains_key(&B));
+        assert_eq!(emu.vm.jit.profile_reset_calls, resets);
+        emu.vm.cpu.write_pc(A);
+        emu.start(100);
+        assert_eq!(read_rax(&mut emu), 3);
+        let replacement_b_group = group_at(&emu, B).unwrap();
+        assert!(replacement_b_group.blocks.0 > old_b_group.blocks.0);
+        assert_eq!(emu.vm.jit.profile_reset_calls, resets);
+
+        // This recompile consumes the newly appended B group and advances
+        // recompile_offset. A later replacement must still retire its current JIT
+        // owner and must never resurrect either old B group.
+        let compiles = emu.vm.jit.profile_compile_calls;
+        emu.vm.recompile();
+        assert!(emu.vm.jit.profile_compile_calls > compiles);
+        assert!(emu.write_memory(B + 1, &4u32.to_le_bytes()));
+        emu.flush_pending_code();
+        assert!(replacement_b_group.range().all(|id| emu.vm.code.blocks[id].entry.is_none()));
+        assert!(group_at(&emu, B).is_none());
+        assert!(!emu.vm.jit.entry_points.contains_key(&B));
+        assert!(!emu.vm.jit.should_purge());
+        emu.vm.recompile();
+        assert!(!emu.vm.jit.entry_points.contains_key(&B));
+        assert_eq!(emu.vm.jit.profile_reset_calls, resets);
+        emu.vm.cpu.write_pc(A);
+        emu.start(100);
+        assert_eq!(read_rax(&mut emu), 4);
+        assert!(group_at(&emu, B).unwrap().blocks.0 > replacement_b_group.blocks.0);
+        assert_eq!(emu.vm.jit.profile_reset_calls, resets);
+    }
+
+    #[test]
+    fn epoch_or_wake_mixed_with_manual_range_uses_full_reset() {
+        const A: u64 = 0x40000;
+        const B: u64 = 0x50000;
+        for reason in [INVALIDATION_EPOCH, INVALIDATION_WAKE] {
+            let mut emu = IcicleEmulator::new_with_instruction_hooks(false);
+            emu.range_invalidation_enabled = true;
+            for address in [A, B] {
+                assert!(emu.map_memory(address, 4096, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+                assert!(emu.write_memory(address, &code(1)));
+                emu.vm.lift(address).expect("lift");
+            }
+            assert!(emu.vm.cpu.mem.ensure_executable(A, 1));
+            assert!(emu.invalidate_code_range(A, 1, MANUAL_PROTECT));
+            emu.mark_invalidation_cause(reason);
+            emu.flush_pending_code();
+            assert!(emu.vm.code.map.is_empty());
+            assert!(emu.pending_manual_pages.is_empty());
+        }
     }
 }

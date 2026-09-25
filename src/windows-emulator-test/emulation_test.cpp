@@ -44,4 +44,29 @@ namespace sogen::test
         ASSERT_TERMINATED_SUCCESSFULLY(new_emu);
         ASSERT_EQ(new_emu.get_executed_instructions(), executedInstructions);
     }
+
+    TEST(EmulationTest, LeanBackendCountSurvivesSnapshotRestore)
+    {
+        emulator_settings settings{.disable_logging = true, .use_relative_time = false,
+                                   .use_instruction_precision = false};
+        auto emu = create_sample_emulator(settings);
+        if (!emu.emu().is_stop_thread_safe() || !emu.emu().has_deterministic_instruction_count())
+        {
+            GTEST_SKIP() << "Requires a stop-safe backend with its own retired-instruction count";
+        }
+
+        emu.start(100);
+        ASSERT_EQ(emu.get_executed_instructions(), 100U);
+        emu.save_snapshot();
+
+        emu.start(50);
+        ASSERT_EQ(emu.get_executed_instructions(), 150U);
+
+        // The regular restore resets Icicle's volatile icount. The Windows counter slot
+        // now stores the cumulative total and becomes the base for post-restore work.
+        emu.restore_snapshot();
+        ASSERT_EQ(emu.get_executed_instructions(), 100U);
+        emu.start(50);
+        ASSERT_EQ(emu.get_executed_instructions(), 150U);
+    }
 } // namespace sogen::test

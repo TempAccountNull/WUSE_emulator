@@ -1,4 +1,9 @@
 #include "std_include.hpp"
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <thread>
 #include "debug_print.hpp"
 #include "fault_observation.hpp"
 
@@ -229,6 +234,12 @@ namespace sogen
                 // An execute fault can also follow JMP/RET, so a sampled stack slot alone does not prove a caller.
                 event.near_null_execute = operation == memory_operation::exec && address < 0x1000;
                 capture_memory_violation(c, event, execution.rip);
+                if (operation == memory_operation::exec && !c.private_execute_dump_captured && event.actual_instruction.location.region &&
+                    event.actual_instruction.location.region->kind == "private")
+                {
+                    c.private_execute_dump_captured = true;
+                    capture_private_execute_memory(c, event, execution.rip);
+                }
             });
 
             if (type == memory_violation_type::unmapped)
@@ -948,56 +959,68 @@ namespace sogen
                 max = std::max(import_thunk, max);
             }
 
-            c.win_emu->emu().hook_memory_write(min, max - min,
-                                               [&c](cpu_interface&, const uint64_t address, const void* value, size_t size) {
-                                                   const auto& watched_module = *c.win_emu->mod_manager.executable;
+            c.win_emu->emu().hook_memory_write(
+                min, max - min, [&c](cpu_interface& cpu, const uint64_t address, const void* value, size_t size) {
+                    if (!cpu.has_guest_cpu_context())
+                    {
+                        return;
+                    }
+                    c.win_emu->dispatch_on_cpu(cpu, [&] {
+                        const auto& watched_module = *c.win_emu->mod_manager.executable;
 
-                                                   const auto sym = watched_module.imports.find(address);
-                                                   if (sym == watched_module.imports.end())
-                                                   {
-                                                       // TODO: Print unaligned write accesses?
-                                                       return;
-                                                   }
+                        const auto sym = watched_module.imports.find(address);
+                        if (sym == watched_module.imports.end())
+                        {
+                            // TODO: Print unaligned write accesses?
+                            return;
+                        }
 
-                                                   uint64_t int_value{};
-                                                   memcpy(&int_value, value, std::min(size, sizeof(int_value)));
+                        uint64_t int_value{};
+                        memcpy(&int_value, value, std::min(size, sizeof(int_value)));
 
-                                                   const auto import_module = watched_module.imported_modules.at(sym->second.module_index);
+                        const auto import_module = watched_module.imported_modules.at(sym->second.module_index);
 
-                                                   c.emit_observation<import_write_event>([&](auto& event) {
-                                                       event.size = size;
-                                                       event.value = int_value;
-                                                       event.import_name = sym->second.name;
-                                                       event.import_module = import_module;
-                                                   });
-                                               });
+                        c.emit_observation<import_write_event>([&](auto& event) {
+                            event.size = size;
+                            event.value = int_value;
+                            event.import_name = sym->second.name;
+                            event.import_module = import_module;
+                        });
+                    });
+                });
 
-            c.win_emu->emu().hook_memory_read(min, max - min, [&c](cpu_interface&, const uint64_t address, const void*, size_t) {
-                const auto rip = c.win_emu->emu().read_instruction_pointer();
-                const auto& watched_module = *c.win_emu->mod_manager.executable;
-                const auto accessor_module = get_module_if_interesting(c.win_emu->mod_manager, c.settings->modules, rip);
-
-                if (!accessor_module.has_value())
+            c.win_emu->emu().hook_memory_read(min, max - min, [&c](cpu_interface& cpu, const uint64_t address, const void*, size_t) {
+                if (!cpu.has_guest_cpu_context())
                 {
                     return;
                 }
+                c.win_emu->dispatch_on_cpu(cpu, [&] {
+                    const auto rip = c.win_emu->active_cpu().read_instruction_pointer();
+                    const auto& watched_module = *c.win_emu->mod_manager.executable;
+                    const auto accessor_module = get_module_if_interesting(c.win_emu->mod_manager, c.settings->modules, rip);
 
-                const auto sym = watched_module.imports.find(address);
-                if (sym == watched_module.imports.end())
-                {
-                    return;
-                }
+                    if (!accessor_module.has_value())
+                    {
+                        return;
+                    }
 
-                accessed_import access{};
-                access.address = c.win_emu->emu().read_memory<uint64_t>(address);
-                access.access_context = c.make_execution_context();
-                access.import_name = sym->second.name;
-                access.import_module = watched_module.imported_modules.at(sym->second.module_index);
+                    const auto sym = watched_module.imports.find(address);
+                    if (sym == watched_module.imports.end())
+                    {
+                        return;
+                    }
 
-                const auto& t = c.win_emu->current_thread();
-                access.access_inst_count = t.executed_instructions;
+                    accessed_import access{};
+                    access.address = c.win_emu->emu().read_memory<uint64_t>(address);
+                    access.access_context = c.make_execution_context();
+                    access.import_name = sym->second.name;
+                    access.import_module = watched_module.imported_modules.at(sym->second.module_index);
 
-                c.accessed_imports.push_back(std::move(access));
+                    const auto& t = c.win_emu->current_thread();
+                    access.access_inst_count = t.executed_instructions;
+
+                    c.accessed_imports.push_back(std::move(access));
+                });
             });
         }
     }
@@ -1042,8 +1065,138 @@ namespace sogen
         return context;
     }
 
+    analysis_event_overlap_probe::analysis_event_overlap_probe() noexcept
+    {
+        const auto* value = std::getenv("SOGEN_ANALYZER_EVENT_OVERLAP_PROBE");
+        this->enabled_.store(value && std::string_view(value) == "1", std::memory_order_relaxed);
+    }
+
+    void analysis_event_overlap_probe::set_enabled(const bool enabled) noexcept
+    {
+        this->enabled_.store(enabled, std::memory_order_relaxed);
+    }
+
+    analysis_event_overlap_probe::snapshot analysis_event_overlap_probe::read_snapshot() const noexcept
+    {
+        const std::lock_guard lock{this->mutex_};
+        return this->stats_;
+    }
+
+    analysis_event_overlap_probe::scope::scope(analysis_event_overlap_probe& probe, const analysis_event& event) noexcept
+    {
+        if (!probe.enabled_.load(std::memory_order_relaxed))
+        {
+            return;
+        }
+
+        this->probe_ = &probe;
+#if defined(_WIN32)
+        const uint64_t host_tid = GetCurrentThreadId();
+#else
+        const uint64_t host_tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+#endif
+        const auto type = event_type_name(event);
+        snapshot packet{};
+        bool print_packet = false;
+        {
+            const std::lock_guard lock{probe.mutex_};
+            const active_entry* peer = nullptr;
+            active_entry* empty = nullptr;
+            for (auto& entry : probe.active_)
+            {
+                if (entry.token == 0)
+                {
+                    if (!empty)
+                    {
+                        empty = &entry;
+                    }
+                }
+                else if (entry.host_tid != host_tid && !peer)
+                {
+                    peer = &entry;
+                }
+            }
+            ++probe.active_count_;
+            probe.stats_.max_active = std::max(probe.stats_.max_active, probe.active_count_);
+            if (peer)
+            {
+                ++probe.stats_.overlaps;
+                probe.stats_.first_host_tid = peer->host_tid;
+                probe.stats_.second_host_tid = host_tid;
+                probe.stats_.first_type = peer->type;
+                probe.stats_.second_type = type;
+                if (probe.stats_.lines_emitted < max_lines)
+                {
+                    ++probe.stats_.lines_emitted;
+                    packet = probe.stats_;
+                    print_packet = true;
+                }
+            }
+            if (empty)
+            {
+                this->token_ = probe.next_token_++;
+                *empty = {.token = this->token_, .host_tid = host_tid, .type = type};
+            }
+        }
+        if (print_packet)
+        {
+            std::fprintf(stderr,
+                         "[ANALYZER_EVENT_OVERLAP] count=%llu active_max=%u first_tid=%llu first_type=%.*s "
+                         "second_tid=%llu second_type=%.*s\n",
+                         static_cast<unsigned long long>(packet.overlaps), packet.max_active,
+                         static_cast<unsigned long long>(packet.first_host_tid), static_cast<int>(packet.first_type.size()),
+                         packet.first_type.data(), static_cast<unsigned long long>(packet.second_host_tid),
+                         static_cast<int>(packet.second_type.size()), packet.second_type.data());
+        }
+    }
+
+    analysis_event_overlap_probe::scope::~scope()
+    {
+        if (!this->probe_)
+        {
+            return;
+        }
+        const std::lock_guard lock{this->probe_->mutex_};
+        if (this->token_)
+        {
+            for (auto& entry : this->probe_->active_)
+            {
+                if (entry.token == this->token_)
+                {
+                    entry = {};
+                    break;
+                }
+            }
+        }
+        --this->probe_->active_count_;
+    }
+
     void analysis_context::emit_event(const analysis_event& event) const
     {
+        analysis_event_overlap_probe::scope overlap_scope{this->event_overlap_probe, event};
+        if (this->hook_profile.enabled)
+        {
+            if (std::holds_alternative<object_access_event>(event))
+            {
+                sampled_analysis_timer<analysis_profile_channel::object_report> timer{&this->hook_profile,
+                                                                                      &this->hook_profile.object_report};
+                for (auto* reporter : this->reporters)
+                {
+                    reporter->report(event);
+                }
+                return;
+            }
+            if (std::holds_alternative<environment_access_event>(event))
+            {
+                sampled_analysis_timer<analysis_profile_channel::environment_report> timer{&this->hook_profile,
+                                                                                           &this->hook_profile.environment_report};
+                for (auto* reporter : this->reporters)
+                {
+                    reporter->report(event);
+                }
+                return;
+            }
+        }
         for (auto* reporter : this->reporters)
         {
             reporter->report(event);

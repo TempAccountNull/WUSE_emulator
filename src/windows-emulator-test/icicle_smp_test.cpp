@@ -2,6 +2,7 @@
 #include "../backends/icicle-emulator/icicle_x86_64_emulator.hpp"
 #include "../emulator/scoped_hook.hpp"
 #include <memory_manager.hpp>
+#include <utils/finally.hpp>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -53,6 +54,59 @@ namespace sogen::test
         }
     }
 
+    TEST(IcicleSmp, ForcedSharedMemoryOnSingleVcpu)
+    {
+        const char* prior_value = std::getenv("SOGEN_ICICLE_FORCE_SMP_MEMORY");
+        const std::string prior = prior_value ? prior_value : "";
+        ASSERT_EQ(_putenv_s("SOGEN_ICICLE_FORCE_SMP_MEMORY", "1"), 0);
+        const auto restore = utils::finally([&] {
+            _putenv_s("SOGEN_ICICLE_FORCE_SMP_MEMORY", prior.c_str());
+        });
+
+        auto emu = icicle::create_x86_64_emulator(1);
+        memory_manager memory(*emu);
+        const auto code = memory.allocate_memory(0x1000, memory_permission::all);
+        const auto data = memory.allocate_memory(0x1000, memory_permission::read_write);
+        ASSERT_NE(code, 0U);
+        ASSERT_NE(data, 0U);
+
+        std::array<uint8_t, 12> program{0x48, 0xB8};
+        std::memcpy(program.data() + 2, &data, sizeof(data));
+        program[10] = 0xFE;
+        program[11] = 0x00;
+        emu->write_memory(code, program.data(), program.size());
+
+        auto& cpu = emu->get_cpu(0);
+        cpu.reg(x86_register::rip, code);
+        cpu.start(2);
+
+        uint8_t result = 0;
+        emu->read_memory(data, &result, sizeof(result));
+        EXPECT_EQ(result, 1U);
+        EXPECT_EQ(cpu.reg(x86_register::rip), code + program.size());
+    }
+
+    // A reservation claims guest VA without backing it in Icicle. A host write into that
+    // range must fail until the guest commits it; treating the failure as an implicit
+    // commit would hide stale or invalid output pointers from syscall/device callers.
+    TEST(IcicleSmp, ReserveOnlyHostWriteFailsUntilCommit)
+    {
+        auto emu = icicle::create_x86_64_emulator(1);
+        memory_manager memory(*emu);
+        constexpr uint64_t base = 0x60000000;
+        constexpr size_t reservation_size = 0x3000;
+        const nt_memory_permission permissions{memory_permission::read_write};
+        ASSERT_TRUE(memory.allocate_memory(base, reservation_size, permissions, true));
+        ASSERT_TRUE(memory.get_reserved_regions().at(base).committed_regions.empty());
+
+        const std::array<uint8_t, 6264> payload{};
+        EXPECT_FALSE(emu->try_write_memory(base, payload.data(), payload.size()));
+        EXPECT_TRUE(memory.get_reserved_regions().at(base).committed_regions.empty());
+
+        ASSERT_TRUE(memory.commit_memory(base, reservation_size, permissions));
+        EXPECT_TRUE(emu->try_write_memory(base, payload.data(), payload.size()));
+    }
+
     TEST(IcicleSmp, ContextWriteRetryReportsFinalFailureOnly)
     {
         auto emu = icicle::create_x86_64_emulator(2);
@@ -75,6 +129,63 @@ namespace sogen::test
         EXPECT_NO_THROW(emu->write_memory(base, context.data(), context.size()));
         const auto success = testing::internal::GetCapturedStderr();
         EXPECT_EQ(success.find("[ICWRITE] context-retry"), std::string::npos);
+    }
+
+    // A protect issued inside vCPU 0's hook changes the shared permission bytes immediately.
+    // vCPU 1 must also discard its warmed write TLB before its next quantum; the old deferred
+    // protect guard skipped this peer work because the issuer's own protect advanced perm_epoch.
+    TEST(IcicleSmp, HookProtectionInvalidatesPeerWriteTlb)
+    {
+        auto emu = icicle::create_x86_64_emulator(2);
+        memory_manager memory(*emu);
+        const auto code = memory.allocate_memory(0x1000, memory_permission::all);
+        const auto target = memory.allocate_memory(0x1000, memory_permission::read_write);
+        const auto trigger_code = memory.allocate_memory(0x1000, memory_permission::all);
+        const auto trigger_data = memory.allocate_memory(0x1000, memory_permission::read_write);
+        ASSERT_NE(code, 0U);
+        ASSERT_NE(target, 0U);
+        ASSERT_NE(trigger_code, 0U);
+        ASSERT_NE(trigger_data, 0U);
+
+        // movabs rax,target; inc byte ptr [rax]; jmp $.
+        std::array<uint8_t, 14> writer{0x48, 0xB8};
+        std::memcpy(writer.data() + 2, &target, sizeof(target));
+        writer[10] = 0xFE; writer[11] = 0x00;
+        writer[12] = 0xEB; writer[13] = 0xFE;
+        emu->write_memory(code, writer.data(), writer.size());
+        auto& peer = emu->get_cpu(1);
+        peer.reg(x86_register::rip, code);
+        peer.start(2); // execute the write once and warm the data TLB
+        uint8_t value{};
+        emu->read_memory(target, &value, sizeof(value));
+        ASSERT_EQ(value, 1U);
+
+        // movabs rax,trigger_data; mov rax,[rax] enters the hook on vCPU 0.
+        std::array<uint8_t, 13> trigger{0x48, 0xB8};
+        std::memcpy(trigger.data() + 2, &trigger_data, sizeof(trigger_data));
+        trigger[10] = 0x48; trigger[11] = 0x8B; trigger[12] = 0x00;
+        emu->write_memory(trigger_code, trigger.data(), trigger.size());
+        bool protected_in_hook = false;
+        emu->hook_memory_read(trigger_data, 1, [&](cpu_interface&, uint64_t, const void*, size_t) {
+            protected_in_hook = memory.protect_memory(target, 0x1000, memory_permission::read);
+        });
+        auto& issuer = emu->get_cpu(0);
+        issuer.reg(x86_register::rip, trigger_code);
+        issuer.start(2);
+        ASSERT_TRUE(protected_in_hook);
+
+        peer.reg(x86_register::rip, code);
+        try
+        {
+            peer.start(2); // drains the queued peer cache refresh before guest execution
+            FAIL() << "peer write unexpectedly succeeded after protection";
+        }
+        catch (const std::runtime_error& error)
+        {
+            EXPECT_NE(std::string(error.what()).find("WritePerm"), std::string::npos);
+        }
+        emu->read_memory(target, &value, sizeof(value));
+        EXPECT_EQ(value, 1U) << "peer wrote through a stale TLB after protection";
     }
 
     // A vcpu_count of 1 keeps the single-vCPU contract: one cpu, no multi-vCPU capability (this is the
@@ -302,6 +413,223 @@ namespace sogen::test
         EXPECT_EQ(emu->get_cpu(1).reg(x86_register::rcx), 0U);
     }
 
+    // Keep vCPU 0 executing one cached JIT loop while vCPU 1 writes the loop's immediate
+    // through GUEST code. The second guest store uses its warmed direct-write TLB pointer.
+    // The disabled arm is a bounded negative control; the enabled arm must observe the patch
+    // without restarting vCPU 0 from the test.
+    static void continuous_peer_guest_code_write(bool wake_enabled)
+    {
+        std::vector<std::pair<std::string, std::string>> prior_env;
+        const auto set_env = [&](const char* name, const char* value) {
+            const char* old = std::getenv(name);
+            prior_env.emplace_back(name, old ? old : "");
+            EXPECT_EQ(_putenv_s(name, value), 0);
+        };
+        const auto restore = utils::finally([&] {
+            for (auto it = prior_env.rbegin(); it != prior_env.rend(); ++it)
+            {
+                _putenv_s(it->first.c_str(), it->second.c_str());
+            }
+        });
+        set_env("SOGEN_ICICLE_JIT", "1");
+        set_env("SOGEN_ICICLE_INSTRUCTION_HOOK", "0");
+        set_env("SOGEN_ICICLE_LEAN_BARRIER", "1");
+        set_env("SOGEN_SMP_LEAN_EPOCH_HOOK", "0");
+        set_env("SOGEN_SMP_PRELIFT_EPOCH", "0");
+        set_env("SOGEN_SMP_FAST_WRITE_EPOCH", "1");
+        set_env("SOGEN_SMP_CODE_EPOCH_ONLY", "1");
+        set_env("ICICLE_ALWAYS_FLUSH_VARS", "1");
+        set_env("SOGEN_SMP_EXEC_WRITE_WAKE", wake_enabled ? "1" : "0");
+
+        auto emu = icicle::create_x86_64_emulator(2);
+        memory_manager memory(*emu);
+        const auto page_p = memory.allocate_memory(0x1000, memory_permission::all);
+        const auto page_q = memory.allocate_memory(0x1000, memory_permission::all);
+        ASSERT_NE(page_p, 0U);
+        ASSERT_NE(page_q, 0U);
+
+        // P's immediate begins at aligned P+4 so vCPU 1 can patch it with a dword store.
+        // vCPU 0 stays in the same JIT hot loop across the writer's guest store.
+        const std::array<uint8_t, 10> p{0x90, 0x90, 0x90, 0xB8, 0x11, 0x11, 0x00, 0x00, 0xEB, 0xF9};
+        emu->write_memory(page_p, p.data(), p.size());
+
+        // Q: movabs rax, P+4; store 0x1111 to warm the write TLB; store 0x2222; jmp $.
+        std::array<uint8_t, 24> q{0x48, 0xB8};
+        const uint64_t target = page_p + 4;
+        for (size_t i = 0; i < 8; ++i)
+        {
+            q[2 + i] = static_cast<uint8_t>(target >> (i * 8));
+        }
+        q[10] = 0xC7;
+        q[11] = 0x00;
+        q[12] = 0x11;
+        q[13] = 0x11;
+        q[16] = 0xC7;
+        q[17] = 0x00;
+        q[18] = 0x22;
+        q[19] = 0x22;
+        q[22] = 0xEB;
+        q[23] = 0xFE;
+        emu->write_memory(page_q, q.data(), q.size());
+
+        auto& cpu0 = emu->get_cpu(0);
+        auto& cpu1 = emu->get_cpu(1);
+        cpu0.reg(x86_register::rip, page_p + 3);
+        cpu0.start(10); // lift and warm vCPU 0's translation before concurrency
+        ASSERT_EQ(cpu0.reg(x86_register::rax), 0x1111U);
+        cpu0.reg(x86_register::rip, page_p + 3);
+        cpu1.reg(x86_register::rip, page_q);
+
+        std::atomic<bool> peer_done{false};
+        std::exception_ptr peer_error;
+        std::thread peer([&] {
+            try
+            {
+                cpu0.start(0);
+            }
+            catch (...)
+            {
+                peer_error = std::current_exception();
+            }
+            peer_done.store(true, std::memory_order_release);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const bool peer_running = !peer_done.load(std::memory_order_acquire);
+
+        std::exception_ptr main_error;
+        bool writer_ok = false;
+        try
+        {
+            if (peer_running)
+            {
+                cpu1.start(3);
+                writer_ok = true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+        }
+        catch (...)
+        {
+            main_error = std::current_exception();
+        }
+        cpu0.stop();
+        peer.join();
+        if (peer_error)
+        {
+            std::rethrow_exception(peer_error);
+        }
+        if (main_error)
+        {
+            std::rethrow_exception(main_error);
+        }
+        ASSERT_TRUE(peer_running) << "vCPU 0 exited its continuous hot loop before the guest write";
+        ASSERT_TRUE(writer_ok) << "guest writer did not complete";
+        const auto wake_profile = emu->smp_profile();
+        if (wake_enabled)
+        {
+            ASSERT_EQ(wake_profile.size(), 2U);
+            EXPECT_GE(wake_profile[0].exec_write_guest_jit_total + wake_profile[0].exec_write_guest_mmu_total, 2U);
+            EXPECT_EQ(wake_profile[0].exec_write_wake_events_total, wake_profile[0].exec_write_guest_jit_total +
+                                                                        wake_profile[0].exec_write_guest_mmu_total +
+                                                                        wake_profile[0].exec_write_host_total);
+            EXPECT_GE(wake_profile[0].exec_write_owner_flushes_total, 1U);
+        }
+        else
+        {
+            EXPECT_TRUE(wake_profile.empty());
+        }
+        EXPECT_EQ(cpu0.reg(x86_register::rax), wake_enabled ? 0x2222U : 0x1111U)
+            << "continuous peer used the wrong code version after the guest store";
+        if (wake_enabled)
+        {
+            const uint32_t same_code = 0x2222;
+            emu->write_memory(page_p + 4, &same_code, sizeof(same_code));
+            const auto after_host_write = emu->smp_profile();
+            ASSERT_EQ(after_host_write.size(), 2U);
+            EXPECT_GT(after_host_write[0].exec_write_host_total, wake_profile[0].exec_write_host_total);
+        }
+    }
+
+    TEST(IcicleSmp, ContinuousPeerGuestWriteWithoutWakeIsStale)
+    {
+        continuous_peer_guest_code_write(false);
+    }
+
+    TEST(IcicleSmp, ContinuousPeerGuestWriteWithWakeSeesNewCode)
+    {
+        continuous_peer_guest_code_write(true);
+    }
+
+    TEST(IcicleSmp, ExecutablePageDataWriteFiltersUnrelatedStores)
+    {
+        std::vector<std::pair<std::string, std::string>> prior_env;
+        const auto set_env = [&](const char* name, const char* value) {
+            const char* old = std::getenv(name);
+            prior_env.emplace_back(name, old ? old : "");
+            ASSERT_EQ(_putenv_s(name, value), 0);
+        };
+        const auto restore = utils::finally([&] {
+            for (auto it = prior_env.rbegin(); it != prior_env.rend(); ++it)
+            {
+                _putenv_s(it->first.c_str(), it->second.c_str());
+            }
+        });
+        set_env("SOGEN_ICICLE_JIT", "1");
+        set_env("SOGEN_ICICLE_INSTRUCTION_HOOK", "0");
+        set_env("SOGEN_ICICLE_LEAN_BARRIER", "1");
+        set_env("SOGEN_SMP_LEAN_EPOCH_HOOK", "0");
+        set_env("SOGEN_SMP_PRELIFT_EPOCH", "0");
+        set_env("SOGEN_SMP_FAST_WRITE_EPOCH", "1");
+        set_env("SOGEN_SMP_CODE_EPOCH_ONLY", "1");
+        set_env("SOGEN_SMP_EXEC_WRITE_WAKE", "1");
+
+        auto emu = icicle::create_x86_64_emulator(2);
+        memory_manager memory(*emu);
+        const auto page_p = memory.allocate_memory(0x1000, memory_permission::all);
+        const auto page_q = memory.allocate_memory(0x1000, memory_permission::all);
+        ASSERT_NE(page_p, 0U);
+        ASSERT_NE(page_q, 0U);
+        const std::array<uint8_t, 7> p_code{0xB8, 0x11, 0x11, 0x00, 0x00, 0xEB, 0xF9};
+        emu->write_memory(page_p, p_code.data(), p_code.size());
+        auto& idle_peer = emu->get_cpu(0);
+        idle_peer.reg(x86_register::rip, page_p);
+        idle_peer.start(10);
+        ASSERT_EQ(idle_peer.reg(x86_register::rax), 0x1111U);
+
+        // Q: movabs rax,P+0x100; mov dword ptr [rax],0x1234; jmp back to store.
+        std::array<uint8_t, 18> q_code{0x48, 0xB8};
+        const uint64_t data_address = page_p + 0x100;
+        for (size_t i = 0; i < 8; ++i)
+        {
+            q_code[2 + i] = static_cast<uint8_t>(data_address >> (i * 8));
+        }
+        q_code[10] = 0xC7;
+        q_code[11] = 0x00;
+        q_code[12] = 0x34;
+        q_code[13] = 0x12;
+        q_code[14] = 0x00;
+        q_code[15] = 0x00;
+        q_code[16] = 0xEB;
+        q_code[17] = 0xF8;
+        emu->write_memory(page_q, q_code.data(), q_code.size());
+
+        auto& writer = emu->get_cpu(1);
+        writer.reg(x86_register::rip, page_q);
+        writer.start(1); // enter the store loop
+        for (size_t i = 0; i < 100; ++i)
+        {
+            writer.start(2); // one store plus jump, then the next scheduler boundary
+        }
+        const auto profile = emu->smp_profile();
+        ASSERT_EQ(profile.size(), 2U);
+        const auto guest_writes = profile[0].exec_write_guest_jit_total + profile[0].exec_write_guest_mmu_total;
+        EXPECT_EQ(guest_writes, 0U);
+        EXPECT_GE(profile[0].exec_write_filtered_noncode_total, 90U);
+        EXPECT_EQ(profile[0].exec_write_notified_overlap_total, 0U);
+        EXPECT_EQ(profile[0].exec_write_notified_concurrent_total, 0U);
+        EXPECT_EQ(profile[1].exec_write_owner_flushes_total, 0U);
+        EXPECT_EQ(profile[0].exec_write_owner_flushes_total, 0U);
+    }
+
     // Step 6.6: cross-vCPU self-modifying code — a host write over a TRANSLATED shared page must
     // invalidate every VM's translation (the peer would otherwise keep executing stale code; the
     // minimal repro showed rax=0x1111 after the peer wrote 0x2222 code). Values printed per step.
@@ -413,6 +741,19 @@ namespace sogen::test
         }
         std::fprintf(stderr, "[GSMC] STEP6 rax=%#llx (expect 0x2222, stale=0x1111)\n", (unsigned long long)eax0());
         EXPECT_EQ(eax0(), 0x2222u) << "vCPU 0 executed stale code after vCPU 1's GUEST stores";
+
+        // Repeat the guest store after the write TLB is warm. The second write must
+        // invalidate the peer's translated code just like the first one.
+        cpu1.reg(x86_register::rax, page_p);
+        cpu1.reg(x86_register::rcx, 0x90F9EB00003333B8ULL);
+        cpu1.reg(x86_register::rip, page_q + 20); // mov [rax],rcx; jmp $
+        cpu1.start(10);
+        uint64_t warm_check{};
+        emu->read_memory(page_p, &warm_check, sizeof(warm_check));
+        ASSERT_EQ(warm_check, 0x90F9EB00003333B8ULL);
+        cpu0.reg(x86_register::rip, page_p);
+        cpu0.start(10);
+        EXPECT_EQ(eax0(), 0x3333u) << "vCPU 0 executed stale code after vCPU 1's warmed guest store";
     }
 
         // Step 6.5 verification — Arc-capture async mapping from an in-hook context reaches peers and they
@@ -441,6 +782,7 @@ namespace sogen::test
         const uint64_t data = data_page;        // A's hooked read target (own page)
         const uint64_t target = page + 0x408;   // B polls this for the new region's code address
         const uint64_t marker = page + 0x410;   // B's code writes the magic here
+        const uint64_t ready = page + 0x418;    // publish after all pointer bytes are written
 
         std::array<uint8_t, 0x600> prog{};
         prog.fill(0x90);
@@ -456,21 +798,25 @@ namespace sogen::test
         emit_movabs(&prog[0x0D], 0xB9, iters);
         prog[0x17] = 0x48; prog[0x18] = 0xFF; prog[0x19] = 0xC9; // dec rcx
         prog[0x1A] = 0x75; prog[0x1B] = 0xFB;                   // jnz
-        // B @ +0x200: movabs rbx,target; poll: mov rax,[rbx]; mov [rbx+0x18],rax (probe); test; jz; jmp rax.
-        emit_movabs(&prog[0x200], 0xBB, target);
-        prog[0x20A] = 0x48; prog[0x20B] = 0x8B; prog[0x20C] = 0x03; // b_poll: mov rax, [rbx]
-        prog[0x20D] = 0x48; prog[0x20E] = 0x89; prog[0x20F] = 0x43; prog[0x210] = 0x18; // mov [rbx+0x18], rax
-        prog[0x211] = 0x48; prog[0x212] = 0x85; prog[0x213] = 0xC0; // test rax, rax
-        prog[0x214] = 0x74; prog[0x215] = 0xF4;                     // jz b_poll (rel -12)
+        // B waits for a one-byte ready flag before reading the pointer. Host writes
+        // of multi-byte values are bytewise in Icicle, so polling target directly can
+        // observe a torn address and jump into unmapped memory.
+        emit_movabs(&prog[0x200], 0xBB, ready);
+        prog[0x20A] = 0x8A; prog[0x20B] = 0x03;                     // poll: mov al,[rbx]
+        prog[0x20C] = 0x84; prog[0x20D] = 0xC0;                     // test al,al
+        prog[0x20E] = 0x74; prog[0x20F] = 0xFA;                     // jz poll
+        emit_movabs(&prog[0x210], 0xBB, target);
+        prog[0x21A] = 0x48; prog[0x21B] = 0x8B; prog[0x21C] = 0x03; // mov rax,[rbx]
         for (auto& b : std::span(prog).subspan(0x400, 0x200))
         {
             b = 0; // data cells must read 0, not NOP bytes (B polls `target` for nonzero)
         }
-        prog[0x216] = 0xFF; prog[0x217] = 0xE0;                     // jmp rax
+        prog[0x21D] = 0xFF; prog[0x21E] = 0xE0;                     // jmp rax
         emu->write_memory(page, prog.data(), prog.size());
 
         constexpr uint64_t magic = 0x5EEDC0DE5EEDC0DEULL;
         std::atomic<bool> mapped{false};
+        std::atomic<uint64_t> mapped_region{0};
 
         emu->hook_memory_read(data, 8, [&](cpu_interface&, uint64_t, const void*, size_t) {
             if (mapped.exchange(true))
@@ -483,6 +829,7 @@ namespace sogen::test
             {
                 return;
             }
+            mapped_region.store(region, std::memory_order_release);
             std::array<uint8_t, 0x40> code{};
             code.fill(0x90);
             emit_movabs(&code[0x00], 0xBB, marker);                 // movabs rbx, marker
@@ -495,6 +842,8 @@ namespace sogen::test
             // visible (bounded-latency smoke; the hard cross-quantum race is the documented 6.6 window).
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             emu->write_memory(target, &region, sizeof(region));
+            const uint8_t published = 1;
+            emu->write_memory(ready, &published, sizeof(published));
         });
 
         emu->get_cpu(0).reg(x86_register::rip, page + 0x000);
@@ -522,7 +871,10 @@ namespace sogen::test
                 }
                 catch (const std::exception& e)
                 {
-                    ADD_FAILURE() << "vCPU 1 start threw at chunk " << chunk << ": " << e.what();
+                    ADD_FAILURE() << "vCPU 1 start threw at chunk " << chunk << ": " << e.what()
+                                  << " page=" << std::hex << page << " data_page=" << data_page
+                                  << " region=" << mapped_region.load(std::memory_order_acquire)
+                                  << " target=" << target << " rax=" << cpu.reg(x86_register::rax);
                     return;
                 }
                 uint64_t observed{};
