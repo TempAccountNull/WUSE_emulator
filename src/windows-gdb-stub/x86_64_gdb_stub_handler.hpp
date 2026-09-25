@@ -320,6 +320,12 @@ namespace sogen
         virtual bool is_32_bit() const = 0;
 
       protected:
+        virtual void on_cpu_stop(cpu_interface& cpu)
+        {
+            (void)cpu;
+            this->on_interrupt();
+        }
+
         virtual uint32_t get_watchpoint_thread_id(cpu_interface& cpu)
         {
             (void)cpu;
@@ -410,8 +416,8 @@ namespace sogen
 
         emulator_hook* create_execute_hook(const uint64_t addr, const size_t size)
         {
-            return this->emu_->hook_memory_range_execution(addr, size, [this](cpu_interface&, const uint64_t) {
-                this->on_interrupt(); //
+            return this->emu_->hook_memory_range_execution(addr, size, [this](cpu_interface& cpu, const uint64_t) {
+                this->on_cpu_stop(cpu);
             });
         }
 
@@ -421,7 +427,7 @@ namespace sogen
                 watched_address, watched_size,
                 [this, watched_address, watched_size](cpu_interface& cpu, uint64_t access_address, const void* data, size_t access_size) {
                     this->record_watchpoint(cpu, watched_address, watched_size, access_address, data, access_size, false, {});
-                    this->on_interrupt(); //
+                    this->on_cpu_stop(cpu);
                 });
         }
 
@@ -437,7 +443,7 @@ namespace sogen
                         return;
                     }
                     this->record_watchpoint(cpu, watched_address, watched_size, access_address, data, access_size, true, result);
-                    this->on_interrupt(); //
+                    this->on_cpu_stop(cpu);
                 });
         }
 

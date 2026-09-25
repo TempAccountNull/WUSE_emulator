@@ -31,6 +31,7 @@ namespace sogen
               target_architecture_(target_architecture)
         {
             auto hook = [this](mapped_module&) {
+                this->remember_stop_cpu(this->win_emu_->active_cpu());
                 library_stop_pending_ = true;
                 win_emu_->stop();
             };
@@ -38,6 +39,7 @@ namespace sogen
             mod_load_id = win_emu_->callbacks.on_module_load.add(hook);
             mod_unload_id = win_emu_->callbacks.on_module_unload.add(hook);
             dbg_msg_id = win_emu_->callbacks.on_debug_string.add([this](std::string_view message) {
+                this->remember_stop_cpu(this->win_emu_->active_cpu());
                 debug_message.assign(message);
                 action = gdb_stub::action::output;
                 win_emu_->stop();
@@ -55,6 +57,12 @@ namespace sogen
         {
             this->interrupt_pending_ = true;
             this->win_emu_->stop();
+        }
+
+        void on_cpu_stop(cpu_interface& cpu) override
+        {
+            this->remember_stop_cpu(cpu);
+            this->on_interrupt();
         }
 
         void on_idle() override
@@ -82,8 +90,15 @@ namespace sogen
             this->execution_failed_ = false;
             try
             {
+                if (!this->debuggee_paused())
+                {
+                    throw std::runtime_error("Cannot resume while a vCPU is running");
+                }
                 this->prepare_execution(false);
+                this->stopped_vcpu_index_.store(UINT32_MAX, std::memory_order_release);
                 this->clear_watchpoint_observations();
+                this->run_in_progress_.store(true, std::memory_order_release);
+                const auto finished = utils::finally([this] { this->run_in_progress_.store(false, std::memory_order_release); });
                 this->win_emu_->start();
             }
             catch (const std::exception& e)
@@ -107,13 +122,18 @@ namespace sogen
             this->execution_failed_ = false;
             try
             {
-                this->prepare_execution(true);
-                auto& vcpu = this->win_emu_->vcpu(0);
+                if (!this->debuggee_paused())
+                {
+                    throw std::runtime_error("Cannot step while a vCPU is running");
+                }
+                auto& vcpu = this->prepare_execution(true);
 
-                // A debugger step must execute the requested thread, even when another thread is scheduler-ready.
                 vcpu.switch_thread = false;
                 vcpu.thread().setup_if_necessary(vcpu.cpu, this->win_emu_->process);
+                this->stopped_vcpu_index_.store(static_cast<uint32_t>(vcpu.cpu.index()), std::memory_order_release);
                 this->clear_watchpoint_observations();
+                this->run_in_progress_.store(true, std::memory_order_release);
+                const auto finished = utils::finally([this] { this->run_in_progress_.store(false, std::memory_order_release); });
                 this->win_emu_->start_cpu(vcpu, 1);
             }
             catch (const std::exception& e)
@@ -130,7 +150,8 @@ namespace sogen
 
         uint32_t get_current_thread_id() override
         {
-            return this->win_emu_->current_thread().id;
+            const auto* thread = this->stopped_vcpu().active_thread;
+            return thread ? thread->id : 0;
         }
 
         std::vector<uint32_t> get_thread_ids() override
@@ -190,6 +211,16 @@ namespace sogen
         size_t write_register(const size_t reg, const void* data, const size_t size) override
         {
             return this->access_selected_registers(true, [&](x86_64_cpu& cpu) { return this->write_cpu_register(cpu, reg, data, size); });
+        }
+
+        bool read_memory(const uint64_t address, void* data, const size_t length) override
+        {
+            return this->debuggee_paused() && x86_64_gdb_stub_handler::read_memory(address, data, length);
+        }
+
+        bool write_memory(const uint64_t address, const void* data, const size_t length) override
+        {
+            return this->debuggee_paused() && x86_64_gdb_stub_handler::write_memory(address, data, length);
         }
 
         std::optional<uint32_t> get_exit_code() override
@@ -310,7 +341,6 @@ namespace sogen
         std::vector<gdb_stub::thread_diagnostic> get_thread_diagnostics() const override
         {
             std::vector<gdb_stub::thread_diagnostic> result;
-            const auto* active = this->win_emu_->vcpu(0).active_thread;
             for (const auto& [index, thread] : this->win_emu_->process.threads)
             {
                 gdb_stub::thread_diagnostic row{.id = thread.id};
@@ -326,7 +356,21 @@ namespace sogen
                 row.fields.emplace_back("handle",
                                         "0x" + utils::string::to_hex_number(this->win_emu_->process.threads.make_handle(index).bits));
                 row.fields.emplace_back("name", u16_to_u8(thread.name));
-                add("active", active == &thread);
+                vcpu_context* owner{};
+                for (uint32_t i = 0; i < this->win_emu_->vcpu_count(); ++i)
+                {
+                    auto& vcpu = this->win_emu_->vcpu(i);
+                    if (vcpu.active_thread == &thread)
+                    {
+                        owner = &vcpu;
+                        break;
+                    }
+                }
+                add("active", owner != nullptr);
+                if (owner)
+                {
+                    add("vcpu", owner->cpu.index());
+                }
                 add("terminated", thread.is_terminated());
                 add("initialized", thread.setup_done);
                 add("suspended", thread.suspended);
@@ -334,9 +378,9 @@ namespace sogen
                 add("blocks", thread.executed_blocks);
                 address("start", thread.start_address);
                 address("last_instruction", thread.current_ip);
-                if (active == &thread)
+                if (owner)
                 {
-                    address("rip", this->win_emu_->vcpu(0).cpu.reg<uint64_t>(x86_register::rip));
+                    address("rip", owner->cpu.reg<uint64_t>(x86_register::rip));
                 }
                 if (thread.exit_status)
                 {
@@ -463,8 +507,11 @@ namespace sogen
         {
             try
             {
-                auto* thread =
-                    this->selected_thread_ ? this->find_live_thread(*this->selected_thread_) : this->win_emu_->vcpu(0).active_thread;
+                if (!this->debuggee_paused())
+                {
+                    return 0;
+                }
+                auto* thread = this->selected_thread_ ? this->find_live_thread(*this->selected_thread_) : this->stopped_vcpu().active_thread;
                 if (!thread)
                 {
                     return 0;
@@ -505,8 +552,49 @@ namespace sogen
             return vcpu.active_thread ? vcpu.active_thread->id : 0;
         }
 
-        void prepare_execution(const bool step)
+        bool debuggee_paused() const
         {
+            if (this->run_in_progress_.load(std::memory_order_acquire))
+            {
+                return false;
+            }
+            for (uint32_t i = 0; i < this->win_emu_->vcpu_count(); ++i)
+            {
+                if (this->win_emu_->vcpu(i).running.load(std::memory_order_acquire))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        vcpu_context& stopped_vcpu() const
+        {
+            const auto index = this->stopped_vcpu_index_.load(std::memory_order_acquire);
+            if (index < this->win_emu_->vcpu_count() && this->win_emu_->vcpu(index).active_thread)
+            {
+                return this->win_emu_->vcpu(index);
+            }
+            for (uint32_t i = 0; i < this->win_emu_->vcpu_count(); ++i)
+            {
+                if (this->win_emu_->vcpu(i).active_thread)
+                {
+                    return this->win_emu_->vcpu(i);
+                }
+            }
+            return this->win_emu_->vcpu(0);
+        }
+
+        void remember_stop_cpu(cpu_interface& cpu)
+        {
+            auto expected = UINT32_MAX;
+            this->stopped_vcpu_index_.compare_exchange_strong(expected, static_cast<uint32_t>(cpu.index()),
+                                                             std::memory_order_acq_rel);
+        }
+
+        vcpu_context& prepare_execution(const bool step)
+        {
+            auto* vcpu = &this->stopped_vcpu();
             auto target = this->continuation_thread_;
             if (!target && step)
             {
@@ -514,10 +602,32 @@ namespace sogen
             }
             this->continuation_thread_ = std::nullopt;
             this->selected_thread_ = std::nullopt;
-            if (target && *target != 0 && *target != UINT32_MAX && !this->win_emu_->activate_thread(this->win_emu_->vcpu(0), *target))
+            if (target && *target != 0 && *target != UINT32_MAX)
             {
-                throw std::runtime_error("Cannot activate debugger continuation thread");
+                auto* thread = this->find_live_thread(*target);
+                if (!thread)
+                {
+                    throw std::runtime_error("Cannot find debugger continuation thread");
+                }
+                for (uint32_t i = 0; i < this->win_emu_->vcpu_count(); ++i)
+                {
+                    auto& candidate = this->win_emu_->vcpu(i);
+                    if (candidate.active_thread == thread)
+                    {
+                        vcpu = &candidate;
+                        break;
+                    }
+                }
+                if (vcpu->active_thread != thread && !this->win_emu_->activate_thread(*vcpu, *target))
+                {
+                    throw std::runtime_error("Cannot activate debugger continuation thread");
+                }
             }
+            for (uint32_t i = 0; i < this->win_emu_->vcpu_count(); ++i)
+            {
+                this->win_emu_->vcpu(i).cpu.acknowledge_stop();
+            }
+            return *vcpu;
         }
 
         std::optional<uint32_t> selected_thread_{};
@@ -537,6 +647,8 @@ namespace sogen
 
         bool execution_failed_{};
         std::atomic_bool interrupt_pending_{false};
+        std::atomic_bool run_in_progress_{false};
+        std::atomic<uint32_t> stopped_vcpu_index_{UINT32_MAX};
         windows_emulator* win_emu_{};
         utils::optional_function<bool()> should_stop_{};
         windows_filesystem windows_filesystem_;
