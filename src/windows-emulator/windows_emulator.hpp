@@ -126,10 +126,24 @@ namespace sogen
     // (docs/multi-vcpu-design.md, section 5.1).
     struct vcpu_context
     {
+        struct scheduler_profile_stats
+        {
+            uint64_t context_switch_calls{};
+            uint64_t context_switch_nanos{};
+            uint64_t device_work_calls{};
+            uint64_t device_work_nanos{};
+            uint64_t idle_retries{};
+            uint64_t idle_host_yields{};
+            uint64_t idle_host_sleeps{};
+            uint64_t idle_relative_ticks{};
+            uint64_t timer_preempt_requests{};
+        };
+
         x86_64_cpu& cpu;
         emulator_thread* active_thread{};
         std::atomic_bool switch_thread{false};
         std::atomic_bool running{false};
+        scheduler_profile_stats scheduler_profile{};
 
         emulator_thread& thread() const
         {
@@ -341,6 +355,7 @@ namespace sogen
 
         // Prints BEL contention stats when SOGEN_LOCK_PROFILE is set (see kernel_lock).
         void dump_lock_profile();
+        void dump_scheduler_profile();
 
         // Signal a guest event from a host-owned thread (e.g. the audio render thread). The handle is resolved
         // under the kernel lock, so it cannot race a concurrent close on an emulator thread; a handle the guest

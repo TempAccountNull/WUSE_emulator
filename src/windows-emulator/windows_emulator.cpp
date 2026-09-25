@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "cpu_context.hpp"
 
@@ -27,6 +28,15 @@ namespace sogen
 
     namespace
     {
+        bool scheduler_profiling_enabled()
+        {
+            static const bool enabled = [] {
+                const auto* value = std::getenv("SOGEN_SCHEDULER_PROFILE");
+                return value && std::strcmp(value, "1") == 0;
+            }();
+            return enabled;
+        }
+
         bool is_vcruntime_throw_module(const std::string_view name)
         {
             constexpr std::string_view prefix = "vcruntime";
@@ -439,6 +449,8 @@ namespace sogen
 
         void perform_context_switch_work(windows_emulator& win_emu, vcpu_context& vcpu)
         {
+            const auto profile = scheduler_profiling_enabled();
+            const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             auto& threads = win_emu.process.threads;
 
             for (auto it = threads.begin(); it != threads.end();)
@@ -481,9 +493,21 @@ namespace sogen
             const auto was_blocked = devices.block_mutation(true);
             const auto _ = utils::finally([&] { devices.block_mutation(was_blocked); });
 
+            const auto device_start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             for (auto& dev : devices | std::views::values)
             {
                 dev.work(win_emu);
+            }
+            if (profile)
+            {
+                const auto end = std::chrono::steady_clock::now();
+                auto& stats = vcpu.scheduler_profile;
+                ++stats.context_switch_calls;
+                stats.context_switch_nanos +=
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                ++stats.device_work_calls;
+                stats.device_work_nanos +=
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - device_start).count());
             }
         }
 
@@ -1004,6 +1028,10 @@ namespace sogen
 
         while (!switch_to_next_thread(*this, vcpu))
         {
+            if (scheduler_profiling_enabled())
+            {
+                ++vcpu.scheduler_profile.idle_retries;
+            }
             if (this->vcpu_count_ > 1 && vcpu.active_thread)
             {
                 // Nothing runnable for this vCPU: detach the stale thread so another
@@ -1040,6 +1068,22 @@ namespace sogen
                             break;
                         }
                     }
+                }
+            }
+            if (scheduler_profiling_enabled())
+            {
+                auto& stats = vcpu.scheduler_profile;
+                if (this->use_relative_time_)
+                {
+                    ++stats.idle_relative_ticks;
+                }
+                else if (host_wait_pending)
+                {
+                    ++stats.idle_host_yields;
+                }
+                else
+                {
+                    ++stats.idle_host_sleeps;
                 }
             }
             this->emu().set_scheduler_vm_parked(vcpu.cpu.index(), false);
@@ -1264,6 +1308,37 @@ namespace sogen
             }
             json += "]}";
             this->activity_status_prev_smp_profile_ = smp_profile;
+        }
+
+        if (scheduler_profiling_enabled())
+        {
+            json += ",\"scheduler_profile\":{\"vcpus\":[";
+            for (size_t i = 0; i < this->vcpus_.size(); ++i)
+            {
+                const auto& stats = this->vcpus_[i]->scheduler_profile;
+                json += i == 0 ? "" : ",";
+                json += "{\"i\":" + std::to_string(i);
+                json += ",\"context_switch_calls_total\":" + std::to_string(stats.context_switch_calls);
+                json += ",\"context_switch_nanos_total\":" + std::to_string(stats.context_switch_nanos);
+                json += ",\"device_work_calls_total\":" + std::to_string(stats.device_work_calls);
+                json += ",\"device_work_nanos_total\":" + std::to_string(stats.device_work_nanos);
+                json += ",\"idle_retries_total\":" + std::to_string(stats.idle_retries);
+                json += ",\"idle_host_yields_total\":" + std::to_string(stats.idle_host_yields);
+                json += ",\"idle_host_sleeps_total\":" + std::to_string(stats.idle_host_sleeps);
+                json += ",\"idle_relative_ticks_total\":" + std::to_string(stats.idle_relative_ticks);
+                json += ",\"timer_preempt_requests_total\":" + std::to_string(stats.timer_preempt_requests);
+                json += "}";
+            }
+            json += "]";
+            if (kernel_lock::profiling_enabled())
+            {
+                const auto lock_stats = this->kernel_lock_.profile();
+                json += ",\"kernel_lock\":{\"acquisitions_total\":" + std::to_string(lock_stats.acquisitions);
+                json += ",\"contended_total\":" + std::to_string(lock_stats.contended);
+                json += ",\"wait_nanos_total\":" + std::to_string(lock_stats.wait_nanos);
+                json += ",\"held_nanos_total\":" + std::to_string(lock_stats.held_nanos) + "}";
+            }
+            json += "}";
         }
 
         json += "}";
@@ -2054,6 +2129,10 @@ namespace sogen
                             }
                             v.switch_thread = true;
                             v.cpu.stop();
+                            if (scheduler_profiling_enabled())
+                            {
+                                ++v.scheduler_profile.timer_preempt_requests;
+                            }
                             preempted = true;
                         }
                         if (preempted)
@@ -2096,6 +2175,7 @@ namespace sogen
 
             this->dump_exception_trace();
             this->dump_lock_profile();
+            this->dump_scheduler_profile();
             return;
         }
 
@@ -2149,6 +2229,7 @@ namespace sogen
 
         this->dump_exception_trace();
         this->dump_lock_profile();
+        this->dump_scheduler_profile();
     }
 
     void windows_emulator::deliver_raw_input(const process_context::raw_input_payload& payload, const hwnd explicit_target)
@@ -2436,6 +2517,39 @@ namespace sogen
                         "  held time:      %.1f ms (BEL busy across all threads)\n",
                         static_cast<unsigned long long>(stats.acquisitions), static_cast<unsigned long long>(stats.contended),
                         contended_pct, wait_ms, held_ms);
+    }
+
+    void windows_emulator::dump_scheduler_profile()
+    {
+        if (!scheduler_profiling_enabled())
+        {
+            return;
+        }
+
+        const auto print = [this] {
+            for (size_t i = 0; i < this->vcpus_.size(); ++i)
+            {
+                const auto& stats = this->vcpus_[i]->scheduler_profile;
+                this->log.print(
+                    color::cyan,
+                    "SCHEDPROFILE vcpu=%zu switches=%llu switch_ms=%.3f device_calls=%llu device_ms=%.3f "
+                    "idle_retries=%llu idle_yields=%llu idle_sleeps=%llu relative_ticks=%llu timer_preempts=%llu\n",
+                    i, static_cast<unsigned long long>(stats.context_switch_calls), static_cast<double>(stats.context_switch_nanos) / 1e6,
+                    static_cast<unsigned long long>(stats.device_work_calls), static_cast<double>(stats.device_work_nanos) / 1e6,
+                    static_cast<unsigned long long>(stats.idle_retries), static_cast<unsigned long long>(stats.idle_host_yields),
+                    static_cast<unsigned long long>(stats.idle_host_sleeps), static_cast<unsigned long long>(stats.idle_relative_ticks),
+                    static_cast<unsigned long long>(stats.timer_preempt_requests));
+            }
+        };
+        if (this->kernel_lock_.is_held_by_current_thread())
+        {
+            print();
+        }
+        else
+        {
+            const std::scoped_lock lock(this->kernel_lock_);
+            print();
+        }
     }
 
     void windows_emulator::stop()
