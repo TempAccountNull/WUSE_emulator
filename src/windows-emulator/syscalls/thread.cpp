@@ -635,6 +635,7 @@ namespace sogen
             {
                 if (t.id == id.UniqueThread)
                 {
+                    ++t.ref_count;
                     thread_handle.write(c.proc.threads.make_handle(h_val));
                     return STATUS_SUCCESS;
                 }
