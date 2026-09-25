@@ -3,6 +3,7 @@ pub mod runtime;
 mod translate;
 
 use std::collections::HashMap;
+use smallvec::SmallVec;
 
 use codegen::ir::Endianness;
 use cranelift::{codegen::Context as CodeContext, prelude::*};
@@ -109,7 +110,7 @@ pub struct JIT {
 
     /// All compilation groups that include each block. An older group can still own a live
     /// entry point after only some of its blocks have been recompiled into newer groups.
-    block_mapping: HashMap<usize, Vec<usize>>,
+    block_mapping: HashMap<usize, SmallVec<[usize; 1]>>,
 
     /// Number of dead compilation units.
     pub dead: usize,

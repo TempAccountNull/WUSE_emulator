@@ -476,6 +476,7 @@ dependencies = [
  "icicle-cpu",
  "memoffset",
  "pcode",
+ "smallvec",
  "target-lexicon",
  "tracing",
  "wasmtime-jit-debug",
