@@ -171,3 +171,5 @@ dist_local/
 /docs/Intel docs
 /docs/timing
 /src/backends/icicle-emulator/icicle-bridge/cargo-build/
+/src/backends/icicle-emulator/icicle-bridge/vendor/icicle-mem/target/
+/src/backends/icicle-emulator/icicle-bridge/vendor/icicle-mem/Cargo.lock
