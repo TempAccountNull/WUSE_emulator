@@ -3,6 +3,7 @@
 #include "execution_hook.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -109,6 +110,12 @@ extern "C"
     void* icicle_smp_capture(icicle_emulator*, uint64_t address, uint64_t length);
     int32_t icicle_smp_map_captured(icicle_emulator*, void* captured, uint64_t address);
     void icicle_smp_release_capture(void* captured);
+    struct icicle_mapped_range
+    {
+        uint64_t start;
+        uint64_t end;
+    };
+    int32_t icicle_query_mapped_range(icicle_emulator*, uint64_t address, uint64_t length, icicle_mapped_range*);
     int32_t icicle_unmap_memory(icicle_emulator*, uint64_t address, uint64_t length);
     int32_t icicle_read_memory(icicle_emulator*, uint64_t address, void* data, size_t length);
     int32_t icicle_write_memory(icicle_emulator*, uint64_t address, const void* data, size_t length);
@@ -888,7 +895,8 @@ namespace sogen::icicle
                             [=](icicle_emulator* h) {
                                 ice(icicle_map_mmio(h, address, size, read_wrapper, ptr, write_wrapper, ptr), "Failed to map MMIO");
                             },
-                            std::nullopt, std::nullopt, pending_op_kind::map, pending_map_origin::mmio, size);
+                            std::nullopt, std::nullopt, pending_op_kind::map, pending_map_origin::mmio, size,
+                            std::pair{address, size});
                     }
                 }
                 this->kick_peers(self->index());
@@ -907,11 +915,19 @@ namespace sogen::icicle
         void map_memory(const uint64_t address, const size_t size, memory_permission permissions) override
         {
             const auto perm = static_cast<uint8_t>(permissions);
+            const auto map_fresh = [&](icicle_emulator* source, const size_t source_index, const bool peers_paused) {
+                if (!icicle_map_smp_shared_fresh(source, address, size, perm))
+                {
+                    this->diagnose_smp_fresh_map_failure(source, source_index, address, size, peers_paused);
+                    ice(false, "Failed to map SMP memory");
+                }
+                this->record_local_map_transition("self-map", source_index, address, size);
+            };
             if (this->vcpus_.size() == 1)
             {
                 if (this->force_smp_memory_)
                 {
-                    ice(icicle_map_smp_shared_fresh(this->emu_, address, size, perm), "Failed to map SMP memory");
+                    map_fresh(this->emu_, 0, false);
                 }
                 else
                 {
@@ -925,7 +941,7 @@ namespace sogen::icicle
             {
                 // External/setup mutator: pause peers, allocate on the master, share into the rest directly.
                 this->pause_peers_and([&] {
-                    ice(icicle_map_smp_shared_fresh(this->emu_, address, size, perm), "Failed to map SMP memory");
+                    map_fresh(this->emu_, 0, true);
                     for (size_t i = 1; i < this->vcpus_.size(); ++i)
                     {
                         ice(icicle_share_smp_pages(this->vcpus_[i]->handle(), this->emu_, address, size), "Failed to share SMP memory");
@@ -950,7 +966,7 @@ namespace sogen::icicle
             icicle_emulator* const source = self->handle();
             const fanout_guard fanout{this->ops_in_flight_};
             this->ops_in_flight_.fetch_add(1, std::memory_order_acquire);
-            ice(icicle_map_smp_shared_fresh(source, address, size, perm), "Failed to map SMP memory");
+            map_fresh(source, self->index(), false);
             void* const raw = icicle_smp_capture(source, address, size);
             ice(raw != nullptr, "Failed to capture SMP pages");
             const std::shared_ptr<void> captured(raw, icicle_smp_release_capture);
@@ -986,7 +1002,8 @@ namespace sogen::icicle
                                 }
                             }
                         },
-                        std::nullopt, std::nullopt, pending_op_kind::map, pending_map_origin::captured, size);
+                        std::nullopt, std::nullopt, pending_op_kind::map, pending_map_origin::captured, size,
+                        std::pair{address, size});
                 }
             }
             // A peer can observe pointers into this new region as soon as this syscall's guest-visible
@@ -1020,7 +1037,7 @@ namespace sogen::icicle
                     if (vcpu.get() != self)
                     {
                         this->queue_op(vcpu->index(), seq, map_vm, std::nullopt, std::nullopt, pending_op_kind::map,
-                                       pending_map_origin::host, size);
+                                       pending_map_origin::host, size, std::pair{address, size});
                     }
                 }
                 this->kick_peers(self->index());
@@ -1091,7 +1108,8 @@ namespace sogen::icicle
                     this->queue_op(
                         v->index(), seq,
                         [address, source, size, perm](icicle_emulator* h) { icicle_map_shared_memory(h, address, source, size, perm); },
-                        std::nullopt, std::nullopt, pending_op_kind::map, pending_map_origin::shared, size);
+                        std::nullopt, std::nullopt, pending_op_kind::map, pending_map_origin::shared, size,
+                        std::pair{address, size});
                 }
             }
             this->kick_peers(self->index());
@@ -1151,6 +1169,7 @@ namespace sogen::icicle
                 {
                     std::lock_guard lock(this->host_view_mutex_);
                     unmap_vm(self->handle());
+                    this->record_local_map_transition("self-unmap", self->index(), address, size);
                     unmap_view();
                 }
                 const auto seq = this->issuer_next(self->index());
@@ -1601,6 +1620,7 @@ namespace sogen::icicle
                     for (auto& op : ops)
                     {
                         op.apply(worker->handle());
+                        this->record_pending_applied(worker->index(), op);
                         this->complete_op(op.ticket);
                     }
                 }
@@ -1901,6 +1921,7 @@ namespace sogen::icicle
                             for (auto& op : ops)
                             {
                                 op.apply(v->handle());
+                                this->record_pending_applied(v->index(), op);
                                 this->complete_op(op.ticket);
                             }
                             return memory_violation_continuation::restart;
@@ -2653,8 +2674,10 @@ namespace sogen::icicle
         {
             uint64_t seq{}; // issuer-local sequence number
             uint64_t ticket{};
+            size_t issuer{};
             std::function<void(icicle_emulator*)> apply{};
             std::optional<std::pair<uint64_t, size_t>> unmap_range{};
+            std::optional<std::pair<uint64_t, size_t>> map_range{};
             // Page span is diagnostic metadata; it never changes queue order or execution.
             std::optional<std::pair<uint64_t, uint64_t>> invalidate_page_span{};
             pending_op_kind kind{pending_op_kind::other};
@@ -2712,7 +2735,26 @@ namespace sogen::icicle
             }
         }
 
+        struct map_diagnostic_record
+        {
+            const char* stage{};
+            size_t target{};
+            size_t issuer{};
+            uint64_t seq{};
+            uint64_t ticket{};
+            uint64_t address{};
+            size_t size{};
+            pending_op_kind kind{};
+            pending_map_origin origin{};
+        };
+
         std::vector<std::vector<pending_op>> pending_ops_{}; // [vm index] -> ops(handle)
+        std::deque<map_diagnostic_record> map_diagnostic_history_{};
+        const bool map_failure_diagnostic_enabled_ = [] {
+            const char* value = std::getenv("SOGEN_ICICLE_SMP_MAP_FAIL_DIAG");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        std::atomic<unsigned> map_failure_diagnostic_reports_{0};
         // Next sequence number per issuer vCPU index (monotonic).
         std::vector<std::atomic<uint64_t>> issuer_seq_{};
         // A visibility mark passes only after every earlier queued op has finished applying.
@@ -2746,11 +2788,162 @@ namespace sogen::icicle
             }
         };
 
+        void append_map_diagnostic_history_locked(const map_diagnostic_record record)
+        {
+            constexpr size_t limit = 64;
+            if (this->map_diagnostic_history_.size() == limit)
+            {
+                this->map_diagnostic_history_.pop_front();
+            }
+            this->map_diagnostic_history_.push_back(record);
+        }
+
+        void record_local_map_transition(const char* stage, const size_t source_index,
+                                         const uint64_t address, const size_t size)
+        {
+            if (!this->map_failure_diagnostic_enabled_)
+            {
+                return;
+            }
+            std::lock_guard lock(this->pending_mutex_);
+            this->append_map_diagnostic_history_locked({stage, source_index, source_index, 0, 0,
+                                                         address, size, pending_op_kind::other,
+                                                         pending_map_origin::none});
+        }
+
+        void record_pending_applied(const size_t target, const pending_op& op)
+        {
+            if (!this->map_failure_diagnostic_enabled_)
+            {
+                return;
+            }
+            const auto range = op.map_range ? op.map_range : op.unmap_range;
+            if (!range)
+            {
+                return;
+            }
+            std::lock_guard lock(this->pending_mutex_);
+            this->append_map_diagnostic_history_locked({"applied", target, op.issuer, op.seq, op.ticket,
+                                                         range->first, range->second, op.kind, op.map_origin});
+        }
+
+        void diagnose_smp_fresh_map_failure(icicle_emulator* source, const size_t source_index,
+                                            const uint64_t address, const size_t size, const bool peers_paused)
+        {
+            if (!this->map_failure_diagnostic_enabled_ ||
+                this->map_failure_diagnostic_reports_.fetch_add(1, std::memory_order_relaxed) >= 8)
+            {
+                return;
+            }
+            constexpr size_t limit = 16;
+            std::array<map_diagnostic_record, limit> pending{};
+            std::array<map_diagnostic_record, limit> history{};
+            size_t pending_count = 0;
+            size_t pending_total = 0;
+            size_t history_count = 0;
+            uint64_t issued = 0;
+            uint64_t completed = 0;
+            {
+                std::lock_guard lock(this->pending_mutex_);
+                if (source_index < this->pending_ops_.size())
+                {
+                    const auto& queue = this->pending_ops_[source_index];
+                    pending_total = queue.size();
+                    for (const auto& op : queue)
+                    {
+                        const auto range = op.map_range ? op.map_range : op.unmap_range;
+                        if (!range || !ranges_overlap(address, size, range->first, range->second))
+                        {
+                            continue;
+                        }
+                        if (pending_count < limit)
+                        {
+                            pending[pending_count] = {"pending", source_index, op.issuer, op.seq, op.ticket,
+                                                      range->first, range->second, op.kind, op.map_origin};
+                        }
+                        ++pending_count;
+                    }
+                }
+                for (auto it = this->map_diagnostic_history_.rbegin(); it != this->map_diagnostic_history_.rend(); ++it)
+                {
+                    if (it->target == source_index && ranges_overlap(address, size, it->address, it->size))
+                    {
+                        if (history_count < limit)
+                        {
+                            history[history_count] = *it;
+                        }
+                        ++history_count;
+                    }
+                }
+                issued = this->ops_issued_watermark_.load(std::memory_order_relaxed);
+                completed = this->ops_completed_watermark_;
+            }
+            const auto print_overlap = [&](const char* label, const size_t index, icicle_emulator* handle) {
+                icicle_mapped_range range{};
+                const auto result = icicle_query_mapped_range(handle, address, size, &range);
+                if (result == 1)
+                {
+                    std::fprintf(stderr, "[SMPMAPDIAG] %s_vcpu=%zu overlap=%#llx-%#llx\n", label, index,
+                                 static_cast<unsigned long long>(range.start), static_cast<unsigned long long>(range.end));
+                }
+                else
+                {
+                    std::fprintf(stderr, "[SMPMAPDIAG] %s_vcpu=%zu overlap=%s\n", label, index,
+                                 result == 0 ? "none" : "query-error");
+                }
+            };
+            std::fprintf(stderr,
+                         "[SMPMAPDIAG] source_vcpu=%zu route=%s address=%#llx size=%zu pending_total=%zu "
+                         "pending_overlap=%zu history_overlap=%zu issued=%llu completed=%llu inflight=%llu\n",
+                         source_index, peers_paused ? "paused" : "owner", static_cast<unsigned long long>(address), size,
+                         pending_total, pending_count, history_count, static_cast<unsigned long long>(issued),
+                         static_cast<unsigned long long>(completed),
+                         static_cast<unsigned long long>(this->ops_in_flight_.load(std::memory_order_acquire)));
+            print_overlap("source", source_index, source);
+            if (this->host_view_)
+            {
+                std::lock_guard lock(this->host_view_mutex_);
+                print_overlap("host_view", this->vcpus_.size(), this->host_view_);
+            }
+            if (peers_paused)
+            {
+                for (const auto& peer : this->vcpus_)
+                {
+                    if (peer->index() != source_index)
+                    {
+                        print_overlap("peer", peer->index(), peer->handle());
+                    }
+                }
+            }
+            else if (this->vcpus_.size() > 1)
+            {
+                std::fprintf(stderr, "[SMPMAPDIAG] peer_overlap=not-queried-running\n");
+            }
+            const auto print_record = [&](const map_diagnostic_record& record) {
+                std::fprintf(stderr,
+                             "[SMPMAPDIAG] %s target=%zu issuer=%zu seq=%llu ticket=%llu kind=%s "
+                             "origin=%s range=%#llx+%zu\n",
+                             record.stage, record.target, record.issuer,
+                             static_cast<unsigned long long>(record.seq), static_cast<unsigned long long>(record.ticket),
+                             pending_op_kind_name(record.kind), pending_map_origin_name(record.origin),
+                             static_cast<unsigned long long>(record.address), record.size);
+            };
+            for (size_t i = 0; i < std::min(pending_count, limit); ++i)
+            {
+                print_record(pending[i]);
+            }
+            for (size_t i = 0; i < std::min(history_count, limit); ++i)
+            {
+                print_record(history[i]);
+            }
+        }
+
         void queue_op(const size_t target, const uint64_t seq, std::function<void(icicle_emulator*)> op,
                       const std::optional<std::pair<uint64_t, size_t>> unmap_range = std::nullopt,
                       const std::optional<std::pair<uint64_t, uint64_t>> invalidate_page_span = std::nullopt,
                       const pending_op_kind kind = pending_op_kind::other, const pending_map_origin map_origin = pending_map_origin::none,
-                      const size_t mapped_bytes = 0)
+                      const size_t mapped_bytes = 0,
+                      const std::optional<std::pair<uint64_t, size_t>> map_range = std::nullopt)
         {
             auto* self = this->mutation_owner();
             auto* profile = this->profile_enabled_ && self ? &self->smp_profile_ : nullptr;
@@ -2777,8 +2970,15 @@ namespace sogen::icicle
                     }
                 }
                 const auto ticket = this->ops_issued_watermark_.load(std::memory_order_relaxed) + 1;
-                pending.push_back(
-                    pending_op{seq, ticket, std::move(op), unmap_range, invalidate_page_span, kind, map_origin, mapped_bytes});
+                const auto issuer = self ? self->index() : this->vcpus_.size();
+                pending.push_back(pending_op{seq, ticket, issuer, std::move(op), unmap_range, map_range,
+                                             invalidate_page_span, kind, map_origin, mapped_bytes});
+                if (this->map_failure_diagnostic_enabled_ && (map_range || unmap_range))
+                {
+                    const auto range = map_range ? *map_range : *unmap_range;
+                    this->append_map_diagnostic_history_locked({"issued", target, issuer, seq, ticket,
+                                                                 range.first, range.second, kind, map_origin});
+                }
                 this->ops_completed_out_of_order_.push_back(0);
                 this->ops_issued_watermark_.store(ticket, std::memory_order_release);
             }
@@ -2863,6 +3063,7 @@ namespace sogen::icicle
                 for (; next < prefix.size(); ++next)
                 {
                     prefix[next].apply(v.handle());
+                    this->record_pending_applied(v.index(), prefix[next]);
                     this->complete_op(prefix[next].ticket);
                 }
             }
@@ -3418,6 +3619,7 @@ namespace sogen::icicle
             {
                 const auto started = diagnostic ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 op.apply(v.handle());
+                this->record_pending_applied(v.index(), op);
                 if (diagnostic)
                 {
                     const auto nanos = static_cast<uint64_t>(
@@ -3481,6 +3683,7 @@ namespace sogen::icicle
             for (auto& op : ops)
             {
                 op.apply(v.handle());
+                this->record_pending_applied(v.index(), op);
                 this->complete_op(op.ticket);
             }
         }
@@ -3501,6 +3704,7 @@ namespace sogen::icicle
                 queue.erase(queue.begin());
             }
             op.apply(v.handle());
+            this->record_pending_applied(v.index(), op);
             this->complete_op(op.ticket);
             return true;
         }

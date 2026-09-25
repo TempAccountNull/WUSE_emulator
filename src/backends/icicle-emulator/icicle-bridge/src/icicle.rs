@@ -2005,6 +2005,12 @@ impl IcicleEmulator {
         true
     }
 
+    /// Query this VM only on its owning thread (or while all vCPUs are paused).
+    pub fn mapped_range_overlap(&self, address: u64, length: u64) -> Option<(u64, u64)> {
+        let last = address.checked_add(length.checked_sub(1)?)?;
+        self.vm.cpu.mem.mapping.get_range(address..=last)
+    }
+
     /// Map the SAME Arc<PageData> backing as the source VM for each page in the range (SMP), so this
     /// vCPU shares the master's guest RAM. Coherency of the shared bytes is the host CPU's (MESI).
     pub fn share_smp_pages_from(&mut self, source: &IcicleEmulator, address: u64, length: u64) -> bool {

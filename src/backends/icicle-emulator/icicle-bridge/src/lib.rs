@@ -456,6 +456,36 @@ pub fn icicle_map_smp_shared_fresh(ptr: *mut c_void, address: u64, length: u64, 
     }
 }
 
+#[repr(C)]
+pub struct IcicleMappedRange {
+    start: u64,
+    end: u64,
+}
+
+/// Read-only overlap query. Call only on this VM's owner or with all vCPUs paused.
+/// Returns 1 for an overlap, 0 for none, -1 for invalid arguments.
+#[unsafe(no_mangle)]
+pub fn icicle_query_mapped_range(
+    ptr: *mut c_void,
+    address: u64,
+    length: u64,
+    out: *mut IcicleMappedRange,
+) -> i32 {
+    if ptr.is_null() || out.is_null() || length == 0 || address.checked_add(length - 1).is_none() {
+        return -1;
+    }
+    unsafe {
+        let emulator = &*(ptr as *const IcicleEmulator);
+        match emulator.mapped_range_overlap(address, length) {
+            Some((start, end)) => {
+                *out = IcicleMappedRange { start, end };
+                1
+            }
+            None => 0,
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub fn icicle_share_smp_pages(dst: *mut c_void, src: *mut c_void, address: u64, length: u64) -> i32 {
     unsafe {
@@ -855,6 +885,26 @@ pub fn icicle_destroy_emulator(ptr: *mut c_void) {
     invalidation_profiles().lock().unwrap().remove(&(ptr as usize));
     unsafe {
         let _ = Box::from_raw(ptr as *mut IcicleEmulator);
+    }
+}
+
+#[cfg(test)]
+mod mapping_query_tests {
+    use super::*;
+
+    #[test]
+    fn overlap_query_tracks_map_and_unmap() {
+        let ptr = icicle_create_emulator(0);
+        assert!(!ptr.is_null());
+        let mut range = IcicleMappedRange { start: 0, end: 0 };
+        assert_eq!(icicle_query_mapped_range(ptr, 0x4000, 0x1000, &mut range), 0);
+        assert_eq!(icicle_query_mapped_range(ptr, 0x4000, 0, &mut range), -1);
+        assert_eq!(icicle_map_smp_shared_fresh(ptr, 0x4000, 0x1000, 3), 1);
+        assert_eq!(icicle_query_mapped_range(ptr, 0x4000, 0x1000, &mut range), 1);
+        assert_eq!((range.start, range.end), (0x4000, 0x4fff));
+        assert_eq!(icicle_unmap_memory(ptr, 0x4000, 0x1000), 1);
+        assert_eq!(icicle_query_mapped_range(ptr, 0x4000, 0x1000, &mut range), 0);
+        icicle_destroy_emulator(ptr);
     }
 }
 
