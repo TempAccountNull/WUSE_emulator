@@ -276,7 +276,7 @@ namespace sogen
             win_emu.setup_process_if_necessary();
 
             auto emit_object_access = [&c](object_access_info info) {
-                c.emit_observation<object_access_event>([&](auto& event) {
+                c.emit_observation<object_access_event>(c.make_execution_context(info.rip, std::move(info.module_name)), [&](auto& event) {
                     event.main_access = info.main_access;
                     event.type_name = std::move(info.type_name);
                     event.offset = info.offset;

@@ -82,6 +82,7 @@ namespace sogen
 
         event_header make_event_header() const;
         execution_context make_execution_context() const;
+        execution_context make_execution_context(uint64_t rip, std::string rip_module) const;
         void emit_event(const analysis_event& event) const;
 
         template <typename Event, typename Initializer>

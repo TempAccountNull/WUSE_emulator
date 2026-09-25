@@ -1012,14 +1012,17 @@ namespace sogen
 
     execution_context analysis_context::make_execution_context() const
     {
-        auto& emu = this->win_emu->active_cpu();
-        const auto rip = emu.read_instruction_pointer();
+        const auto rip = this->win_emu->active_cpu().read_instruction_pointer();
         const auto* rip_module = this->win_emu->mod_manager.find_name(rip);
+        return this->make_execution_context(rip, rip_module ? rip_module : "<N/A>");
+    }
 
+    execution_context analysis_context::make_execution_context(const uint64_t rip, std::string rip_module) const
+    {
         execution_context context{
             .thread_id = 0,
             .rip = rip,
-            .rip_module = rip_module ? rip_module : "<N/A>",
+            .rip_module = std::move(rip_module),
         };
 
         try

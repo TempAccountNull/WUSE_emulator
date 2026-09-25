@@ -112,6 +112,21 @@ namespace sogen::test
         }
     };
 
+    TEST_F(AnalysisObservation, ObjectAccessContextReusesResolvedModule)
+    {
+        win_emu.current_thread().previous_ip = caller;
+        const auto expected = analysis.make_execution_context();
+        const auto* module = win_emu.mod_manager.find_by_address(callee);
+        ASSERT_NE(module, nullptr);
+
+        const auto actual = analysis.make_execution_context(callee, module->name);
+        EXPECT_EQ(actual.thread_id, expected.thread_id);
+        EXPECT_EQ(actual.rip, expected.rip);
+        EXPECT_EQ(actual.rip_module, expected.rip_module);
+        EXPECT_EQ(actual.previous_ip, expected.previous_ip);
+        EXPECT_EQ(actual.previous_ip_module, expected.previous_ip_module);
+    }
+
     TEST_F(AnalysisObservation, FastFailCapturesBoundedGuestCodeAndRegisters)
     {
         const auto page = win_emu.memory.allocate_memory(0x1000, memory_permission::read_write);
