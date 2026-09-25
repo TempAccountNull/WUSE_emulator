@@ -1389,6 +1389,7 @@ impl Mmu {
         addr: u64,
         value: [u8; N],
         perm: u8,
+        mapped_range: Option<(u64, u8)>,
     ) -> MemResult<()> {
         // SMP 6.6a experiment (SOGEN_SMP_EPOCH=2): bump the epoch for PRIVATE (executed) pages too,
         // so the same raise/recovery can be A/B tested at N=1 on a private page.
@@ -1401,10 +1402,14 @@ impl Mmu {
         let page_start = self.page_aligned(addr);
         let page_size = self.page_size();
 
-        let shared_perm = match self.mapping.get_with_range(addr) {
-            Some((_, last, MemoryMapping::Physical(mapping))) if last - addr >= (N - 1) as u64 => mapping.shared_perm,
-            _ => return Err(MemError::Unmapped),
+        let (last, shared_perm) = match mapped_range {
+            Some(range) => range,
+            None => match self.mapping.get_with_range(addr) {
+                Some((_, last, MemoryMapping::Physical(mapping))) => (last, mapping.shared_perm),
+                _ => return Err(MemError::Unmapped),
+            },
         };
+        if last - addr < (N - 1) as u64 { return Err(MemError::Unmapped); }
         if shared_perm != 0 { perm::check(shared_perm, perm)?; }
         let mut page = self.physical.get_mut(index);
         if page.smp_shared {
@@ -1609,12 +1614,13 @@ impl Mmu {
         self.tlb_miss_count += 1;
         let mut legacy_notify = false;
         let result = (|| {
-            let result = match self.mapping.get(addr).ok_or(MemError::Unmapped)? {
-                MemoryMapping::Physical(entry) => self.write_physical(entry.index, addr, value, perm),
+            let (_, last, mapping) = self.mapping.get_with_range(addr).ok_or(MemError::Unmapped)?;
+            let result = match mapping {
+                MemoryMapping::Physical(entry) => self.write_physical(entry.index, addr, value, perm, Some((last, entry.shared_perm))),
                 &MemoryMapping::Unallocated(entry) => {
                     perm::check(entry.perm | perm::MAP, perm)?;
                     let index = self.init_physical(addr, true).ok_or(MemError::OutOfMemory)?;
-                    self.write_physical(index, addr, value, perm)
+                    self.write_physical(index, addr, value, perm, None)
                 }
                 MemoryMapping::Io(id) => self.io[*id].write(addr, &value),
             };
@@ -1963,6 +1969,51 @@ mod smp_batch_tests {
         assert_eq!(serial.mapping.len(), batch.mapping.len());
         assert_eq!(batch.mapping.len(), (EXISTING + CAPTURED) as usize);
         eprintln!("middle insert: existing={EXISTING} captured={CAPTURED} mappings={} serial={serial_time:?} batch={batch_time:?}", batch.mapping.len());
+    }
+}
+
+#[cfg(test)]
+mod write_mapping_lookup_tests {
+    use super::*;
+    use crate::UnallocatedMemory;
+
+    #[test]
+    fn physical_partial_range_falls_back_to_byte_writes() {
+        const SOURCE: u64 = 0x2000;
+        const ALIAS: u64 = 0x4000;
+        let mut mem = Mmu::default();
+        assert!(mem.map_smp_shared_fresh(SOURCE, perm::READ | perm::WRITE));
+        let index = mem.get_physical_index(SOURCE).unwrap();
+        assert!(mem.map_memory_len(ALIAS, 4, MemoryMapping::Physical(PhysicalMapping { index, addr: ALIAS, shared_perm: 0 })));
+
+        assert_eq!(mem.write_u64(ALIAS, 0x8877_6655_4433_2211, perm::WRITE), Err(MemError::Unmapped));
+        assert_eq!(mem.read::<4>(SOURCE, perm::READ).unwrap(), [0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn shared_alias_permission_is_checked_before_write() {
+        const SOURCE: u64 = 0x6000;
+        const ALIAS: u64 = 0x8000;
+        let mut mem = Mmu::default();
+        assert!(mem.map_smp_shared_fresh(SOURCE, perm::READ | perm::WRITE));
+        mem.write_u8(SOURCE, 0x5a, perm::WRITE).unwrap();
+        mem.map_shared(ALIAS, SOURCE, 0x1000, perm::READ).unwrap();
+
+        assert!(mem.write_u8(ALIAS, 0xa5, perm::WRITE).is_err());
+        assert_eq!(mem.read_u8(SOURCE, perm::READ).unwrap(), 0x5a);
+    }
+
+    #[test]
+    fn unallocated_write_uses_post_initialization_range() {
+        const ADDRESS: u64 = 0xa000;
+        let mut mem = Mmu::default();
+        assert!(mem.map_memory_len(ADDRESS, 4, UnallocatedMemory { perm: perm::READ | perm::WRITE, value: 0x11 }));
+        assert!(mem.map_memory_len(ADDRESS + 4, 4, UnallocatedMemory { perm: perm::READ | perm::WRITE, value: 0x22 }));
+
+        mem.write_u64(ADDRESS, 0x8877_6655_4433_2211, perm::WRITE).unwrap();
+        assert_eq!(mem.tlb_miss_count, 1);
+        assert_eq!(mem.read_u64(ADDRESS, perm::READ).unwrap(), 0x8877_6655_4433_2211);
+        assert!(matches!(mem.get_mapping().get_with_range(ADDRESS), Some((_, last, MemoryMapping::Physical(_))) if last >= ADDRESS + 7));
     }
 }
 
