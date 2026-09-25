@@ -1392,7 +1392,7 @@ impl Mmu {
     ) -> MemResult<()> {
         // SMP 6.6a experiment (SOGEN_SMP_EPOCH=2): bump the epoch for PRIVATE (executed) pages too,
         // so the same raise/recovery can be A/B tested at N=1 on a private page.
-        if std::env::var("SOGEN_SMP_EPOCH").map(|v| v == "2").unwrap_or(false) {
+        if smp_private_code_epoch_enabled() {
             let page = self.physical.get(index);
             if page.executed {
                 page.data().bump_code_epoch();
@@ -1689,6 +1689,12 @@ impl Mmu {
         }
         Ok(addr)
     }
+}
+
+#[inline]
+fn smp_private_code_epoch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SOGEN_SMP_EPOCH").as_deref() == Ok("2"))
 }
 
 #[cold]
