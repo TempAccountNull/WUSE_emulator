@@ -888,7 +888,7 @@ namespace sogen::icicle
                             [=](icicle_emulator* h) {
                                 ice(icicle_map_mmio(h, address, size, read_wrapper, ptr, write_wrapper, ptr), "Failed to map MMIO");
                             },
-                            std::nullopt, std::nullopt, pending_op_kind::map);
+                            std::nullopt, std::nullopt, pending_op_kind::map, pending_map_origin::mmio, size);
                     }
                 }
                 this->kick_peers(self->index());
@@ -986,7 +986,7 @@ namespace sogen::icicle
                                 }
                             }
                         },
-                        std::nullopt, std::nullopt, pending_op_kind::map);
+                        std::nullopt, std::nullopt, pending_op_kind::map, pending_map_origin::captured, size);
                 }
             }
             // A peer can observe pointers into this new region as soon as this syscall's guest-visible
@@ -1019,7 +1019,8 @@ namespace sogen::icicle
                 {
                     if (vcpu.get() != self)
                     {
-                        this->queue_op(vcpu->index(), seq, map_vm, std::nullopt, std::nullopt, pending_op_kind::map);
+                        this->queue_op(vcpu->index(), seq, map_vm, std::nullopt, std::nullopt, pending_op_kind::map,
+                                       pending_map_origin::host, size);
                     }
                 }
                 this->kick_peers(self->index());
@@ -1090,7 +1091,7 @@ namespace sogen::icicle
                     this->queue_op(
                         v->index(), seq,
                         [address, source, size, perm](icicle_emulator* h) { icicle_map_shared_memory(h, address, source, size, perm); },
-                        std::nullopt, std::nullopt, pending_op_kind::map);
+                        std::nullopt, std::nullopt, pending_op_kind::map, pending_map_origin::shared, size);
                 }
             }
             this->kick_peers(self->index());
@@ -2277,12 +2278,13 @@ namespace sogen::icicle
                             std::fprintf(stderr,
                                          "[ICICLEPENDING] vcpu=%zu sync_ms=%lld gate_ms=%lld drain_ms=%lld publish_ms=%lld "
                                          "queued=%zu applied=%zu map=%zu protect=%zu unmap=%zu invalidate=%zu other=%zu "
-                                         "slowest_kind=%s slowest_ms=%llu\n",
+                                         "slowest_kind=%s slowest_ms=%llu slowest_map_origin=%s slowest_mapped_bytes=%zu\n",
                                          vcpu_index, static_cast<long long>(total_ms), static_cast<long long>(gate_ms),
                                          static_cast<long long>(drain_ms), static_cast<long long>(publish_ms), diagnostic.queued,
                                          diagnostic.applied, diagnostic.maps, diagnostic.protects, diagnostic.unmaps,
                                          diagnostic.invalidations, diagnostic.other, pending_op_kind_name(diagnostic.slowest_kind),
-                                         static_cast<unsigned long long>(diagnostic.slowest_nanos / 1000000));
+                                         static_cast<unsigned long long>(diagnostic.slowest_nanos / 1000000),
+                                         pending_map_origin_name(diagnostic.slowest_map_origin), diagnostic.slowest_mapped_bytes);
                         }
                     }
                 }
@@ -2636,6 +2638,15 @@ namespace sogen::icicle
             invalidate,
         };
 
+        enum class pending_map_origin : uint8_t
+        {
+            none,
+            captured,
+            mmio,
+            host,
+            shared,
+        };
+
         struct pending_op
         {
             uint64_t seq{}; // issuer-local sequence number
@@ -2645,6 +2656,8 @@ namespace sogen::icicle
             // Page span is diagnostic metadata; it never changes queue order or execution.
             std::optional<std::pair<uint64_t, uint64_t>> invalidate_page_span{};
             pending_op_kind kind{pending_op_kind::other};
+            pending_map_origin map_origin{pending_map_origin::none};
+            size_t mapped_bytes{};
         };
 
         struct pending_drain_diagnostic
@@ -2657,6 +2670,8 @@ namespace sogen::icicle
             size_t invalidations{};
             size_t other{};
             pending_op_kind slowest_kind{pending_op_kind::other};
+            pending_map_origin slowest_map_origin{pending_map_origin::none};
+            size_t slowest_mapped_bytes{};
             uint64_t slowest_nanos{};
         };
 
@@ -2674,6 +2689,23 @@ namespace sogen::icicle
                 return "invalidate";
             default:
                 return "other";
+            }
+        }
+
+        static const char* pending_map_origin_name(const pending_map_origin origin)
+        {
+            switch (origin)
+            {
+            case pending_map_origin::captured:
+                return "captured";
+            case pending_map_origin::mmio:
+                return "mmio";
+            case pending_map_origin::host:
+                return "host";
+            case pending_map_origin::shared:
+                return "shared";
+            default:
+                return "none";
             }
         }
 
@@ -2714,7 +2746,8 @@ namespace sogen::icicle
         void queue_op(const size_t target, const uint64_t seq, std::function<void(icicle_emulator*)> op,
                       const std::optional<std::pair<uint64_t, size_t>> unmap_range = std::nullopt,
                       const std::optional<std::pair<uint64_t, uint64_t>> invalidate_page_span = std::nullopt,
-                      const pending_op_kind kind = pending_op_kind::other)
+                      const pending_op_kind kind = pending_op_kind::other, const pending_map_origin map_origin = pending_map_origin::none,
+                      const size_t mapped_bytes = 0)
         {
             auto* self = this->mutation_owner();
             auto* profile = this->profile_enabled_ && self ? &self->smp_profile_ : nullptr;
@@ -2741,7 +2774,8 @@ namespace sogen::icicle
                     }
                 }
                 const auto ticket = this->ops_issued_watermark_.load(std::memory_order_relaxed) + 1;
-                pending.push_back(pending_op{seq, ticket, std::move(op), unmap_range, invalidate_page_span, kind});
+                pending.push_back(
+                    pending_op{seq, ticket, std::move(op), unmap_range, invalidate_page_span, kind, map_origin, mapped_bytes});
                 this->ops_completed_out_of_order_.push_back(0);
                 this->ops_issued_watermark_.store(ticket, std::memory_order_release);
             }
@@ -3408,6 +3442,8 @@ namespace sogen::icicle
                     {
                         diagnostic->slowest_nanos = nanos;
                         diagnostic->slowest_kind = op.kind;
+                        diagnostic->slowest_map_origin = op.map_origin;
+                        diagnostic->slowest_mapped_bytes = op.mapped_bytes;
                     }
                 }
                 this->complete_op(op.ticket);
