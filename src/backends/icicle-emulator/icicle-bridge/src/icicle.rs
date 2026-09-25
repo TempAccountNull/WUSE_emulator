@@ -55,6 +55,9 @@ fn create_x64_vm() -> icicle_vm::Vm {
     cpu_config.optimize_block = false;
 
     let mut vm = icicle_vm::build(&cpu_config).unwrap();
+    // Upstream builder only copies enable_jit from Config. Propagate this bridge flag to the
+    // field actually checked by Vm::run() before its periodic recompilation.
+    vm.enable_recompilation = cpu_config.enable_recompilation;
 
     // SMP 6.7: register LOCK()/UNLOCK() hooks (acquire/release the RMW spinlock) and op
     // injectors that rewrite those pcode userops into the hooks. If the locked instruction
@@ -2910,6 +2913,37 @@ mod parallel_scaling_bench {
             let _ = std::fs::create_dir_all(parent);
         }
         std::fs::write(&out, &report).expect("write bench results");
+    }
+}
+
+#[cfg(test)]
+mod recompilation_flag_tests {
+    use super::*;
+    use std::process::Command;
+
+    const TEST_NAME: &str = "icicle::recompilation_flag_tests::environment_flag_reaches_vm";
+
+    #[test]
+    fn environment_flag_reaches_vm() {
+        if std::env::var_os("SOGEN_RECOMP_FLAG_TEST_CHILD").is_some() {
+            let expected = std::env::var("SOGEN_ICICLE_RECOMP").as_deref() != Ok("0");
+            assert_eq!(create_x64_vm().enable_recompilation, expected);
+            return;
+        }
+
+        // Child processes keep environment overrides isolated from parallel Rust tests.
+        for flag in [Some("0"), Some("1"), None] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", TEST_NAME, "--nocapture"]);
+            command.env("SOGEN_RECOMP_FLAG_TEST_CHILD", "1");
+            match flag {
+                Some(value) => { command.env("SOGEN_ICICLE_RECOMP", value); }
+                None => { command.env_remove("SOGEN_ICICLE_RECOMP"); }
+            }
+            let result = command.output().unwrap();
+            assert!(result.status.success(), "flag={flag:?}: {} {}",
+                String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+        }
     }
 }
 
