@@ -2103,7 +2103,20 @@ impl IcicleEmulator {
         else {
             return false;
         };
+        static UNMAP_ATTRIBUTION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static SLOW_UNMAP_REPORTS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let attribution = *UNMAP_ATTRIBUTION
+            .get_or_init(|| std::env::var("SOGEN_ICICLE_UNMAP_ATTRIBUTION").as_deref() == Ok("1"));
+        let started = attribution.then(Instant::now);
+        let pending_before = if attribution {
+            self.pending_free_pages.len()
+        } else {
+            0
+        };
+
         self.invalidate_code_range(address, length, MANUAL_UNMAP);
+        let invalidated = attribution.then(Instant::now);
         let mem = &mut self.vm.cpu.mem;
         for (_, _, entry) in mem.mapping.overlapping_iter(address..=last) {
             if let Some(icicle_cpu::mem::MemoryMapping::Physical(page)) = entry {
@@ -2112,8 +2125,37 @@ impl IcicleEmulator {
                 }
             }
         }
+        let collected_pages = if attribution {
+            self.pending_free_pages.len().saturating_sub(pending_before)
+        } else {
+            0
+        };
+        let collected = attribution.then(Instant::now);
         let result = mem.unmap_memory_len(address, length);
+        let unmapped = attribution.then(Instant::now);
         self.reclaim_pending_pages();
+
+        if let (Some(started), Some(invalidated), Some(collected), Some(unmapped)) =
+            (started, invalidated, collected, unmapped)
+        {
+            let ended = Instant::now();
+            let total_ms = ended.duration_since(started).as_millis();
+            if total_ms >= 1000
+                && SLOW_UNMAP_REPORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 48
+            {
+                eprintln!(
+                    "[ICICLEUNMAP] bytes={} pages={} result={} total_ms={} invalidate_ms={} collect_ms={} mmu_ms={} reclaim_ms={}",
+                    length,
+                    collected_pages,
+                    result,
+                    total_ms,
+                    invalidated.duration_since(started).as_millis(),
+                    collected.duration_since(invalidated).as_millis(),
+                    unmapped.duration_since(collected).as_millis(),
+                    ended.duration_since(unmapped).as_millis(),
+                );
+            }
+        }
         result
     }
 
