@@ -159,16 +159,25 @@ namespace sogen
     {
         const std::scoped_lock lock(this->mutex_);
 
-        this->update();
-
         if (addr >= KUSD_SIZE)
         {
             return;
         }
 
-        const auto end = addr + size;
-        const auto valid_end = std::min(end, static_cast<uint64_t>(KUSD_SIZE));
+        const auto valid_end = addr + std::min<uint64_t>(size, KUSD_SIZE - addr);
         const auto real_size = valid_end - addr;
+        const auto overlaps = [addr, valid_end](const uint64_t field, const uint64_t field_size) {
+            return addr < field + field_size && field < valid_end;
+        };
+        // Most KUSER_SHARED_DATA reads target static process/CPU metadata.
+        // Sampling both host clocks for those reads adds cost but cannot alter
+        // their result. Keep time fields fresh for reads that overlap them.
+        if (overlaps(offsetof(KUSER_SHARED_DATA64, InterruptTime), sizeof(this->kusd_.InterruptTime)) ||
+            overlaps(offsetof(KUSER_SHARED_DATA64, SystemTime), sizeof(this->kusd_.SystemTime)) ||
+            overlaps(offsetof(KUSER_SHARED_DATA64, TickCount), sizeof(this->kusd_.TickCount)))
+        {
+            this->update();
+        }
 
         const auto* kusd_buffer = reinterpret_cast<uint8_t*>(&this->kusd_);
         memcpy(data, kusd_buffer + addr, static_cast<size_t>(real_size));
