@@ -1059,10 +1059,8 @@ impl IcicleEmulator {
                     let data = page.data();
                     let start = ((page_address.max(address) - page_address) & (page_size - 1)) as usize;
                     let end = (((last.min(page_address + page_size - 1)) - page_address) & (page_size - 1)) as usize;
-                    for p in &data.perm[start..=end.min(data.perm.len() - 1)] {
-                        if p & perm::IN_CODE_CACHE != 0 {
-                            return true;
-                        }
+                    if data.any_perm_bit(start, end - start + 1, perm::IN_CODE_CACHE) {
+                        return true;
                     }
                 }
             }
@@ -1088,14 +1086,8 @@ impl IcicleEmulator {
                 if page.executed {
                     page.executed = false;
                     if page.smp_shared {
-                        // SMP: never `make_mut` a shared page — the clone would privatize this VM's
-                        // view and silently diverge the vCPUs (write_memory invalidates before
-                        // writing, so every host write to executed shared memory hits this).
-                        // Safety: smp_shared pages are never cloned; see Page::data_mut_shared.
-                        let data = unsafe { page.data_mut_shared() };
-                        for permission in &mut data.perm {
-                            *permission &= !icicle_cpu::mem::perm::IN_CODE_CACHE;
-                        }
+                        // Other VMs may still execute this backing page. Their shared cache
+                        // marker remains set while this VM invalidates its own translation.
                     } else {
                         for permission in &mut page.data_mut().perm {
                             *permission &= !icicle_cpu::mem::perm::IN_CODE_CACHE;
@@ -2918,5 +2910,27 @@ mod parallel_scaling_bench {
             let _ = std::fs::create_dir_all(parent);
         }
         std::fs::write(&out, &report).expect("write bench results");
+    }
+}
+
+#[cfg(test)]
+mod shared_permission_bridge_tests {
+    use super::*;
+    use icicle_vm::cpu::mem::perm;
+
+    #[test]
+    fn local_invalidation_keeps_peer_shared_cache_marker() {
+        const PAGE: u64 = 0x42000;
+        let mut local = IcicleEmulator::new();
+        let mut peer = IcicleEmulator::new();
+        assert!(local.vm.cpu.mem.map_smp_shared_fresh(PAGE, perm::READ | perm::WRITE | perm::EXEC));
+        let shared = local.vm.cpu.mem.share_page(PAGE).expect("shared page");
+        assert!(peer.vm.cpu.mem.map_smp_shared(PAGE, shared.clone()));
+        assert!(local.vm.cpu.mem.ensure_executable(PAGE, 1));
+        assert!(peer.vm.cpu.mem.ensure_executable(PAGE, 1));
+        shared.add_shared_perm_bits(0, 1, perm::IN_CODE_CACHE);
+        assert!(local.invalidate_code_range(PAGE, 1));
+        assert!(shared.any_perm_bit(0, 1, perm::IN_CODE_CACHE));
+        assert!(local.code_range_is_cached(PAGE, 1));
     }
 }
