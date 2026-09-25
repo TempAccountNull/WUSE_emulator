@@ -1,8 +1,10 @@
 #include "cm_api.hpp"
 #include "../std_include.hpp"
 #include "../windows_emulator.hpp"
+#include <utils/finally.hpp>
 
-#include <cstdlib> // std::getenv for the SOGEN_LOG_CMAPI_INTERFACE_LIST gate
+#include <chrono>
+#include <cstdlib> // opt-in CMApi logging and profiling gates
 
 namespace sogen {
 namespace {
@@ -1181,9 +1183,17 @@ struct cm_api : stateless_device {
     }
     const auto opened = win_emu.process.registry_keys.store(std::move(*key));
     key_handle = opened.bits;
-    win_emu.log.info("CMApi class key %s -> 0x%" PRIx64 " (access: 0x%X)\n",
-                     u16_to_u8(path).c_str(), key_handle,
-                     request.desired_access);
+    // This open can repeat thousands of times during package registration. Keep the
+    // detailed line available for a targeted diagnosis without formatting it on every call.
+    static const bool log_class_key = [] {
+      const char *value = std::getenv("SOGEN_LOG_CMAPI_CLASS_KEY");
+      return value && *value && *value != '0';
+    }();
+    if (log_class_key) {
+      win_emu.log.info("CMApi class key %s -> 0x%" PRIx64 " (access: 0x%X)\n",
+                       u16_to_u8(path).c_str(), key_handle,
+                       request.desired_access);
+    }
     return STATUS_SUCCESS;
   }
 
@@ -1281,10 +1291,27 @@ struct cm_api : stateless_device {
 
   NTSTATUS get_interface_list(windows_emulator &win_emu,
                               const io_device_context &c) const {
+    const bool profile = win_emu.cmapi_interface_profile.enabled();
+    const auto started = profile ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+    std::optional<uint32_t> profiled_flags;
+    std::array<uint8_t, 16> profiled_guid{};
+    const auto publish_profile = utils::finally([&] {
+      if (!profile) return;
+      const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - started);
+      win_emu.cmapi_interface_profile.record(profiled_flags, profiled_guid,
+                                              static_cast<uint64_t>(elapsed.count()));
+    });
     interface_list_request request{};
     auto status = this->read_interface_request(win_emu, c, request);
     if (status != STATUS_SUCCESS) {
       return status;
+    }
+    if (profile) {
+      profiled_flags = request.flags;
+      std::memcpy(profiled_guid.data(), &request.interface_class,
+                  profiled_guid.size());
     }
     std::u16string device_id;
     if (request.device_id) {

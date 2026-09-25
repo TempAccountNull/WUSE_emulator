@@ -1401,6 +1401,54 @@ namespace sogen
         std::snprintf(buf, sizeof(buf), ",\"total_mips\":%.2f", total_mips);
         json += buf;
 
+        if (this->cmapi_interface_profile.enabled())
+        {
+            const auto profile = this->cmapi_interface_profile.read();
+            json += ",\"cmapi_interface_profile\":{\"guid_capacity\":" +
+                    std::to_string(cm_api_interface_profile::guid_capacity);
+            json += ",\"tracked_unique_guids\":" + std::to_string(profile.tracked_unique_guids);
+            json += ",\"untracked_guid_calls\":" + std::to_string(profile.untracked_guid_calls);
+            json += ",\"untracked_guid_nanos\":" + std::to_string(profile.untracked_guid_nanos);
+            json += ",\"by_flags\":{";
+            constexpr std::array names{"all_registered", "active_only", "invalid", "unparsed"};
+            for (size_t i = 0; i < names.size(); ++i)
+            {
+                const auto& bucket = profile.by_flags[i];
+                json += i == 0 ? "" : ",";
+                json += "\"" + std::string(names[i]) + "\":{\"calls\":" + std::to_string(bucket.calls);
+                json += ",\"nanos\":" + std::to_string(bucket.nanos);
+                json += ",\"max_nanos\":" + std::to_string(bucket.max_nanos) + "}";
+            }
+            json += "},\"top_guids\":[";
+            std::array<size_t, cm_api_interface_profile::guid_capacity> by_cost{};
+            for (size_t i = 0; i < profile.tracked_unique_guids; ++i) by_cost[i] = i;
+            std::sort(by_cost.begin(), by_cost.begin() + profile.tracked_unique_guids,
+                [&](size_t left, size_t right)
+                {
+                    return profile.by_guid[left].timing.nanos > profile.by_guid[right].timing.nanos;
+                });
+            const auto top_count = std::min<size_t>(profile.tracked_unique_guids, 4);
+            for (size_t rank = 0; rank < top_count; ++rank)
+            {
+                const auto& entry = profile.by_guid[by_cost[rank]];
+                const auto& g = entry.guid;
+                char guid_text[37];
+                std::snprintf(guid_text, sizeof(guid_text),
+                    "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                    g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6],
+                    g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+                json += rank == 0 ? "" : ",";
+                json += "{\"guid\":\"" + std::string(guid_text) + "\",\"calls\":" +
+                        std::to_string(entry.timing.calls);
+                json += ",\"nanos\":" + std::to_string(entry.timing.nanos);
+                json += ",\"max_nanos\":" + std::to_string(entry.timing.max_nanos);
+                json += ",\"all_registered_calls\":" + std::to_string(entry.calls_by_flags[0]);
+                json += ",\"active_only_calls\":" + std::to_string(entry.calls_by_flags[1]);
+                json += ",\"invalid_calls\":" + std::to_string(entry.calls_by_flags[2]) + "}";
+            }
+            json += "]}";
+        }
+
         if (!smp_profile.empty() && smp_profile.size() == activity.size())
         {
             // The first snapshot establishes a baseline; subsequent entries are 1 Hz deltas.
