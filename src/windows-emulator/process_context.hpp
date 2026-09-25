@@ -448,6 +448,7 @@ namespace sogen
         void deserialize(utils::buffer_deserializer& buffer, emulator_thread*& active_thread);
         void prepare_for_state_restore(windows_emulator& win_emu);
         void restore_after_state_restore(windows_emulator& win_emu);
+        void rebase_steady_deadlines(std::chrono::steady_clock::duration offset);
         void restore_windows_after_state_restore(windows_emulator& win_emu);
 
         generic_handle_store* get_handle_store(handle handle);

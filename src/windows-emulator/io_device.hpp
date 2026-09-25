@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <chrono>
 #include <memory>
 #include <string_view>
 #include <arch_emulator.hpp>
@@ -118,6 +119,10 @@ namespace sogen
             (void)win_emu;
         }
 
+        virtual void rebase_steady_deadlines(std::chrono::steady_clock::duration)
+        {
+        }
+
         NTSTATUS execute_ioctl(windows_emulator& win_emu, const io_device_context& c);
     };
 
@@ -170,6 +175,7 @@ namespace sogen
         }
 
         void work(windows_emulator& win_emu) override;
+        void rebase_steady_deadlines(std::chrono::steady_clock::duration offset) override;
         NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& context) override;
 
         void serialize_object(utils::buffer_serializer& buffer) const override;

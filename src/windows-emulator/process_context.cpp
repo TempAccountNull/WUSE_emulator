@@ -8,6 +8,7 @@
 #include "version/windows_version_manager.hpp"
 
 #include <utils/io.hpp>
+#include <utils/time.hpp>
 #include <utils/buffer_accessor.hpp>
 #include <regex>
 #include <sstream>
@@ -972,6 +973,27 @@ namespace sogen
         for (auto& port : this->ports | std::views::values)
         {
             port.prepare_for_state_restore(win_emu);
+        }
+    }
+
+    void process_context::rebase_steady_deadlines(const std::chrono::steady_clock::duration offset)
+    {
+        for (auto& thread : this->threads | std::views::values)
+        {
+            utils::rebase_steady_deadline(thread.await_time, offset);
+            if (thread.await_io_completion)
+            {
+                utils::rebase_steady_deadline(thread.await_io_completion->timeout, offset);
+            }
+            for (auto& timer : thread.user_timers | std::views::values)
+            {
+                utils::rebase_steady_deadline(timer.due_time, offset);
+            }
+        }
+
+        for (auto& device : this->devices | std::views::values)
+        {
+            device.rebase_steady_deadlines(offset);
         }
     }
 

@@ -181,6 +181,12 @@ namespace sogen
         this->device_->work(win_emu);
     }
 
+    void io_device_container::rebase_steady_deadlines(const std::chrono::steady_clock::duration offset)
+    {
+        this->assert_validity();
+        this->device_->rebase_steady_deadlines(offset);
+    }
+
     void io_device_container::serialize_object(utils::buffer_serializer& buffer) const
     {
         this->assert_validity();

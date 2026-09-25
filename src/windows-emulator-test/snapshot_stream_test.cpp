@@ -26,6 +26,23 @@ namespace sogen::test
                 return 0;
             }
         };
+
+        class snapshot_test_clock : public utils::clock
+        {
+          public:
+            explicit snapshot_test_clock(const steady_time_point now)
+                : now_(now)
+            {
+            }
+
+            steady_time_point steady_now() override
+            {
+                return this->now_;
+            }
+
+          private:
+            steady_time_point now_;
+        };
     }
 
     TEST(SnapshotStream, ChunkingPreservesLegacyMarkersAndZeroLengthFields)
@@ -201,6 +218,78 @@ namespace sogen::test
         EXPECT_EQ(restored.emu().read_instruction_pointer(), emu.emu().read_instruction_pointer());
         snapshot::write_emulator_snapshot(emu, file, false);
         EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory), std::filesystem::directory_iterator{}), 1);
+    }
+
+    TEST_F(SnapshotFile, RestoredHostDeadlinesFollowTheCurrentSteadyClockEpoch)
+    {
+        using steady_clock = std::chrono::steady_clock;
+        const auto saved_now = steady_clock::time_point{std::chrono::seconds{1'278'655}};
+        const auto restored_now = steady_clock::time_point{std::chrono::seconds{183'976}};
+        emulator_settings settings{.disable_logging = true};
+        settings.path_mappings["C:\\test-sample.exe"] = std::filesystem::current_path() / "test-sample.exe";
+        emulator_interfaces source_interfaces{};
+        source_interfaces.clock = std::make_unique<snapshot_test_clock>(saved_now);
+        auto source = create_sample_emulator(std::move(settings), {}, {}, std::move(source_interfaces));
+        source.setup_process_if_necessary();
+        const auto thread_handle = source.process.create_thread(source.memory, source.mod_manager.executable->entry_point, 0, 0x10000, 0);
+        auto* thread = source.process.threads.get(thread_handle);
+        ASSERT_NE(thread, nullptr);
+        thread->await_time = saved_now + std::chrono::milliseconds{1};
+        thread->await_io_completion = pending_io_completion_wait{};
+        thread->await_io_completion->timeout = steady_clock::time_point::min();
+        const user_timer_key key{.hwnd = 0x100, .timer_id = 7};
+        thread->user_timers[key].due_time = saved_now + std::chrono::milliseconds{250};
+        const auto saved_ticks = std::chrono::duration_cast<std::chrono::duration<uint64_t, std::ratio<1, 10'000'000>>>(
+                                     saved_now.time_since_epoch())
+                                     .count();
+        source.process.kusd.access([&](KUSER_SHARED_DATA64& kusd) {
+            kusd.InterruptTime.High1Time = static_cast<int32_t>(saved_ticks >> 32);
+            kusd.InterruptTime.High2Time = kusd.InterruptTime.High1Time;
+            kusd.InterruptTime.LowPart = static_cast<uint32_t>(saved_ticks);
+        });
+
+        utils::buffer_serializer serialized{};
+        ASSERT_NO_THROW(source.serialize(serialized));
+
+        emulator_settings restore_settings{.disable_logging = true};
+        restore_settings.path_mappings["C:\\test-sample.exe"] = std::filesystem::current_path() / "test-sample.exe";
+        emulator_interfaces restore_interfaces{};
+        restore_interfaces.clock = std::make_unique<snapshot_test_clock>(restored_now);
+        auto restored = create_sample_emulator(std::move(restore_settings), {}, {}, std::move(restore_interfaces));
+        utils::buffer_deserializer input{serialized.get_buffer()};
+        {
+            SCOPED_TRACE("new snapshot clock extension");
+            ASSERT_NO_THROW(restored.deserialize(input));
+        }
+
+        const auto* resumed = restored.process.threads.get(thread_handle);
+        ASSERT_NE(resumed, nullptr);
+        EXPECT_EQ(resumed->await_time, restored_now + std::chrono::milliseconds{1});
+        EXPECT_EQ(resumed->await_io_completion->timeout, steady_clock::time_point::min());
+        EXPECT_EQ(resumed->user_timers.at(key).due_time, restored_now + std::chrono::milliseconds{250});
+        EXPECT_EQ(input.get_remaining_size(), 0u);
+
+        // Existing checkpoint files predate the explicit clock anchor and must remain resumable.
+        auto legacy = serialized.get_buffer();
+        // buffer_serializer prefixes each scalar with a one-byte length marker.
+        constexpr auto extension_bytes = sizeof(uint64_t) + sizeof(steady_clock::duration::rep) + 2;
+        ASSERT_GE(legacy.size(), extension_bytes);
+        legacy.resize(legacy.size() - extension_bytes);
+        emulator_settings legacy_settings{.disable_logging = true};
+        legacy_settings.path_mappings["C:\\test-sample.exe"] = std::filesystem::current_path() / "test-sample.exe";
+        emulator_interfaces legacy_interfaces{};
+        legacy_interfaces.clock = std::make_unique<snapshot_test_clock>(restored_now);
+        auto legacy_restored = create_sample_emulator(std::move(legacy_settings), {}, {}, std::move(legacy_interfaces));
+        utils::buffer_deserializer legacy_input{legacy};
+        {
+            SCOPED_TRACE("legacy snapshot clock fallback");
+            ASSERT_NO_THROW(legacy_restored.deserialize(legacy_input));
+        }
+        const auto* legacy_thread = legacy_restored.process.threads.get(thread_handle);
+        ASSERT_NE(legacy_thread, nullptr);
+        EXPECT_EQ(legacy_thread->await_time, restored_now + std::chrono::milliseconds{1});
+        EXPECT_EQ(legacy_thread->user_timers.at(key).due_time, restored_now + std::chrono::milliseconds{250});
+        EXPECT_EQ(legacy_input.get_remaining_size(), 0u);
     }
 
     TEST_F(SnapshotFile, FailedPublicationPreservesExistingDestinationAndCleansStaging)

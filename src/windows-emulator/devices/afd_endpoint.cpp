@@ -459,6 +459,11 @@ namespace sogen
                 return STATUS_PENDING;
             }
 
+            void rebase_steady_deadlines(const std::chrono::steady_clock::duration offset) override
+            {
+                utils::rebase_steady_deadline(this->timeout_, offset);
+            }
+
             void work(windows_emulator& win_emu) override
             {
                 if (!this->s_ || (!this->delayed_ioctl_ && !this->event_select_mask_))

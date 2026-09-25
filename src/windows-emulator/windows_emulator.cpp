@@ -2617,8 +2617,43 @@ namespace sogen
         });
     }
 
+    namespace
+    {
+        constexpr uint64_t steady_clock_snapshot_marker = 0x314B434F4C435453ULL;
+
+        void restore_snapshot_deadlines(windows_emulator& emulator, utils::buffer_deserializer& buffer)
+        {
+            std::chrono::steady_clock::time_point saved_steady_time{};
+            if (buffer.get_remaining_size())
+            {
+                if (buffer.read<uint64_t>() != steady_clock_snapshot_marker)
+                {
+                    throw std::runtime_error("Invalid steady clock snapshot extension");
+                }
+                saved_steady_time = std::chrono::steady_clock::time_point{
+                    std::chrono::steady_clock::duration{buffer.read<std::chrono::steady_clock::duration::rep>()}};
+            }
+            else
+            {
+                // Older snapshots persisted absolute host-monotonic deadlines without an anchor. The saved
+                // KUSER_SHARED_DATA InterruptTime is the last sampled value of the same guest steady clock.
+                const auto ticks = emulator.process.kusd.access([](const KUSER_SHARED_DATA64& kusd) {
+                    return (static_cast<uint64_t>(static_cast<uint32_t>(kusd.InterruptTime.High1Time)) << 32) |
+                           kusd.InterruptTime.LowPart;
+                });
+                saved_steady_time = std::chrono::steady_clock::time_point{std::chrono::nanoseconds{ticks * 100}};
+            }
+
+            if (!emulator.uses_relative_time())
+            {
+                emulator.process.rebase_steady_deadlines(emulator.clock().steady_now() - saved_steady_time);
+            }
+        }
+    }
+
     void windows_emulator::serialize(utils::buffer_serializer& buffer) const
     {
+        const auto saved_steady_time = this->clock_->steady_now();
         buffer.write(this->application_settings_);
         buffer.write(this->setup_completed_);
         buffer.write(this->executed_instructions_);
@@ -2636,6 +2671,8 @@ namespace sogen
         this->process.serialize(buffer, this->vcpus_[0]->active_thread);
         this->memory.serialize_aslr_state(buffer);
         this->cng_changes.serialize(buffer);
+        buffer.write(steady_clock_snapshot_marker);
+        buffer.write(saved_steady_time.time_since_epoch().count());
     }
 
     void windows_emulator::deserialize(utils::buffer_deserializer& buffer)
@@ -2682,6 +2719,7 @@ namespace sogen
                                                                              IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) != 0,
                                             this->process.is_wow64_process, this->uses_relative_time());
         this->cng_changes.deserialize(buffer, *this);
+        restore_snapshot_deadlines(*this, buffer);
         this->process.restore_after_state_restore(*this);
     }
 
@@ -2704,6 +2742,7 @@ namespace sogen
     void windows_emulator::save_snapshot()
     {
         utils::buffer_serializer buffer{};
+        const auto saved_steady_time = this->clock_->steady_now();
 
         buffer.write(this->setup_completed_);
         buffer.write(this->executed_instructions_);
@@ -2721,6 +2760,8 @@ namespace sogen
         this->process.serialize(buffer, this->vcpus_[0]->active_thread);
         this->memory.serialize_aslr_state(buffer);
         this->cng_changes.serialize(buffer);
+        buffer.write(steady_clock_snapshot_marker);
+        buffer.write(saved_steady_time.time_since_epoch().count());
 
         this->process_snapshot_ = buffer.move_buffer();
     }
@@ -2766,6 +2807,7 @@ namespace sogen
                                                                              IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) != 0,
                                             this->process.is_wow64_process, this->uses_relative_time());
         this->cng_changes.deserialize(buffer, *this);
+        restore_snapshot_deadlines(*this, buffer);
         this->process.restore_after_state_restore(*this);
     }
 

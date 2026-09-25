@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <optional>
 
 #include <platform/platform.hpp>
 #if defined(_MSC_VER)
@@ -19,6 +20,15 @@ namespace sogen
 
     namespace utils
     {
+        inline void rebase_steady_deadline(std::optional<std::chrono::steady_clock::time_point>& deadline,
+                                           const std::chrono::steady_clock::duration offset)
+        {
+            if (deadline && *deadline != std::chrono::steady_clock::time_point::min())
+            {
+                *deadline += offset;
+            }
+        }
+
         struct clock
         {
             using system_time_point = std::chrono::system_clock::time_point;
