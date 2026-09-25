@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <iostream>
 #include <utils/finally.hpp>
 #include <utils/wildcard.hpp>
@@ -1261,8 +1262,11 @@ namespace sogen
                                    const ULONG length, const emulator_object<LARGE_INTEGER> byte_offset,
                                    const emulator_object<ULONG> /*key*/)
         {
+            const bool profile_read = c.win_emu.file_reads_profile.enabled();
+            const auto started = profile_read ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             std::string temp_buffer{};
             temp_buffer.resize(length);
+            const auto allocated = profile_read ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
             if (file_handle == STDIN_HANDLE)
             {
@@ -1327,6 +1331,24 @@ namespace sogen
                 return STATUS_INVALID_HANDLE;
             }
 
+            const auto nanos_between = [](const auto first, const auto last) {
+                return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(last - first).count());
+            };
+            file_read_profile::sample profile_sample{};
+            if (profile_read)
+            {
+                profile_sample.requested_bytes = length;
+                profile_sample.allocation_nanos = nanos_between(started, allocated);
+            }
+            const auto record_profile = utils::finally([&] {
+                if (profile_read)
+                {
+                    profile_sample.total_nanos = nanos_between(started, std::chrono::steady_clock::now());
+                    c.win_emu.file_reads_profile.record(f->name.ends_with(u".pkg"), profile_sample);
+                }
+            });
+
+            const auto seek_started = profile_read ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (byte_offset)
             {
                 const auto offset = byte_offset.read();
@@ -1345,12 +1367,27 @@ namespace sogen
                     }
                 }
             }
+            if (profile_read)
+            {
+                profile_sample.seek_nanos = nanos_between(seek_started, std::chrono::steady_clock::now());
+            }
 
+            const auto read_started = profile_read ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const auto bytes_read = fread(temp_buffer.data(), 1, temp_buffer.size(), f->handle);
+            if (profile_read)
+            {
+                profile_sample.host_read_nanos = nanos_between(read_started, std::chrono::steady_clock::now());
+                profile_sample.read_bytes = bytes_read;
+            }
 
             if (bytes_read > 0)
             {
+                const auto write_started = profile_read ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 commit_file_data(std::string_view(temp_buffer.data(), bytes_read), c.emu, io_status_block, buffer);
+                if (profile_read)
+                {
+                    profile_sample.guest_write_nanos = nanos_between(write_started, std::chrono::steady_clock::now());
+                }
                 deliver_file_io_completion(c, event, apc_routine, apc_context, io_status_block, STATUS_SUCCESS, bytes_read);
                 return STATUS_SUCCESS;
             }

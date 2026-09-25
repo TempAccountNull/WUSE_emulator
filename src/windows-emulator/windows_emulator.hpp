@@ -11,6 +11,7 @@
 #include "kernel_lock.hpp"
 #include "devices/cng_notifications.hpp"
 #include "devices/cm_api_profile.hpp"
+#include "file_read_profile.hpp"
 #include "logger.hpp"
 #include "file_system.hpp"
 #include "memory_manager.hpp"
@@ -194,6 +195,7 @@ namespace sogen
         syscall_dispatcher dispatcher;
         cng_notifications cng_changes;
         cm_api_interface_profile cmapi_interface_profile{};
+        file_read_profile file_reads_profile{};
 
         windows_emulator(std::unique_ptr<x86_64_emulator> emu, const emulator_settings& settings = {}, emulator_callbacks callbacks = {},
                          emulator_interfaces interfaces = {});

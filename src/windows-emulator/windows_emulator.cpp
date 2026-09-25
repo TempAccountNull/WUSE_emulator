@@ -1401,6 +1401,26 @@ namespace sogen
         std::snprintf(buf, sizeof(buf), ",\"total_mips\":%.2f", total_mips);
         json += buf;
 
+        if (this->file_reads_profile.enabled())
+        {
+            const auto profile = this->file_reads_profile.read();
+            const auto append_bucket = [&](const char* name, const file_read_profile::bucket& bucket) {
+                json += "\"" + std::string(name) + "\":{\"calls\":" + std::to_string(bucket.calls);
+                json += ",\"requested_bytes\":" + std::to_string(bucket.requested_bytes);
+                json += ",\"read_bytes\":" + std::to_string(bucket.read_bytes);
+                json += ",\"allocation_nanos\":" + std::to_string(bucket.allocation_nanos);
+                json += ",\"seek_nanos\":" + std::to_string(bucket.seek_nanos);
+                json += ",\"host_read_nanos\":" + std::to_string(bucket.host_read_nanos);
+                json += ",\"guest_write_nanos\":" + std::to_string(bucket.guest_write_nanos);
+                json += ",\"total_nanos\":" + std::to_string(bucket.total_nanos) + "}";
+            };
+            json += ",\"file_read_profile\":{";
+            append_bucket("package", profile.package);
+            json += ",";
+            append_bucket("other", profile.other);
+            json += "}";
+        }
+
         if (this->cmapi_interface_profile.enabled())
         {
             const auto profile = this->cmapi_interface_profile.read();
