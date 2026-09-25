@@ -1659,7 +1659,7 @@ namespace sogen
                 static detail::telemetry_shared_memory mapping;
                 (void)mapping.publish(json);
             }
-            else
+            if (!directory.empty())
             {
                 std::ofstream output(directory / "emu-status.json", std::ios::binary | std::ios::trunc);
                 output << json << '\n';

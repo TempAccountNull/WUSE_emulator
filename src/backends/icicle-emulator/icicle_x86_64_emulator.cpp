@@ -883,9 +883,12 @@ namespace sogen::icicle
                 {
                     if (vcpu.get() != self)
                     {
-                        this->queue_op(vcpu->index(), seq, [=](icicle_emulator* h) {
-                            ice(icicle_map_mmio(h, address, size, read_wrapper, ptr, write_wrapper, ptr), "Failed to map MMIO");
-                        });
+                        this->queue_op(
+                            vcpu->index(), seq,
+                            [=](icicle_emulator* h) {
+                                ice(icicle_map_mmio(h, address, size, read_wrapper, ptr, write_wrapper, ptr), "Failed to map MMIO");
+                            },
+                            std::nullopt, std::nullopt, pending_op_kind::map);
                     }
                 }
                 this->kick_peers(self->index());
@@ -964,25 +967,26 @@ namespace sogen::icicle
                     // this cost separately from the issuer's map/capture/queue timer.
                     auto* peer_profile = this->profile_enabled_ ? &v->smp_profile_ : nullptr;
                     const auto page_count = size / 0x1000;
-                    this->queue_op(v->index(), seq, [captured, address, page_count, peer_profile](icicle_emulator* h) {
-                        const auto start = peer_profile ? std::chrono::steady_clock::now()
-                                                        : std::chrono::steady_clock::time_point{};
-                        ice(icicle_smp_map_captured(h, captured.get(), address), "Failed to map captured SMP pages");
-                        if (peer_profile)
-                        {
-                            const auto nanos = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                std::chrono::steady_clock::now() - start).count());
-                            peer_profile->peer_map_calls.fetch_add(1, std::memory_order_relaxed);
-                            peer_profile->peer_map_pages.fetch_add(page_count, std::memory_order_relaxed);
-                            peer_profile->peer_map_nanos.fetch_add(nanos, std::memory_order_relaxed);
-                            auto maximum = peer_profile->peer_map_max_nanos.load(std::memory_order_relaxed);
-                            while (maximum < nanos &&
-                                   !peer_profile->peer_map_max_nanos.compare_exchange_weak(
-                                       maximum, nanos, std::memory_order_relaxed))
+                    this->queue_op(
+                        v->index(), seq,
+                        [captured, address, page_count, peer_profile](icicle_emulator* h) {
+                            const auto start = peer_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                            ice(icicle_smp_map_captured(h, captured.get(), address), "Failed to map captured SMP pages");
+                            if (peer_profile)
                             {
+                                const auto nanos = static_cast<uint64_t>(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+                                peer_profile->peer_map_calls.fetch_add(1, std::memory_order_relaxed);
+                                peer_profile->peer_map_pages.fetch_add(page_count, std::memory_order_relaxed);
+                                peer_profile->peer_map_nanos.fetch_add(nanos, std::memory_order_relaxed);
+                                auto maximum = peer_profile->peer_map_max_nanos.load(std::memory_order_relaxed);
+                                while (maximum < nanos &&
+                                       !peer_profile->peer_map_max_nanos.compare_exchange_weak(maximum, nanos, std::memory_order_relaxed))
+                                {
+                                }
                             }
-                        }
-                    });
+                        },
+                        std::nullopt, std::nullopt, pending_op_kind::map);
                 }
             }
             // A peer can observe pointers into this new region as soon as this syscall's guest-visible
@@ -1015,7 +1019,7 @@ namespace sogen::icicle
                 {
                     if (vcpu.get() != self)
                     {
-                        this->queue_op(vcpu->index(), seq, map_vm);
+                        this->queue_op(vcpu->index(), seq, map_vm, std::nullopt, std::nullopt, pending_op_kind::map);
                     }
                 }
                 this->kick_peers(self->index());
@@ -1083,9 +1087,10 @@ namespace sogen::icicle
             {
                 if (v.get() != self)
                 {
-                    this->queue_op(v->index(), seq, [address, source, size, perm](icicle_emulator* h) {
-                        icicle_map_shared_memory(h, address, source, size, perm);
-                    });
+                    this->queue_op(
+                        v->index(), seq,
+                        [address, source, size, perm](icicle_emulator* h) { icicle_map_shared_memory(h, address, source, size, perm); },
+                        std::nullopt, std::nullopt, pending_op_kind::map);
                 }
             }
             this->kick_peers(self->index());
@@ -1152,7 +1157,7 @@ namespace sogen::icicle
                 {
                     if (vcpu.get() != self)
                     {
-                        this->queue_op(vcpu->index(), seq, unmap_vm, std::pair{address, size});
+                        this->queue_op(vcpu->index(), seq, unmap_vm, std::pair{address, size}, std::nullopt, pending_op_kind::unmap);
                     }
                 }
                 this->kick_peers(self->index());
@@ -1675,34 +1680,36 @@ namespace sogen::icicle
             {
                 if (v->index() != own)
                 {
-                    this->queue_op(v->index(), pseq, [address, size, perm, all_smp_shared](icicle_emulator* h) {
-                        if (all_smp_shared)
-                        {
-                            icicle_refresh_peer_protection(h, address, size);
-                        }
-                        else
-                        {
-                            // Mixed ranges need per-page handling. Never replay an old permission
-                            // write over a shared page, even if another page in the range is local.
-                            // Local mappings still require their own permission update.
-                            size_t offset = 0;
-                            while (offset < size)
+                    this->queue_op(
+                        v->index(), pseq,
+                        [address, size, perm, all_smp_shared](icicle_emulator* h) {
+                            if (all_smp_shared)
                             {
-                                const auto page_address = address + offset;
-                                const auto length = std::min(size - offset,
-                                                             size_t{0x1000} - static_cast<size_t>(page_address & 0xfff));
-                                if (icicle_perm_epoch_of_range(h, page_address, length) != 0)
-                                {
-                                    icicle_refresh_peer_protection(h, page_address, length);
-                                }
-                                else
-                                {
-                                    ice(icicle_protect_memory(h, page_address, length, perm), "Failed to apply permissions");
-                                }
-                                offset += length;
+                                icicle_refresh_peer_protection(h, address, size);
                             }
-                        }
-                    });
+                            else
+                            {
+                                // Mixed ranges need per-page handling. Never replay an old permission
+                                // write over a shared page, even if another page in the range is local.
+                                // Local mappings still require their own permission update.
+                                size_t offset = 0;
+                                while (offset < size)
+                                {
+                                    const auto page_address = address + offset;
+                                    const auto length = std::min(size - offset, size_t{0x1000} - static_cast<size_t>(page_address & 0xfff));
+                                    if (icicle_perm_epoch_of_range(h, page_address, length) != 0)
+                                    {
+                                        icicle_refresh_peer_protection(h, page_address, length);
+                                    }
+                                    else
+                                    {
+                                        ice(icicle_protect_memory(h, page_address, length, perm), "Failed to apply permissions");
+                                    }
+                                    offset += length;
+                                }
+                            }
+                        },
+                        std::nullopt, std::nullopt, pending_op_kind::protect);
                 }
             }
             this->kick_peers(own);
@@ -2211,9 +2218,16 @@ namespace sogen::icicle
             // drain its own queue (GATEDIAG livelock at N>=4: q_i stuck forever, all parked).
             if (vcpu_index < this->vcpus_.size())
             {
+                const auto started =
+                    this->pending_drain_diagnostic_enabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 auto& worker = *this->vcpus_[vcpu_index];
                 std::lock_guard<std::recursive_mutex> parked_owner(worker.parked_vm_mutex_);
-                this->drain_pending_ops(worker);
+                const auto gate_acquired =
+                    this->pending_drain_diagnostic_enabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                pending_drain_diagnostic diagnostic{};
+                this->drain_pending_ops(worker, this->pending_drain_diagnostic_enabled_ ? &diagnostic : nullptr);
+                const auto drained =
+                    this->pending_drain_diagnostic_enabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 // Progress-meter safe point: the caller owns this vCPU and its VM is parked
                 // here, so both reads are race-free.
                 worker.published_instructions_.store(icicle_get_icount(worker.emu_), std::memory_order_relaxed);
@@ -2238,11 +2252,38 @@ namespace sogen::icicle
                         worker.jit_generation_compile_calls_.store(p.generation_compile_calls, std::memory_order_relaxed);
                         worker.jit_generation_compile_nanos_.store(p.generation_compile_nanos, std::memory_order_relaxed);
                         worker.jit_origin_first_address_compiles_.store(p.origin_first_address_compiles, std::memory_order_relaxed);
-                        worker.jit_origin_repeat_after_reset_compiles_.store(p.origin_repeat_after_reset_compiles, std::memory_order_relaxed);
-                        worker.jit_origin_repeat_in_generation_compiles_.store(p.origin_repeat_in_generation_compiles, std::memory_order_relaxed);
-                        worker.jit_origin_periodic_recompile_compiles_.store(p.origin_periodic_recompile_compiles, std::memory_order_relaxed);
+                        worker.jit_origin_repeat_after_reset_compiles_.store(p.origin_repeat_after_reset_compiles,
+                                                                             std::memory_order_relaxed);
+                        worker.jit_origin_repeat_in_generation_compiles_.store(p.origin_repeat_in_generation_compiles,
+                                                                               std::memory_order_relaxed);
+                        worker.jit_origin_periodic_recompile_compiles_.store(p.origin_periodic_recompile_compiles,
+                                                                             std::memory_order_relaxed);
                         worker.jit_origin_unclassified_compiles_.store(p.origin_unclassified_compiles, std::memory_order_relaxed);
                         worker.jit_origin_generation_number_.store(p.origin_generation_number, std::memory_order_relaxed);
+                    }
+                }
+                if (this->pending_drain_diagnostic_enabled_)
+                {
+                    const auto finished = std::chrono::steady_clock::now();
+                    const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(finished - started).count();
+                    if (total_ms >= 1500)
+                    {
+                        static std::atomic<unsigned> emitted{0};
+                        if (emitted.fetch_add(1, std::memory_order_relaxed) < 48)
+                        {
+                            const auto gate_ms = std::chrono::duration_cast<std::chrono::milliseconds>(gate_acquired - started).count();
+                            const auto drain_ms = std::chrono::duration_cast<std::chrono::milliseconds>(drained - gate_acquired).count();
+                            const auto publish_ms = std::chrono::duration_cast<std::chrono::milliseconds>(finished - drained).count();
+                            std::fprintf(stderr,
+                                         "[ICICLEPENDING] vcpu=%zu sync_ms=%lld gate_ms=%lld drain_ms=%lld publish_ms=%lld "
+                                         "queued=%zu applied=%zu map=%zu protect=%zu unmap=%zu invalidate=%zu other=%zu "
+                                         "slowest_kind=%s slowest_ms=%llu\n",
+                                         vcpu_index, static_cast<long long>(total_ms), static_cast<long long>(gate_ms),
+                                         static_cast<long long>(drain_ms), static_cast<long long>(publish_ms), diagnostic.queued,
+                                         diagnostic.applied, diagnostic.maps, diagnostic.protects, diagnostic.unmaps,
+                                         diagnostic.invalidations, diagnostic.other, pending_op_kind_name(diagnostic.slowest_kind),
+                                         static_cast<unsigned long long>(diagnostic.slowest_nanos / 1000000));
+                        }
                     }
                 }
             }
@@ -2529,6 +2570,10 @@ namespace sogen::icicle
             const char* value = std::getenv("SOGEN_SMP_PROFILE");
             return value && std::strcmp(value, "1") == 0;
         }();
+        const bool pending_drain_diagnostic_enabled_ = [] {
+            const char* value = std::getenv("SOGEN_LOCK_ATTRIBUTION");
+            return value && std::strcmp(value, "1") == 0;
+        }();
         uint32_t index_{0};
 
         // icicle_vcpu::start() runs pending hook installs/deletes through the machine (hook machinery is
@@ -2582,6 +2627,15 @@ namespace sogen::icicle
         // sequences (the loader's map->protect) ALWAYS apply in order; the perm_epoch stale-skip
         // only applies to CROSS-issuer ops (a stale protect from another thread over a range this
         // issuer remapped). This reconciles eager application with the epoch guard.
+        enum class pending_op_kind : uint8_t
+        {
+            other,
+            map,
+            protect,
+            unmap,
+            invalidate,
+        };
+
         struct pending_op
         {
             uint64_t seq{}; // issuer-local sequence number
@@ -2590,7 +2644,38 @@ namespace sogen::icicle
             std::optional<std::pair<uint64_t, size_t>> unmap_range{};
             // Page span is diagnostic metadata; it never changes queue order or execution.
             std::optional<std::pair<uint64_t, uint64_t>> invalidate_page_span{};
+            pending_op_kind kind{pending_op_kind::other};
         };
+
+        struct pending_drain_diagnostic
+        {
+            size_t queued{};
+            size_t applied{};
+            size_t maps{};
+            size_t protects{};
+            size_t unmaps{};
+            size_t invalidations{};
+            size_t other{};
+            pending_op_kind slowest_kind{pending_op_kind::other};
+            uint64_t slowest_nanos{};
+        };
+
+        static const char* pending_op_kind_name(const pending_op_kind kind)
+        {
+            switch (kind)
+            {
+            case pending_op_kind::map:
+                return "map";
+            case pending_op_kind::protect:
+                return "protect";
+            case pending_op_kind::unmap:
+                return "unmap";
+            case pending_op_kind::invalidate:
+                return "invalidate";
+            default:
+                return "other";
+            }
+        }
 
         std::vector<std::vector<pending_op>> pending_ops_{}; // [vm index] -> ops(handle)
         // Next sequence number per issuer vCPU index (monotonic).
@@ -2628,7 +2713,8 @@ namespace sogen::icicle
 
         void queue_op(const size_t target, const uint64_t seq, std::function<void(icicle_emulator*)> op,
                       const std::optional<std::pair<uint64_t, size_t>> unmap_range = std::nullopt,
-                      const std::optional<std::pair<uint64_t, uint64_t>> invalidate_page_span = std::nullopt)
+                      const std::optional<std::pair<uint64_t, uint64_t>> invalidate_page_span = std::nullopt,
+                      const pending_op_kind kind = pending_op_kind::other)
         {
             auto* self = this->mutation_owner();
             auto* profile = this->profile_enabled_ && self ? &self->smp_profile_ : nullptr;
@@ -2655,7 +2741,7 @@ namespace sogen::icicle
                     }
                 }
                 const auto ticket = this->ops_issued_watermark_.load(std::memory_order_relaxed) + 1;
-                pending.push_back(pending_op{seq, ticket, std::move(op), unmap_range, invalidate_page_span});
+                pending.push_back(pending_op{seq, ticket, std::move(op), unmap_range, invalidate_page_span, kind});
                 this->ops_completed_out_of_order_.push_back(0);
                 this->ops_issued_watermark_.store(ticket, std::memory_order_release);
             }
@@ -2676,18 +2762,21 @@ namespace sogen::icicle
                     static_cast<uint64_t>(size - 1), std::numeric_limits<uint64_t>::max() - address);
                 page_span = std::pair{address & page_mask, last & page_mask};
             }
-            this->queue_op(target, seq, [address, size, profile](icicle_emulator* h) {
-                const smp_profile_timer apply_timer{profile ? &profile->invalidate_apply_nanos : nullptr};
-                const bool changed = icicle_invalidate_code_range(h, address, size) != 0;
-                if (profile)
-                {
-                    profile->invalidate_applied.fetch_add(1, std::memory_order_relaxed);
-                    if (!changed)
+            this->queue_op(
+                target, seq,
+                [address, size, profile](icicle_emulator* h) {
+                    const smp_profile_timer apply_timer{profile ? &profile->invalidate_apply_nanos : nullptr};
+                    const bool changed = icicle_invalidate_code_range(h, address, size) != 0;
+                    if (profile)
                     {
-                        profile->invalidate_no_change.fetch_add(1, std::memory_order_relaxed);
+                        profile->invalidate_applied.fetch_add(1, std::memory_order_relaxed);
+                        if (!changed)
+                        {
+                            profile->invalidate_no_change.fetch_add(1, std::memory_order_relaxed);
+                        }
                     }
-                }
-            }, std::nullopt, page_span);
+                },
+                std::nullopt, page_span, pending_op_kind::invalidate);
         }
 
         void complete_op(const uint64_t ticket)
@@ -3264,12 +3353,16 @@ namespace sogen::icicle
         }
 
         // 6.5 — run the ops queued for this vCPU on its own thread (safe), before it next executes.
-        void drain_pending_ops(icicle_vcpu& v)
+        void drain_pending_ops(icicle_vcpu& v, pending_drain_diagnostic* diagnostic = nullptr)
         {
             std::vector<pending_op> ops;
             {
                 std::lock_guard<std::mutex> lock(this->pending_mutex_);
                 ops.swap(this->pending_ops_[v.index_]);
+            }
+            if (diagnostic)
+            {
+                diagnostic->queued = ops.size();
             }
             // 6.6c'': reentrancy guard - drained ops (maps/protects) can re-enter host write paths;
             // a nested drain must not run (double-apply/ordering corruption + the CrossVmMap/
@@ -3286,7 +3379,37 @@ namespace sogen::icicle
             const auto clear = utils::finally([] { t_draining_own_queue = false; });
             for (auto& op : ops)
             {
+                const auto started = diagnostic ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 op.apply(v.handle());
+                if (diagnostic)
+                {
+                    const auto nanos = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+                    ++diagnostic->applied;
+                    switch (op.kind)
+                    {
+                    case pending_op_kind::map:
+                        ++diagnostic->maps;
+                        break;
+                    case pending_op_kind::protect:
+                        ++diagnostic->protects;
+                        break;
+                    case pending_op_kind::unmap:
+                        ++diagnostic->unmaps;
+                        break;
+                    case pending_op_kind::invalidate:
+                        ++diagnostic->invalidations;
+                        break;
+                    default:
+                        ++diagnostic->other;
+                        break;
+                    }
+                    if (nanos > diagnostic->slowest_nanos)
+                    {
+                        diagnostic->slowest_nanos = nanos;
+                        diagnostic->slowest_kind = op.kind;
+                    }
+                }
                 this->complete_op(op.ticket);
             }
         }
