@@ -347,16 +347,18 @@ namespace sogen
         }
         catch (std::exception& e)
         {
-            win_emu.log.error("Syscall %s threw an exception: 0x%X (raw: 0x%X) (0x%" PRIx64 ") - %s\n", syscall_name, syscall_id,
-                              raw_syscall_id, address, e.what());
+            const auto* module = win_emu.mod_manager.find_name(address);
+            win_emu.log.error("Syscall %s threw an exception: 0x%X (raw: 0x%X) @ Module: %s (0x%" PRIx64 ") - %s\n",
+                              syscall_name, syscall_id, raw_syscall_id, module ? module : "<unknown>", address, e.what());
             win_emu.record_stop(stop_reason::syscall_exception, std::string(syscall_name) + ": " + e.what());
             emu.reg<uint64_t>(x86_register::rax, STATUS_UNSUCCESSFUL);
             win_emu.stop();
         }
         catch (...)
         {
-            win_emu.log.error("Syscall %s threw an unknown exception: 0x%X (raw: 0x%X) (0x%" PRIx64 ")\n", syscall_name, syscall_id,
-                              raw_syscall_id, address);
+            const auto* module = win_emu.mod_manager.find_name(address);
+            win_emu.log.error("Syscall %s threw an unknown exception: 0x%X (raw: 0x%X) @ Module: %s (0x%" PRIx64 ")\n",
+                              syscall_name, syscall_id, raw_syscall_id, module ? module : "<unknown>", address);
             win_emu.record_stop(stop_reason::syscall_exception, std::string(syscall_name) + ": <unknown exception>");
             emu.reg<uint64_t>(x86_register::rax, STATUS_UNSUCCESSFUL);
             win_emu.stop();
