@@ -2278,13 +2278,15 @@ namespace sogen::icicle
                             std::fprintf(stderr,
                                          "[ICICLEPENDING] vcpu=%zu sync_ms=%lld gate_ms=%lld drain_ms=%lld publish_ms=%lld "
                                          "queued=%zu applied=%zu map=%zu protect=%zu unmap=%zu invalidate=%zu other=%zu "
-                                         "slowest_kind=%s slowest_ms=%llu slowest_map_origin=%s slowest_mapped_bytes=%zu\n",
+                                         "slowest_kind=%s slowest_ms=%llu slowest_map_origin=%s slowest_mapped_bytes=%zu "
+                                         "slowest_unmapped_bytes=%zu\n",
                                          vcpu_index, static_cast<long long>(total_ms), static_cast<long long>(gate_ms),
                                          static_cast<long long>(drain_ms), static_cast<long long>(publish_ms), diagnostic.queued,
                                          diagnostic.applied, diagnostic.maps, diagnostic.protects, diagnostic.unmaps,
                                          diagnostic.invalidations, diagnostic.other, pending_op_kind_name(diagnostic.slowest_kind),
                                          static_cast<unsigned long long>(diagnostic.slowest_nanos / 1000000),
-                                         pending_map_origin_name(diagnostic.slowest_map_origin), diagnostic.slowest_mapped_bytes);
+                                         pending_map_origin_name(diagnostic.slowest_map_origin), diagnostic.slowest_mapped_bytes,
+                                         diagnostic.slowest_unmapped_bytes);
                         }
                     }
                 }
@@ -2672,6 +2674,7 @@ namespace sogen::icicle
             pending_op_kind slowest_kind{pending_op_kind::other};
             pending_map_origin slowest_map_origin{pending_map_origin::none};
             size_t slowest_mapped_bytes{};
+            size_t slowest_unmapped_bytes{};
             uint64_t slowest_nanos{};
         };
 
@@ -3444,6 +3447,7 @@ namespace sogen::icicle
                         diagnostic->slowest_kind = op.kind;
                         diagnostic->slowest_map_origin = op.map_origin;
                         diagnostic->slowest_mapped_bytes = op.mapped_bytes;
+                        diagnostic->slowest_unmapped_bytes = op.unmap_range ? op.unmap_range->second : 0;
                     }
                 }
                 this->complete_op(op.ticket);
