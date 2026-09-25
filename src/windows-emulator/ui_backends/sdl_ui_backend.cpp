@@ -34,6 +34,24 @@ namespace sogen
         }
 #endif
 
+        // ui_window_desc::rect is the guest outer window rectangle, while SDL positions the client origin.
+        // Measure the actual native frame so the title bar remains visible at the requested screen position.
+        void set_host_window_outer_position(SDL_Window* window, int outer_x, int outer_y)
+        {
+#ifdef _WIN32
+            auto* hwnd =
+                static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+            RECT frame{};
+            POINT client_origin{};
+            if (hwnd && GetWindowRect(hwnd, &frame) && ClientToScreen(hwnd, &client_origin))
+            {
+                outer_x += client_origin.x - frame.left;
+                outer_y += client_origin.y - frame.top;
+            }
+#endif
+            SDL_SetWindowPosition(window, outer_x, outer_y);
+        }
+
         // X11 can run without a window manager to process SDL's SetKeyboardFocus request. Use XSetInputFocus
         // instead, but only when no external X11 client owns the focus.
         void apply_x11_focus_fallback(SDL_Window* window)
@@ -1091,7 +1109,7 @@ namespace sogen
                     return;
                 }
 
-                SDL_SetWindowPosition(window, desc.rect.left, desc.rect.top);
+                set_host_window_outer_position(window, desc.rect.left, desc.rect.top);
                 SDL_StartTextInput(window);
                 if ((flags & SDL_WINDOW_HIDDEN) == 0)
                 {
@@ -1152,7 +1170,7 @@ namespace sogen
                         if (state->desc.top_level)
                         {
                             const auto& insets = state->desc.client_insets;
-                            SDL_SetWindowPosition(state->window, rect.left, rect.top);
+                            set_host_window_outer_position(state->window, rect.left, rect.top);
                             SDL_SetWindowSize(state->window, std::max<int>(1, (rect.right - rect.left) - insets.left - insets.right),
                                               std::max<int>(1, (rect.bottom - rect.top) - insets.top - insets.bottom));
                         }
