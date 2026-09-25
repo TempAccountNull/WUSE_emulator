@@ -32,7 +32,8 @@ endif()
 # main.cpp is a large translation unit (CLI11 plus the analysis code) that exceeds the COFF section
 # limit in Debug builds without the large-object format.
 if(MSVC)
-  target_compile_options(windows-analyzer PRIVATE /bigobj)
+  target_compile_options(windows-analyzer PRIVATE /bigobj $<$<CONFIG:Release>:/FS>)
+  set_property(TARGET windows-analyzer PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
 elseif(MINGW)
   target_compile_options(windows-analyzer PRIVATE -Wa,-mbig-obj)
 endif()
