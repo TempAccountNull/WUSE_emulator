@@ -272,15 +272,25 @@ namespace sogen
 
             if (utils::string::equals_ignore_case(filename_sv, u"DBWIN_BUFFER"sv))
             {
-                constexpr auto dbwin_buffer_section_size = 0x1000;
+                for (const auto& [index, existing] : c.proc.sections)
+                {
+                    if (utils::string::equals_ignore_case(std::u16string_view(existing.name), u"DBWIN_BUFFER"sv))
+                    {
+                        const auto h = c.proc.sections.make_handle(index);
+                        c.proc.sections.duplicate(h);
+                        section_handle.write(h);
+                        return STATUS_SUCCESS;
+                    }
+                }
 
-                const auto address = c.win_emu.memory.find_free_allocation_base(dbwin_buffer_section_size);
-                c.win_emu.memory.allocate_memory(address, dbwin_buffer_section_size, memory_permission::read_write, false,
-                                                 memory_region_kind::pagefile_section_view);
-                c.proc.dbwin_buffer = address;
-                c.proc.dbwin_buffer_size = dbwin_buffer_section_size;
-
-                section_handle.write(DBWIN_BUFFER);
+                section dbwin{};
+                dbwin.name = u"DBWIN_BUFFER";
+                dbwin.maximum_size = 0x1000;
+                dbwin.section_page_protection = PAGE_READWRITE;
+                dbwin.allocation_attributes = SEC_COMMIT;
+                // The debug monitor keeps the named section alive across transient guest opens.
+                dbwin.ref_count = 2;
+                section_handle.write(c.proc.sections.store(std::move(dbwin)));
                 return STATUS_SUCCESS;
             }
 
@@ -378,21 +388,6 @@ namespace sogen
                 if (view_size)
                 {
                     view_size.write(shared_section_size);
-                }
-
-                base_address.write(address);
-
-                return STATUS_SUCCESS;
-            }
-
-            if (section_handle == DBWIN_BUFFER)
-            {
-                const auto dbwin_buffer_section_size = c.proc.dbwin_buffer_size;
-                const auto address = c.proc.dbwin_buffer;
-
-                if (view_size)
-                {
-                    view_size.write(dbwin_buffer_section_size);
                 }
 
                 base_address.write(address);
@@ -567,6 +562,12 @@ namespace sogen
                 }
                 base_address.write(address);
                 view_size.write(length);
+                if (utils::string::equals_ignore_case(std::u16string_view(section_entry->name), u"DBWIN_BUFFER"sv))
+                {
+                    c.proc.dbwin_views.push_back(address);
+                    c.proc.dbwin_buffer = address;
+                    c.proc.dbwin_buffer_size = length;
+                }
                 if (section_offset)
                 {
                     section_offset.write(LARGE_INTEGER{.QuadPart = static_cast<int64_t>(aligned_offset)});
@@ -822,14 +823,6 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
-            if (c.proc.dbwin_buffer && is_within_start_and_length(base_address, c.proc.dbwin_buffer, c.proc.dbwin_buffer_size))
-            {
-                const auto address = c.proc.dbwin_buffer;
-                c.proc.dbwin_buffer = 0;
-                c.win_emu.memory.release_memory(address, static_cast<size_t>(c.proc.dbwin_buffer_size));
-                return STATUS_SUCCESS;
-            }
-
             const auto* mod = c.win_emu.mod_manager.find_by_address(base_address);
             if (mod != nullptr)
             {
@@ -847,7 +840,14 @@ namespace sogen
                 if (const auto source = c.win_emu.memory.shared_view_source(region_info.allocation_base))
                 {
                     const auto backing = c.win_emu.memory.get_region_info(source).allocation_base;
+                    const auto dbwin_view = std::ranges::find(c.proc.dbwin_views, region_info.allocation_base);
                     c.win_emu.memory.release_memory(region_info.allocation_base, 0);
+                    if (dbwin_view != c.proc.dbwin_views.end())
+                    {
+                        c.proc.dbwin_views.erase(dbwin_view);
+                        c.proc.dbwin_buffer = c.proc.dbwin_views.empty() ? 0 : c.proc.dbwin_views.back();
+                        c.proc.dbwin_buffer_size = c.proc.dbwin_views.empty() ? 0 : 0x1000;
+                    }
                     const auto handle_alive =
                         std::ranges::any_of(c.proc.sections, [&](const auto& entry) { return entry.second.backing_address == backing; });
                     if (!handle_alive && !c.win_emu.memory.has_shared_views(backing))
