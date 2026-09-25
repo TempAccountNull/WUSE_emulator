@@ -179,6 +179,113 @@ namespace
         return results[0] != results[1];
     }
 
+    bool run_smp_fair_load()
+    {
+        constexpr size_t worker_count = 4; // More runnable guest threads than the test's two vCPUs.
+        constexpr uint64_t iterations = 500'000;
+        std::atomic<unsigned> ready{0};
+        std::atomic<bool> go{false};
+        std::array<uint64_t, worker_count> results{};
+        std::array<uint64_t, worker_count> progress{};
+        std::array<DWORD, worker_count> tids{};
+        std::array<std::thread, worker_count> workers;
+
+        for (size_t index = 0; index < worker_count; ++index)
+        {
+            workers[index] = std::thread([&, index] {
+                volatile uint64_t value = index + 1;
+                ready.fetch_add(1, std::memory_order_release);
+                while (!go.load(std::memory_order_acquire))
+                {
+                    _mm_pause();
+                }
+                tids[index] = GetCurrentThreadId();
+                uint64_t completed = 0;
+                for (; completed < iterations; ++completed)
+                {
+                    value = value * 6364136223846793005ULL + completed;
+                }
+                progress[index] = completed;
+                results[index] = value;
+            });
+        }
+
+        while (ready.load(std::memory_order_acquire) != worker_count)
+        {
+            Sleep(0);
+        }
+        puts("SOGEN_SMP_FAIR_START");
+        fflush(stdout);
+        go.store(true, std::memory_order_release);
+        for (auto& worker : workers)
+        {
+            worker.join();
+        }
+        for (size_t index = 0; index < worker_count; ++index)
+        {
+            printf("SOGEN_SMP_FAIR_WORKER %u %lu %llu %llu\n",
+                   static_cast<unsigned>(index), static_cast<unsigned long>(tids[index]),
+                   static_cast<unsigned long long>(progress[index]), static_cast<unsigned long long>(results[index]));
+        }
+        printf("SOGEN_SMP_FAIR_END %u\n", static_cast<unsigned>(worker_count));
+        fflush(stdout);
+        return true;
+    }
+
+    bool run_smp_scaling_load()
+    {
+        constexpr size_t worker_count = 8;
+        constexpr uint64_t iterations = 250'000;
+        std::atomic<unsigned> ready{0};
+        std::atomic<bool> go{false};
+        std::array<uint64_t, worker_count> results{};
+        std::array<uint64_t, worker_count> progress{};
+        std::array<DWORD, worker_count> tids{};
+        std::array<std::thread, worker_count> workers;
+
+        for (size_t index = 0; index < worker_count; ++index)
+        {
+            workers[index] = std::thread([&, index] {
+                volatile uint64_t value = index + 1;
+                ready.fetch_add(1, std::memory_order_release);
+                while (!go.load(std::memory_order_acquire))
+                {
+                    _mm_pause();
+                }
+                tids[index] = GetCurrentThreadId();
+                uint64_t completed = 0;
+                for (; completed < iterations; ++completed)
+                {
+                    value = value * 6364136223846793005ULL + completed;
+                }
+                progress[index] = completed;
+                results[index] = value;
+            });
+        }
+
+        while (ready.load(std::memory_order_acquire) != worker_count)
+        {
+            Sleep(0);
+        }
+        puts("SOGEN_SMP_SCALING_START");
+        fflush(stdout);
+        go.store(true, std::memory_order_release);
+        for (auto& worker : workers)
+        {
+            worker.join();
+        }
+        puts("SOGEN_SMP_SCALING_END");
+        fflush(stdout);
+        for (size_t index = 0; index < worker_count; ++index)
+        {
+            printf("SOGEN_SMP_SCALING_WORKER %u %lu %llu %llu\n",
+                   static_cast<unsigned>(index), static_cast<unsigned long>(tids[index]),
+                   static_cast<unsigned long long>(progress[index]), static_cast<unsigned long long>(results[index]));
+        }
+        fflush(stdout);
+        return true;
+    }
+
     bool test_tls()
     {
         std::atomic_bool kill{false};
@@ -1986,7 +2093,15 @@ int main(const int argc, const char* argv[])
     {
         return run_smp_cpu_load() ? 0 : 1;
     }
+    if (argc == 2 && argv[1] == "-smp-fair"sv)
+    {
+        return run_smp_fair_load() ? 0 : 1;
+    }
 
+    if (argc == 2 && argv[1] == "-smp-scaling"sv)
+    {
+        return run_smp_scaling_load() ? 0 : 1;
+    }
     if (argc == 2 && argv[1] == "-time"sv)
     {
         print_time();
