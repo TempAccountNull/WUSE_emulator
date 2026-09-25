@@ -173,3 +173,8 @@ dist_local/
 /src/backends/icicle-emulator/icicle-bridge/cargo-build/
 /src/backends/icicle-emulator/icicle-bridge/vendor/icicle-mem/target/
 /src/backends/icicle-emulator/icicle-bridge/vendor/icicle-mem/Cargo.lock
+
+# Cargo intermediate output from nested Icicle bridge crates
+/src/backends/icicle-emulator/icicle-bridge/target/
+/src/backends/icicle-emulator/icicle-bridge/vendor/*/target/
+**/.fingerprint/
