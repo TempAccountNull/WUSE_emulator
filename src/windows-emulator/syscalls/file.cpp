@@ -96,11 +96,10 @@ namespace sogen
                 return path;
             }
 
-            std::pair<utils::file_handle, NTSTATUS> open_file(const file_system& file_sys, const windows_path& path,
-                                                              const std::u16string& mode)
+            std::pair<utils::file_handle, NTSTATUS> open_file(const std::filesystem::path& host_path, const std::u16string& mode)
             {
                 FILE* file{};
-                const auto error = open_unicode(&file, file_sys.translate(path), mode);
+                const auto error = open_unicode(&file, host_path, mode);
 
                 if (file)
                 {
@@ -1125,7 +1124,7 @@ namespace sogen
                     return ret(STATUS_BUFFER_OVERFLOW);
                 }
 
-                auto [native_file_handle, status] = open_file(c.win_emu.file_sys, filename, u"r");
+                auto [native_file_handle, status] = open_file(c.win_emu.file_sys.translate(filename), u"r");
                 if (status != STATUS_SUCCESS)
                 {
                     return ret(status);
@@ -1972,7 +1971,7 @@ namespace sogen
                 return STATUS_NOT_SUPPORTED;
             }
 
-            auto [native_file_handle, status] = open_file(c.win_emu.file_sys, path, mode);
+            auto [native_file_handle, status] = open_file(host_path, mode);
             if (status != STATUS_SUCCESS)
             {
                 return status;
