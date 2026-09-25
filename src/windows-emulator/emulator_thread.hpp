@@ -293,6 +293,8 @@ namespace sogen
 
         uint32_t id{};
         uint32_t ideal_processor{};
+        std::optional<uint32_t> last_vcpu{};
+        bool affinity_deferred_once{};
 
         uint64_t current_ip{0};
         uint64_t previous_ip{0};

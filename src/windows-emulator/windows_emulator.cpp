@@ -1,5 +1,6 @@
 #include "std_include.hpp"
 #include "windows_emulator.hpp"
+#include "guest_thread_affinity.hpp"
 #include "scheduler_vm_gate.hpp"
 
 #include <cctype>
@@ -32,6 +33,15 @@ namespace sogen
         {
             static const bool enabled = [] {
                 const auto* value = std::getenv("SOGEN_SCHEDULER_PROFILE");
+                return value && std::strcmp(value, "1") == 0;
+            }();
+            return enabled;
+        }
+
+        bool guest_thread_affinity_enabled()
+        {
+            static const bool enabled = [] {
+                const auto* value = std::getenv("SOGEN_SMP_GUEST_THREAD_AFFINITY");
                 return value && std::strcmp(value, "1") == 0;
             }();
             return enabled;
@@ -646,6 +656,11 @@ namespace sogen
             }
 
             thread.apc_alertable = false;
+            if (guest_thread_affinity_enabled())
+            {
+                thread.last_vcpu = static_cast<uint32_t>(vcpu.cpu.index());
+                thread.affinity_deferred_once = false;
+            }
             return true;
         }
 
@@ -665,36 +680,10 @@ namespace sogen
             perform_context_switch_work(win_emu, vcpu);
 
             auto& context = win_emu.process;
-
-            bool next_thread = false;
-
-            for (auto& t : context.threads | std::views::values)
-            {
-                if (next_thread)
-                {
-                    if (switch_to_thread(win_emu, vcpu, t))
-                    {
-                        return true;
-                    }
-
-                    continue;
-                }
-
-                if (&t == vcpu.active_thread)
-                {
-                    next_thread = true;
-                }
-            }
-
-            for (auto& t : context.threads | std::views::values)
-            {
-                if (switch_to_thread(win_emu, vcpu, t))
-                {
-                    return true;
-                }
-            }
-
-            return false;
+            return detail::select_next_guest_thread(
+                context.threads | std::views::values, vcpu.active_thread, static_cast<uint32_t>(vcpu.cpu.index()),
+                guest_thread_affinity_enabled() && win_emu.vcpu_count() > 1,
+                [&](emulator_thread& thread) { return switch_to_thread(win_emu, vcpu, thread); });
         }
 
         struct instruction_tick_clock : utils::tick_clock
