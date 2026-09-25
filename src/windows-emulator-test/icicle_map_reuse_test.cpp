@@ -73,4 +73,47 @@ namespace sogen::test
         ASSERT_TRUE(read_on_worker(1, observed));
         EXPECT_EQ(observed, new_value);
     }
+
+    // Recycle a 64-KiB reservation with committed pages into a one-page section
+    // while the other vCPU still has queued map/unmap operations for the same VA.
+    TEST(IcicleSmp, ReuseReservedAndCommittedSlotAcrossVcpus)
+    {
+        constexpr uint64_t address = 0x5edb3d0000;
+        constexpr size_t allocation_size = 0x10000;
+        constexpr size_t page_size = 0x1000;
+        const nt_memory_permission permissions{memory_permission::read_write};
+        auto emu = icicle::create_x86_64_emulator(2);
+        ASSERT_EQ(emu->vcpu_count(), 2U);
+        memory_manager memory(*emu);
+        for (size_t iteration = 0; iteration < 32; ++iteration)
+        {
+            const auto reservation_owner = iteration % 2;
+            const auto section_owner = (iteration + 1) % 2;
+            emu->set_scheduler_worker_context(reservation_owner, true);
+            {
+                const auto clear = utils::finally([&] { emu->set_scheduler_worker_context(reservation_owner, false); });
+                ASSERT_TRUE(memory.allocate_memory(address, allocation_size, permissions, true));
+                ASSERT_TRUE(memory.commit_memory(address, 2 * page_size, permissions));
+                ASSERT_TRUE(memory.commit_memory(address + 2 * page_size, page_size, permissions));
+                ASSERT_TRUE(memory.release_memory(address, 0));
+            }
+            emu->set_scheduler_worker_context(section_owner, true);
+            {
+                const auto clear = utils::finally([&] { emu->set_scheduler_worker_context(section_owner, false); });
+                bool mapped = false;
+                ASSERT_NO_THROW(mapped = memory.allocate_memory(address, page_size, permissions, false,
+                                                                 memory_region_kind::pagefile_section_view));
+                ASSERT_TRUE(mapped) << "iteration=" << iteration;
+                const uint64_t marker = iteration + 1;
+                ASSERT_TRUE(emu->try_write_memory(address, &marker, sizeof(marker)));
+                uint64_t observed{};
+                ASSERT_TRUE(emu->try_read_memory(address, &observed, sizeof(observed)));
+                EXPECT_EQ(observed, marker);
+                ASSERT_TRUE(memory.release_memory(address, 0));
+            }
+        }
+        ASSERT_NO_THROW(emu->sync_worker_context(0));
+        ASSERT_NO_THROW(emu->sync_worker_context(1));
+        EXPECT_TRUE(emu->smp_op_applied(emu->smp_op_watermark()));
+    }
 }
