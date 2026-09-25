@@ -115,6 +115,26 @@ namespace sogen::icicle
             }
         }
 
+        constexpr size_t context_record_bytes = 1232;
+
+        struct context_write_retry_probe
+        {
+            uint64_t address{};
+            bool initial_failed{};
+        };
+
+        void diagnose_context_write_retry(const uint64_t address, const int64_t caller_vcpu, const bool succeeded, const char* disposition)
+        {
+            static std::atomic<unsigned> emitted{0};
+            if (emitted.fetch_add(1, std::memory_order_relaxed) >= 16)
+            {
+                return;
+            }
+            std::fprintf(stderr, "[ICWRITE] context-retry addr=%#llx bytes=%zu caller_vcpu=%lld final=%s disposition=%s tid=%u\n",
+                         static_cast<unsigned long long>(address), context_record_bytes, static_cast<long long>(caller_vcpu),
+                         succeeded ? "success" : "failure", disposition, static_cast<unsigned>(GetCurrentThreadId()));
+        }
+
         // SMP deadlock tracing (SOGEN_SMP_TRACE=1): prints every cross-VM coordination event with
         // values so a hung run's stderr tail shows exactly which wait is stuck and on which vCPU.
         bool smp_trace_enabled()
@@ -182,6 +202,7 @@ namespace sogen::icicle
     // True while THIS thread is inside drain_pending_ops: a drained op (e.g. a map) can re-enter
     // try_write_memory, which would otherwise drain again (re-entrancy broke CrossVmMap/RangedExec).
     thread_local bool t_draining_own_queue = false;
+    thread_local context_write_retry_probe* t_context_write_retry_probe = nullptr;
 
         uint64_t configured_memory_limit_mib()
         {
@@ -876,6 +897,10 @@ namespace sogen::icicle
                 bool ok = icicle_write_memory(this->emu_, address, data, size);
                 if (!ok)
                 {
+                    if (size == context_record_bytes && t_context_write_retry_probe && t_context_write_retry_probe->address == address)
+                    {
+                        t_context_write_retry_probe->initial_failed = true;
+                    }
                     // 6.6: the MAIN-thread loader write can hit a map that is queued for the
                     // MASTER but issued by a peer (the master's own queue). Drain the master's
                     // queue (+ in-flight wait) and retry - the write-RETRIED-OK trace showed the
@@ -908,6 +933,10 @@ namespace sogen::icicle
             bool ok = icicle_write_memory(self->handle(), address, data, size);
             if (!ok)
             {
+                if (size == context_record_bytes && t_context_write_retry_probe && t_context_write_retry_probe->address == address)
+                {
+                    t_context_write_retry_probe->initial_failed = true;
+                }
                 // 6.6: an IN-quantum hook write (syscall handler) races queued maps the same way
                 // (the remaining untraced ...FB20 write failures land here: vCPU caller, uncached
                 // range). Drain own queue (+ in-flight wait) and retry - same discipline the
@@ -941,9 +970,29 @@ namespace sogen::icicle
 
         void write_memory(const uint64_t address, const void* data, const size_t size) override
         {
+            context_write_retry_probe probe{address};
+            const bool track_context = size == context_record_bytes && this->vcpus_.size() > 1;
+            auto* const previous_probe = t_context_write_retry_probe;
+            if (track_context)
+            {
+                t_context_write_retry_probe = &probe;
+            }
+            const auto restore_probe = utils::finally([&] {
+                if (track_context)
+                {
+                    t_context_write_retry_probe = previous_probe;
+                }
+            });
+            const auto report_retry = [&](const bool succeeded, const char* disposition, const icicle_vcpu* caller) {
+                if (probe.initial_failed)
+                {
+                    diagnose_context_write_retry(address, caller ? static_cast<int64_t>(caller->index()) : -1, succeeded, disposition);
+                }
+            };
             const auto res = try_write_memory(address, data, size);
             if (res)
             {
+                report_retry(true, "try-write", this->mutation_owner());
                 return;
             }
             // SMP 6.6c': a host write inside a syscall hook can fail the guest-perm check when a
@@ -967,6 +1016,7 @@ namespace sogen::icicle
                 {
                     this->acting_sink(self->index())->defer_hook_exception(std::current_exception());
                 }
+                report_retry(false, "guest-fault", self);
                 return;
             }
                         // 6.6c'': a BETWEEN-quantum worker write (t_running_vcpu null, but this thread owns a
@@ -1010,6 +1060,7 @@ namespace sogen::icicle
                         std::fprintf(stderr, "[SMPTRC] write-RETRIED-OK addr=%#llx size=%zu vcpu=%zu\n",
                                      (unsigned long long)address, size, worker->index());
                     }
+                    report_retry(true, "worker-retry", worker);
                     return;
                 }
                 if (this->violation_callback_)
@@ -1022,6 +1073,7 @@ namespace sogen::icicle
                                      (unsigned long long)address, size, worker->index(),
                                      (unsigned)(GetCurrentThreadId()));
                     }
+                    report_retry(false, "deferred-fault", worker);
                     return;
                 }
             }
@@ -1030,6 +1082,7 @@ namespace sogen::icicle
                 std::fprintf(stderr, "[SMPTRC] write-FAIL ice-throw addr=%#llx size=%zu tid=%u\n",
                              (unsigned long long)address, size, (unsigned)(GetCurrentThreadId()));
             }
+            report_retry(false, "throw", worker);
             ice(false, "Failed to write memory");
         }
 

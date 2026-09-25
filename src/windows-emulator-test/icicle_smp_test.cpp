@@ -10,6 +10,7 @@
 #include <span>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -50,6 +51,30 @@ namespace sogen::test
             cpu.start(4);
             EXPECT_EQ(cpu.reg(x86_register::rip), code + 4) << "vCPU " << i << " did not execute the shared code page";
         }
+    }
+
+    TEST(IcicleSmp, ContextWriteRetryReportsFinalFailureOnly)
+    {
+        auto emu = icicle::create_x86_64_emulator(2);
+        memory_manager memory(*emu);
+        constexpr uint64_t base = 0x61000000;
+        constexpr size_t reservation_size = 0x3000;
+        const nt_memory_permission permissions{memory_permission::read_write};
+        ASSERT_TRUE(memory.allocate_memory(base, reservation_size, permissions, true));
+
+        const std::array<uint8_t, 1232> context{};
+        testing::internal::CaptureStderr();
+        EXPECT_THROW(emu->write_memory(base, context.data(), context.size()), std::runtime_error);
+        const auto failure = testing::internal::GetCapturedStderr();
+        EXPECT_NE(failure.find("[ICWRITE] context-retry"), std::string::npos);
+        EXPECT_NE(failure.find("final=failure"), std::string::npos);
+        EXPECT_NE(failure.find("caller_vcpu=-1"), std::string::npos);
+
+        ASSERT_TRUE(memory.commit_memory(base, reservation_size, permissions));
+        testing::internal::CaptureStderr();
+        EXPECT_NO_THROW(emu->write_memory(base, context.data(), context.size()));
+        const auto success = testing::internal::GetCapturedStderr();
+        EXPECT_EQ(success.find("[ICWRITE] context-retry"), std::string::npos);
     }
 
     // A vcpu_count of 1 keeps the single-vCPU contract: one cpu, no multi-vCPU capability (this is the
