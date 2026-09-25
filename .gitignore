@@ -168,3 +168,6 @@ page/public/64/linux-analyzer.wasm
 __pycache__/
 devdocs/
 dist_local/
+/docs/Intel docs
+/docs/timing
+/src/backends/icicle-emulator/icicle-bridge/cargo-build/
