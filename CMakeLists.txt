@@ -46,6 +46,11 @@ set(ENV{ARCHFLAGS} "nope")
 project(sogen LANGUAGES C CXX)
 enable_testing()
 
+if(MSVC)
+  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo,Release>:ProgramDatabase>")
+  add_link_options($<$<CONFIG:Release>:/DEBUG:FULL>)
+endif()
+
 include(cmake/reflection-check.cmake)
 sogen_check_reflection_support()
 
