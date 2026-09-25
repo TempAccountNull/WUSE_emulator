@@ -1,9 +1,12 @@
 #include "emulation_test_utils.hpp"
 #include "../windows-analyzer/analysis.hpp"
 #include "../windows-analyzer/analysis_reporter.hpp"
+#include "../windows-analyzer/jsonl_reporter.hpp"
 #include "../windows-analyzer/debug_print.hpp"
 #include <emulator_utils.hpp>
 #include <syscall_utils.hpp>
+#include <utils/finally.hpp>
+#include <utils/io.hpp>
 
 namespace sogen::syscalls
 {
@@ -333,6 +336,59 @@ namespace sogen::test
         EXPECT_EQ(reads, 0U);
         ASSERT_EQ(calls.size(), 1U);
         EXPECT_EQ(calls[0].arguments[0].error, "unreadable memory");
+    }
+
+    TEST_F(DebugPrintCapture, OodleErrorCapturesBoundedCpuStateWithoutChangingNormalPrints)
+    {
+        win.emu().reg(x86_register::rax, 0x12345678);
+        win.emu().write_memory<uint64_t>(stack + 8, entry + 0x188);
+        observe_debug_string(context, "normal print\n");
+        ASSERT_EQ(output.size(), 1U);
+        EXPECT_FALSE(output.back().cpu_snapshot.has_value());
+        observe_debug_string(context, "OODLE ERROR : LZ corruption : bad decode len\n");
+        ASSERT_EQ(output.size(), 2U);
+        ASSERT_TRUE(output.back().cpu_snapshot.has_value());
+        const auto& snapshot = *output.back().cpu_snapshot;
+        EXPECT_EQ(snapshot.pointer_bits, 64U);
+        EXPECT_EQ(snapshot.instruction_pointer, entry);
+        EXPECT_EQ(snapshot.stack_pointer, stack);
+        EXPECT_EQ(snapshot.gprs[0], 0x12345678U);
+        ASSERT_GE(snapshot.stack_words.size(), 2U);
+        EXPECT_EQ(snapshot.stack_words[0], entry + 0x90);
+        EXPECT_EQ(snapshot.stack_words[1], entry + 0x188);
+        EXPECT_LE(snapshot.stack_words.size(), 64U);
+
+        const auto file = std::filesystem::temp_directory_path() / ("sogen-oodle-print-" + std::to_string(getpid()) + ".jsonl");
+        const auto cleanup = utils::finally([&] {
+            std::error_code error;
+            std::filesystem::remove(file, error);
+        });
+        auto reporter = create_jsonl_reporter(file);
+        reporter->report(output.back());
+        reporter->flush();
+        const auto saved = utils::io::read_file(file);
+        const std::string json(reinterpret_cast<const char*>(saved.data()), saved.size());
+        EXPECT_NE(json.find("\"cpu_snapshot\":"), std::string::npos);
+        EXPECT_NE(json.find("\"pointer_bits\":64"), std::string::npos);
+        EXPECT_NE(json.find("\"stack_words\":[\"0x"), std::string::npos);
+    }
+
+    TEST_F(DebugPrintCapture, X86OodleErrorCapturesFourByteStackWords)
+    {
+        win.emu().reg(x86_register::cs, 0x23);
+        win.emu().reg(x86_register::esp, static_cast<uint32_t>(stack));
+        win.emu().write_memory<uint32_t>(stack, 0x10203040);
+        win.emu().write_memory<uint32_t>(stack + 4, 0x50607080);
+        observe_debug_string(context, "OODLE ERROR : LZ corruption : not enough comp buf\n");
+        ASSERT_EQ(output.size(), 1U);
+        ASSERT_TRUE(output.back().cpu_snapshot.has_value());
+        const auto& snapshot = *output.back().cpu_snapshot;
+        EXPECT_EQ(snapshot.pointer_bits, 32U);
+        EXPECT_EQ(snapshot.stack_pointer, stack);
+        ASSERT_GE(snapshot.stack_words.size(), 2U);
+        EXPECT_EQ(snapshot.stack_words[0], 0x10203040U);
+        EXPECT_EQ(snapshot.stack_words[1], 0x50607080U);
+        EXPECT_EQ(snapshot.gprs[8], 0U);
     }
 
     TEST_F(DebugPrintCapture, DbwinIsBoundedAndCaptureFailurePreservesSuccess)

@@ -116,11 +116,21 @@ namespace sogen
         std::string error{};
     };
 
+    struct debug_string_cpu_snapshot
+    {
+        uint32_t pointer_bits{};
+        uint64_t instruction_pointer{};
+        uint64_t stack_pointer{};
+        std::array<uint64_t, 16> gprs{};
+        std::vector<uint64_t> stack_words{};
+    };
+
     struct debug_string_event : observation_event
     {
         std::string details{};
         std::string transport{};
         std::vector<uint64_t> origin_calls{};
+        std::optional<debug_string_cpu_snapshot> cpu_snapshot{};
         uint64_t data_address{};
         uint64_t byte_length{};
         std::string encoding{};

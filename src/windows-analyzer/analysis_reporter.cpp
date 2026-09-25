@@ -885,6 +885,34 @@ namespace sogen
                 object.field("encoding", event.encoding);
                 object.field("bytes_hex", event.bytes_hex);
                 object.field("error", event.error);
+                if (event.cpu_snapshot)
+                {
+                    const auto& snapshot = *event.cpu_snapshot;
+                    object.object_field("cpu_snapshot", [&](auto& item) {
+                        item.field("pointer_bits", snapshot.pointer_bits);
+                        item.hex_field("instruction_pointer", snapshot.instruction_pointer);
+                        item.hex_field("stack_pointer", snapshot.stack_pointer);
+                        constexpr std::array<std::string_view, 16> names{
+                            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+                        };
+                        item.object_field("gprs", [&](auto& gprs) {
+                            for (size_t i = 0; i < names.size(); ++i)
+                            {
+                                gprs.hex_field(names[i], snapshot.gprs[i]);
+                            }
+                        });
+                        item.array_field("stack_words", [&](const auto& emit) {
+                            for (const auto value : snapshot.stack_words)
+                            {
+                                emit([&](std::string& output) {
+                                    output += "\"0x";
+                                    append_unsigned(output, value, 16);
+                                    output += '"';
+                                });
+                            }
+                        });
+                    });
+                }
                 if (event.ansi_fallback)
                 {
                     object.field("ansi_fallback_text", event.ansi_fallback->text);

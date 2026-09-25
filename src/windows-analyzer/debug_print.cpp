@@ -200,6 +200,51 @@ namespace sogen
                 event.details = display_bytes(text_bytes, wide);
                 event.transport = transport;
                 event.origin_calls = origins(c);
+                if (transport == "dbwin" && text_bytes.starts_with("OODLE ERROR"))
+                {
+                    auto& snapshot = event.cpu_snapshot.emplace();
+                    auto& cpu = c.win_emu->active_cpu();
+                    const bool bits32 = is_32bit_code_segment(cpu);
+                    snapshot.pointer_bits = bits32 ? 32 : 64;
+                    snapshot.instruction_pointer = cpu.read_instruction_pointer();
+                    snapshot.stack_pointer = bits32 ? cpu.reg<uint32_t>(x86_register::esp) : cpu.reg(x86_register::rsp);
+                    constexpr std::array registers{x86_register::rax, x86_register::rbx, x86_register::rcx, x86_register::rdx,
+                                                   x86_register::rsi, x86_register::rdi, x86_register::rbp, x86_register::rsp,
+                                                   x86_register::r8,  x86_register::r9,  x86_register::r10, x86_register::r11,
+                                                   x86_register::r12, x86_register::r13, x86_register::r14, x86_register::r15};
+                    for (size_t i = 0; i < registers.size(); ++i)
+                    {
+                        if (bits32 && i >= 8)
+                        {
+                            break;
+                        }
+                        snapshot.gprs[i] = bits32 ? cpu.reg<uint32_t>(registers[i]) : cpu.reg(registers[i]);
+                    }
+                    for (size_t i = 0; i < 64; ++i)
+                    {
+                        const auto width = bits32 ? sizeof(uint32_t) : sizeof(uint64_t);
+                        if (snapshot.stack_pointer > std::numeric_limits<uint64_t>::max() - i * width)
+                        {
+                            break;
+                        }
+                        const auto word_address = snapshot.stack_pointer + i * width;
+                        uint64_t word{};
+                        if (bits32)
+                        {
+                            uint32_t value{};
+                            if (!passive_read(c, word_address, &value, sizeof(value)))
+                            {
+                                break;
+                            }
+                            word = value;
+                        }
+                        else if (!passive_read(c, word_address, &word, sizeof(word)))
+                        {
+                            break;
+                        }
+                        snapshot.stack_words.push_back(word);
+                    }
+                }
                 event.data_address = address;
                 event.byte_length = length;
                 event.encoding = wide ? "utf-16le" : "windows-1252";
