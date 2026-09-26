@@ -56,6 +56,8 @@ namespace sogen
             std::string_view{"VK_KHR_win32_keyed_mutex"},        //
             std::string_view{"VK_EXT_full_screen_exclusive"},    //
             std::string_view{"VK_NV_low_latency2"},              //
+            std::string_view{"VK_EXT_hdr_metadata"},             // no host swapchain HDR metadata path, including readback
+            std::string_view{"VK_KHR_maintenance6"},             // four required bridge commands are not implemented
         };
 
         bool is_unsupported_extension_name(const std::string_view name)
@@ -72,7 +74,6 @@ namespace sogen
                                        std::string_view{"VK_EXT_swapchain_maintenance1"},
                                        std::string_view{"VK_KHR_swapchain_maintenance1"},
                                        std::string_view{"VK_KHR_incremental_present"},
-                                       std::string_view{"VK_EXT_hdr_metadata"},
                                        std::string_view{"VK_GOOGLE_display_timing"},
                                        std::string_view{"VK_EXT_present_timing"},
                                        std::string_view{"VK_NV_present_barrier"}};
@@ -2210,11 +2211,13 @@ namespace sogen
                 {
                     break;
                 }
-                if (this->impl_->native_wsi && unsupported_native_wsi_extension(cursor))
+                const std::string_view name{cursor};
+                if (name == VK_EXT_HDR_METADATA_EXTENSION_NAME || name == VK_KHR_MAINTENANCE_6_EXTENSION_NAME ||
+                    (this->impl_->native_wsi && unsupported_native_wsi_extension(name)))
                 {
                     return VK_ERROR_EXTENSION_NOT_PRESENT;
                 }
-                if (!is_unsupported_extension_name(std::string_view{cursor}))
+                if (!is_unsupported_extension_name(name))
                 {
                     extensions.push_back(cursor);
                 }
