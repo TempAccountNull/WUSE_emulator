@@ -3101,6 +3101,38 @@ mod lean_exact_execution_hook_tests {
 }
 
 #[cfg(test)]
+mod guest_cookie_check_branch_tests {
+    use super::*;
+
+    #[test]
+    fn bnd_jne_follows_the_cookie_comparison_in_lean_jit() {
+        const ADDRESS: u64 = 0x91000;
+        const COOKIE: u64 = 0x7bc8_89ba_f046;
+        // cmp rcx, [rip+cookie]; bnd jne mismatch; mov eax,1/2; jmp $
+        // The F2-prefixed JNE matches the check at Destiny image RVA 0x187c480.
+        const CODE: [u8; 24] = [
+            0x48, 0x3b, 0x0d, 0x19, 0, 0, 0, 0xf2, 0x75, 0x07,
+            0xb8, 1, 0, 0, 0, 0xeb, 0x05, 0xb8, 2, 0, 0, 0,
+            0xeb, 0xfe,
+        ];
+        for (supplied, expected) in [(COOKIE, 1), (COOKIE ^ 0x10, 2)] {
+            let mut emu = IcicleEmulator::new_with_instruction_hooks(false);
+            emu.vm.enable_jit = true;
+            assert!(emu.map_memory(ADDRESS, 0x1000, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+            assert!(emu.write_memory(ADDRESS, &CODE));
+            assert!(emu.write_memory(ADDRESS + 0x20, &COOKIE.to_le_bytes()));
+            emu.write_register(registers::X86Register::Rcx, &supplied.to_le_bytes());
+            emu.vm.cpu.write_pc(ADDRESS);
+            emu.start(20);
+            assert!(matches!(emu.last_vm_exit, icicle_vm::VmExit::InstructionLimit));
+            let mut rax = [0u8; 8];
+            emu.read_register(registers::X86Register::Rax, &mut rax);
+            assert_eq!(u64::from_le_bytes(rax), expected, "wrong BND JNE cookie path");
+        }
+    }
+}
+
+#[cfg(test)]
 mod fast_noop_barrier_tests {
     use super::*;
 
