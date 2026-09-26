@@ -1,6 +1,7 @@
 #include "std_include.hpp"
 #include "windows_emulator.hpp"
 #include "guest_thread_affinity.hpp"
+#include "host_wait_idle_policy.hpp"
 #include "scheduler_vm_gate.hpp"
 #include "telemetry_shared_memory.hpp"
 
@@ -1180,7 +1181,7 @@ namespace sogen
                 }
                 else if (host_wait_pending)
                 {
-                    ++stats.idle_host_yields;
+                    ++stats.idle_host_wait_sleeps;
                 }
                 else
                 {
@@ -1203,8 +1204,11 @@ namespace sogen
             }
             else if (host_wait_pending)
             {
-                // A host wait (e.g. a GPU semaphore) is parked - re-poll immediately to wake it promptly.
-                std::this_thread::yield();
+                // A host wait (e.g. a GPU semaphore) is parked. Yielding here
+                // lets every idle vCPU repeatedly acquire the kernel lock to
+                // poll the same predicate and run device work. Bound that
+                // contention while retaining prompt host-completion polling.
+                detail::sleep_for_pending_host_wait();
             }
             else
             {
@@ -1620,6 +1624,7 @@ namespace sogen
                 json += ",\"device_work_nanos_total\":" + std::to_string(stats.device_work_nanos);
                 json += ",\"idle_retries_total\":" + std::to_string(stats.idle_retries);
                 json += ",\"idle_host_yields_total\":" + std::to_string(stats.idle_host_yields);
+                json += ",\"idle_host_wait_sleeps_total\":" + std::to_string(stats.idle_host_wait_sleeps);
                 json += ",\"idle_host_sleeps_total\":" + std::to_string(stats.idle_host_sleeps);
                 json += ",\"idle_relative_ticks_total\":" + std::to_string(stats.idle_relative_ticks);
                 json += ",\"timer_preempt_requests_total\":" + std::to_string(stats.timer_preempt_requests);
@@ -3229,10 +3234,11 @@ namespace sogen
                 this->log.print(
                     color::cyan,
                     "SCHEDPROFILE vcpu=%zu switches=%llu switch_ms=%.3f device_calls=%llu device_ms=%.3f "
-                    "idle_retries=%llu idle_yields=%llu idle_sleeps=%llu relative_ticks=%llu timer_preempts=%llu\n",
+                    "idle_retries=%llu idle_yields=%llu idle_host_wait_sleeps=%llu idle_sleeps=%llu relative_ticks=%llu timer_preempts=%llu\n",
                     i, static_cast<unsigned long long>(stats.context_switch_calls), static_cast<double>(stats.context_switch_nanos) / 1e6,
                     static_cast<unsigned long long>(stats.device_work_calls), static_cast<double>(stats.device_work_nanos) / 1e6,
                     static_cast<unsigned long long>(stats.idle_retries), static_cast<unsigned long long>(stats.idle_host_yields),
+                    static_cast<unsigned long long>(stats.idle_host_wait_sleeps),
                     static_cast<unsigned long long>(stats.idle_host_sleeps), static_cast<unsigned long long>(stats.idle_relative_ticks),
                     static_cast<unsigned long long>(stats.timer_preempt_requests));
             }

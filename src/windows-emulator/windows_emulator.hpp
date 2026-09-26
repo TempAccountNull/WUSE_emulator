@@ -135,7 +135,8 @@ namespace sogen
             uint64_t device_work_calls{};
             uint64_t device_work_nanos{};
             uint64_t idle_retries{};
-            uint64_t idle_host_yields{};
+            uint64_t idle_host_yields{}; // legacy counter; bounded host waits no longer yield-spin
+            uint64_t idle_host_wait_sleeps{};
             uint64_t idle_host_sleeps{};
             uint64_t idle_relative_ticks{};
             uint64_t timer_preempt_requests{};
