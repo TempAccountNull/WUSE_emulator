@@ -9,6 +9,7 @@
 // so it can be included unchanged by both the emulator and guest-side shims.
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace sogen::gpu_bridge
@@ -16,7 +17,7 @@ namespace sogen::gpu_bridge
     // Identifies a valid bridge and lets the guest detect a host that speaks a different
     // protocol revision before issuing any further commands.
     inline constexpr uint32_t protocol_magic = 0x55504753; // 'SGPU'
-    inline constexpr uint32_t protocol_version = 31;
+    inline constexpr uint32_t protocol_version = 32;
 
     // Windows IOCTL encoding: CTL_CODE(DeviceType, Function, Method, Access).
     //   value = (DeviceType << 16) | (Access << 14) | (Function << 2) | Method
@@ -169,7 +170,7 @@ namespace sogen::gpu_bridge
         cmd_copy_image = 0x884,
         get_physical_device_memory_budget = 0x885,
         // Coalesced vkUpdateDescriptorSets: payload is a concatenation of update_descriptor_sets_request blobs
-        // (each a header + its descriptor_write[] + inline-uniform data), applied in issue order.
+        // (each a header + descriptor_write[] + descriptor_copy[] + inline-uniform data), applied in issue order.
         update_descriptor_sets_batch = 0x886,
         cmd_blit_image = 0x887,
         reset_descriptor_pool = 0x888,
@@ -2554,16 +2555,37 @@ namespace sogen::gpu_bridge
         uint32_t inline_uniform_data_size;
     };
 
-    // ioctl_update_descriptor_sets: in header immediately followed by `write_count` descriptor_write
-    // entries and `inline_uniform_data_size` bytes; out = result_response
+    // Pointer-free VkCopyDescriptorSet. A record applies all writes first, then its copies in order.
+    struct descriptor_copy
+    {
+        object_id src_set;
+        uint32_t src_binding;
+        uint32_t src_array_element;
+        object_id dst_set;
+        uint32_t dst_binding;
+        uint32_t dst_array_element;
+        uint32_t descriptor_count;
+        uint32_t reserved;
+    };
+    static_assert(sizeof(descriptor_copy) == 40 && offsetof(descriptor_copy, dst_set) == 16 &&
+                  offsetof(descriptor_copy, descriptor_count) == 32);
+
+    // ioctl_update_descriptor_sets: header, write_count descriptor_write entries, copy_count
+    // descriptor_copy entries, then inline_uniform_data_size bytes; out = result_response.
     struct update_descriptor_sets_request
     {
         object_id device;
         uint32_t write_count;
+        uint32_t copy_count;
         uint32_t inline_uniform_data_size;
+        uint32_t reserved;
         // descriptor_write writes[write_count];
+        // descriptor_copy copies[copy_count];
         // uint8_t inline_uniform_data[inline_uniform_data_size];
     };
+    static_assert(sizeof(update_descriptor_sets_request) == 24 &&
+                  offsetof(update_descriptor_sets_request, copy_count) == 12 &&
+                  offsetof(update_descriptor_sets_request, inline_uniform_data_size) == 16);
 
     // immediately followed by `set_count` object_id descriptor-set ids. Bind point is graphics.
     struct cmd_bind_descriptor_sets_request

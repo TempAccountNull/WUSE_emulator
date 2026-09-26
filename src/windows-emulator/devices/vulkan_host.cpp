@@ -750,6 +750,7 @@ namespace sogen
             uint64_t device_id{};
             uint32_t flags{};
             std::vector<uint32_t> bindings;
+            std::vector<vulkan_host::descriptor_binding> descriptor_bindings;
         };
 
         struct descriptor_pool_data
@@ -771,6 +772,7 @@ namespace sogen
             VkDescriptorSet handle{};
             uint64_t device_id{};
             uint64_t pool_id{};
+            std::vector<vulkan_host::descriptor_binding> layout_bindings;
             std::unordered_map<uint32_t, bound_buffer_info> buffer_bindings;
         };
 
@@ -7812,7 +7814,8 @@ namespace sogen
         }
 
         const uint64_t id = this->impl_->next_id++;
-        impl::descriptor_set_layout_data retained{.handle = layout, .device_id = device, .flags = flags};
+        impl::descriptor_set_layout_data retained{.handle = layout, .device_id = device, .flags = flags,
+                                                  .descriptor_bindings = {bindings.begin(), bindings.end()}};
         if (flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT)
         {
             retained.bindings.reserve(bindings.size());
@@ -8581,7 +8584,9 @@ namespace sogen
         {
             const uint64_t id = this->impl_->next_id++;
             this->impl_->descriptor_sets.emplace(
-                id, impl::descriptor_set_data{.handle = sets[i], .device_id = device, .pool_id = pool, .buffer_bindings = {}});
+                id, impl::descriptor_set_data{.handle = sets[i], .device_id = device, .pool_id = pool,
+                                              .layout_bindings = this->impl_->descriptor_set_layouts.at(set_layouts[i]).descriptor_bindings,
+                                              .buffer_bindings = {}});
             if (i < out_sets.size())
             {
                 out_sets[i] = id;
@@ -8628,7 +8633,8 @@ namespace sogen
         return result;
     }
 
-    int32_t vulkan_host::update_descriptor_sets(uint64_t device, std::span<const descriptor_write> writes)
+    int32_t vulkan_host::update_descriptor_sets(uint64_t device, std::span<const descriptor_write> writes,
+                                                std::span<const descriptor_copy> copies)
     {
         const auto dev = this->impl_->devices.find(device);
         if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
@@ -8675,6 +8681,23 @@ namespace sogen
                 cached_set_id = w.dst_set;
                 cached_set_handle = set->second.handle;
                 cached_set = &set->second;
+            }
+
+            const bool supported_type = w.descriptor_type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ||
+                                        w.descriptor_type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+                                        w.descriptor_type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+                                        w.descriptor_type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+                                        w.descriptor_type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ||
+                                        w.descriptor_type == VK_DESCRIPTOR_TYPE_SAMPLER ||
+                                        w.descriptor_type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+                                        w.descriptor_type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER ||
+                                        w.descriptor_type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+                                        w.descriptor_type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                                        w.descriptor_type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+                                        w.descriptor_type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+            if (!supported_type)
+            {
+                return VK_ERROR_FEATURE_NOT_PRESENT;
             }
 
             VkWriteDescriptorSet vw{};
@@ -8768,9 +8791,64 @@ namespace sogen
             vk_writes.push_back(vw);
         }
 
-        if (!vk_writes.empty())
+        static thread_local std::vector<VkCopyDescriptorSet> vk_copies;
+        vk_copies.clear();
+        vk_copies.reserve(copies.size());
+        for (const auto& copy : copies)
         {
-            dev->second.update_descriptor_sets(dev->second.handle, static_cast<uint32_t>(vk_writes.size()), vk_writes.data(), 0, nullptr);
+            const auto src = this->impl_->descriptor_sets.find(copy.src_set);
+            const auto dst = this->impl_->descriptor_sets.find(copy.dst_set);
+            if (src == this->impl_->descriptor_sets.end() || dst == this->impl_->descriptor_sets.end() ||
+                src->second.device_id != device || dst->second.device_id != device || !copy.descriptor_count)
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            const auto find_binding = [](const impl::descriptor_set_data& set, uint32_t index) {
+                return std::ranges::find_if(set.layout_bindings, [index](const descriptor_binding& binding) {
+                    return binding.binding == index;
+                });
+            };
+            const auto src_binding = find_binding(src->second, copy.src_binding);
+            const auto dst_binding = find_binding(dst->second, copy.dst_binding);
+            if (src_binding == src->second.layout_bindings.end() || dst_binding == dst->second.layout_bindings.end() ||
+                src_binding->descriptor_type != dst_binding->descriptor_type)
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            const uint32_t type = src_binding->descriptor_type;
+            const bool supported_type = type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ||
+                                        type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+                                        type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+                                        type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT || type == VK_DESCRIPTOR_TYPE_SAMPLER ||
+                                        type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+                                        type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER ||
+                                        type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                                        type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+                                        type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+            if (!supported_type)
+            {
+                return VK_ERROR_FEATURE_NOT_PRESENT;
+            }
+            // Vulkan permits copies to spill into consecutive compatible bindings. Native Vulkan
+            // retains the original descriptor count and binding indices for that legal case.
+            VkCopyDescriptorSet native{};
+            native.sType = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET;
+            native.srcSet = src->second.handle;
+            native.srcBinding = copy.src_binding;
+            native.srcArrayElement = copy.src_array_element;
+            native.dstSet = dst->second.handle;
+            native.dstBinding = copy.dst_binding;
+            native.dstArrayElement = copy.dst_array_element;
+            native.descriptorCount = copy.descriptor_count;
+            vk_copies.push_back(native);
+        }
+
+        if (!vk_writes.empty() || !vk_copies.empty())
+        {
+            // One native call preserves the spec's all-writes-then-all-copies order, including a copy
+            // whose source was written earlier in this same guest call.
+            dev->second.update_descriptor_sets(dev->second.handle, static_cast<uint32_t>(vk_writes.size()), vk_writes.data(),
+                                               static_cast<uint32_t>(vk_copies.size()), vk_copies.data());
         }
         return VK_SUCCESS;
     }

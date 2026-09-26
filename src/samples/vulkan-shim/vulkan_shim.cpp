@@ -364,7 +364,14 @@ namespace
         batch.swap(g_pending_descriptor_updates);
 
         gb::result_response response{};
-        bridge_call(gb::ioctl_update_descriptor_sets_batch, batch.data(), static_cast<DWORD>(batch.size()), &response, sizeof(response));
+        if (bridge_call(gb::ioctl_update_descriptor_sets_batch, batch.data(), static_cast<DWORD>(batch.size()), &response,
+                        sizeof(response)) && response.vk_result != VK_SUCCESS)
+        {
+            std::array<char, 160> message{};
+            std::snprintf(message.data(), message.size(),
+                          "vulkan-shim: vkUpdateDescriptorSets batch rejected by host: VkResult=%d\n", response.vk_result);
+            shim_log(message.data());
+        }
     }
 
     void record_command(gb::object_id command_buffer, gb::command command, const void* payload, size_t size)
@@ -5703,15 +5710,27 @@ extern "C"
         {
             return type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
         }
+
+        bool is_buffer_descriptor(VkDescriptorType type)
+        {
+            return type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                   type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+        }
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
-                                                                            const VkWriteDescriptorSet* pDescriptorWrites, uint32_t,
-                                                                            const VkCopyDescriptorSet*)
+                                                                            const VkWriteDescriptorSet* pDescriptorWrites,
+                                                                            uint32_t descriptorCopyCount,
+                                                                            const VkCopyDescriptorSet* pDescriptorCopies)
     {
-        // Descriptor copies are not modeled; only writes are forwarded. Non-inline writes are flattened
-        // to `descriptorCount` single-descriptor wire writes.
+        if ((descriptorWriteCount && !pDescriptorWrites) || (descriptorCopyCount && !pDescriptorCopies))
+        {
+            shim_log("vulkan-shim: vkUpdateDescriptorSets missing write/copy array\n");
+            return;
+        }
+        // Keep each API call as one batch record: Vulkan applies all writes before any copy.
         std::vector<gb::descriptor_write> writes;
+        std::vector<gb::descriptor_copy> copies;
         std::vector<uint8_t> inline_uniform_data;
         for (uint32_t w = 0; w < descriptorWriteCount; ++w)
         {
@@ -5731,7 +5750,8 @@ extern "C"
                     (inline_uniform_block->dataSize != 0 && !inline_uniform_block->pData) ||
                     inline_uniform_data.size() > UINT32_MAX - inline_uniform_block->dataSize)
                 {
-                    continue;
+                    shim_log("vulkan-shim: vkUpdateDescriptorSets invalid inline-uniform write\n");
+                    return;
                 }
 
                 gb::descriptor_write wire{};
@@ -5750,6 +5770,23 @@ extern "C"
                 continue;
             }
 
+            if (!is_image_descriptor(src.descriptorType) && !is_texel_buffer_descriptor(src.descriptorType) &&
+                !is_buffer_descriptor(src.descriptorType))
+            {
+                char message[160]{};
+                std::snprintf(message, sizeof(message),
+                              "vulkan-shim: vkUpdateDescriptorSets unsupported descriptor type %u\n",
+                              static_cast<uint32_t>(src.descriptorType));
+                shim_log(message);
+                return;
+            }
+            if (src.descriptorCount && ((is_image_descriptor(src.descriptorType) && !src.pImageInfo) ||
+                                        (is_texel_buffer_descriptor(src.descriptorType) && !src.pTexelBufferView) ||
+                                        (is_buffer_descriptor(src.descriptorType) && !src.pBufferInfo)))
+            {
+                shim_log("vulkan-shim: vkUpdateDescriptorSets missing descriptor payload\n");
+                return;
+            }
             for (uint32_t e = 0; e < src.descriptorCount; ++e)
             {
                 gb::descriptor_write wire{};
@@ -5777,20 +5814,39 @@ extern "C"
             }
         }
 
+        copies.reserve(descriptorCopyCount);
+        for (uint32_t c = 0; c < descriptorCopyCount; ++c)
+        {
+            const auto& src = pDescriptorCopies[c];
+            copies.push_back(gb::descriptor_copy{.src_set = to_object_id(src.srcSet),
+                                                 .src_binding = src.srcBinding,
+                                                 .src_array_element = src.srcArrayElement,
+                                                 .dst_set = to_object_id(src.dstSet),
+                                                 .dst_binding = src.dstBinding,
+                                                 .dst_array_element = src.dstArrayElement,
+                                                 .descriptor_count = src.descriptorCount});
+        }
         gb::update_descriptor_sets_request header{};
         header.device = to_object_id(device);
         header.write_count = static_cast<uint32_t>(writes.size());
+        header.copy_count = static_cast<uint32_t>(copies.size());
         header.inline_uniform_data_size = static_cast<uint32_t>(inline_uniform_data.size());
 
         // Append to the pending batch instead of issuing an IOCTL now (drained before the next bridge call).
         const auto* header_bytes = reinterpret_cast<const uint8_t*>(&header);
         const auto* write_bytes = reinterpret_cast<const uint8_t*>(writes.data());
+        const auto* copy_bytes = reinterpret_cast<const uint8_t*>(copies.data());
         std::lock_guard<std::mutex> lock(g_pending_descriptor_updates_mutex);
         g_pending_descriptor_updates.insert(g_pending_descriptor_updates.end(), header_bytes, header_bytes + sizeof(header));
         if (!writes.empty())
         {
             g_pending_descriptor_updates.insert(g_pending_descriptor_updates.end(), write_bytes,
                                                 write_bytes + writes.size() * sizeof(gb::descriptor_write));
+        }
+        if (!copies.empty())
+        {
+            g_pending_descriptor_updates.insert(g_pending_descriptor_updates.end(), copy_bytes,
+                                                copy_bytes + copies.size() * sizeof(gb::descriptor_copy));
         }
         g_pending_descriptor_updates.insert(g_pending_descriptor_updates.end(), inline_uniform_data.begin(), inline_uniform_data.end());
     }
