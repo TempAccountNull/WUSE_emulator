@@ -610,6 +610,7 @@ namespace sogen::icicle
         // quiesce cancel (a peer's cross-VM mutation), so start() knows whether to return or re-enter.
         std::atomic_bool run_active_{false};
         std::atomic_bool stop_requested_{false};
+        std::atomic_uint64_t diagnostic_run_start_ms_{0};
         // Excludes external stop-the-world VM access from parked scheduler host work.
         std::recursive_mutex parked_vm_mutex_{};
 
@@ -2465,25 +2466,45 @@ namespace sogen::icicle
         std::string smp_gate_debug() const override
         {
             std::string out{};
-            char buf[48];
+            char buf[128];
             {
                 std::lock_guard<std::mutex> lock(this->pending_mutex_);
                 for (size_t i = 0; i < this->pending_ops_.size(); ++i)
                 {
-                    std::snprintf(buf, sizeof(buf), "q%zu=%zu ", i, this->pending_ops_[i].size());
+                    const auto& queue = this->pending_ops_[i];
+                    if (queue.empty())
+                    {
+                        std::snprintf(buf, sizeof(buf), "q%zu=0 ", i);
+                    }
+                    else
+                    {
+                        std::snprintf(buf, sizeof(buf), "q%zu=%zu oldest=%llu/%s ", i, queue.size(),
+                                      static_cast<unsigned long long>(queue.front().ticket),
+                                      pending_op_kind_name(queue.front().kind));
+                    }
                     out += buf;
                 }
+                std::snprintf(buf, sizeof(buf), "completed=%llu ",
+                              static_cast<unsigned long long>(this->ops_completed_watermark_));
+                out += buf;
             }
             const auto issued = this->ops_issued_watermark_.load(std::memory_order_acquire);
             std::snprintf(buf, sizeof(buf), "issued=%llu ", static_cast<unsigned long long>(issued));
             out += buf;
-            for (const auto& vcpu : this->vcpus_)
-            {
-                std::snprintf(buf, sizeof(buf), "v%u=%s ", vcpu->index_, vcpu->run_active_.load() ? "RUN" : "park");
-                out += buf;
-            }
             {
                 std::lock_guard<std::mutex> lock(this->quiesce_mutex_);
+                const auto now_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+                for (const auto& vcpu : this->vcpus_)
+                {
+                    const auto running = vcpu->run_active_.load(std::memory_order_relaxed);
+                    const auto started_ms = vcpu->diagnostic_run_start_ms_.load(std::memory_order_relaxed);
+                    const auto age_ms = running && started_ms != 0 && now_ms >= started_ms ? now_ms - started_ms : 0;
+                    std::snprintf(buf, sizeof(buf), "v%u=%s/k%u/age=%llu ", vcpu->index_,
+                                  running ? "RUN" : "park", this->quantum_kick_[vcpu->index_],
+                                  static_cast<unsigned long long>(age_ms));
+                    out += buf;
+                }
                 out += this->quiescing_ ? "quiescing=1" : "quiescing=0";
             }
             return out;
@@ -3564,6 +3585,12 @@ namespace sogen::icicle
             {
                 std::unique_lock lock(this->quiesce_mutex_);
                 this->quiesce_cv_.wait(lock, [this] { return !this->quiescing_; });
+                if (this->pending_drain_diagnostic_enabled_)
+                {
+                    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    v.diagnostic_run_start_ms_.store(static_cast<uint64_t>(now_ms), std::memory_order_relaxed);
+                }
                 v.run_active_ = true;
             }
             // 6.5: drain AFTER run_active_ is set. An external stop-the-world now observes this vCPU as

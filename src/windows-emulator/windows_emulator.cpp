@@ -1163,9 +1163,9 @@ namespace sogen
                     {
                         if (thread.smp_visibility_mark != 0 && !this->emu().smp_op_applied(thread.smp_visibility_mark))
                         {
-                            this->log.error("GATEDIAG tid=%u mark=%llu stuck: %s\n", thread.id,
-                                            static_cast<unsigned long long>(thread.smp_visibility_mark),
-                                            this->emu().smp_gate_debug().c_str());
+                            this->log.error("GATEDIAG tid=%u mark=%llu stuck: suspended=%u terminated=%u %s\n",
+                                            thread.id, static_cast<unsigned long long>(thread.smp_visibility_mark),
+                                            thread.suspended, thread.is_terminated(), this->emu().smp_gate_debug().c_str());
                             break;
                         }
                     }
