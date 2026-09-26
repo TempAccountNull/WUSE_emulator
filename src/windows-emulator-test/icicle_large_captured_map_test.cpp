@@ -27,8 +27,10 @@ namespace sogen::test
         constexpr std::array<size_t, 3> page_offsets{0, region_size / 2, region_size - page_size};
         constexpr std::array<uint64_t, 3> values{0x1020304050607080ULL, 0x192a3b4c5d6e7f80ULL, 0x8877665544332211ULL};
 
-        auto emu = icicle::create_x86_64_emulator(2);
-        ASSERT_EQ(emu->vcpu_count(), 2U);
+        const auto* eight = std::getenv("SOGEN_SMP_LARGE_MAP_EIGHT_VCPUS");
+        const size_t vcpu_count = eight && std::strcmp(eight, "1") == 0 ? 8 : 2;
+        auto emu = icicle::create_x86_64_emulator(vcpu_count);
+        ASSERT_EQ(emu->vcpu_count(), vcpu_count);
         memory_manager memory(*emu);
         const auto code = memory.allocate_memory(0x1000, memory_permission::all);
         const auto trigger_data = memory.allocate_memory(0x1000, memory_permission::read_write);
@@ -94,31 +96,43 @@ namespace sogen::test
         ASSERT_TRUE(hook_called);
         ASSERT_TRUE(mapped);
 
-        const auto drain_start = std::chrono::steady_clock::now();
-        ASSERT_NO_THROW(emu->sync_worker_context(1));
-        const auto peer_drain_time = std::chrono::steady_clock::now() - drain_start;
-        std::cout << "[SMP-LARGE-MAP] pages=" << region_size / page_size
-                  << " owner_map_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(owner_map_time).count()
-                  << " peer_drain_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(peer_drain_time).count() << '\n';
-        const auto profile = emu->smp_profile();
-        if (profile.size() == 2 && profile[1].invalidation_profile_enabled)
+        std::chrono::steady_clock::duration peer_drain_time{};
+        for (size_t i = 1; i < vcpu_count; ++i)
         {
-            std::cout << "[SMP-LARGE-MAP] peer_map_calls=" << profile[1].peer_map_calls << " peer_map_pages=" << profile[1].peer_map_pages
-                      << " peer_map_total_ms=" << profile[1].peer_map_nanos / 1000000
-                      << " peer_map_max_ms=" << profile[1].peer_map_max_nanos / 1000000 << '\n';
-            EXPECT_EQ(profile[1].peer_map_calls, 1U);
-            EXPECT_EQ(profile[1].peer_map_pages, region_size / page_size);
-            EXPECT_GT(profile[1].peer_map_nanos, 0U);
-            EXPECT_GT(profile[1].peer_map_max_nanos, 0U);
+            const auto drain_start = std::chrono::steady_clock::now();
+            ASSERT_NO_THROW(emu->sync_worker_context(i));
+            peer_drain_time += std::chrono::steady_clock::now() - drain_start;
+        }
+        std::cout << "[SMP-LARGE-MAP] vcpus=" << vcpu_count << " pages=" << region_size / page_size
+                  << " owner_map_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(owner_map_time).count()
+                  << " peer_drain_total_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(peer_drain_time).count() << '\n';
+        const auto profile = emu->smp_profile();
+        if (profile.size() == vcpu_count && profile[1].invalidation_profile_enabled)
+        {
+            for (size_t i = 1; i < vcpu_count; ++i)
+            {
+                std::cout << "[SMP-LARGE-MAP] peer=" << i << " peer_map_calls=" << profile[i].peer_map_calls
+                          << " peer_map_pages=" << profile[i].peer_map_pages
+                          << " peer_map_total_ms=" << profile[i].peer_map_nanos / 1000000
+                          << " peer_map_max_ms=" << profile[i].peer_map_max_nanos / 1000000 << '\n';
+                EXPECT_EQ(profile[i].peer_map_calls, 1U);
+                EXPECT_EQ(profile[i].peer_map_pages, region_size / page_size);
+                EXPECT_GT(profile[i].peer_map_nanos, 0U);
+                EXPECT_GT(profile[i].peer_map_max_nanos, 0U);
+            }
         }
 
         for (size_t i = 0; i < page_offsets.size(); ++i)
         {
             owner.reg(x86_register::rip, code + 0x20 + i * 0x20);
             ASSERT_NO_THROW(owner.start(3));
-            peer.reg(x86_register::rip, code + 0x100 + i * 0x20);
-            ASSERT_NO_THROW(peer.start(2));
-            EXPECT_EQ(peer.reg(x86_register::rax), values[i]) << "page offset " << page_offsets[i];
+            for (size_t j = 1; j < vcpu_count; ++j)
+            {
+                auto& reader = emu->get_cpu(j);
+                reader.reg(x86_register::rip, code + 0x100 + i * 0x20);
+                ASSERT_NO_THROW(reader.start(2));
+                EXPECT_EQ(reader.reg(x86_register::rax), values[i]) << "peer " << j << " page offset " << page_offsets[i];
+            }
             uint64_t host_value{};
             emu->read_memory(region + page_offsets[i], &host_value, sizeof(host_value));
             EXPECT_EQ(host_value, values[i]) << "host read at page offset " << page_offsets[i];
@@ -129,6 +143,13 @@ namespace sogen::test
         owner.reg(x86_register::rip, code + 0x1C0);
         ASSERT_NO_THROW(owner.start(2));
         EXPECT_EQ(owner.reg(x86_register::rax), peer_value);
+        for (size_t i = 2; i < vcpu_count; ++i)
+        {
+            auto& reader = emu->get_cpu(i);
+            reader.reg(x86_register::rip, code + 0x1C0);
+            ASSERT_NO_THROW(reader.start(2));
+            EXPECT_EQ(reader.reg(x86_register::rax), peer_value) << "peer " << i;
+        }
         uint64_t host_value{};
         emu->read_memory(region + page_offsets[2], &host_value, sizeof(host_value));
         EXPECT_EQ(host_value, peer_value);
