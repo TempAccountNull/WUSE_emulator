@@ -34,4 +34,27 @@ namespace sogen::test
             EXPECT_EQ(win_emu.get_executed_instructions(), before + 1);
         }
     }
+
+    TEST(GdbOutputInterrupt, PassiveEventsKeepExecutionRunningUntilExplicitInterrupt)
+    {
+        emulator_settings settings{.disable_logging = true};
+        settings.path_mappings["C:\\test-sample.exe"] = std::filesystem::current_path() / "test-sample.exe";
+        auto win_emu = create_sample_emulator(std::move(settings));
+        win_emu.setup_process_if_necessary();
+
+        size_t reported_messages{};
+        win_emu.callbacks.on_debug_string.add([&](std::string_view) { ++reported_messages; });
+        win_x86_64_gdb_stub_handler handler{win_emu, {}, gdb_target_architecture::bits_64, false};
+        win_emu.callbacks.on_module_load(*win_emu.mod_manager.executable);
+        EXPECT_TRUE(handler.should_signal_library());
+        EXPECT_FALSE(win_emu.stop_requested());
+        win_emu.callbacks.on_debug_string("guest output remains in the analyzer");
+        EXPECT_EQ(reported_messages, 1u);
+        EXPECT_FALSE(win_emu.stop_requested());
+        EXPECT_TRUE(handler.consume_debug_output().empty());
+
+        handler.on_interrupt();
+        EXPECT_TRUE(win_emu.stop_requested());
+        EXPECT_EQ(handler.run(), gdb_stub::action::resume);
+    }
 }

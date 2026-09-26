@@ -426,6 +426,11 @@ namespace sogen
         void start(size_t count = 0);
         void stop();
 
+        bool stop_requested() const
+        {
+            return should_stop.load(std::memory_order_acquire);
+        }
+
         void serialize(utils::buffer_serializer& buffer) const;
         void deserialize(utils::buffer_deserializer& buffer);
 

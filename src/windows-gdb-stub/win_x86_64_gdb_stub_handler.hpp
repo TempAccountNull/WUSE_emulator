@@ -23,34 +23,45 @@ namespace sogen
     {
       public:
         win_x86_64_gdb_stub_handler(windows_emulator& win_emu, utils::optional_function<bool()> should_stop = {},
-                                    const gdb_target_architecture target_architecture = gdb_target_architecture::bits_64)
+                                    const gdb_target_architecture target_architecture = gdb_target_architecture::bits_64,
+                                    const bool stop_on_async_events = true)
             : x86_64_gdb_stub_handler(win_emu.emu()),
               win_emu_(&win_emu),
               should_stop_(std::move(should_stop)),
               windows_filesystem_(win_emu),
-              target_architecture_(target_architecture)
+              target_architecture_(target_architecture),
+              stop_on_async_events_(stop_on_async_events)
         {
             auto hook = [this](mapped_module&) {
-                this->remember_stop_cpu(this->win_emu_->active_cpu());
                 library_stop_pending_ = true;
-                win_emu_->stop();
+                if (stop_on_async_events_)
+                {
+                    this->remember_stop_cpu(this->win_emu_->active_cpu());
+                    win_emu_->stop();
+                }
             };
 
             mod_load_id = win_emu_->callbacks.on_module_load.add(hook);
             mod_unload_id = win_emu_->callbacks.on_module_unload.add(hook);
-            dbg_msg_id = win_emu_->callbacks.on_debug_string.add([this](std::string_view message) {
-                this->remember_stop_cpu(this->win_emu_->active_cpu());
-                debug_message.assign(message);
-                action = gdb_stub::action::output;
-                win_emu_->stop();
-            });
+            if (stop_on_async_events_)
+            {
+                dbg_msg_id = win_emu_->callbacks.on_debug_string.add([this](std::string_view message) {
+                    this->remember_stop_cpu(this->win_emu_->active_cpu());
+                    debug_message.assign(message);
+                    action = gdb_stub::action::output;
+                    win_emu_->stop();
+                });
+            }
         }
 
         ~win_x86_64_gdb_stub_handler() override
         {
             win_emu_->callbacks.on_module_load.remove(mod_load_id);
             win_emu_->callbacks.on_module_unload.remove(mod_unload_id);
-            win_emu_->callbacks.on_debug_string.remove(dbg_msg_id);
+            if (stop_on_async_events_)
+            {
+                win_emu_->callbacks.on_debug_string.remove(dbg_msg_id);
+            }
         }
 
         void on_interrupt() override
@@ -653,6 +664,7 @@ namespace sogen
         utils::optional_function<bool()> should_stop_{};
         windows_filesystem windows_filesystem_;
         gdb_target_architecture target_architecture_{gdb_target_architecture::bits_64};
+        bool stop_on_async_events_{true};
 
         // Track library stop events
         std::atomic<bool> library_stop_pending_{true};

@@ -641,8 +641,10 @@ namespace sogen
                         bool connected{};
                         gdb_stub::session_end_reason end_reason{};
                         {
-                            win_x86_64_gdb_stub_handler handler{win_emu, should_stop,
-                                                                parse_gdb_target_architecture(options.gdb_architecture)};
+                            const auto* passive_events = std::getenv("SOGEN_GDB_PASSIVE_EVENTS");
+                            const bool stop_on_async_events = !passive_events || std::string_view(passive_events) != "1";
+                            win_x86_64_gdb_stub_handler handler{
+                                win_emu, should_stop, parse_gdb_target_architecture(options.gdb_architecture), stop_on_async_events};
                             connected = gdb_stub::run_gdb_stub(address, handler, &end_reason);
                             debugger_execution_failed = handler.execution_failed();
                         }
