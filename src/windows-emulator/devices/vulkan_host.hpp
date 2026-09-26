@@ -69,10 +69,23 @@ namespace sogen
         int32_t debug_utils_messenger(std::span<const std::byte> packet, uint64_t& out_messenger);
         int32_t debug_utils_command(std::span<const std::byte> packet);
 
-        // Creates a bare instance (no layers/extensions). out_instance is set to a fresh object id
-        // on success, or 0 on failure.
+        struct instance_create_options
+        {
+            uint32_t api_version{}; // 0 means Vulkan 1.0, as for VkApplicationInfo.
+            uint32_t application_version{};
+            uint32_t engine_version{};
+            uint32_t extension_bits{};
+            bool application_info_present{};
+            bool application_name_present{};
+            bool engine_name_present{};
+            std::string application_name;
+            std::string engine_name;
+        };
+        // The optional options are reconstructed from a bounded pointer-free guest packet.
+        // When absent, retain the internal maximum-version behavior for existing host callers.
         int32_t create_instance(uint64_t& out_instance, bool debug_utils_enabled = false,
-                                std::span<const std::byte> creation_callback = {});
+                                std::span<const std::byte> creation_callback = {},
+                                const instance_create_options* options = nullptr);
         // Reports the version used for this native instance, not the loader's maximum supported version.
         int32_t get_instance_api_version(uint64_t instance, uint32_t& out_version) const;
         void destroy_instance(uint64_t instance);

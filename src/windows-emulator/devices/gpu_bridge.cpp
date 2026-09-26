@@ -5,6 +5,7 @@
 #include "../windows_emulator.hpp"
 
 #include <gpu_bridge_protocol.hpp>
+#include <vk_instance_create_wire.hpp>
 #include <vk_debug_utils_callback_relay.hpp>
 #include <vk_debug_utils_command_wire.hpp>
 #include <vk_debug_utils_messenger_wire.hpp>
@@ -762,20 +763,32 @@ namespace sogen
 
                 bool debug_utils_enabled = false;
                 std::vector<std::byte> callback;
-                if (context.input_buffer_length)
+                vulkan_host::instance_create_options options{};
+                const vulkan_host::instance_create_options* options_ptr = nullptr;
+                if (context.input_buffer_length >= sizeof(gpu_bridge::create_instance_request))
                 {
-                    gpu_bridge::debug_utils_instance_request request{};
-                    if (!read_input(win_emu, context, request) || request.enabled > 1 ||
-                        request.callback_size > gpu_bridge::debug_utils_messenger_wire::max_packet_bytes ||
-                        context.input_buffer_length != sizeof(request) + request.callback_size)
+                    if (context.input_buffer_length > gpu_bridge::instance_create_wire::max_packet_bytes)
                         return STATUS_INVALID_PARAMETER;
-                    debug_utils_enabled = request.enabled != 0;
-                    callback.resize(request.callback_size);
-                    if (!callback.empty())
-                        win_emu.emu().read_memory(context.input_buffer + sizeof(request), callback.data(), callback.size());
+                    std::vector<std::byte> packet(context.input_buffer_length);
+                    win_emu.emu().read_memory(context.input_buffer, packet.data(), packet.size());
+                    auto decoded = gpu_bridge::instance_create_wire::decode(packet);
+                    if (!decoded) return STATUS_INVALID_PARAMETER;
+                    options.api_version = decoded->request.api_version;
+                    options.application_version = decoded->request.application_version;
+                    options.engine_version = decoded->request.engine_version;
+                    options.extension_bits = decoded->request.extension_bits;
+                    options.application_info_present = decoded->request.application_info_present != 0;
+                    options.application_name_present = decoded->request.application_name_bytes != 0;
+                    options.engine_name_present = decoded->request.engine_name_bytes != 0;
+                    options.application_name = std::move(decoded->application_name);
+                    options.engine_name = std::move(decoded->engine_name);
+                    callback = std::move(decoded->callback);
+                    debug_utils_enabled = (options.extension_bits & gpu_bridge::instance_ext_debug_utils) != 0;
+                    options_ptr = &options;
                 }
+                else return STATUS_INVALID_PARAMETER;
                 uint64_t instance = gpu_bridge::null_object;
-                const int32_t result = this->vulkan_.create_instance(instance, debug_utils_enabled, callback);
+                const int32_t result = this->vulkan_.create_instance(instance, debug_utils_enabled, callback, options_ptr);
 
                 const gpu_bridge::create_instance_response response{
                     .vk_result = result,

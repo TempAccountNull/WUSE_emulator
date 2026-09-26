@@ -50,42 +50,6 @@ namespace
         return enabled;
     }
 
-    VkResult validate_native_instance(const VkInstanceCreateInfo* info, const VkAllocationCallbacks* allocator, VkInstance* instance)
-    {
-        if (!info || !instance || allocator || info->sType != VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO || info->pNext || info->flags)
-        {
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
-        if (info->enabledLayerCount)
-        {
-            return VK_ERROR_LAYER_NOT_PRESENT;
-        }
-        if (info->enabledExtensionCount && !info->ppEnabledExtensionNames)
-        {
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
-        if (info->pApplicationInfo)
-        {
-            const auto api = info->pApplicationInfo->apiVersion;
-            if (VK_API_VERSION_VARIANT(api) != 0 || VK_API_VERSION_MAJOR(api) > 1 ||
-                (VK_API_VERSION_MAJOR(api) == 1 && VK_API_VERSION_MINOR(api) > 3))
-            {
-                return VK_ERROR_INCOMPATIBLE_DRIVER;
-            }
-        }
-        for (uint32_t i = 0; i < info->enabledExtensionCount; ++i)
-        {
-            const auto* name = info->ppEnabledExtensionNames[i];
-            if (!name ||
-                (std::strcmp(name, VK_KHR_SURFACE_EXTENSION_NAME) != 0 && std::strcmp(name, VK_KHR_WIN32_SURFACE_EXTENSION_NAME) != 0 &&
-                 std::strcmp(name, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) != 0))
-            {
-                return VK_ERROR_EXTENSION_NOT_PRESENT;
-            }
-        }
-        return VK_SUCCESS;
-    }
-
     VkResult native_destroy(const nw::operation op, const uint64_t owner, const uint64_t object = 0)
     {
         nw::request request{};

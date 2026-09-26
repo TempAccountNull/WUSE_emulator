@@ -17,7 +17,7 @@ namespace sogen::gpu_bridge
     // Identifies a valid bridge and lets the guest detect a host that speaks a different
     // protocol revision before issuing any further commands.
     inline constexpr uint32_t protocol_magic = 0x55504753; // 'SGPU'
-    inline constexpr uint32_t protocol_version = 32;
+    inline constexpr uint32_t protocol_version = 33;
 
     // Windows IOCTL encoding: CTL_CODE(DeviceType, Function, Method, Access).
     //   value = (DeviceType << 16) | (Access << 14) | (Function << 2) | Method
@@ -245,11 +245,33 @@ namespace sogen::gpu_bridge
 
     // Debug-utils callback data itself is encoded by vk_debug_utils_wire.hpp. All pointers are
     // copied before crossing this boundary and callback addresses remain opaque guest values.
-    struct debug_utils_instance_request
+    // Pointer-free vkCreateInstance request. Names are zero-terminated byte strings immediately
+    // after this header (application, engine), followed by the optional debug-utils callback wire.
+    // Surface extensions are synthetic in readback mode; the host only enables native WSI support
+    // when its presentation path needs it. Unknown bits and malformed lengths are rejected.
+    inline constexpr uint32_t create_instance_request_magic = 0x53494e53; // "SNIS"
+    inline constexpr uint32_t instance_ext_surface = 1u << 0;
+    inline constexpr uint32_t instance_ext_win32_surface = 1u << 1;
+    inline constexpr uint32_t instance_ext_surface_capabilities2 = 1u << 2;
+    inline constexpr uint32_t instance_ext_debug_utils = 1u << 3;
+    inline constexpr uint32_t instance_ext_supported = instance_ext_surface | instance_ext_win32_surface |
+                                                       instance_ext_surface_capabilities2 | instance_ext_debug_utils;
+    inline constexpr uint32_t max_instance_name_bytes = 256;
+    struct create_instance_request
     {
-        uint32_t enabled;
+        uint32_t magic;
+        uint32_t api_version;
+        uint32_t application_version;
+        uint32_t engine_version;
+        uint32_t application_info_present;
+        uint32_t extension_bits;
+        uint32_t application_name_bytes;
+        uint32_t engine_name_bytes;
         uint32_t callback_size;
+        uint32_t reserved;
     };
+    static_assert(sizeof(create_instance_request) == 40);
+
     struct debug_utils_capabilities_response
     {
         uint32_t available;

@@ -1608,7 +1608,8 @@ namespace sogen
     }
 
     int32_t vulkan_host::create_instance(uint64_t& out_instance, bool debug_utils_enabled,
-                                         std::span<const std::byte> creation_callback_packet)
+                                         std::span<const std::byte> creation_callback_packet,
+                                         const instance_create_options* options)
     {
         out_instance = 0;
 
@@ -1619,6 +1620,24 @@ namespace sogen
 
         if (debug_utils_enabled && !this->debug_utils_available())
             return VK_ERROR_EXTENSION_NOT_PRESENT;
+        if (options)
+        {
+            if (!options->application_info_present &&
+                (options->api_version || options->application_version || options->engine_version ||
+                 options->application_name_present || options->engine_name_present))
+                return VK_ERROR_INITIALIZATION_FAILED;
+            constexpr auto supported = gpu_bridge::instance_ext_supported;
+            if ((options->extension_bits & ~supported) != 0 ||
+                debug_utils_enabled != ((options->extension_bits & gpu_bridge::instance_ext_debug_utils) != 0))
+                return VK_ERROR_EXTENSION_NOT_PRESENT;
+            if ((options->extension_bits & (gpu_bridge::instance_ext_win32_surface |
+                                            gpu_bridge::instance_ext_surface_capabilities2)) != 0 &&
+                (options->extension_bits & gpu_bridge::instance_ext_surface) == 0)
+                return VK_ERROR_EXTENSION_NOT_PRESENT;
+            if (!this->impl_->native_wsi &&
+                (options->extension_bits & gpu_bridge::instance_ext_surface_capabilities2) != 0)
+                return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
         std::shared_ptr<impl::debug_callback_state> creation_callback;
         VkDebugUtilsMessengerCreateInfoEXT callback_info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
         if (!creation_callback_packet.empty())
@@ -1656,13 +1675,28 @@ namespace sogen
             }
         }
 
+        if (options)
+        {
+            const uint32_t requested = options->api_version ? options->api_version : VK_API_VERSION_1_0;
+            if (VK_API_VERSION_VARIANT(requested) != 0 || VK_API_VERSION_MAJOR(requested) != 1 ||
+                requested > api_version)
+                return VK_ERROR_INCOMPATIBLE_DRIVER;
+            api_version = requested;
+        }
         VkApplicationInfo app_info{};
         app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         app_info.apiVersion = api_version;
+        if (options)
+        {
+            app_info.applicationVersion = options->application_version;
+            app_info.engineVersion = options->engine_version;
+            app_info.pApplicationName = options->application_name_present ? options->application_name.c_str() : nullptr;
+            app_info.pEngineName = options->engine_name_present ? options->engine_name.c_str() : nullptr;
+        }
 
         VkInstanceCreateInfo create_info{};
         create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-        create_info.pApplicationInfo = &app_info;
+        create_info.pApplicationInfo = !options || options->application_info_present ? &app_info : nullptr;
         native_present_sync::surface_support native_extensions;
         if (this->impl_->native_wsi)
         {

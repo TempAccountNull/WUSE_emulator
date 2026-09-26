@@ -35,6 +35,7 @@
 #include <vulkan/vulkan_win32.h>
 
 #include <gpu_bridge_protocol.hpp>
+#include <vk_instance_create_policy.hpp>
 #include <native_wsi_wire.hpp>
 #include <vk_feature_chain.hpp>
 #include <vk_render_pass.hpp>
@@ -576,52 +577,66 @@ extern "C"
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo,
                                                                           const VkAllocationCallbacks* pAllocator, VkInstance* pInstance)
     {
-        if (native_wsi_enabled())
-        {
-            const auto validation = validate_native_instance(pCreateInfo, pAllocator, pInstance);
-            if (validation != VK_SUCCESS)
-            {
-                return validation;
-            }
-        }
-
         if (passthrough_active())
         {
             if (auto* const fn = real_global_command<PFN_vkCreateInstance>("vkCreateInstance"))
-            {
                 return fn(pCreateInfo, pAllocator, pInstance);
+        }
+        const auto validation = gb::instance_create_policy::validate(
+            pCreateInfo, pAllocator, pInstance, native_wsi_enabled(), debug_utils_supported_by_bridge());
+        if (validation.result != VK_SUCCESS)
+        {
+            if (validation.rejected_pnext != VK_STRUCTURE_TYPE_MAX_ENUM)
+            {
+                char diagnostic[128]{};
+                std::snprintf(diagnostic, sizeof(diagnostic), "[vulkan-shim] vkCreateInstance unsupported pNext sType=%u\n",
+                              static_cast<uint32_t>(validation.rejected_pnext));
+                shim_log(diagnostic);
             }
+            return validation.result;
+        }
+        const uint32_t extension_bits = validation.extension_bits;
+        const bool debug_enabled = (extension_bits & gb::instance_ext_debug_utils) != 0;
+        const VkApplicationInfo* app = pCreateInfo->pApplicationInfo;
+        std::string application_name;
+        std::string engine_name;
+        const auto copy_name = [](const char* source, std::string& out) {
+            if (!source) return true;
+            const size_t length = strnlen_s(source, gb::max_instance_name_bytes);
+            if (length == gb::max_instance_name_bytes) return false;
+            out.assign(source, length + 1); // Include the terminator in the wire payload.
+            return true;
+        };
+        if (app)
+        {
+            if (!copy_name(app->pApplicationName, application_name) || !copy_name(app->pEngineName, engine_name))
+                return VK_ERROR_INITIALIZATION_FAILED;
         }
 
-        bool debug_enabled = false;
-        if (pCreateInfo && pCreateInfo->ppEnabledExtensionNames)
-        {
-            for (uint32_t index = 0; index < pCreateInfo->enabledExtensionCount; ++index)
-                debug_enabled |= pCreateInfo->ppEnabledExtensionNames[index] &&
-                                 std::strcmp(pCreateInfo->ppEnabledExtensionNames[index], VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
-        }
-        if (debug_enabled && !debug_utils_supported_by_bridge())
-            return VK_ERROR_EXTENSION_NOT_PRESENT;
         std::vector<std::byte> creation_callback;
-        if (debug_enabled && pCreateInfo)
+        if (validation.callback)
         {
-            uint32_t chain_length = 0;
-            for (auto* next = static_cast<const VkBaseInStructure*>(pCreateInfo->pNext); next && chain_length++ < 256; next = next->pNext)
-            {
-                if (next->sType != VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT) continue;
-                auto callback = *reinterpret_cast<const VkDebugUtilsMessengerCreateInfoEXT*>(next);
-                callback.pNext = nullptr;
-                try { creation_callback = gb::debug_utils_messenger_wire::marshal_create(0, 0, callback, sizeof(void*)); }
-                catch (const std::exception&) { return VK_ERROR_INITIALIZATION_FAILED; }
-                break;
-            }
-            if (chain_length >= 256) return VK_ERROR_INITIALIZATION_FAILED;
+            auto callback = *validation.callback;
+            callback.pNext = nullptr;
+            try { creation_callback = gb::debug_utils_messenger_wire::marshal_create(0, 0, callback, sizeof(void*)); }
+            catch (const std::exception&) { return VK_ERROR_INITIALIZATION_FAILED; }
         }
-        gb::debug_utils_instance_request header{.enabled = debug_enabled ? 1u : 0u,
-                                                .callback_size = static_cast<uint32_t>(creation_callback.size())};
-        std::vector<std::byte> packet(sizeof(header) + creation_callback.size());
+        gb::create_instance_request header{
+            .magic = gb::create_instance_request_magic,
+            .api_version = app ? app->apiVersion : 0,
+            .application_version = app ? app->applicationVersion : 0,
+            .engine_version = app ? app->engineVersion : 0,
+            .application_info_present = app ? 1u : 0u,
+            .extension_bits = extension_bits,
+            .application_name_bytes = static_cast<uint32_t>(application_name.size()),
+            .engine_name_bytes = static_cast<uint32_t>(engine_name.size()),
+            .callback_size = static_cast<uint32_t>(creation_callback.size())};
+        std::vector<std::byte> packet(sizeof(header) + application_name.size() + engine_name.size() + creation_callback.size());
         std::memcpy(packet.data(), &header, sizeof(header));
-        if (!creation_callback.empty()) std::memcpy(packet.data() + sizeof(header), creation_callback.data(), creation_callback.size());
+        size_t cursor = sizeof(header);
+        if (!application_name.empty()) { std::memcpy(packet.data() + cursor, application_name.data(), application_name.size()); cursor += application_name.size(); }
+        if (!engine_name.empty()) { std::memcpy(packet.data() + cursor, engine_name.data(), engine_name.size()); cursor += engine_name.size(); }
+        if (!creation_callback.empty()) std::memcpy(packet.data() + cursor, creation_callback.data(), creation_callback.size());
         if (!creation_callback.empty()) g_debug_callback_count.fetch_add(1, std::memory_order_release);
         gb::create_instance_response response{};
         const bool created = bridge_call(gb::ioctl_create_instance, packet.data(), static_cast<DWORD>(packet.size()),
@@ -758,6 +773,9 @@ extern "C"
                 return fn(pLayerName, pPropertyCount, pProperties);
             }
         }
+
+        if (pLayerName)
+            return VK_ERROR_LAYER_NOT_PRESENT; // The guest enumerates no instance layers.
 
         static const VkExtensionProperties extensions[] = {
             {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_SURFACE_SPEC_VERSION},

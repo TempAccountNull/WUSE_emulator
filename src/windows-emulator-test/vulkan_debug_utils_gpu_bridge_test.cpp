@@ -55,7 +55,8 @@ namespace sogen::test
         if (!win.emu().read_memory<gpu_bridge::debug_utils_capabilities_response>(memory + 0x1000).available)
             GTEST_SKIP() << "Native Vulkan loader lacks VK_EXT_debug_utils";
 
-        const gpu_bridge::debug_utils_instance_request instance_request{.enabled = 1, .callback_size = 0};
+        const gpu_bridge::create_instance_request instance_request{
+            .magic = gpu_bridge::create_instance_request_magic, .extension_bits = gpu_bridge::instance_ext_debug_utils};
         ASSERT_EQ(ioctl(gpu_bridge::ioctl_create_instance, &instance_request, sizeof(instance_request),
                         sizeof(gpu_bridge::create_instance_response)), STATUS_SUCCESS);
         const auto created = win.emu().read_memory<gpu_bridge::create_instance_response>(memory + 0x1000);
@@ -139,7 +140,8 @@ namespace sogen::test
         if (!win.emu().read_memory<gpu_bridge::debug_utils_capabilities_response>(memory + 0x1000).available)
             GTEST_SKIP() << "Native Vulkan loader lacks VK_EXT_debug_utils";
 
-        const gpu_bridge::debug_utils_instance_request instance_request{.enabled = 1};
+        const gpu_bridge::create_instance_request instance_request{
+            .magic = gpu_bridge::create_instance_request_magic, .extension_bits = gpu_bridge::instance_ext_debug_utils};
         ASSERT_EQ(ioctl(gpu_bridge::ioctl_create_instance, &instance_request, sizeof(instance_request),
                         sizeof(gpu_bridge::create_instance_response)), STATUS_SUCCESS);
         const auto instance = win.emu().read_memory<gpu_bridge::create_instance_response>(memory + 0x1000);
