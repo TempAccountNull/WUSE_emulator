@@ -3140,6 +3140,39 @@ mod fast_noop_barrier_tests {
         emu.read_register(registers::X86Register::Rax, &mut rax);
         assert_eq!(u64::from_le_bytes(rax), 0, "second instruction ran after the exception");
     }
+
+    #[test]
+    fn measured_single_thread_barrier_loop() {
+        if std::env::var("SOGEN_ICICLE_BARRIER_BENCH").as_deref() != Ok("1") {
+            return;
+        }
+        const ADDRESS: u64 = 0x90000;
+        const ITERATIONS: u64 = 5_000_000;
+        // mov ecx, 5M; xor eax, eax; add rax, rcx; dec rcx; jne add; jmp $
+        const CODE: [u8; 17] = [
+            0xb9, 0x40, 0x4b, 0x4c, 0x00, 0x31, 0xc0, 0x48, 0x01, 0xc8,
+            0x48, 0xff, 0xc9, 0x75, 0xf8, 0xeb, 0xfe,
+        ];
+        let mut emu = IcicleEmulator::new_with_instruction_hooks(false);
+        emu.vm.enable_jit = true;
+        assert!(emu.map_memory(ADDRESS, 0x1000, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+        assert!(emu.write_memory(ADDRESS, &CODE));
+        emu.vm.cpu.write_pc(ADDRESS);
+        let start_count = emu.vm.cpu.icount;
+        let start = Instant::now();
+        emu.start(ITERATIONS * 3 + 10);
+        let elapsed = start.elapsed();
+        assert!(matches!(emu.last_vm_exit, icicle_vm::VmExit::InstructionLimit));
+        let mut rax = [0u8; 8];
+        let mut rcx = [0u8; 8];
+        emu.read_register(registers::X86Register::Rax, &mut rax);
+        emu.read_register(registers::X86Register::Rcx, &mut rcx);
+        assert_eq!(u64::from_le_bytes(rax), ITERATIONS * (ITERATIONS + 1) / 2);
+        assert_eq!(u64::from_le_bytes(rcx), 0);
+        eprintln!("BARRIERBENCH fast={} iterations={} icount_delta={} elapsed_ms={:.3}",
+            std::env::var("SOGEN_ICICLE_FAST_NOOP_BARRIER").unwrap_or_default(),
+            ITERATIONS, emu.vm.cpu.icount - start_count, elapsed.as_secs_f64() * 1000.0);
+    }
 }
 
 #[cfg(test)]
