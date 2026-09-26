@@ -267,6 +267,8 @@ namespace sogen
             VkPhysicalDevice handle{};
             uint64_t instance_id{};
             std::optional<VkPhysicalDeviceProperties> properties;
+            std::optional<bool> native_multi_draw;
+            std::optional<bool> indirect_multi_draw_available;
         };
 
         struct device_data
@@ -434,6 +436,7 @@ namespace sogen
             PFN_vkCmdDrawMultiIndexedEXT cmd_draw_multi_indexed{};
             bool multi_draw_extension{};
             bool multi_draw_feature{};
+            bool multi_draw_indirect_fallback{};
             uint32_t max_multi_draw_count{};
             PFN_vkCmdBindVertexBuffers cmd_bind_vertex_buffers{};
             PFN_vkCmdBindVertexBuffers2 cmd_bind_vertex_buffers2{};
@@ -529,11 +532,21 @@ namespace sogen
             uint64_t device_id{};
         };
 
+        struct indirect_draw_page
+        {
+            VkBuffer buffer{};
+            VkDeviceMemory memory{};
+            void* mapped{};
+            VkDeviceSize capacity{};
+            VkDeviceSize used{};
+        };
+
         struct command_buffer_data
         {
             VkCommandBuffer handle{};
             uint64_t device_id{};
             uint64_t pool_id{};
+            std::vector<indirect_draw_page> multi_draw_pages;
         };
 
         struct fence_data
@@ -705,6 +718,24 @@ namespace sogen
         std::unordered_map<uint64_t, descriptor_set_data> descriptor_sets;
         uint64_t next_id{1};
 
+        static void release_indirect_page(device_data& dev, indirect_draw_page& page)
+        {
+            if (page.mapped && dev.unmap_memory)
+                dev.unmap_memory(dev.handle, page.memory);
+            if (page.buffer && dev.destroy_buffer)
+                dev.destroy_buffer(dev.handle, page.buffer, nullptr);
+            if (page.memory && dev.free_memory)
+                dev.free_memory(dev.handle, page.memory, nullptr);
+            page = {};
+        }
+
+        static void release_indirect_pages(device_data& dev, command_buffer_data& cb)
+        {
+            for (auto& page : cb.multi_draw_pages)
+                release_indirect_page(dev, page);
+            cb.multi_draw_pages.clear();
+        }
+
         static bool drain_readback(swapchain_data& sc, device_data& dev, vulkan_host::presented_frame& frame)
         {
             const auto readback_size = static_cast<VkDeviceSize>(sc.width) * sc.height * 4;
@@ -746,6 +777,203 @@ namespace sogen
                 }
             }
             return UINT32_MAX;
+        }
+
+        bool native_multi_draw_available(physical_device_data& pd)
+        {
+            if (pd.native_multi_draw.has_value())
+                return *pd.native_multi_draw;
+            pd.native_multi_draw = false;
+            const auto instance = this->instances.find(pd.instance_id);
+            if (instance == this->instances.end() || !instance->second.enumerate_device_extension_properties)
+                return false;
+            uint32_t count = 0;
+            if (instance->second.enumerate_device_extension_properties(pd.handle, nullptr, &count, nullptr) != VK_SUCCESS)
+                return false;
+            std::vector<VkExtensionProperties> names(count);
+            if (count && instance->second.enumerate_device_extension_properties(pd.handle, nullptr, &count, names.data()) != VK_SUCCESS)
+                return false;
+            pd.native_multi_draw = std::ranges::any_of(names, [](const VkExtensionProperties& extension) {
+                return std::strcmp(extension.extensionName, VK_EXT_MULTI_DRAW_EXTENSION_NAME) == 0;
+            });
+            return *pd.native_multi_draw;
+        }
+
+        bool indirect_multi_draw_available(physical_device_data& pd)
+        {
+            if (pd.indirect_multi_draw_available.has_value())
+                return *pd.indirect_multi_draw_available;
+            pd.indirect_multi_draw_available = false;
+            if (native_multi_draw_available(pd))
+                return false;
+            const auto instance = this->instances.find(pd.instance_id);
+            if (instance == this->instances.end() || !instance->second.get_physical_device_features2 ||
+                !instance->second.get_physical_device_properties || !instance->second.get_physical_device_memory_properties ||
+                !instance->second.get_queue_family_properties || !instance->second.create_device ||
+                !instance->second.get_device_proc_addr)
+                return false;
+            VkPhysicalDeviceVulkan11Features v11{};
+            v11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+            VkPhysicalDeviceFeatures2 features{};
+            features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            features.pNext = &v11;
+            instance->second.get_physical_device_features2(pd.handle, &features);
+            VkPhysicalDeviceProperties properties{};
+            instance->second.get_physical_device_properties(pd.handle, &properties);
+            VkPhysicalDeviceMemoryProperties memory{};
+            instance->second.get_physical_device_memory_properties(pd.handle, &memory);
+            uint32_t queue_count = 0;
+            instance->second.get_queue_family_properties(pd.handle, &queue_count, nullptr);
+            std::vector<VkQueueFamilyProperties> queue_families(queue_count);
+            if (queue_count)
+                instance->second.get_queue_family_properties(pd.handle, &queue_count, queue_families.data());
+            uint32_t graphics_family = UINT32_MAX;
+            for (uint32_t i = 0; i < queue_families.size(); ++i)
+            {
+                if (queue_families[i].queueCount && (queue_families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT))
+                {
+                    graphics_family = i;
+                    break;
+                }
+            }
+            if (properties.apiVersion < VK_API_VERSION_1_1 || features.features.multiDrawIndirect != VK_TRUE ||
+                features.features.drawIndirectFirstInstance != VK_TRUE || v11.shaderDrawParameters != VK_TRUE ||
+                properties.limits.maxDrawIndirectCount < 1024 || graphics_family == UINT32_MAX)
+                return false;
+
+            // Probe the exact argument-buffer usage rather than assuming a generally coherent
+            // memory type is compatible with indirect buffers on this physical device.
+            const float priority = 1.0f;
+            VkDeviceQueueCreateInfo queue_info{};
+            queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+            queue_info.queueFamilyIndex = graphics_family;
+            queue_info.queueCount = 1;
+            queue_info.pQueuePriorities = &priority;
+            features.features.multiDrawIndirect = VK_TRUE;
+            features.features.drawIndirectFirstInstance = VK_TRUE;
+            v11.shaderDrawParameters = VK_TRUE;
+            VkDeviceCreateInfo create_info{};
+            create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+            create_info.pNext = &features;
+            create_info.queueCreateInfoCount = 1;
+            create_info.pQueueCreateInfos = &queue_info;
+            VkDevice probe_device{};
+            if (instance->second.create_device(pd.handle, &create_info, nullptr, &probe_device) != VK_SUCCESS)
+                return false;
+            const auto proc = [&](const char* name) { return instance->second.get_device_proc_addr(probe_device, name); };
+            const auto destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(proc("vkDestroyDevice"));
+            const auto create_buffer = reinterpret_cast<PFN_vkCreateBuffer>(proc("vkCreateBuffer"));
+            const auto destroy_buffer = reinterpret_cast<PFN_vkDestroyBuffer>(proc("vkDestroyBuffer"));
+            const auto get_requirements = reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(proc("vkGetBufferMemoryRequirements"));
+            const auto allocate_memory = reinterpret_cast<PFN_vkAllocateMemory>(proc("vkAllocateMemory"));
+            const auto free_memory = reinterpret_cast<PFN_vkFreeMemory>(proc("vkFreeMemory"));
+            const auto bind_memory = reinterpret_cast<PFN_vkBindBufferMemory>(proc("vkBindBufferMemory"));
+            const auto map_memory = reinterpret_cast<PFN_vkMapMemory>(proc("vkMapMemory"));
+            const auto unmap_memory = reinterpret_cast<PFN_vkUnmapMemory>(proc("vkUnmapMemory"));
+            const bool functions = destroy_device && create_buffer && destroy_buffer && get_requirements &&
+                                   allocate_memory && free_memory && bind_memory && map_memory && unmap_memory &&
+                                   proc("vkCmdDrawIndirect") && proc("vkCmdDrawIndexedIndirect");
+            VkBuffer buffer{};
+            VkDeviceMemory allocation{};
+            void* mapped{};
+            bool available = false;
+            if (functions)
+            {
+                VkBufferCreateInfo buffer_info{};
+                buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+                buffer_info.size = 64 * 1024;
+                buffer_info.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+                buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                if (create_buffer(probe_device, &buffer_info, nullptr, &buffer) == VK_SUCCESS)
+                {
+                    VkMemoryRequirements requirements{};
+                    get_requirements(probe_device, buffer, &requirements);
+                    for (uint32_t i = 0; i < memory.memoryTypeCount; ++i)
+                    {
+                        constexpr auto required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                        if (!(requirements.memoryTypeBits & (1u << i)) ||
+                            (memory.memoryTypes[i].propertyFlags & required) != required)
+                            continue;
+                        VkMemoryAllocateInfo alloc_info{};
+                        alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+                        alloc_info.allocationSize = requirements.size;
+                        alloc_info.memoryTypeIndex = i;
+                        if (allocate_memory(probe_device, &alloc_info, nullptr, &allocation) == VK_SUCCESS)
+                        {
+                            available = bind_memory(probe_device, buffer, allocation, 0) == VK_SUCCESS &&
+                                        map_memory(probe_device, allocation, 0, requirements.size, 0, &mapped) == VK_SUCCESS && mapped;
+                        }
+                        break;
+                    }
+                }
+            }
+            if (mapped) unmap_memory(probe_device, allocation);
+            if (buffer && destroy_buffer) destroy_buffer(probe_device, buffer, nullptr);
+            if (allocation && free_memory) free_memory(probe_device, allocation, nullptr);
+            if (destroy_device) destroy_device(probe_device, nullptr);
+            pd.indirect_multi_draw_available = available;
+            return *pd.indirect_multi_draw_available;
+        }
+
+        // Snapshot guest multi-draw arguments in coherent indirect buffers owned by the native
+        // command buffer. A 64 KiB page amortizes allocations across many recorded commands.
+        VkResult append_indirect_draw_args(device_data& dev, command_buffer_data& cb, const void* source, size_t size,
+                                           VkBuffer& out_buffer, VkDeviceSize& out_offset)
+        {
+            if (!source || size == 0)
+                return VK_ERROR_INITIALIZATION_FAILED;
+            indirect_draw_page* page = cb.multi_draw_pages.empty() ? nullptr : &cb.multi_draw_pages.back();
+            if (!page || page->used > page->capacity || size > page->capacity - page->used)
+            {
+                if (!dev.create_buffer || !dev.get_buffer_memory_requirements || !dev.allocate_memory ||
+                    !dev.bind_buffer_memory || !dev.map_memory || !dev.cmd_draw_indirect || !dev.cmd_draw_indexed_indirect)
+                    return VK_ERROR_FEATURE_NOT_PRESENT;
+                indirect_draw_page created{};
+                created.capacity = std::max<VkDeviceSize>(64 * 1024, static_cast<VkDeviceSize>(size));
+                VkBufferCreateInfo buffer_info{};
+                buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+                buffer_info.size = created.capacity;
+                buffer_info.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+                buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                VkResult result = dev.create_buffer(dev.handle, &buffer_info, nullptr, &created.buffer);
+                if (result != VK_SUCCESS)
+                    return result;
+                VkMemoryRequirements requirements{};
+                dev.get_buffer_memory_requirements(dev.handle, created.buffer, &requirements);
+                const uint32_t type = find_memory_type(dev, requirements.memoryTypeBits,
+                                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                if (type == UINT32_MAX)
+                {
+                    release_indirect_page(dev, created);
+                    return VK_ERROR_FEATURE_NOT_PRESENT;
+                }
+                VkMemoryAllocateInfo allocation{};
+                allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+                allocation.allocationSize = requirements.size;
+                allocation.memoryTypeIndex = type;
+                result = dev.allocate_memory(dev.handle, &allocation, nullptr, &created.memory);
+                if (result == VK_SUCCESS)
+                    result = dev.bind_buffer_memory(dev.handle, created.buffer, created.memory, 0);
+                if (result == VK_SUCCESS)
+                    result = dev.map_memory(dev.handle, created.memory, 0, requirements.size, 0, &created.mapped);
+                if (result != VK_SUCCESS || !created.mapped)
+                {
+                    release_indirect_page(dev, created);
+                    return result == VK_SUCCESS ? VK_ERROR_MEMORY_MAP_FAILED : result;
+                }
+                try { cb.multi_draw_pages.push_back(created); }
+                catch (const std::bad_alloc&)
+                {
+                    release_indirect_page(dev, created);
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
+                page = &cb.multi_draw_pages.back();
+            }
+            out_buffer = page->buffer;
+            out_offset = page->used;
+            std::memcpy(static_cast<std::byte*>(page->mapped) + page->used, source, size);
+            page->used += static_cast<VkDeviceSize>(size);
+            return VK_SUCCESS;
         }
 
         // Redirect a CPU-slow host-visible allocation to plain cached system RAM. DXVK places CPU-written
@@ -1067,6 +1295,13 @@ namespace sogen
             this->erase_owned(this->buffer_views, [&](const buffer_view_data& d) { return d.device_id == device_id; });
             this->erase_owned(this->query_pools, [&](const query_pool_data& d) { return d.device_id == device_id; });
             this->erase_owned(this->shader_modules, [&](const shader_module_data& d) { return d.device_id == device_id; });
+
+            // Indirect argument buffers are not in the guest buffer/memory tables.
+            for (auto& [id, cb] : this->command_buffers)
+            {
+                if (cb.device_id == device_id)
+                    release_indirect_pages(it->second, cb);
+            }
 
             // Destroy GPU-owned children (pools free their command buffers; fences are freed) before
             // the device itself.
@@ -1747,6 +1982,13 @@ namespace sogen
                    (this->impl_->native_wsi && unsupported_native_wsi_extension(extension.extensionName));
         });
         extensions.erase(removed.begin(), removed.end());
+        if (this->impl_->indirect_multi_draw_available(pd->second))
+        {
+            VkExtensionProperties synthetic{};
+            std::memcpy(synthetic.extensionName, VK_EXT_MULTI_DRAW_EXTENSION_NAME, sizeof(VK_EXT_MULTI_DRAW_EXTENSION_NAME));
+            synthetic.specVersion = VK_EXT_MULTI_DRAW_SPEC_VERSION;
+            extensions.push_back(synthetic);
+        }
 
         out_count = static_cast<uint32_t>(extensions.size());
 
@@ -2008,8 +2250,12 @@ namespace sogen
             auto* base = reinterpret_cast<VkBaseOutStructure*>(buffer.data());
             base->sType = type;
             base->pNext = nullptr;
-            tail->pNext = base;
-            tail = base;
+            if (!(type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT &&
+                  this->impl_->indirect_multi_draw_available(pd->second)))
+            {
+                tail->pNext = base;
+                tail = base;
+            }
         }
 
         instance->second.get_physical_device_features2(pd->second.handle, &features2);
@@ -2022,6 +2268,11 @@ namespace sogen
                 auto* features = reinterpret_cast<VkPhysicalDeviceTransformFeedbackFeaturesEXT*>(buffer.data());
                 // TODO: Expose geometry-stream support after geometry shaders are bridged.
                 features->geometryStreams = VK_FALSE;
+            }
+            if (base->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT &&
+                this->impl_->indirect_multi_draw_available(pd->second))
+            {
+                reinterpret_cast<VkPhysicalDeviceMultiDrawFeaturesEXT*>(buffer.data())->multiDraw = VK_TRUE;
             }
         }
 
@@ -2112,8 +2363,12 @@ namespace sogen
             auto* base = reinterpret_cast<VkBaseOutStructure*>(buffer.data());
             base->sType = type;
             base->pNext = nullptr;
-            tail->pNext = base;
-            tail = base;
+            if (!(type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT &&
+                  this->impl_->indirect_multi_draw_available(pd->second)))
+            {
+                tail->pNext = base;
+                tail = base;
+            }
         }
 
         instance->second.get_physical_device_properties2(pd->second.handle, &properties2);
@@ -2128,6 +2383,11 @@ namespace sogen
                 properties->maxTransformFeedbackStreams = std::min(properties->maxTransformFeedbackStreams, 1u);
                 properties->transformFeedbackStreamsLinesTriangles = VK_FALSE;
                 properties->transformFeedbackRasterizationStreamSelect = VK_FALSE;
+            }
+            if (base->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT &&
+                this->impl_->indirect_multi_draw_available(pd->second))
+            {
+                reinterpret_cast<VkPhysicalDeviceMultiDrawPropertiesEXT*>(buffer.data())->maxMultiDrawCount = 1024;
             }
         }
 
@@ -2236,6 +2496,7 @@ namespace sogen
         // advertised, and we cannot marshal them across the bridge.
         std::vector<const char*> extensions;
         extensions.reserve(extension_count);
+        bool synthetic_multi_draw_requested = false;
         {
             const auto* cursor = static_cast<const char*>(extension_blob);
             const char* const end = cursor + extension_blob_size;
@@ -2251,7 +2512,14 @@ namespace sogen
                 {
                     return VK_ERROR_EXTENSION_NOT_PRESENT;
                 }
-                if (!is_unsupported_extension_name(name))
+                if (name == VK_EXT_MULTI_DRAW_EXTENSION_NAME &&
+                    !this->impl_->native_multi_draw_available(pd->second))
+                {
+                    if (!this->impl_->indirect_multi_draw_available(pd->second))
+                        return VK_ERROR_EXTENSION_NOT_PRESENT;
+                    synthetic_multi_draw_requested = true;
+                }
+                else if (!is_unsupported_extension_name(name))
                 {
                     extensions.push_back(cursor);
                 }
@@ -2266,6 +2534,7 @@ namespace sogen
         std::vector<std::vector<std::byte>> chained;
         auto* feature_tail = reinterpret_cast<VkBaseOutStructure*>(&features2);
         bool has_features = false;
+        bool synthetic_multi_draw_feature = false;
         {
             const auto* cursor = static_cast<const std::byte*>(feature_blob);
             const std::byte* const end = cursor + feature_blob_size;
@@ -2284,6 +2553,15 @@ namespace sogen
                 }
 
                 const auto type = static_cast<VkStructureType>(record.s_type);
+                if (synthetic_multi_draw_requested && type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT)
+                {
+                    VkBool32 enabled = VK_FALSE;
+                    if (record.body_size >= sizeof(enabled))
+                        std::memcpy(&enabled, cursor, sizeof(enabled));
+                    synthetic_multi_draw_feature = enabled == VK_TRUE;
+                    cursor += record.body_size;
+                    continue; // never pass a synthetic extension feature struct to the native driver
+                }
                 const size_t size = gpu_bridge::feature_struct_size(type);
                 if (size != 0)
                 {
@@ -2312,6 +2590,40 @@ namespace sogen
                     }
                 }
                 cursor += record.body_size;
+            }
+        }
+
+        if (synthetic_multi_draw_feature)
+        {
+            // The guest only enables multiDraw; its implementation requires these native core features.
+            features2.features.multiDrawIndirect = VK_TRUE;
+            features2.features.drawIndirectFirstInstance = VK_TRUE;
+            has_features = true;
+            bool shader_parameters_in_chain = false;
+            for (auto& buffer : chained)
+            {
+                auto* base = reinterpret_cast<VkBaseOutStructure*>(buffer.data());
+                if (base->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES)
+                {
+                    reinterpret_cast<VkPhysicalDeviceVulkan11Features*>(buffer.data())->shaderDrawParameters = VK_TRUE;
+                    shader_parameters_in_chain = true;
+                    break;
+                }
+                if (base->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES)
+                {
+                    reinterpret_cast<VkPhysicalDeviceShaderDrawParametersFeatures*>(buffer.data())->shaderDrawParameters = VK_TRUE;
+                    shader_parameters_in_chain = true;
+                    break;
+                }
+            }
+            if (!shader_parameters_in_chain)
+            {
+                auto& buffer = chained.emplace_back(sizeof(VkPhysicalDeviceVulkan11Features), std::byte{});
+                auto* v11 = reinterpret_cast<VkPhysicalDeviceVulkan11Features*>(buffer.data());
+                v11->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+                v11->shaderDrawParameters = VK_TRUE;
+                feature_tail->pNext = reinterpret_cast<VkBaseOutStructure*>(v11);
+                feature_tail = reinterpret_cast<VkBaseOutStructure*>(v11);
             }
         }
 
@@ -2400,8 +2712,14 @@ namespace sogen
             return std::ranges::any_of(extensions, [&](const char* enabled) { return std::strcmp(enabled, name) == 0; });
         };
         data.conditional_rendering_extension = enabled_extension(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
-        data.multi_draw_extension = enabled_extension(VK_EXT_MULTI_DRAW_EXTENSION_NAME);
-        if (data.multi_draw_extension && instance->second.get_physical_device_properties2)
+        data.multi_draw_extension = synthetic_multi_draw_requested || enabled_extension(VK_EXT_MULTI_DRAW_EXTENSION_NAME);
+        data.multi_draw_feature = synthetic_multi_draw_feature;
+        data.multi_draw_indirect_fallback = synthetic_multi_draw_feature;
+        if (synthetic_multi_draw_requested)
+        {
+            data.max_multi_draw_count = 1024;
+        }
+        else if (data.multi_draw_extension && instance->second.get_physical_device_properties2)
         {
             VkPhysicalDeviceMultiDrawPropertiesEXT multi_draw{};
             multi_draw.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT;
@@ -2829,7 +3147,12 @@ namespace sogen
             dev->second.destroy_command_pool(dev->second.handle, it->second.handle, nullptr);
         }
 
-        // Command buffers from this pool are freed implicitly by the driver; drop their ids.
+        // Command buffers from this pool are freed implicitly by the driver.
+        for (auto& [id, cb] : this->impl_->command_buffers)
+        {
+            if (cb.pool_id == pool)
+                impl::release_indirect_pages(dev->second, cb);
+        }
         this->impl_->erase_owned(this->impl_->command_buffers, [&](const impl::command_buffer_data& d) { return d.pool_id == pool; });
         this->impl_->command_pools.erase(it);
     }
@@ -2890,6 +3213,7 @@ namespace sogen
             dev->second.free_command_buffers(dev->second.handle, pool_it->second.handle, 1, &cb->second.handle);
         }
 
+        impl::release_indirect_pages(dev->second, cb->second);
         this->impl_->command_buffers.erase(cb);
     }
 
@@ -2962,7 +3286,10 @@ namespace sogen
             info.pInheritanceInfo = &inheritance;
         }
 
-        return dev->second.begin_command_buffer(cb->second.handle, &info);
+        const VkResult result = dev->second.begin_command_buffer(cb->second.handle, &info);
+        if (result == VK_SUCCESS)
+            impl::release_indirect_pages(dev->second, cb->second);
+        return result;
     }
 
     int32_t vulkan_host::cmd_execute_commands(uint64_t command_buffer, std::span<const uint64_t> secondaries)
@@ -3037,7 +3364,16 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
 
-        return dev->second.reset_command_pool(dev->second.handle, it->second.handle, flags);
+        const VkResult result = dev->second.reset_command_pool(dev->second.handle, it->second.handle, flags);
+        if (result == VK_SUCCESS)
+        {
+            for (auto& [id, cb] : this->impl_->command_buffers)
+            {
+                if (cb.pool_id == pool)
+                    impl::release_indirect_pages(dev->second, cb);
+            }
+        }
+        return result;
     }
 
     int32_t vulkan_host::reset_command_buffer(uint64_t command_buffer, uint32_t flags)
@@ -3058,7 +3394,10 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
 
-        return dev->second.reset_command_buffer(cb->second.handle, flags);
+        const VkResult result = dev->second.reset_command_buffer(cb->second.handle, flags);
+        if (result == VK_SUCCESS)
+            impl::release_indirect_pages(dev->second, cb->second);
+        return result;
     }
 
     int32_t vulkan_host::queue_wait_idle(uint64_t queue)
@@ -4074,7 +4413,10 @@ namespace sogen
     {
         const auto dev = this->impl_->devices.find(device);
         return dev != this->impl_->devices.end() && dev->second.multi_draw_extension && dev->second.multi_draw_feature &&
-               dev->second.max_multi_draw_count > 0 && dev->second.cmd_draw_multi && dev->second.cmd_draw_multi_indexed;
+               dev->second.max_multi_draw_count > 0 &&
+               (dev->second.multi_draw_indirect_fallback
+                    ? (dev->second.cmd_draw_indirect && dev->second.cmd_draw_indexed_indirect)
+                    : (dev->second.cmd_draw_multi && dev->second.cmd_draw_multi_indexed));
     }
 
     int32_t vulkan_host::cmd_write_buffer_marker(uint64_t command_buffer, uint64_t buffer, uint64_t offset, uint64_t stage, uint32_t marker,
@@ -8334,30 +8676,45 @@ namespace sogen
     {
         const auto cb = this->impl_->command_buffers.find(command_buffer);
         if (cb == this->impl_->command_buffers.end())
-        {
             return VK_ERROR_INITIALIZATION_FAILED;
-        }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
         if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
-        {
             return VK_ERROR_DEVICE_LOST;
-        }
         if (dev == this->impl_->devices.end() || !supports_multi_draw(cb->second.device_id))
-        {
             return VK_ERROR_FEATURE_NOT_PRESENT;
-        }
-        if (draws.size() > dev->second.max_multi_draw_count)
-        {
+        // The EXT limit is exclusive (VUID 04934). Empty batches have no effect.
+        if (draws.size() >= dev->second.max_multi_draw_count)
             return VK_ERROR_INITIALIZATION_FAILED;
+        if (draws.empty())
+            return VK_SUCCESS;
+
+        if (!dev->second.multi_draw_indirect_fallback)
+        {
+            std::vector<VkMultiDrawInfoEXT> native;
+            native.reserve(draws.size());
+            for (const auto& draw : draws)
+                native.push_back({.firstVertex = draw.first_vertex, .vertexCount = draw.vertex_count});
+            dev->second.cmd_draw_multi(cb->second.handle, static_cast<uint32_t>(native.size()), native.data(),
+                                       instance_count, first_instance, sizeof(VkMultiDrawInfoEXT));
+            return VK_SUCCESS;
         }
-        std::vector<VkMultiDrawInfoEXT> native;
+
+        std::vector<VkDrawIndirectCommand> native;
         native.reserve(draws.size());
         for (const auto& draw : draws)
         {
-            native.push_back({.firstVertex = draw.first_vertex, .vertexCount = draw.vertex_count});
+            native.push_back({.vertexCount = draw.vertex_count, .instanceCount = instance_count,
+                              .firstVertex = draw.first_vertex, .firstInstance = first_instance});
         }
-        dev->second.cmd_draw_multi(cb->second.handle, static_cast<uint32_t>(native.size()), native.data(), instance_count,
-                                   first_instance, sizeof(VkMultiDrawInfoEXT));
+        VkBuffer buffer{};
+        VkDeviceSize offset{};
+        const VkResult result = this->impl_->append_indirect_draw_args(dev->second, cb->second, native.data(),
+                                                                         native.size() * sizeof(native[0]), buffer, offset);
+        if (result != VK_SUCCESS)
+            return result;
+        // One indirect call preserves DrawIndex = 0..drawCount-1 and resets it for the next EXT call.
+        dev->second.cmd_draw_indirect(cb->second.handle, buffer, offset, static_cast<uint32_t>(native.size()),
+                                      sizeof(VkDrawIndirectCommand));
         return VK_SUCCESS;
     }
 
@@ -8367,31 +8724,48 @@ namespace sogen
     {
         const auto cb = this->impl_->command_buffers.find(command_buffer);
         if (cb == this->impl_->command_buffers.end())
-        {
             return VK_ERROR_INITIALIZATION_FAILED;
-        }
         const auto dev = this->impl_->devices.find(cb->second.device_id);
         if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
-        {
             return VK_ERROR_DEVICE_LOST;
-        }
         if (dev == this->impl_->devices.end() || !supports_multi_draw(cb->second.device_id))
-        {
             return VK_ERROR_FEATURE_NOT_PRESENT;
-        }
-        if (draws.size() > dev->second.max_multi_draw_count)
-        {
+        if (draws.size() >= dev->second.max_multi_draw_count)
             return VK_ERROR_INITIALIZATION_FAILED;
+        if (draws.empty())
+            return VK_SUCCESS;
+
+        if (!dev->second.multi_draw_indirect_fallback)
+        {
+            std::vector<VkMultiDrawIndexedInfoEXT> native;
+            native.reserve(draws.size());
+            for (const auto& draw : draws)
+            {
+                native.push_back({.firstIndex = draw.first_index, .indexCount = draw.index_count,
+                                  .vertexOffset = draw.vertex_offset});
+            }
+            dev->second.cmd_draw_multi_indexed(cb->second.handle, static_cast<uint32_t>(native.size()), native.data(),
+                                               instance_count, first_instance, sizeof(VkMultiDrawIndexedInfoEXT), vertex_offset);
+            return VK_SUCCESS;
         }
-        std::vector<VkMultiDrawIndexedInfoEXT> native;
+
+        std::vector<VkDrawIndexedIndirectCommand> native;
         native.reserve(draws.size());
         for (const auto& draw : draws)
         {
-            native.push_back({.firstIndex = draw.first_index, .indexCount = draw.index_count,
-                              .vertexOffset = draw.vertex_offset});
+            native.push_back({.indexCount = draw.index_count, .instanceCount = instance_count,
+                              .firstIndex = draw.first_index,
+                              .vertexOffset = vertex_offset ? *vertex_offset : draw.vertex_offset,
+                              .firstInstance = first_instance});
         }
-        dev->second.cmd_draw_multi_indexed(cb->second.handle, static_cast<uint32_t>(native.size()), native.data(),
-                                           instance_count, first_instance, sizeof(VkMultiDrawIndexedInfoEXT), vertex_offset);
+        VkBuffer buffer{};
+        VkDeviceSize offset{};
+        const VkResult result = this->impl_->append_indirect_draw_args(dev->second, cb->second, native.data(),
+                                                                         native.size() * sizeof(native[0]), buffer, offset);
+        if (result != VK_SUCCESS)
+            return result;
+        dev->second.cmd_draw_indexed_indirect(cb->second.handle, buffer, offset, static_cast<uint32_t>(native.size()),
+                                              sizeof(VkDrawIndexedIndirectCommand));
         return VK_SUCCESS;
     }
 
