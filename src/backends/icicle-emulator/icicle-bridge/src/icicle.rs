@@ -944,7 +944,11 @@ impl IcicleEmulator {
     }
 
     fn new_with_instruction_hooks(install_instruction_hooks: bool) -> Self {
-        let lean_exact_probe = std::env::var("SOGEN_GUEST_CXX_THROW_PROBE").as_deref() == Ok("1");
+        // Both diagnostics install exact execution hooks while broad per-instruction
+        // instrumentation remains off. Keep their triggers aligned with the C++ hook setup.
+        let lean_exact_probe = ["SOGEN_GUEST_CXX_THROW_PROBE", "SOGEN_DESTINY_GS_COOKIE_PROBE"]
+            .iter()
+            .any(|name| std::env::var(name).as_deref() == Ok("1"));
         Self::new_with_hook_modes(install_instruction_hooks, lean_exact_probe)
     }
 
@@ -3065,6 +3069,23 @@ mod lean_exact_execution_hook_tests {
         emu.start(2);
         assert_eq!(*seen.borrow(), vec![ADDRESS + 1], "removed exact hook still ran");
         emu.remove_hook(generic);
+    }
+
+    #[test]
+    fn gs_cookie_probe_enables_exact_hook_in_lean_mode() {
+        if std::env::var("SOGEN_DESTINY_GS_COOKIE_PROBE").as_deref() != Ok("1") {
+            return;
+        }
+        let mut emu = IcicleEmulator::new_with_instruction_hooks(false);
+        emu.vm.enable_jit = true;
+        assert!(emu.map_memory(ADDRESS, 0x1000, FOREIGN_READ | FOREIGN_WRITE | FOREIGN_EXEC));
+        assert!(emu.write_memory(ADDRESS, &[0x90, 0x90, 0xeb, 0xfe]));
+        let called = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&called);
+        emu.add_execution_hook(ADDRESS + 1, Box::new(move |_| observed.set(true)));
+        emu.vm.cpu.write_pc(ADDRESS);
+        emu.start(2);
+        assert!(called.get(), "GS cookie probe did not activate lean exact execution hooks");
     }
 
     #[test]
