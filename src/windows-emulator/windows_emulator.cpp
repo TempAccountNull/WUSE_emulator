@@ -732,6 +732,7 @@ namespace sogen
 
         bool switch_to_next_thread(windows_emulator& win_emu, vcpu_context& vcpu)
         {
+            const windows_emulator::scoped_dispatch dispatch(win_emu, vcpu);
             set_worker_lock_phase(worker_lock_phase::context_switch_work);
             perform_context_switch_work(win_emu, vcpu);
             set_worker_lock_phase(worker_lock_phase::selection_restore);
