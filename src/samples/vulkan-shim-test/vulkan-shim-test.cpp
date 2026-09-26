@@ -18,6 +18,8 @@ bool test_synchronization(PFN_vkGetInstanceProcAddr, VkInstance, VkDevice, VkQue
 bool test_render_pass2(PFN_vkGetInstanceProcAddr, VkInstance, VkPhysicalDevice, VkDevice, VkQueue, uint32_t);
 bool test_layered_resolve_readback(PFN_vkGetInstanceProcAddr);
 bool test_memory_priority(PFN_vkGetInstanceProcAddr, VkInstance, VkPhysicalDevice, uint32_t, uint32_t);
+bool test_descriptor_buffer_properties(PFN_vkGetInstanceProcAddr, VkInstance, const VkPhysicalDevice*, uint32_t);
+int run_descriptor_buffer_properties_query(PFN_vkGetInstanceProcAddr);
 
 namespace
 {
@@ -1097,6 +1099,10 @@ int main(int argc, char** argv)
         std::printf("[shim-test] no vkGetInstanceProcAddr export\n");
         return 2;
     }
+    if (argc > 2 && std::strcmp(argv[2], "--descriptor-properties-only") == 0)
+    {
+        return run_descriptor_buffer_properties_query(get_instance_proc);
+    }
     if (!test_debug_utils_entrypoints(get_instance_proc, mod))
     {
         return 3;
@@ -1175,6 +1181,7 @@ int main(int argc, char** argv)
     bool memory_priority_test_ok = false;
     bool image_readback_ok = false;
     bool dynamic_commands_ok = false;
+    bool descriptor_buffer_properties_ok = true;
     uint32_t count = 0;
     result = enumerate(instance, &count, nullptr);
     std::printf("[shim-test] vkEnumeratePhysicalDevices -> %d, count=%u\n", result, count);
@@ -1205,6 +1212,7 @@ int main(int argc, char** argv)
         const auto destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(get_instance_proc(instance, "vkDestroyDevice"));
         const auto get_properties2 =
             reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(get_instance_proc(instance, "vkGetPhysicalDeviceProperties2"));
+        descriptor_buffer_properties_ok = test_descriptor_buffer_properties(get_instance_proc, instance, devices.data(), count);
 
         bool transform_feedback_extension_present = false;
         bool shader_identifier_extension_present = false;
@@ -1493,7 +1501,7 @@ int main(int argc, char** argv)
     const bool all_ok = memory_priority_test_ok && synchronization_test_ok && render_pass_test_ok && layered_resolve_test_ok &&
                         dynamic_commands_ok && timestamp2_test_ok && calibrated_timestamps_test_ok && transform_feedback_test_ok &&
                         transform_feedback_capabilities_ok && shader_identifier_test_ok && pipeline_cache_test_ok && fill_readback_ok &&
-                        persistent_coherent_ok && image_readback_ok;
+                        persistent_coherent_ok && image_readback_ok && descriptor_buffer_properties_ok;
     std::printf("[shim-test] %s\n", all_ok ? "ok" : "FAILED");
     return all_ok ? 0 : 6;
 }

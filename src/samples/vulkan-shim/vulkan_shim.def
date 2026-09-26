@@ -23,7 +23,6 @@ EXPORTS
     vkCmdBindIndexBuffer
     vkCmdBindIndexBuffer2KHR
     vkCmdBindPipeline
-    vkCmdBeginDebugUtilsLabelEXT
     vkCmdBindVertexBuffers
     vkCmdBindVertexBuffers2
     vkCmdBindTransformFeedbackBuffersEXT
@@ -33,6 +32,7 @@ EXPORTS
     vkCmdClearAttachments
     vkCmdClearColorImage
     vkCmdClearDepthStencilImage
+    vkCmdBeginConditionalRenderingEXT
     vkCmdBeginQuery
     vkCmdBeginQueryIndexedEXT
     vkCmdCopyBuffer
@@ -58,6 +58,7 @@ EXPORTS
     vkCmdDrawIndirectCount
     vkCmdDrawIndirectCountKHR
     vkCmdDrawIndirectByteCountEXT
+    vkCmdEndConditionalRenderingEXT
     vkCmdEndQuery
     vkCmdEndQueryIndexedEXT
     vkCmdEndTransformFeedbackEXT
@@ -65,13 +66,11 @@ EXPORTS
     vkCmdWriteTimestamp
     vkCmdWriteTimestamp2
     vkCmdWriteTimestamp2KHR
-    vkCmdEndDebugUtilsLabelEXT
     vkCmdEndRenderPass
     vkCmdNextSubpass
     vkCmdEndRendering
     vkCmdExecuteCommands
     vkCmdFillBuffer
-    vkCmdInsertDebugUtilsLabelEXT
     vkCmdPipelineBarrier
     vkCmdPushConstants
     vkCmdPushConstants2KHR
@@ -103,7 +102,6 @@ EXPORTS
     vkCreateBufferView
     vkCreateCommandPool
     vkCreateQueryPool
-    vkCreateDebugUtilsMessengerEXT
     vkCreateDescriptorPool
     vkCreateDescriptorSetLayout
     vkCreateDevice
@@ -135,7 +133,6 @@ EXPORTS
     vkDestroyBufferView
     vkDestroyCommandPool
     vkDestroyQueryPool
-    vkDestroyDebugUtilsMessengerEXT
     vkDestroyDescriptorPool
     vkDestroyDescriptorSetLayout
     vkDestroyDevice
@@ -216,9 +213,6 @@ EXPORTS
     vkMapMemory
     vkMergePipelineCaches
     vkQueuePresentKHR
-    vkQueueBeginDebugUtilsLabelEXT
-    vkQueueEndDebugUtilsLabelEXT
-    vkQueueInsertDebugUtilsLabelEXT
     vkQueueBindSparse
     vkQueueSubmit
     vkQueueWaitIdle
@@ -228,9 +222,6 @@ EXPORTS
     vkResetDescriptorPool
     vkResetQueryPool
     vkResetFences
-    vkSubmitDebugUtilsMessageEXT
-    vkSetDebugUtilsObjectNameEXT
-    vkSetDebugUtilsObjectTagEXT
     vkUnmapMemory
     vkUpdateDescriptorSets
     vkWaitForFences

@@ -141,7 +141,8 @@ namespace sogen
         // is_secondary supplies the dynamic-rendering inheritance (attachment formats) the secondary renders to.
         int32_t begin_command_buffer(uint64_t command_buffer, uint32_t flags, bool is_secondary, uint32_t view_mask,
                                      std::span<const uint32_t> color_formats, uint32_t depth_format, uint32_t stencil_format,
-                                     uint32_t rasterization_samples, uint32_t rendering_flags);
+                                     uint32_t rasterization_samples, uint32_t rendering_flags,
+                                     bool rendering_info_present = false, bool conditional_rendering_enabled = false);
         int32_t cmd_execute_commands(uint64_t command_buffer, std::span<const uint64_t> secondaries);
         int32_t end_command_buffer(uint64_t command_buffer);
         int32_t reset_command_pool(uint64_t device, uint64_t pool, uint32_t flags);
@@ -458,6 +459,8 @@ namespace sogen
         int32_t get_query_pool_results(uint64_t device, uint64_t query_pool, uint32_t first_query, uint32_t query_count, uint32_t flags,
                                        void* out, size_t out_size, size_t stride, size_t& out_written);
         int32_t cmd_reset_query_pool(uint64_t command_buffer, uint64_t query_pool, uint32_t first_query, uint32_t query_count);
+        int32_t cmd_begin_conditional_rendering(uint64_t command_buffer, uint64_t buffer, uint64_t offset, uint32_t flags);
+        int32_t cmd_end_conditional_rendering(uint64_t command_buffer);
         int32_t cmd_begin_query(uint64_t command_buffer, uint64_t query_pool, uint32_t query, uint32_t flags);
         int32_t cmd_end_query(uint64_t command_buffer, uint64_t query_pool, uint32_t query);
         int32_t cmd_begin_query_indexed(uint64_t command_buffer, uint64_t query_pool, uint32_t query, uint32_t flags, uint32_t index);

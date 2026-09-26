@@ -211,6 +211,8 @@ namespace sogen::gpu_bridge
         get_rendering_area_granularity = 0x8AD,
         cmd_extended_dynamic = 0x8B0,
         get_multisample_properties = 0x8B1,
+        cmd_begin_conditional_rendering = 0x8B2,
+        cmd_end_conditional_rendering = 0x8B3,
         cmd_synchronization = 0x8C0,
         get_event_status_owned = 0x8C1,
         cmd_copy_image_to_buffer_full = 0x8D0,
@@ -666,8 +668,7 @@ namespace sogen::gpu_bridge
         object_id command_buffer;
     };
 
-    // For a secondary command buffer recorded inside dynamic rendering, the begin carries the inheritance
-    // rendering info (immediately followed by `inherit_color_count` uint32 VkFormat color formats).
+    // Secondary command buffer inheritance, followed by `inherit_color_count` uint32 VkFormat color formats.
     struct begin_command_buffer_request
     {
         object_id command_buffer;
@@ -679,6 +680,8 @@ namespace sogen::gpu_bridge
         uint32_t inherit_stencil_format;        // VkFormat
         uint32_t inherit_rasterization_samples; // VkSampleCountFlagBits
         uint32_t inherit_rendering_flags;       // VkRenderingFlags
+        uint32_t inherit_rendering_info_present;
+        uint32_t inherit_conditional_rendering_enabled;
         // uint32_t inherit_color_formats[inherit_color_count];
     };
 
@@ -1613,6 +1616,20 @@ namespace sogen::gpu_bridge
         uint32_t reserved;
     };
 
+    struct cmd_begin_conditional_rendering_request
+    {
+        object_id command_buffer;
+        object_id buffer;
+        uint64_t offset;
+        uint32_t flags;
+        uint32_t reserved;
+    };
+
+    struct cmd_end_conditional_rendering_request
+    {
+        object_id command_buffer;
+    };
+
     struct cmd_begin_query_indexed_request
     {
         object_id command_buffer;
@@ -2422,6 +2439,8 @@ namespace sogen::gpu_bridge
     static_assert(sizeof(cmd_reset_query_pool_request) == 24, "wire layout drift");
     static_assert(sizeof(cmd_begin_query_request) == 24, "wire layout drift");
     static_assert(sizeof(cmd_end_query_request) == 24, "wire layout drift");
+    static_assert(sizeof(cmd_begin_conditional_rendering_request) == 32, "wire layout drift");
+    static_assert(sizeof(cmd_end_conditional_rendering_request) == 8, "wire layout drift");
     static_assert(sizeof(cmd_begin_query_indexed_request) == 32, "wire layout drift");
     static_assert(sizeof(cmd_end_query_indexed_request) == 24, "wire layout drift");
     static_assert(sizeof(transform_feedback_buffer_binding) == 24, "wire layout drift");
@@ -2448,7 +2467,7 @@ namespace sogen::gpu_bridge
     static_assert(sizeof(cmd_begin_rendering_request) == 48, "wire layout drift");
     static_assert(sizeof(cmd_end_rendering_request) == 8, "wire layout drift");
     static_assert(sizeof(allocate_command_buffer_request) == 24, "wire layout drift");
-    static_assert(sizeof(begin_command_buffer_request) == 40, "wire layout drift");
+    static_assert(sizeof(begin_command_buffer_request) == 48, "wire layout drift");
     static_assert(sizeof(cmd_execute_commands_request) == 16, "wire layout drift");
     static_assert(sizeof(cmd_clear_attachments_request) == 16, "wire layout drift");
     static_assert(sizeof(viewport_entry) == 24, "wire layout drift");

@@ -10,7 +10,12 @@
 // is identical, so only the bool run crosses the wire. The guest (always pad-free on x86) computes the
 // body size and the host echoes it, keeping a 32-bit guest and 64-bit host in agreement.
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <type_traits>
 #include <vk_feature_layouts.hpp>
 #include <vulkan/vulkan_core.h>
 
@@ -78,5 +83,94 @@ namespace sogen::gpu_bridge
     {
         const size_t total = property_struct_size(type);
         return total > feature_chain_header_size ? total - feature_chain_header_size : 0;
+    }
+
+    // Fixed-width field order avoids copying host size_t layout into a 32-bit guest property struct.
+    using descriptor_buffer_properties_wire = std::array<uint64_t, 33>;
+    static_assert(sizeof(descriptor_buffer_properties_wire) == 33 * sizeof(uint64_t));
+
+    template <typename SizeType>
+    constexpr SizeType narrow_descriptor_buffer_property_size(const uint64_t value)
+    {
+        static_assert(std::is_unsigned_v<SizeType>);
+        return static_cast<SizeType>(std::min(value, static_cast<uint64_t>(std::numeric_limits<SizeType>::max())));
+    }
+
+    inline descriptor_buffer_properties_wire encode_descriptor_buffer_properties(
+        const VkPhysicalDeviceDescriptorBufferPropertiesEXT& properties)
+    {
+        return {
+            properties.combinedImageSamplerDescriptorSingleArray,
+            properties.bufferlessPushDescriptors,
+            properties.allowSamplerImageViewPostSubmitCreation,
+            properties.descriptorBufferOffsetAlignment,
+            properties.maxDescriptorBufferBindings,
+            properties.maxResourceDescriptorBufferBindings,
+            properties.maxSamplerDescriptorBufferBindings,
+            properties.maxEmbeddedImmutableSamplerBindings,
+            properties.maxEmbeddedImmutableSamplers,
+            properties.bufferCaptureReplayDescriptorDataSize,
+            properties.imageCaptureReplayDescriptorDataSize,
+            properties.imageViewCaptureReplayDescriptorDataSize,
+            properties.samplerCaptureReplayDescriptorDataSize,
+            properties.accelerationStructureCaptureReplayDescriptorDataSize,
+            properties.samplerDescriptorSize,
+            properties.combinedImageSamplerDescriptorSize,
+            properties.sampledImageDescriptorSize,
+            properties.storageImageDescriptorSize,
+            properties.uniformTexelBufferDescriptorSize,
+            properties.robustUniformTexelBufferDescriptorSize,
+            properties.storageTexelBufferDescriptorSize,
+            properties.robustStorageTexelBufferDescriptorSize,
+            properties.uniformBufferDescriptorSize,
+            properties.robustUniformBufferDescriptorSize,
+            properties.storageBufferDescriptorSize,
+            properties.robustStorageBufferDescriptorSize,
+            properties.inputAttachmentDescriptorSize,
+            properties.accelerationStructureDescriptorSize,
+            properties.maxSamplerDescriptorBufferRange,
+            properties.maxResourceDescriptorBufferRange,
+            properties.samplerDescriptorBufferAddressSpaceSize,
+            properties.resourceDescriptorBufferAddressSpaceSize,
+            properties.descriptorBufferAddressSpaceSize,
+        };
+    }
+
+    inline void decode_descriptor_buffer_properties(const descriptor_buffer_properties_wire& wire,
+                                                    VkPhysicalDeviceDescriptorBufferPropertiesEXT& properties)
+    {
+        properties.combinedImageSamplerDescriptorSingleArray = static_cast<VkBool32>(wire[0]);
+        properties.bufferlessPushDescriptors = static_cast<VkBool32>(wire[1]);
+        properties.allowSamplerImageViewPostSubmitCreation = static_cast<VkBool32>(wire[2]);
+        properties.descriptorBufferOffsetAlignment = static_cast<VkDeviceSize>(wire[3]);
+        properties.maxDescriptorBufferBindings = static_cast<uint32_t>(wire[4]);
+        properties.maxResourceDescriptorBufferBindings = static_cast<uint32_t>(wire[5]);
+        properties.maxSamplerDescriptorBufferBindings = static_cast<uint32_t>(wire[6]);
+        properties.maxEmbeddedImmutableSamplerBindings = static_cast<uint32_t>(wire[7]);
+        properties.maxEmbeddedImmutableSamplers = static_cast<uint32_t>(wire[8]);
+        properties.bufferCaptureReplayDescriptorDataSize = narrow_descriptor_buffer_property_size<size_t>(wire[9]);
+        properties.imageCaptureReplayDescriptorDataSize = narrow_descriptor_buffer_property_size<size_t>(wire[10]);
+        properties.imageViewCaptureReplayDescriptorDataSize = narrow_descriptor_buffer_property_size<size_t>(wire[11]);
+        properties.samplerCaptureReplayDescriptorDataSize = narrow_descriptor_buffer_property_size<size_t>(wire[12]);
+        properties.accelerationStructureCaptureReplayDescriptorDataSize = narrow_descriptor_buffer_property_size<size_t>(wire[13]);
+        properties.samplerDescriptorSize = narrow_descriptor_buffer_property_size<size_t>(wire[14]);
+        properties.combinedImageSamplerDescriptorSize = narrow_descriptor_buffer_property_size<size_t>(wire[15]);
+        properties.sampledImageDescriptorSize = narrow_descriptor_buffer_property_size<size_t>(wire[16]);
+        properties.storageImageDescriptorSize = narrow_descriptor_buffer_property_size<size_t>(wire[17]);
+        properties.uniformTexelBufferDescriptorSize = narrow_descriptor_buffer_property_size<size_t>(wire[18]);
+        properties.robustUniformTexelBufferDescriptorSize = narrow_descriptor_buffer_property_size<size_t>(wire[19]);
+        properties.storageTexelBufferDescriptorSize = narrow_descriptor_buffer_property_size<size_t>(wire[20]);
+        properties.robustStorageTexelBufferDescriptorSize = narrow_descriptor_buffer_property_size<size_t>(wire[21]);
+        properties.uniformBufferDescriptorSize = narrow_descriptor_buffer_property_size<size_t>(wire[22]);
+        properties.robustUniformBufferDescriptorSize = narrow_descriptor_buffer_property_size<size_t>(wire[23]);
+        properties.storageBufferDescriptorSize = narrow_descriptor_buffer_property_size<size_t>(wire[24]);
+        properties.robustStorageBufferDescriptorSize = narrow_descriptor_buffer_property_size<size_t>(wire[25]);
+        properties.inputAttachmentDescriptorSize = narrow_descriptor_buffer_property_size<size_t>(wire[26]);
+        properties.accelerationStructureDescriptorSize = narrow_descriptor_buffer_property_size<size_t>(wire[27]);
+        properties.maxSamplerDescriptorBufferRange = static_cast<VkDeviceSize>(wire[28]);
+        properties.maxResourceDescriptorBufferRange = static_cast<VkDeviceSize>(wire[29]);
+        properties.samplerDescriptorBufferAddressSpaceSize = static_cast<VkDeviceSize>(wire[30]);
+        properties.resourceDescriptorBufferAddressSpaceSize = static_cast<VkDeviceSize>(wire[31]);
+        properties.descriptorBufferAddressSpaceSize = static_cast<VkDeviceSize>(wire[32]);
     }
 }

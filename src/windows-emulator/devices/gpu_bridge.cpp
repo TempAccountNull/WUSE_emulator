@@ -3327,7 +3327,9 @@ namespace sogen
                     }
                     return this->vulkan_.begin_command_buffer(req.command_buffer, req.flags, req.is_secondary != 0, req.inherit_view_mask,
                                                               color_formats, req.inherit_depth_format, req.inherit_stencil_format,
-                                                              req.inherit_rasterization_samples, req.inherit_rendering_flags);
+                                                              req.inherit_rasterization_samples, req.inherit_rendering_flags,
+                                                              req.inherit_rendering_info_present != 0,
+                                                              req.inherit_conditional_rendering_enabled != 0);
                 }
                 case gpu_bridge::command::cmd_execute_commands: {
                     gpu_bridge::cmd_execute_commands_request req{};
@@ -3532,6 +3534,22 @@ namespace sogen
                         return vk_error_initialization_failed;
                     }
                     return this->vulkan_.cmd_reset_query_pool(req.command_buffer, req.query_pool, req.first_query, req.query_count);
+                }
+                case gpu_bridge::command::cmd_begin_conditional_rendering: {
+                    gpu_bridge::cmd_begin_conditional_rendering_request req{};
+                    if (!read(req))
+                    {
+                        return vk_error_initialization_failed;
+                    }
+                    return this->vulkan_.cmd_begin_conditional_rendering(req.command_buffer, req.buffer, req.offset, req.flags);
+                }
+                case gpu_bridge::command::cmd_end_conditional_rendering: {
+                    gpu_bridge::cmd_end_conditional_rendering_request req{};
+                    if (!read(req))
+                    {
+                        return vk_error_initialization_failed;
+                    }
+                    return this->vulkan_.cmd_end_conditional_rendering(req.command_buffer);
                 }
                 case gpu_bridge::command::cmd_begin_query: {
                     gpu_bridge::cmd_begin_query_request req{};

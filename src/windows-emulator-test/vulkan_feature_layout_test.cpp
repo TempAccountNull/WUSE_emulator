@@ -46,6 +46,48 @@ namespace sogen::test
                       offsetof(VkPhysicalDeviceExtendedDynamicState3FeaturesEXT, extendedDynamicState3TessellationDomainOrigin));
     }
 
+    TEST(VulkanFeatureLayoutTest, DescriptorBufferPropertiesUseFixedWidthWireFields)
+    {
+        gpu_bridge::descriptor_buffer_properties_wire wire{};
+        for (size_t i = 0; i < wire.size(); ++i)
+        {
+            wire[i] = i + 1;
+        }
+
+        VkPhysicalDeviceDescriptorBufferPropertiesEXT properties{};
+        properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT;
+        properties.pNext = reinterpret_cast<void*>(static_cast<uintptr_t>(0x1234));
+        gpu_bridge::decode_descriptor_buffer_properties(wire, properties);
+
+        EXPECT_EQ(properties.sType, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT);
+        EXPECT_EQ(properties.pNext, reinterpret_cast<void*>(static_cast<uintptr_t>(0x1234)));
+        EXPECT_EQ(properties.combinedImageSamplerDescriptorSingleArray, 1u);
+        EXPECT_EQ(properties.descriptorBufferOffsetAlignment, 4u);
+        EXPECT_EQ(properties.bufferCaptureReplayDescriptorDataSize, 10u);
+        EXPECT_EQ(properties.accelerationStructureDescriptorSize, 28u);
+        EXPECT_EQ(properties.maxSamplerDescriptorBufferRange, 29u);
+        EXPECT_EQ(properties.descriptorBufferAddressSpaceSize, 33u);
+        EXPECT_EQ(gpu_bridge::encode_descriptor_buffer_properties(properties), wire);
+    }
+
+    TEST(VulkanFeatureLayoutTest, DescriptorBufferSizeFieldsNarrowWithoutWrappingOnWow64)
+    {
+        constexpr uint64_t too_large_for_wow64 = static_cast<uint64_t>(UINT32_MAX) + 1;
+        EXPECT_EQ(gpu_bridge::narrow_descriptor_buffer_property_size<uint32_t>(too_large_for_wow64), UINT32_MAX);
+        EXPECT_EQ(gpu_bridge::narrow_descriptor_buffer_property_size<uint64_t>(too_large_for_wow64), too_large_for_wow64);
+
+        gpu_bridge::descriptor_buffer_properties_wire wire{};
+        wire[9] = UINT64_MAX;
+        wire[14] = too_large_for_wow64;
+        wire[32] = UINT64_MAX;
+        VkPhysicalDeviceDescriptorBufferPropertiesEXT properties{};
+        gpu_bridge::decode_descriptor_buffer_properties(wire, properties);
+        EXPECT_EQ(properties.bufferCaptureReplayDescriptorDataSize, SIZE_MAX);
+        EXPECT_EQ(properties.samplerDescriptorSize, gpu_bridge::narrow_descriptor_buffer_property_size<size_t>(too_large_for_wow64));
+        EXPECT_EQ(properties.descriptorBufferAddressSpaceSize, UINT64_MAX);
+        EXPECT_EQ(gpu_bridge::property_struct_size(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT), 0u);
+    }
+
     TEST(VulkanFeatureLayoutTest, NonFeatureAndUnknownTypesAreNotCopiedAsFeatureBytes)
     {
         EXPECT_EQ(gpu_bridge::feature_body_size(VK_STRUCTURE_TYPE_APPLICATION_INFO), 0u);

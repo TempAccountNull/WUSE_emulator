@@ -991,7 +991,13 @@ extern "C"
                 if (next->sType == VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO)
                 {
                     rendering = reinterpret_cast<const VkCommandBufferInheritanceRenderingInfo*>(next);
-                    break;
+                    request.inherit_rendering_info_present = 1;
+                }
+                else if (next->sType == VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_CONDITIONAL_RENDERING_INFO_EXT)
+                {
+                    const auto* conditional =
+                        reinterpret_cast<const VkCommandBufferInheritanceConditionalRenderingInfoEXT*>(next);
+                    request.inherit_conditional_rendering_enabled = conditional->conditionalRenderingEnable == VK_TRUE;
                 }
             }
         }
@@ -2105,6 +2111,30 @@ extern "C"
         request.query = query;
         request.flags = static_cast<uint32_t>(flags);
         record_command(request.command_buffer, gb::command::cmd_begin_query, &request, sizeof(request));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL
+    vkCmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer, const VkConditionalRenderingBeginInfoEXT* pConditionalRenderingBegin)
+    {
+        if (!pConditionalRenderingBegin || pConditionalRenderingBegin->sType != VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT ||
+            pConditionalRenderingBegin->pNext)
+        {
+            shim_log("vulkan-shim: invalid conditional rendering begin info\n");
+            return;
+        }
+        gb::cmd_begin_conditional_rendering_request request{};
+        request.command_buffer = to_object_id(commandBuffer);
+        request.buffer = to_object_id(pConditionalRenderingBegin->buffer);
+        request.offset = pConditionalRenderingBegin->offset;
+        request.flags = pConditionalRenderingBegin->flags;
+        record_command(request.command_buffer, gb::command::cmd_begin_conditional_rendering, &request, sizeof(request));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdEndConditionalRenderingEXT(VkCommandBuffer commandBuffer)
+    {
+        gb::cmd_end_conditional_rendering_request request{};
+        request.command_buffer = to_object_id(commandBuffer);
+        record_command(request.command_buffer, gb::command::cmd_end_conditional_rendering, &request, sizeof(request));
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t query)
@@ -3968,6 +3998,7 @@ extern "C"
         // alignment fields DXVK divides by). Same chain convention as vkGetPhysicalDeviceFeatures2.
         struct dest
         {
+            VkBaseOutStructure* structure;
             uint8_t* body;
             uint32_t body_size;
         };
@@ -3976,12 +4007,15 @@ extern "C"
         std::vector<gb::feature_chain_record> records;
         for (auto* next = static_cast<VkBaseOutStructure*>(pProperties->pNext); next; next = next->pNext)
         {
-            const auto body_size = static_cast<uint32_t>(gb::property_body_size(next->sType));
+            const auto body_size = static_cast<uint32_t>(next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT
+                                                             ? sizeof(gb::descriptor_buffer_properties_wire)
+                                                             : gb::property_body_size(next->sType));
             if (body_size == 0)
             {
                 continue; // struct the host does not know; left as the caller initialized it
             }
-            dests.push_back({.body = reinterpret_cast<uint8_t*>(next) + gb::feature_chain_header_size, .body_size = body_size});
+            dests.push_back(
+                {.structure = next, .body = reinterpret_cast<uint8_t*>(next) + gb::feature_chain_header_size, .body_size = body_size});
             records.push_back({.s_type = static_cast<uint32_t>(next->sType), .body_size = body_size});
         }
 
@@ -4030,10 +4064,26 @@ extern "C"
                 break;
             }
 
-            const uint32_t copy = record->body_size < dests[i].body_size ? record->body_size : dests[i].body_size;
-            if (copy > 0)
+            if (record->s_type == static_cast<uint32_t>(dests[i].structure->sType))
             {
-                std::memcpy(dests[i].body, out.data() + offset, copy);
+                if (dests[i].structure->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT)
+                {
+                    if (record->body_size == sizeof(gb::descriptor_buffer_properties_wire))
+                    {
+                        gb::descriptor_buffer_properties_wire wire{};
+                        std::memcpy(wire.data(), out.data() + offset, sizeof(wire));
+                        gb::decode_descriptor_buffer_properties(
+                            wire, *reinterpret_cast<VkPhysicalDeviceDescriptorBufferPropertiesEXT*>(dests[i].structure));
+                    }
+                }
+                else
+                {
+                    const uint32_t copy = std::min(record->body_size, dests[i].body_size);
+                    if (copy > 0)
+                    {
+                        std::memcpy(dests[i].body, out.data() + offset, copy);
+                    }
+                }
             }
             offset += record->body_size;
         }
@@ -4627,70 +4677,6 @@ extern "C"
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         return vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, pSurfaceInfo->surface, pPresentModeCount, pPresentModes);
-    }
-
-    // VK_EXT_debug_utils: accepted but not modeled (labels/messengers are no-ops).
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdBeginDebugUtilsLabelEXT(VkCommandBuffer, const VkDebugUtilsLabelEXT*)
-    {
-    }
-
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdEndDebugUtilsLabelEXT(VkCommandBuffer)
-    {
-    }
-
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdInsertDebugUtilsLabelEXT(VkCommandBuffer, const VkDebugUtilsLabelEXT*)
-    {
-    }
-
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkQueueBeginDebugUtilsLabelEXT(VkQueue, const VkDebugUtilsLabelEXT*)
-    {
-    }
-
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkQueueEndDebugUtilsLabelEXT(VkQueue)
-    {
-    }
-
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkQueueInsertDebugUtilsLabelEXT(VkQueue, const VkDebugUtilsLabelEXT*)
-    {
-    }
-
-    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkSetDebugUtilsObjectNameEXT(VkDevice, const VkDebugUtilsObjectNameInfoEXT*)
-    {
-        return VK_SUCCESS;
-    }
-
-    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkSetDebugUtilsObjectTagEXT(VkDevice, const VkDebugUtilsObjectTagInfoEXT*)
-    {
-        return VK_SUCCESS;
-    }
-
-    static_assert(std::is_same_v<decltype(&vkQueueBeginDebugUtilsLabelEXT), PFN_vkQueueBeginDebugUtilsLabelEXT>);
-    static_assert(std::is_same_v<decltype(&vkQueueEndDebugUtilsLabelEXT), PFN_vkQueueEndDebugUtilsLabelEXT>);
-    static_assert(std::is_same_v<decltype(&vkQueueInsertDebugUtilsLabelEXT), PFN_vkQueueInsertDebugUtilsLabelEXT>);
-    static_assert(std::is_same_v<decltype(&vkSetDebugUtilsObjectNameEXT), PFN_vkSetDebugUtilsObjectNameEXT>);
-    static_assert(std::is_same_v<decltype(&vkSetDebugUtilsObjectTagEXT), PFN_vkSetDebugUtilsObjectTagEXT>);
-
-    __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateDebugUtilsMessengerEXT(VkInstance,
-                                                                                        const VkDebugUtilsMessengerCreateInfoEXT*,
-                                                                                        const VkAllocationCallbacks*,
-                                                                                        VkDebugUtilsMessengerEXT* pMessenger)
-    {
-        if (pMessenger)
-        {
-            *pMessenger = to_handle<VkDebugUtilsMessengerEXT>(1);
-        }
-        return VK_SUCCESS;
-    }
-
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkDestroyDebugUtilsMessengerEXT(VkInstance, VkDebugUtilsMessengerEXT,
-                                                                                     const VkAllocationCallbacks*)
-    {
-    }
-
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkSubmitDebugUtilsMessageEXT(VkInstance, VkDebugUtilsMessageSeverityFlagBitsEXT,
-                                                                                  VkDebugUtilsMessageTypeFlagsEXT,
-                                                                                  const VkDebugUtilsMessengerCallbackDataEXT*)
-    {
     }
 
     // VK_EXT_swapchain_maintenance1: the bridge's readback present has nothing to release.
@@ -6894,17 +6880,6 @@ extern "C"
              .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetPhysicalDeviceSurfaceFormats2KHR)},
             {.name = "vkGetPhysicalDeviceSurfacePresentModes2EXT",
              .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetPhysicalDeviceSurfacePresentModes2EXT)},
-            {.name = "vkCmdBeginDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBeginDebugUtilsLabelEXT)},
-            {.name = "vkCmdEndDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdEndDebugUtilsLabelEXT)},
-            {.name = "vkCmdInsertDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdInsertDebugUtilsLabelEXT)},
-            {.name = "vkQueueBeginDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkQueueBeginDebugUtilsLabelEXT)},
-            {.name = "vkQueueEndDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkQueueEndDebugUtilsLabelEXT)},
-            {.name = "vkQueueInsertDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkQueueInsertDebugUtilsLabelEXT)},
-            {.name = "vkSetDebugUtilsObjectNameEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkSetDebugUtilsObjectNameEXT)},
-            {.name = "vkSetDebugUtilsObjectTagEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkSetDebugUtilsObjectTagEXT)},
-            {.name = "vkCreateDebugUtilsMessengerEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateDebugUtilsMessengerEXT)},
-            {.name = "vkDestroyDebugUtilsMessengerEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyDebugUtilsMessengerEXT)},
-            {.name = "vkSubmitDebugUtilsMessageEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkSubmitDebugUtilsMessageEXT)},
             {.name = "vkReleaseSwapchainImagesEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkReleaseSwapchainImagesEXT)},
             {.name = "vkCreateDevice", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateDevice)},
             {.name = "vkDestroyDevice", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyDevice)},
@@ -6973,6 +6948,8 @@ extern "C"
             {.name = "vkGetQueryPoolResults", .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetQueryPoolResults)},
             {.name = "vkCmdResetQueryPool", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdResetQueryPool)},
             {.name = "vkCmdBeginQuery", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBeginQuery)},
+            {.name = "vkCmdBeginConditionalRenderingEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBeginConditionalRenderingEXT)},
+            {.name = "vkCmdEndConditionalRenderingEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdEndConditionalRenderingEXT)},
             {.name = "vkCmdBeginQueryIndexedEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBeginQueryIndexedEXT)},
             {.name = "vkCmdEndQuery", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdEndQuery)},
             {.name = "vkCmdCopyQueryPoolResults", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdCopyQueryPoolResults)},

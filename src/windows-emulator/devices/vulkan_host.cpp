@@ -59,7 +59,6 @@ namespace sogen
             std::string_view{"VK_EXT_hdr_metadata"},             // no host swapchain HDR metadata path, including readback
             std::string_view{"VK_KHR_maintenance6"},             // four required bridge commands are not implemented
             std::string_view{"VK_AMD_buffer_marker"},
-            std::string_view{"VK_EXT_conditional_rendering"},
             std::string_view{"VK_EXT_depth_bias_control"},
             std::string_view{"VK_EXT_descriptor_buffer"},
             std::string_view{"VK_EXT_descriptor_heap"},
@@ -376,6 +375,11 @@ namespace sogen
             PFN_vkResetQueryPool reset_query_pool{};
             PFN_vkGetQueryPoolResults get_query_pool_results{};
             PFN_vkCmdResetQueryPool cmd_reset_query_pool{};
+            PFN_vkCmdBeginConditionalRenderingEXT cmd_begin_conditional_rendering{};
+            PFN_vkCmdEndConditionalRenderingEXT cmd_end_conditional_rendering{};
+            bool conditional_rendering_extension{};
+            bool conditional_rendering_feature{};
+            bool inherited_conditional_rendering_feature{};
             PFN_vkCmdBeginQuery cmd_begin_query{};
             PFN_vkCmdEndQuery cmd_end_query{};
             PFN_vkCmdBeginQueryIndexedEXT cmd_begin_query_indexed{};
@@ -562,6 +566,7 @@ namespace sogen
             uint64_t memory_id{};
             uint64_t memory_offset{};
             uint64_t size{};
+            uint32_t usage{};
         };
 
         struct image_data
@@ -2089,7 +2094,9 @@ namespace sogen
         for (uint32_t i = 0; i < struct_count; ++i)
         {
             const auto type = static_cast<VkStructureType>(records[i].s_type);
-            const size_t size = gpu_bridge::property_struct_size(type);
+            const size_t size = type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT
+                                    ? sizeof(VkPhysicalDeviceDescriptorBufferPropertiesEXT)
+                                    : gpu_bridge::property_struct_size(type);
             if (size == 0)
             {
                 continue; // unknown struct: not queried, reported empty below
@@ -2122,20 +2129,31 @@ namespace sogen
             const auto type = static_cast<VkStructureType>(records[i].s_type);
 
             const std::byte* body = nullptr;
+            uint32_t body_size = 0;
+            gpu_bridge::descriptor_buffer_properties_wire descriptor_wire{};
             for (const auto& buffer : chained)
             {
-                if (reinterpret_cast<const VkBaseOutStructure*>(buffer.data())->sType == type)
+                if (reinterpret_cast<const VkBaseOutStructure*>(buffer.data())->sType != type)
+                {
+                    continue;
+                }
+                if (type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT)
+                {
+                    if (records[i].body_size == sizeof(descriptor_wire))
+                    {
+                        descriptor_wire = gpu_bridge::encode_descriptor_buffer_properties(
+                            *reinterpret_cast<const VkPhysicalDeviceDescriptorBufferPropertiesEXT*>(buffer.data()));
+                        body = reinterpret_cast<const std::byte*>(descriptor_wire.data());
+                        body_size = static_cast<uint32_t>(sizeof(descriptor_wire));
+                    }
+                }
+                else
                 {
                     body = buffer.data() + gpu_bridge::feature_chain_header_size;
-                    break;
+                    const size_t host_capacity = gpu_bridge::property_body_size(type);
+                    body_size = static_cast<uint32_t>(std::min<size_t>(records[i].body_size, host_capacity));
                 }
-            }
-
-            uint32_t body_size = 0;
-            if (body)
-            {
-                const size_t host_capacity = gpu_bridge::property_struct_size(type) - gpu_bridge::feature_chain_header_size;
-                body_size = static_cast<uint32_t>(std::min<size_t>(records[i].body_size, host_capacity));
+                break;
             }
 
             const gpu_bridge::feature_chain_record out_record{.s_type = records[i].s_type, .body_size = body_size};
@@ -2374,10 +2392,17 @@ namespace sogen
         const auto enabled_extension = [&](const char* name) {
             return std::ranges::any_of(extensions, [&](const char* enabled) { return std::strcmp(enabled, name) == 0; });
         };
+        data.conditional_rendering_extension = enabled_extension(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
         data.memory_priority_extension = enabled_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
         data.pageable_memory_extension = enabled_extension(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
         for (const auto* feature = static_cast<const VkBaseInStructure*>(features2.pNext); feature; feature = feature->pNext)
         {
+            if (feature->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT)
+            {
+                const auto* conditional = reinterpret_cast<const VkPhysicalDeviceConditionalRenderingFeaturesEXT*>(feature);
+                data.conditional_rendering_feature = conditional->conditionalRendering == VK_TRUE;
+                data.inherited_conditional_rendering_feature = conditional->inheritedConditionalRendering == VK_TRUE;
+            }
             if (feature->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT)
             {
                 data.memory_priority_feature =
@@ -2514,6 +2539,10 @@ namespace sogen
             data.reset_query_pool = reinterpret_cast<PFN_vkResetQueryPool>(resolve("vkResetQueryPool"));
             data.get_query_pool_results = reinterpret_cast<PFN_vkGetQueryPoolResults>(resolve("vkGetQueryPoolResults"));
             data.cmd_reset_query_pool = reinterpret_cast<PFN_vkCmdResetQueryPool>(resolve("vkCmdResetQueryPool"));
+            data.cmd_begin_conditional_rendering =
+                reinterpret_cast<PFN_vkCmdBeginConditionalRenderingEXT>(resolve("vkCmdBeginConditionalRenderingEXT"));
+            data.cmd_end_conditional_rendering =
+                reinterpret_cast<PFN_vkCmdEndConditionalRenderingEXT>(resolve("vkCmdEndConditionalRenderingEXT"));
             data.cmd_begin_query = reinterpret_cast<PFN_vkCmdBeginQuery>(resolve("vkCmdBeginQuery"));
             data.cmd_end_query = reinterpret_cast<PFN_vkCmdEndQuery>(resolve("vkCmdEndQuery"));
             data.cmd_begin_query_indexed = reinterpret_cast<PFN_vkCmdBeginQueryIndexedEXT>(resolve("vkCmdBeginQueryIndexedEXT"));
@@ -2823,7 +2852,8 @@ namespace sogen
 
     int32_t vulkan_host::begin_command_buffer(uint64_t command_buffer, uint32_t flags, bool is_secondary, uint32_t view_mask,
                                               std::span<const uint32_t> color_formats, uint32_t depth_format, uint32_t stencil_format,
-                                              uint32_t rasterization_samples, uint32_t rendering_flags)
+                                              uint32_t rasterization_samples, uint32_t rendering_flags,
+                                              bool rendering_info_present, bool conditional_rendering_enabled)
     {
         const auto cb = this->impl_->command_buffers.find(command_buffer);
         if (cb == this->impl_->command_buffers.end())
@@ -2841,14 +2871,21 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
 
+        if (conditional_rendering_enabled &&
+            (!is_secondary || !dev->second.conditional_rendering_extension ||
+             !dev->second.inherited_conditional_rendering_feature))
+        {
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+
         VkCommandBufferBeginInfo info{};
         info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         info.flags = flags;
 
-        // A secondary command buffer recorded inside dynamic rendering needs an inheritance chain describing
-        // the attachment formats it will render to (VkCommandBufferInheritanceRenderingInfo).
+        // Preserve both dynamic-rendering and conditional-rendering inheritance for secondary buffers.
         VkCommandBufferInheritanceInfo inheritance{};
         VkCommandBufferInheritanceRenderingInfo rendering{};
+        VkCommandBufferInheritanceConditionalRenderingInfoEXT conditional{};
         std::vector<VkFormat> color_format_handles;
         if (is_secondary)
         {
@@ -2858,18 +2895,28 @@ namespace sogen
                 color_format_handles.push_back(static_cast<VkFormat>(f));
             }
 
-            rendering.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO;
-            rendering.flags = rendering_flags;
-            rendering.viewMask = view_mask;
-            rendering.colorAttachmentCount = static_cast<uint32_t>(color_format_handles.size());
-            rendering.pColorAttachmentFormats = color_format_handles.empty() ? nullptr : color_format_handles.data();
-            rendering.depthAttachmentFormat = static_cast<VkFormat>(depth_format);
-            rendering.stencilAttachmentFormat = static_cast<VkFormat>(stencil_format);
-            rendering.rasterizationSamples =
-                rasterization_samples ? static_cast<VkSampleCountFlagBits>(rasterization_samples) : VK_SAMPLE_COUNT_1_BIT;
+            if (rendering_info_present)
+            {
+                rendering.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO;
+                rendering.flags = rendering_flags;
+                rendering.viewMask = view_mask;
+                rendering.colorAttachmentCount = static_cast<uint32_t>(color_format_handles.size());
+                rendering.pColorAttachmentFormats = color_format_handles.empty() ? nullptr : color_format_handles.data();
+                rendering.depthAttachmentFormat = static_cast<VkFormat>(depth_format);
+                rendering.stencilAttachmentFormat = static_cast<VkFormat>(stencil_format);
+                rendering.rasterizationSamples =
+                    rasterization_samples ? static_cast<VkSampleCountFlagBits>(rasterization_samples) : VK_SAMPLE_COUNT_1_BIT;
+            }
 
             inheritance.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
-            inheritance.pNext = &rendering;
+            inheritance.pNext = rendering_info_present ? &rendering : nullptr;
+            if (conditional_rendering_enabled)
+            {
+                conditional.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_CONDITIONAL_RENDERING_INFO_EXT;
+                conditional.conditionalRenderingEnable = VK_TRUE;
+                conditional.pNext = inheritance.pNext;
+                inheritance.pNext = &conditional;
+            }
             info.pInheritanceInfo = &inheritance;
         }
 
@@ -3876,7 +3923,7 @@ namespace sogen
         }
 
         const uint64_t id = this->impl_->next_id++;
-        this->impl_->buffers.emplace(id, impl::buffer_data{.handle = buffer, .device_id = device, .size = size});
+        this->impl_->buffers.emplace(id, impl::buffer_data{.handle = buffer, .device_id = device, .size = size, .usage = usage});
         out_buffer = id;
         return VK_SUCCESS;
     }
@@ -5944,6 +5991,58 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         dev->second.cmd_reset_query_pool(cb->second.handle, qp->second.handle, first_query, query_count);
+        return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::cmd_begin_conditional_rendering(uint64_t command_buffer, uint64_t buffer, uint64_t offset, uint32_t flags)
+    {
+        const auto cb = this->impl_->command_buffers.find(command_buffer);
+        const auto predicate = this->impl_->buffers.find(buffer);
+        if (cb == this->impl_->command_buffers.end() || predicate == this->impl_->buffers.end() ||
+            predicate->second.device_id != cb->second.device_id ||
+            !(predicate->second.usage & VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT) || offset % 4 != 0 ||
+            offset > predicate->second.size || predicate->second.size - offset < 4 ||
+            (flags & ~VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT) != 0)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
+        if (dev == this->impl_->devices.end() || !dev->second.conditional_rendering_extension ||
+            !dev->second.conditional_rendering_feature || !dev->second.cmd_begin_conditional_rendering)
+        {
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        VkConditionalRenderingBeginInfoEXT info{};
+        info.sType = VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT;
+        info.buffer = predicate->second.handle;
+        info.offset = offset;
+        info.flags = static_cast<VkConditionalRenderingFlagsEXT>(flags);
+        dev->second.cmd_begin_conditional_rendering(cb->second.handle, &info);
+        return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::cmd_end_conditional_rendering(uint64_t command_buffer)
+    {
+        const auto cb = this->impl_->command_buffers.find(command_buffer);
+        if (cb == this->impl_->command_buffers.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
+        if (dev == this->impl_->devices.end() || !dev->second.conditional_rendering_extension ||
+            !dev->second.conditional_rendering_feature || !dev->second.cmd_end_conditional_rendering)
+        {
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        dev->second.cmd_end_conditional_rendering(cb->second.handle);
         return VK_SUCCESS;
     }
 
