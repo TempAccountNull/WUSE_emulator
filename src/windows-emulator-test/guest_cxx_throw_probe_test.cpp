@@ -193,4 +193,68 @@ namespace sogen::test
         EXPECT_EQ(log_lines.find("[GUESTCXXTERM]", before_unloaded_run), std::string::npos)
             << "unloaded DXVK left a terminal execution hook behind";
     }
+
+    TEST(GuestCxxThrowProbe, MatchingDxgiStaticCrtCapturesConstructorThrow)
+    {
+        const char* prior = std::getenv("SOGEN_GUEST_CXX_THROW_PROBE");
+        const std::string saved = prior ? prior : "";
+        const auto restore = utils::finally([&] { _putenv_s("SOGEN_GUEST_CXX_THROW_PROBE", saved.c_str()); });
+        ASSERT_EQ(_putenv_s("SOGEN_GUEST_CXX_THROW_PROBE", "1"), 0);
+
+        emulator_settings settings{};
+        settings.emulation_root = get_emulator_root();
+        settings.use_relative_time = false;
+        settings.use_instruction_precision = false;
+        settings.load_registry = false;
+        emulator_interfaces interfaces{};
+        interfaces.socket_factory = network::create_static_socket_factory();
+        interfaces.ui = std::make_unique<null_ui_backend>();
+        windows_emulator win_emu{icicle::create_x86_64_emulator(1), settings, {}, std::move(interfaces)};
+        std::string log_lines;
+        win_emu.log.set_silent(true);
+        win_emu.log.set_sink([&](const color, const std::string_view line) { log_lines += line; });
+
+        constexpr uint64_t throw_rva = 0x36296c;
+        constexpr uint64_t image_size = 0x512000;
+        const auto image = win_emu.memory.allocate_memory(image_size, memory_permission::all);
+        const auto stack = win_emu.memory.allocate_memory(0x1000, memory_permission::read_write);
+        ASSERT_NE(image, 0U);
+        ASSERT_NE(stack, 0U);
+        constexpr std::array<uint8_t, 16> signature{
+            0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x74,
+            0x24, 0x20, 0x57, 0x48, 0x83, 0xec, 0x50, 0x48};
+        const auto entry = image + throw_rva;
+        win_emu.emu().write_memory(entry, signature.data(), signature.size());
+        const auto return_address = image + 0x2000;
+        win_emu.emu().write_memory(stack + 0x100, &return_address, sizeof(return_address));
+
+        mapped_module runtime{};
+        runtime.name = "DXGI.DLL";
+        runtime.image_base = image;
+        runtime.size_of_image = image_size - 0x1000;
+        win_emu.callbacks.on_module_load(runtime);
+        auto& cpu = win_emu.emu().get_cpu(0);
+        cpu.reg(x86_register::rsp, stack + 0x100);
+        cpu.reg(x86_register::rip, entry);
+        cpu.start(1);
+        EXPECT_EQ(log_lines.find("[GUESTCXXTHROW]"), std::string::npos);
+        EXPECT_NE(log_lines.find("reason=image_size"), std::string::npos);
+
+        runtime.size_of_image = image_size;
+        win_emu.callbacks.on_module_load(runtime);
+        cpu.reg(x86_register::rsp, stack + 0x100);
+        cpu.reg(x86_register::rip, entry);
+        cpu.start(1);
+        EXPECT_NE(log_lines.find("[GUESTCXXPROBE] module=DXGI.DLL"), std::string::npos);
+        EXPECT_NE(log_lines.find("requested_rva=0x36296c"), std::string::npos);
+        EXPECT_NE(log_lines.find("reason=installed"), std::string::npos);
+        EXPECT_NE(log_lines.find("[GUESTCXXTHROW] n=1"), std::string::npos);
+        EXPECT_NE(log_lines.find("runtime=DXGI.DLL"), std::string::npos);
+        win_emu.callbacks.on_module_unload(runtime);
+        const auto before_unloaded_run = log_lines.size();
+        cpu.reg(x86_register::rsp, stack + 0x100);
+        cpu.reg(x86_register::rip, entry);
+        cpu.start(1);
+        EXPECT_EQ(log_lines.find("[GUESTCXXTHROW]", before_unloaded_run), std::string::npos);
+    }
 }

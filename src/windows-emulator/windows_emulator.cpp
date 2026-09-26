@@ -138,6 +138,23 @@ namespace sogen
             return true;
         }
 
+        bool is_dxgi_throw_module(const std::string_view name)
+        {
+            constexpr std::string_view expected = "dxgi.dll";
+            if (name.size() != expected.size())
+            {
+                return false;
+            }
+            for (size_t i = 0; i < name.size(); ++i)
+            {
+                if (static_cast<char>(std::tolower(static_cast<unsigned char>(name[i]))) != expected[i])
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         template <size_t N>
         uint32_t capture_guest_hex(x86_64_cpu& cpu, const uint64_t address, std::array<char, N>& output)
         {
@@ -2056,6 +2073,10 @@ namespace sogen
             // _CxxThrowException at RVA 0x4eeb68; require an explicit RVA plus image/signature
             // match so other d3d11.dll builds cannot accidentally receive this hook.
             constexpr uint64_t dxvk_image_size = 0x794000;
+            // DXGI's matching DLL/PDB is GUID 467AE7C3-804E-4279-AF7A-35D7335D017E,
+            // age 3. It statically links a separate CRT that can throw before d3d11 loads.
+            constexpr uint64_t dxgi_image_size = 0x512000;
+            constexpr uint64_t dxgi_throw_rva = 0x36296c;
             constexpr uint64_t dxvk_terminate_rva = 0x5334f4;
             constexpr uint64_t dxvk_abort_rva = 0x536904;
             constexpr std::array<uint8_t, 8> dxvk_terminate_entry{
@@ -2093,20 +2114,24 @@ namespace sogen
                 bool signature_match = false;
                 bool join_layout_match = false;
                 const char* reason = "not_dxvk";
+                const bool dxgi_module = is_dxgi_throw_module(mod.name);
+                const bool d3d11_module = is_d3d11_throw_module(mod.name);
+                const auto throw_rva = dxgi_module ? dxgi_throw_rva : dxvk_throw_rva;
+                const auto expected_image_size = dxgi_module ? dxgi_image_size : dxvk_image_size;
                 if (is_vcruntime_throw_module(mod.name))
                 {
                     entry = mod.find_export("_CxxThrowException");
                 }
-                else if (is_d3d11_throw_module(mod.name))
+                else if (d3d11_module || dxgi_module)
                 {
-                    reason = dxvk_throw_rva ? "image_size" : "rva_unset_or_invalid";
-                    if (dxvk_throw_rva && mod.size_of_image == dxvk_image_size)
+                    reason = throw_rva ? "image_size" : "rva_unset_or_invalid";
+                    if (throw_rva && mod.size_of_image == expected_image_size)
                     {
                         reason = "rva_range";
-                        if (dxvk_throw_rva <= mod.size_of_image - dxvk_throw_entry.size() &&
-                            mod.image_base <= UINT64_MAX - dxvk_throw_rva)
+                        if (throw_rva <= mod.size_of_image - dxvk_throw_entry.size() &&
+                            mod.image_base <= UINT64_MAX - throw_rva)
                         {
-                            const auto candidate = mod.image_base + dxvk_throw_rva;
+                            const auto candidate = mod.image_base + throw_rva;
                             std::array<uint8_t, dxvk_throw_entry.size()> actual{};
                             signature_read = this->emu().try_read_memory(candidate, actual.data(), actual.size());
                             signature_match = signature_read && actual == dxvk_throw_entry;
@@ -2115,7 +2140,7 @@ namespace sogen
                             if (signature_match)
                             {
                                 entry = candidate;
-                                if (dxvk_join_rva <= mod.size_of_image - dxvk_join_entry.size() &&
+                                if (d3d11_module && dxvk_join_rva <= mod.size_of_image - dxvk_join_entry.size() &&
                                     dxvk_join_throw_call_rva <= mod.size_of_image - dxvk_join_throw_call.size() &&
                                     mod.image_base <= UINT64_MAX - dxvk_join_throw_call_rva)
                                 {
@@ -2134,8 +2159,8 @@ namespace sogen
                 }
                 const auto report_dxvk = [&](const char* result, const uint64_t installed,
                                              const uint64_t terminate, const uint64_t abort) {
-                    if (is_d3d11_throw_module(mod.name) &&
-                        load_records->fetch_add(1, std::memory_order_relaxed) < 4)
+                    if ((d3d11_module || dxgi_module) &&
+                        load_records->fetch_add(1, std::memory_order_relaxed) < 8)
                     {
                         this->log.error(
                             "[GUESTCXXPROBE] module=%.*s base=%#llx requested_rva=%#llx image_size=%#llx "
@@ -2143,9 +2168,9 @@ namespace sogen
                             "reason=%s terminate_hook=%#llx abort_hook=%#llx\n",
                             static_cast<int>(std::min<size_t>(mod.name.size(), 32)), mod.name.c_str(),
                             static_cast<unsigned long long>(mod.image_base),
-                            static_cast<unsigned long long>(dxvk_throw_rva),
+                            static_cast<unsigned long long>(throw_rva),
                             static_cast<unsigned long long>(mod.size_of_image),
-                            static_cast<unsigned long long>(dxvk_image_size),
+                            static_cast<unsigned long long>(expected_image_size),
                             static_cast<unsigned>(signature_read), static_cast<unsigned>(signature_match),
                             static_cast<unsigned long long>(installed), result,
                             static_cast<unsigned long long>(terminate), static_cast<unsigned long long>(abort));
