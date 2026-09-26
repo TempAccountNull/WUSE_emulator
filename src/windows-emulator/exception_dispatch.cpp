@@ -260,14 +260,6 @@ namespace sogen
     {
         auto& thread = vcpu.thread();
 
-        win_emu.record_exception_trace({
-            .status = static_cast<uint32_t>(status),
-            .tid = thread.id,
-            .vcpu = static_cast<uint32_t>(vcpu.cpu.index()),
-            .rip = vcpu.cpu.read_instruction_pointer(),
-            .info = parameters.size() > 1 ? static_cast<uint64_t>(parameters[1]) : 0,
-        });
-
         CONTEXT64 ctx{};
         ctx.ContextFlags = CONTEXT64_ALL;
         cpu_context::save(vcpu.cpu, ctx);
@@ -304,6 +296,17 @@ namespace sogen
         }
 
         record.ExceptionAddress = ctx.Rip;
+
+        // Capture the final fault RIP before the dispatcher replaces the guest context.
+        // The backend's current RIP may be one instruction beyond the fault when
+        // instruction precision is enabled.
+        win_emu.record_exception_trace({
+            .status = static_cast<uint32_t>(status),
+            .tid = thread.id,
+            .vcpu = static_cast<uint32_t>(vcpu.cpu.index()),
+            .rip = ctx.Rip,
+            .info = parameters.size() > 1 ? static_cast<uint64_t>(parameters[1]) : 0,
+        }, vcpu.cpu);
 
         sync_wow64_cpu_reserved_context(win_emu, vcpu.cpu, thread, ctx);
 

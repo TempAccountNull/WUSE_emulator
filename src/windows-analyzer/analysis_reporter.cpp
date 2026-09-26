@@ -733,6 +733,7 @@ namespace sogen
     }
 
             EVENT_NAME(instruction_summary_event, "instruction_summary");
+            EVENT_NAME(guest_exception_event, "guest_exception");
             EVENT_NAME(buffered_stdout_event, "buffered_stdout");
             EVENT_NAME(stdout_chunk_event, "stdout_chunk");
             EVENT_NAME(suspicious_activity_event, "suspicious_activity");
@@ -1077,6 +1078,45 @@ namespace sogen
                 });
             }
 
+            static void write_fields(json_object_builder& object, const guest_exception_event& event)
+            {
+                object.field("ordinal", event.ordinal);
+                object.field("nonDebugTotal", event.non_debug_total);
+                object.field("debugTotal", event.debug_total);
+                object.hex_field("status", event.status);
+                object.field("tid", event.tid);
+                object.field("vcpu", event.vcpu);
+                object.hex_field("rip", event.rip);
+                object.hex_field("info", event.info);
+                object.field("mod", event.module_name);
+                object.hex_field("moduleBase", event.module_base);
+                object.hex_field("moduleRva", event.module_rva);
+                object.field("codeBytes", event.code_bytes);
+                object.field("readableCodeBytes", event.readable_code_bytes);
+                object.field("debugSample", event.debug_sample);
+                object.hex_field("eflags", event.eflags);
+                constexpr std::array<std::string_view, 16> names{
+                    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+                };
+                object.object_field("gprs", [&](auto& registers) {
+                    for (size_t i = 0; i < names.size(); ++i)
+                    {
+                        registers.hex_field(names[i], event.gprs[i]);
+                    }
+                });
+                object.array_field("stackWords", [&](const auto& emit) {
+                    for (const auto value : event.stack_words)
+                    {
+                        emit([&](std::string& output) {
+                            output += "\"0x";
+                            append_unsigned(output, value, 16);
+                            output += '"';
+                        });
+                    }
+                });
+            }
+
             static void write_fields(json_object_builder& object, const io_control_event& event)
             {
                 object.field("device", event.device_name);
@@ -1341,7 +1381,8 @@ namespace sogen
     {
         return std::visit(
             make_overloaded([](const run_started_event&) { return false; }, [](const run_finished_event&) { return false; },
-                            [](const run_failed_event&) { return false; }, [](const stdout_chunk_event&) { return false; },
+                            [](const run_failed_event&) { return false; }, [](const guest_exception_event&) { return false; },
+                            [](const stdout_chunk_event&) { return false; },
                             [](const buffered_stdout_event&) { return false; }, [](const instruction_summary_event&) { return false; },
                             [](const execution_progress_event&) { return false; }, [](const thread_switch_event&) { return false; },
                             [](const memory_violation_event&) { return false; }, [](const fast_fail_event&) { return false; },
@@ -1378,7 +1419,7 @@ namespace sogen
             return false;
         }
         return std::visit(make_overloaded([](const run_started_event&) { return false; }, [](const run_finished_event&) { return false; },
-                                          [](const run_failed_event&) { return false; },
+                                          [](const run_failed_event&) { return false; }, [](const guest_exception_event&) { return false; },
                                           [](const memory_violation_event&) { return false; }, [](const fast_fail_event&) { return false; },
                                           [&](const auto& e) {
                                               using event_type = std::decay_t<decltype(e)>;
@@ -1447,7 +1488,8 @@ namespace sogen
     bool event_of_hidden_type(const analysis_event& event, const std::vector<std::string>& hidden_types)
     {
         if (hidden_types.empty() || std::holds_alternative<run_started_event>(event) || std::holds_alternative<run_finished_event>(event) ||
-            std::holds_alternative<run_failed_event>(event) || std::holds_alternative<memory_violation_event>(event) ||
+            std::holds_alternative<run_failed_event>(event) || std::holds_alternative<guest_exception_event>(event) ||
+            std::holds_alternative<memory_violation_event>(event) ||
             std::holds_alternative<fast_fail_event>(event))
         {
             return false;

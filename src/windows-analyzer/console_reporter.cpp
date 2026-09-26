@@ -167,6 +167,10 @@ namespace sogen
                                 this->log_.error("Emulation failed at: 0x%" PRIx64 " - %s\n", e.rip, e.message.c_str());
                             }
                         },
+                        // The bounded exception snapshots are available as structured
+                        // guest_exception records to the panel/MCP. Do not duplicate
+                        // their register and stack dumps in the console.
+                        [&](const guest_exception_event&) {},
                         [&](const instruction_summary_event& e) {
                             this->log_.print(color::white, "Instruction summary:\n");
                             for (const auto& entry : e.entries)

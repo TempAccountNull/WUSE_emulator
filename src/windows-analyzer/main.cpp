@@ -498,6 +498,40 @@ namespace sogen
 
         void do_post_emulation_work(const analysis_context& c)
         {
+            // The guest exception dispatcher retains only the first eight and
+            // last 32 non-debug exceptions, plus a bounded debug sample. Emit
+            // those snapshots once on terminal exit rather than writing a
+            // register/stack record for every exception on the execution path.
+            for (const auto& trace : c.win_emu->exception_trace_snapshot())
+            {
+                c.emit_summary<guest_exception_event>([&](auto& event) {
+                    event.ordinal = trace.ordinal;
+                    event.non_debug_total = c.win_emu->exception_trace_non_debug_count();
+                    event.debug_total = c.win_emu->exception_trace_debug_count();
+                    event.status = trace.status;
+                    event.tid = trace.tid;
+                    event.vcpu = trace.vcpu;
+                    event.rip = trace.rip;
+                    event.info = trace.info;
+                    event.module_name = trace.module_name.data();
+                    event.module_base = trace.module_base;
+                    event.module_rva = trace.module_rva;
+                    event.readable_code_bytes = trace.readable_code_bytes;
+                    event.debug_sample = trace.debug_sample;
+                    event.gprs = trace.gprs;
+                    event.eflags = trace.eflags;
+                    event.stack_words.assign(trace.stack_words.begin(),
+                                             trace.stack_words.begin() + trace.readable_stack_words);
+                    event.code_bytes.reserve(trace.readable_code_bytes * 2);
+                    for (size_t i = 0; i < trace.readable_code_bytes; ++i)
+                    {
+                        char byte[3];
+                        std::snprintf(byte, sizeof(byte), "%02X", trace.code_bytes[i]);
+                        event.code_bytes.append(byte);
+                    }
+                });
+            }
+
             if (c.settings->instruction_summary)
             {
                 c.emit_summary<instruction_summary_event>([&](auto& event) { event.entries = build_instruction_summary(c); });

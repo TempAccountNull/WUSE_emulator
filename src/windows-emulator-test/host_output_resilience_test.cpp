@@ -378,6 +378,44 @@ namespace sogen
 
     // ------------------------------------------------------------------ duplicate suppression
 
+    TEST(GuestExceptionTelemetry, JsonlRetainsStructuredFaultContext)
+    {
+        const auto path = unique_path("sogen-guest-exception", ".jsonl");
+        const auto cleanup = utils::finally([&] {
+            std::error_code error;
+            std::filesystem::remove(path, error);
+        });
+        jsonl_report_settings settings{};
+        settings.dedupe = true;
+        auto jsonl = create_jsonl_reporter(path, settings);
+
+        guest_exception_event event{};
+        event.ordinal = 1;
+        event.non_debug_total = 2;
+        event.status = 0xC0000005;
+        event.tid = 8;
+        event.vcpu = 0;
+        event.rip = 0x140001234;
+        event.module_name = "destiny2.exe";
+        event.module_base = 0x140000000;
+        event.module_rva = 0x1234;
+        event.code_bytes = "0F0B";
+        event.readable_code_bytes = 2;
+        event.gprs[0] = 0x1234;
+        event.stack_words = {0x140001234, 0x7FF00000};
+        jsonl->report(event);
+        jsonl->report(event);
+        jsonl->flush();
+
+        const auto text = read_text(path);
+        EXPECT_EQ(count_prefixed(text, "{\"type\":\"guest_exception\""), 2U) << text;
+        EXPECT_NE(text.find("\"ordinal\":\"1\""), std::string::npos) << text;
+        EXPECT_NE(text.find("\"status\":\"0xc0000005\""), std::string::npos) << text;
+        EXPECT_NE(text.find("\"codeBytes\":\"0F0B\""), std::string::npos) << text;
+        EXPECT_NE(text.find("\"gprs\":{\"rax\":\"0x1234\""), std::string::npos) << text;
+        EXPECT_NE(text.find("\"stackWords\":[\"0x140001234\",\"0x7ff00000\"]"), std::string::npos) << text;
+    }
+
     TEST(Dedupe, JsonlWritesARecordOnlyWhenItsDataDiffers)
     {
         const auto path = unique_path("sogen-dedupe", ".jsonl");

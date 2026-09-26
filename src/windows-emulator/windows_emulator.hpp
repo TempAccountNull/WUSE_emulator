@@ -354,18 +354,28 @@ namespace sogen
         // not perturb the timing-sensitive races it is meant to catch.
         struct exception_trace_entry
         {
+            uint64_t ordinal{};
             uint32_t status{};
             uint32_t tid{};
             uint32_t vcpu{};
             uint64_t rip{};
             uint64_t info{};
+            uint64_t module_base{};
+            uint64_t module_rva{};
+            std::array<char, 64> module_name{};
+            std::array<uint8_t, 16> code_bytes{};
+            uint8_t readable_code_bytes{};
+            std::array<uint64_t, 16> gprs{};
+            uint64_t eflags{};
+            std::array<uint64_t, 16> stack_words{};
+            uint8_t readable_stack_words{};
+            bool debug_sample{};
         };
 
-        void record_exception_trace(const exception_trace_entry& entry)
-        {
-            this->exception_trace_[this->exception_trace_index_ % this->exception_trace_.size()] = entry;
-            ++this->exception_trace_index_;
-        }
+        void record_exception_trace(exception_trace_entry entry, x86_64_cpu& cpu);
+        [[nodiscard]] std::vector<exception_trace_entry> exception_trace_snapshot() const;
+        [[nodiscard]] uint64_t exception_trace_non_debug_count() const { return this->exception_trace_index_; }
+        [[nodiscard]] uint64_t exception_trace_debug_count() const { return this->debug_exception_trace_index_; }
 
         void dump_exception_trace();
 
@@ -505,8 +515,15 @@ namespace sogen
         // current_thread(). See scoped_dispatch.
         vcpu_context* dispatch_vcpu_{};
 
+        std::array<exception_trace_entry, 8> first_exception_trace_{};
         std::array<exception_trace_entry, 32> exception_trace_{};
-        size_t exception_trace_index_{0};
+        uint64_t exception_trace_index_{0};
+        std::array<exception_trace_entry, 4> first_debug_exception_trace_{};
+        std::array<exception_trace_entry, 4> sampled_debug_exception_trace_{};
+        uint64_t debug_exception_trace_index_{0};
+        uint64_t sampled_debug_exception_trace_index_{0};
+        uint64_t all_exception_trace_index_{0};
+        uint64_t last_exception_trace_dump_index_{0};
 
         // unique_ptr because vcpu_context contains an atomic and must stay address-stable.
         std::vector<std::unique_ptr<vcpu_context>> vcpus_{};

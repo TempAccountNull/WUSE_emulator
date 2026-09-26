@@ -3165,6 +3165,112 @@ namespace sogen
         }
     }
 
+    void windows_emulator::record_exception_trace(exception_trace_entry entry, x86_64_cpu& cpu)
+    {
+        entry.ordinal = ++this->all_exception_trace_index_;
+        const bool debug_exception = entry.status == STATUS_BREAKPOINT || entry.status == STATUS_SINGLE_STEP;
+        if (debug_exception)
+        {
+            const auto index = this->debug_exception_trace_index_++;
+            if (index >= this->first_debug_exception_trace_.size() && (index % 1024) != 0)
+            {
+                return;
+            }
+            entry.debug_sample = true;
+        }
+        else
+        {
+            ++this->exception_trace_index_;
+        }
+
+        if (const auto* module = this->mod_manager.find_by_address(entry.rip))
+        {
+            entry.module_base = module->image_base;
+            entry.module_rva = entry.rip - module->image_base;
+            std::snprintf(entry.module_name.data(), entry.module_name.size(), "%s", module->name.c_str());
+        }
+        else
+        {
+            std::snprintf(entry.module_name.data(), entry.module_name.size(), "<N/A>");
+        }
+
+        for (size_t i = 0; i < entry.code_bytes.size(); ++i)
+        {
+            if (!cpu.try_read_memory(entry.rip + i, &entry.code_bytes[i], 1))
+            {
+                break;
+            }
+            ++entry.readable_code_bytes;
+        }
+
+        constexpr std::array<x86_register, 16> registers{
+            x86_register::rax, x86_register::rbx, x86_register::rcx, x86_register::rdx,
+            x86_register::rsi, x86_register::rdi, x86_register::rbp, x86_register::rsp,
+            x86_register::r8, x86_register::r9, x86_register::r10, x86_register::r11,
+            x86_register::r12, x86_register::r13, x86_register::r14, x86_register::r15,
+        };
+        for (size_t i = 0; i < registers.size(); ++i)
+        {
+            entry.gprs[i] = cpu.reg(registers[i]);
+        }
+        entry.eflags = cpu.reg(x86_register::eflags);
+
+        const auto rsp = entry.gprs[7];
+        for (size_t i = 0; i < entry.stack_words.size(); ++i)
+        {
+            if (rsp > UINT64_MAX - i * sizeof(uint64_t) ||
+                !cpu.try_read_memory(rsp + i * sizeof(uint64_t), &entry.stack_words[i], sizeof(uint64_t)))
+            {
+                break;
+            }
+            ++entry.readable_stack_words;
+        }
+
+        if (debug_exception)
+        {
+            if (this->debug_exception_trace_index_ <= this->first_debug_exception_trace_.size())
+            {
+                this->first_debug_exception_trace_[this->debug_exception_trace_index_ - 1] = entry;
+            }
+            else
+            {
+                this->sampled_debug_exception_trace_[this->sampled_debug_exception_trace_index_++ %
+                                                     this->sampled_debug_exception_trace_.size()] = entry;
+            }
+            return;
+        }
+
+        if (this->exception_trace_index_ <= this->first_exception_trace_.size())
+        {
+            this->first_exception_trace_[this->exception_trace_index_ - 1] = entry;
+        }
+        this->exception_trace_[(this->exception_trace_index_ - 1) % this->exception_trace_.size()] = entry;
+    }
+
+    std::vector<windows_emulator::exception_trace_entry> windows_emulator::exception_trace_snapshot() const
+    {
+        std::vector<exception_trace_entry> result{};
+        result.reserve(first_exception_trace_.size() + exception_trace_.size() + first_debug_exception_trace_.size() +
+                       sampled_debug_exception_trace_.size());
+        const auto append = [&](const auto& entries, const uint64_t count) {
+            for (size_t i = 0; i < std::min<uint64_t>(count, entries.size()); ++i)
+            {
+                if (entries[i].ordinal != 0)
+                {
+                    result.push_back(entries[i]);
+                }
+            }
+        };
+        append(this->first_exception_trace_, this->exception_trace_index_);
+        append(this->exception_trace_, this->exception_trace_index_);
+        append(this->first_debug_exception_trace_, this->debug_exception_trace_index_);
+        append(this->sampled_debug_exception_trace_, this->sampled_debug_exception_trace_index_);
+        std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.ordinal < b.ordinal; });
+        result.erase(std::unique(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.ordinal == b.ordinal; }),
+                     result.end());
+        return result;
+    }
+
     void windows_emulator::dump_exception_trace()
     {
         // Opt-in post-mortem aid for multi-vCPU debugging (see docs/multi-vcpu-design.md).
@@ -3174,15 +3280,20 @@ namespace sogen
             return;
         }
 
-        const auto count = std::min(this->exception_trace_index_, this->exception_trace_.size());
-        if (count == 0)
+        if (this->last_exception_trace_dump_index_ == this->all_exception_trace_index_)
         {
             return;
         }
+        this->last_exception_trace_dump_index_ = this->all_exception_trace_index_;
 
-        const auto total = this->exception_trace_index_;
-        const auto start = total - count;
-        this->log.error("--- exception trace (last %zu of %zu) ---\n", count, total);
+        const auto entries = this->exception_trace_snapshot();
+        if (entries.empty())
+        {
+            return;
+        }
+        this->log.error("--- exception trace (non-debug %llu, debug %llu, retained %zu) ---\n",
+                        static_cast<unsigned long long>(this->exception_trace_index_),
+                        static_cast<unsigned long long>(this->debug_exception_trace_index_), entries.size());
 
         const auto describe = [this](const uint64_t address) -> std::string {
             const auto* mod = this->mod_manager.find_by_address(address);
@@ -3194,10 +3305,10 @@ namespace sogen
             return buffer.data();
         };
 
-        for (size_t i = 0; i < count; ++i)
+        for (const auto& e : entries)
         {
-            const auto& e = this->exception_trace_[(start + i) % this->exception_trace_.size()];
-            this->log.error("  [%zu] status 0x%08x vcpu %u tid %u\n      rip  0x%llx %s\n      addr 0x%llx %s\n", start + i, e.status,
+            this->log.error("  [%llu] status 0x%08x vcpu %u tid %u\n      rip  0x%llx %s\n      addr 0x%llx %s\n",
+                            static_cast<unsigned long long>(e.ordinal), e.status,
                             e.vcpu, e.tid, static_cast<unsigned long long>(e.rip), describe(e.rip).c_str(),
                             static_cast<unsigned long long>(e.info), describe(e.info).c_str());
         }
