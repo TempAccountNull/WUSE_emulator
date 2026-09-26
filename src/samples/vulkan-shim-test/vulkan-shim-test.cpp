@@ -1108,6 +1108,11 @@ int main(int argc, char** argv)
         return 3;
     }
 
+    if (argc > 2 && std::strcmp(argv[2], "--entrypoints-only") == 0)
+    {
+        return 0;
+    }
+
     const auto write_timestamp2 = reinterpret_cast<PFN_vkCmdWriteTimestamp2>(get_instance_proc(nullptr, "vkCmdWriteTimestamp2"));
     const auto write_timestamp2_khr = reinterpret_cast<PFN_vkCmdWriteTimestamp2KHR>(get_instance_proc(nullptr, "vkCmdWriteTimestamp2KHR"));
     const auto draw_indirect_count_khr =

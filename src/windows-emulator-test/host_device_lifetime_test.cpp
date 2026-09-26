@@ -211,6 +211,12 @@ namespace sogen::test
             return emu.process.devices.get(device_handle)->io_control(emu, request);
         }
 
+        NTSTATUS create_instance()
+        {
+            constexpr gpu_bridge::create_instance_request request{.magic = gpu_bridge::create_instance_request_magic};
+            return ioctl(gpu_bridge::ioctl_create_instance, &request, sizeof(request), sizeof(gpu_bridge::create_instance_response));
+        }
+
         template <typename T>
         T output(const size_t offset = 0)
         {
@@ -221,7 +227,7 @@ namespace sogen::test
     TEST_F(GpuHostLifetimeTest, FinalDeviceHandleCloseRevokesDirectMappingAndSharedAlias)
     {
         device_handle = emu.process.devices.store(io_device_container{u"SogenGpu", emu, {}});
-        ASSERT_EQ(ioctl(gpu_bridge::ioctl_create_instance, nullptr, 0, sizeof(gpu_bridge::create_instance_response)), STATUS_SUCCESS);
+        ASSERT_EQ(create_instance(), STATUS_SUCCESS);
         const auto instance = output<gpu_bridge::create_instance_response>();
         if (instance.vk_result != 0)
         {
@@ -338,7 +344,7 @@ namespace sogen::test
         {
             auto& mapping = mappings[index];
             const auto alias = view + index * 0x10000;
-            ASSERT_EQ(ioctl(gpu_bridge::ioctl_create_instance, nullptr, 0, sizeof(gpu_bridge::create_instance_response)), STATUS_SUCCESS);
+            ASSERT_EQ(create_instance(), STATUS_SUCCESS);
             const auto instance = output<gpu_bridge::create_instance_response>();
             if (index == 0 && instance.vk_result != 0)
             {
