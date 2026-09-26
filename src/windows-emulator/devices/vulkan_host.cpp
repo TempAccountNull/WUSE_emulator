@@ -58,6 +58,19 @@ namespace sogen
             std::string_view{"VK_NV_low_latency2"},              //
             std::string_view{"VK_EXT_hdr_metadata"},             // no host swapchain HDR metadata path, including readback
             std::string_view{"VK_KHR_maintenance6"},             // four required bridge commands are not implemented
+            std::string_view{"VK_AMD_buffer_marker"},
+            std::string_view{"VK_EXT_conditional_rendering"},
+            std::string_view{"VK_EXT_depth_bias_control"},
+            std::string_view{"VK_EXT_descriptor_buffer"},
+            std::string_view{"VK_EXT_descriptor_heap"},
+            std::string_view{"VK_EXT_multi_draw"},
+            std::string_view{"VK_EXT_present_timing"},
+            std::string_view{"VK_KHR_device_fault"},
+            std::string_view{"VK_KHR_present_wait"},
+            std::string_view{"VK_KHR_present_wait2"},
+            std::string_view{"VK_NVX_binary_import"},
+            std::string_view{"VK_NVX_image_view_handle"},
+            std::string_view{"VK_NV_device_diagnostic_checkpoints"},
         };
 
         bool is_unsupported_extension_name(const std::string_view name)
@@ -69,13 +82,10 @@ namespace sogen
         {
             constexpr std::array names{std::string_view{"VK_KHR_present_id"},
                                        std::string_view{"VK_KHR_present_id2"},
-                                       std::string_view{"VK_KHR_present_wait"},
-                                       std::string_view{"VK_KHR_present_wait2"},
                                        std::string_view{"VK_EXT_swapchain_maintenance1"},
                                        std::string_view{"VK_KHR_swapchain_maintenance1"},
                                        std::string_view{"VK_KHR_incremental_present"},
                                        std::string_view{"VK_GOOGLE_display_timing"},
-                                       std::string_view{"VK_EXT_present_timing"},
                                        std::string_view{"VK_NV_present_barrier"}};
             return std::ranges::find(names, name) != names.end();
         }
@@ -2212,8 +2222,7 @@ namespace sogen
                     break;
                 }
                 const std::string_view name{cursor};
-                if (name == VK_EXT_HDR_METADATA_EXTENSION_NAME || name == VK_KHR_MAINTENANCE_6_EXTENSION_NAME ||
-                    (this->impl_->native_wsi && unsupported_native_wsi_extension(name)))
+                if (is_unsupported_extension_name(name) || (this->impl_->native_wsi && unsupported_native_wsi_extension(name)))
                 {
                     return VK_ERROR_EXTENSION_NOT_PRESENT;
                 }

@@ -12,7 +12,7 @@
 
 namespace sogen::test
 {
-    TEST(VulkanExtensionFilterHostTest, HidesUnbridgedHdrAndMaintenance6InBothPresentationModes)
+    TEST(VulkanExtensionFilterHostTest, HidesUnbridgedExtensionFamiliesInBothPresentationModes)
     {
         for (const bool native_wsi : {false, true})
         {
@@ -74,10 +74,33 @@ namespace sogen::test
                 return std::any_of(extensions.begin(), extensions.end(),
                                    [&](const VkExtensionProperties& extension) { return std::strcmp(extension.extensionName, name) == 0; });
             };
-            EXPECT_FALSE(contains(VK_EXT_HDR_METADATA_EXTENSION_NAME));
-            EXPECT_FALSE(contains(VK_KHR_MAINTENANCE_6_EXTENSION_NAME));
+            constexpr std::array unsupported{"VK_KHR_external_memory_win32",
+                                             "VK_KHR_external_semaphore_win32",
+                                             "VK_KHR_external_fence_win32",
+                                             "VK_KHR_win32_keyed_mutex",
+                                             "VK_EXT_full_screen_exclusive",
+                                             "VK_NV_low_latency2",
+                                             "VK_EXT_hdr_metadata",
+                                             "VK_KHR_maintenance6",
+                                             "VK_AMD_buffer_marker",
+                                             "VK_EXT_conditional_rendering",
+                                             "VK_EXT_depth_bias_control",
+                                             "VK_EXT_descriptor_buffer",
+                                             "VK_EXT_descriptor_heap",
+                                             "VK_EXT_multi_draw",
+                                             "VK_EXT_present_timing",
+                                             "VK_KHR_device_fault",
+                                             "VK_KHR_present_wait",
+                                             "VK_KHR_present_wait2",
+                                             "VK_NVX_binary_import",
+                                             "VK_NVX_image_view_handle",
+                                             "VK_NV_device_diagnostic_checkpoints"};
+            for (const char* name : unsupported)
+            {
+                EXPECT_FALSE(contains(name)) << name;
+            }
 
-            for (const char* name : {VK_EXT_HDR_METADATA_EXTENSION_NAME, VK_KHR_MAINTENANCE_6_EXTENSION_NAME})
+            for (const char* name : unsupported)
             {
                 uint64_t device = 0;
                 EXPECT_EQ(host.create_device(physical_devices[0], &queue, 1, name, std::strlen(name) + 1, 1, nullptr, 0, 0, device),
