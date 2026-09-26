@@ -61,6 +61,7 @@ namespace
     // our exports before it has those pointers (vkCreateInstance, vkEnumerateInstance*) forward explicitly.
     PFN_vkGetInstanceProcAddr g_real_get_instance_proc_addr = nullptr;
     PFN_vkGetDeviceProcAddr g_real_get_device_proc_addr = nullptr;
+    HMODULE g_real_loader = nullptr;
 
     void shim_log(const char* message); // defined below
 
@@ -118,6 +119,7 @@ namespace
 
         g_real_get_device_proc_addr =
             reinterpret_cast<PFN_vkGetDeviceProcAddr>(reinterpret_cast<void*>(GetProcAddress(real, "vkGetDeviceProcAddr")));
+        g_real_loader = real;
         g_real_get_instance_proc_addr = gipa; // published last: this is what passthrough_active() tests
 
         shim_log("vulkan-shim: \\\\.\\SogenGpu unavailable; forwarding to the system vulkan-1.dll\n");
@@ -136,6 +138,12 @@ namespace
     Fn real_global_command(const char* name)
     {
         return reinterpret_cast<Fn>(g_real_get_instance_proc_addr(VK_NULL_HANDLE, name));
+    }
+
+    template <typename Fn>
+    Fn real_direct_command(const char* name)
+    {
+        return reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(g_real_loader, name)));
     }
 
     // Flushes the coalesced descriptor-set updates (see vkUpdateDescriptorSets); defined below.
@@ -3948,25 +3956,32 @@ extern "C"
         return VK_SUCCESS;
     }
 
-    // --- Core physical-device + surface queries (minimal stubs for D3D->Vulkan layers like DXVK) ---
-    // The `2` variants delegate to the already-remoted base queries and drop the pNext chain. Features
-    // and format support are reported permissively (everything available) so the layer proceeds; this
-    // is optimistic — the bridge may not actually support every capability — but it advances bring-up.
-    // Surface queries report a single common BGRA format and FIFO present mode.
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice,
+                                                                                  VkPhysicalDeviceFeatures2* pFeatures);
 
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDevice, VkPhysicalDeviceFeatures* pFeatures)
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDevice physicalDevice,
+                                                                                 VkPhysicalDeviceFeatures* pFeatures)
     {
         if (!pFeatures)
         {
             return;
         }
-        // VkPhysicalDeviceFeatures is a block of VkBool32 toggles; advertise them all as available.
-        auto* flags = reinterpret_cast<VkBool32*>(pFeatures);
-        for (size_t i = 0; i < sizeof(*pFeatures) / sizeof(VkBool32); ++i)
+
+        *pFeatures = {};
+        if (passthrough_active())
         {
-            flags[i] = VK_TRUE;
+            if (auto* const fn = real_direct_command<PFN_vkGetPhysicalDeviceFeatures>("vkGetPhysicalDeviceFeatures"))
+            {
+                fn(physicalDevice, pFeatures);
+            }
+            mask_unsupported_sparse_features(*pFeatures);
+            return;
         }
-        mask_unsupported_sparse_features(*pFeatures);
+
+        VkPhysicalDeviceFeatures2 queried{};
+        queried.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        vkGetPhysicalDeviceFeatures2(physicalDevice, &queried);
+        *pFeatures = queried.features;
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice,
@@ -3977,8 +3992,16 @@ extern "C"
             return;
         }
 
-        // Keep unsupported fields deterministic even if the bridge query fails before filling the root.
-        mask_unsupported_sparse_features(pFeatures->features);
+        pFeatures->features = {};
+        if (passthrough_active())
+        {
+            if (auto* const fn = real_direct_command<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2"))
+            {
+                fn(physicalDevice, pFeatures);
+            }
+            mask_unsupported_sparse_features(pFeatures->features);
+            return;
+        }
 
         // Collect the caller's chain: the root VkPhysicalDeviceFeatures2 (carrying the base
         // VkPhysicalDeviceFeatures), then each pNext struct. For each we record its sType + pad-free
