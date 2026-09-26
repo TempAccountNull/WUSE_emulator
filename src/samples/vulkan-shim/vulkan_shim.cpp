@@ -157,7 +157,20 @@ namespace
         }
 
         DWORD returned = 0;
-        return DeviceIoControl(handle, code, const_cast<void*>(in), in_len, out, out_len, &returned, nullptr) != FALSE;
+        if (DeviceIoControl(handle, code, const_cast<void*>(in), in_len, out, out_len, &returned, nullptr) != FALSE)
+        {
+            return true;
+        }
+
+        const DWORD error = GetLastError();
+        std::array<char, 256> message{};
+        std::snprintf(message.data(), message.size(),
+                      "vulkan-shim: GPU bridge DeviceIoControl failed: code=0x%08lX input=%lu output=%lu GetLastError=%lu\n",
+                      static_cast<unsigned long>(code), static_cast<unsigned long>(in_len), static_cast<unsigned long>(out_len),
+                      static_cast<unsigned long>(error));
+        shim_log(message.data());
+        SetLastError(error);
+        return false;
     }
 
     // Vulkan handles come in two shapes: dispatchable handles (VkInstance, VkDevice, VkQueue,
