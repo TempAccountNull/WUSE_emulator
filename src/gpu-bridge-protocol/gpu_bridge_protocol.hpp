@@ -217,6 +217,8 @@ namespace sogen::gpu_bridge
         cmd_draw_multi = 0x8B5,
         cmd_draw_multi_indexed = 0x8B6,
         get_descriptor = 0x8B7,
+        get_descriptor_set_layout_size = 0x8B8,
+        get_descriptor_set_layout_binding_offset = 0x8B9,
         cmd_synchronization = 0x8C0,
         get_event_status_owned = 0x8C1,
         cmd_copy_image_to_buffer_full = 0x8D0,
@@ -230,6 +232,10 @@ namespace sogen::gpu_bridge
 
     inline constexpr uint32_t ioctl_get_multisample_properties = make_ioctl(static_cast<uint32_t>(command::get_multisample_properties));
     inline constexpr uint32_t ioctl_get_descriptor = make_ioctl(static_cast<uint32_t>(command::get_descriptor));
+    inline constexpr uint32_t ioctl_get_descriptor_set_layout_size =
+        make_ioctl(static_cast<uint32_t>(command::get_descriptor_set_layout_size));
+    inline constexpr uint32_t ioctl_get_descriptor_set_layout_binding_offset =
+        make_ioctl(static_cast<uint32_t>(command::get_descriptor_set_layout_binding_offset));
 
     struct get_multisample_properties_request
     {
@@ -2332,6 +2338,27 @@ namespace sogen::gpu_bridge
         uint32_t data_size;
     };
 
+    struct get_descriptor_set_layout_size_request
+    {
+        object_id device;
+        object_id layout;
+    };
+
+    struct get_descriptor_set_layout_binding_offset_request
+    {
+        object_id device;
+        object_id layout;
+        uint32_t binding;
+        uint32_t reserved;
+    };
+
+    struct descriptor_layout_value_response
+    {
+        int32_t vk_result;
+        uint32_t reserved;
+        uint64_t value;
+    };
+
     struct get_descriptor_set_layout_support_request
     {
         object_id device;
@@ -2556,6 +2583,9 @@ namespace sogen::gpu_bridge
     static_assert(sizeof(descriptor_set_layout_binding) == 20, "wire layout drift");
     static_assert(sizeof(get_descriptor_request) == 16, "wire layout drift");
     static_assert(sizeof(get_descriptor_response) == 8, "wire layout drift");
+    static_assert(sizeof(get_descriptor_set_layout_size_request) == 16, "wire layout drift");
+    static_assert(sizeof(get_descriptor_set_layout_binding_offset_request) == 24, "wire layout drift");
+    static_assert(sizeof(descriptor_layout_value_response) == 16, "wire layout drift");
     static_assert(sizeof(get_descriptor_set_layout_support_request) == 16, "wire layout drift");
     static_assert(sizeof(descriptor_set_layout_support_response) == 12, "wire layout drift");
     static_assert(sizeof(cmd_bind_descriptor_sets_request) == 32, "wire layout drift");

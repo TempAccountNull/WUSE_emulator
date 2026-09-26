@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 #include <vk_descriptor_buffer_wire.hpp>
 #include <gpu_bridge_protocol.hpp>
+#include "../windows-emulator/devices/vulkan_host.hpp"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -271,6 +272,13 @@ namespace sogen::test
         EXPECT_EQ(sizeof(gb::get_descriptor_request), 16u);
         EXPECT_EQ(sizeof(gb::get_descriptor_response), 8u);
         EXPECT_EQ(gb::max_get_descriptor_bytes, wire::max_descriptor_bytes);
+        EXPECT_EQ(static_cast<uint32_t>(gb::command::get_descriptor_set_layout_size), 0x8b8u);
+        EXPECT_EQ(static_cast<uint32_t>(gb::command::get_descriptor_set_layout_binding_offset), 0x8b9u);
+        EXPECT_EQ(gb::ioctl_get_descriptor_set_layout_size, gb::make_ioctl(0x8b8u));
+        EXPECT_EQ(gb::ioctl_get_descriptor_set_layout_binding_offset, gb::make_ioctl(0x8b9u));
+        EXPECT_EQ(sizeof(gb::get_descriptor_set_layout_size_request), 16u);
+        EXPECT_EQ(sizeof(gb::get_descriptor_set_layout_binding_offset_request), 24u);
+        EXPECT_EQ(sizeof(gb::descriptor_layout_value_response), 16u);
         const gb::get_descriptor_request request{.device = 7, .data_size = 16, .wire_size = wire::get_info_byte_count};
         EXPECT_EQ(request.device, 7u);
         EXPECT_EQ(request.data_size, 16u);
@@ -285,11 +293,13 @@ namespace sogen::test
             VkInstance instance{};
             VkDevice device{};
             VkSampler sampler{};
+            VkDescriptorSetLayout layout{};
             VkBuffer buffer{};
             VkDeviceMemory memory{};
             PFN_vkDestroyInstance destroy_instance{};
             PFN_vkDestroyDevice destroy_device{};
             PFN_vkDestroySampler destroy_sampler{};
+            PFN_vkDestroyDescriptorSetLayout destroy_layout{};
             PFN_vkDestroyBuffer destroy_buffer{};
             PFN_vkFreeMemory free_memory{};
 
@@ -306,6 +316,10 @@ namespace sogen::test
                 if (sampler && destroy_sampler)
                 {
                     destroy_sampler(device, sampler, nullptr);
+                }
+                if (layout && destroy_layout)
+                {
+                    destroy_layout(device, layout, nullptr);
                 }
                 if (device && destroy_device)
                 {
@@ -474,10 +488,18 @@ namespace sogen::test
 
         native.destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(get_device_proc(native.device, "vkDestroyDevice"));
         native.destroy_sampler = reinterpret_cast<PFN_vkDestroySampler>(get_device_proc(native.device, "vkDestroySampler"));
+        native.destroy_layout =
+            reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(get_device_proc(native.device, "vkDestroyDescriptorSetLayout"));
         native.destroy_buffer = reinterpret_cast<PFN_vkDestroyBuffer>(get_device_proc(native.device, "vkDestroyBuffer"));
         native.free_memory = reinterpret_cast<PFN_vkFreeMemory>(get_device_proc(native.device, "vkFreeMemory"));
         const auto create_sampler = reinterpret_cast<PFN_vkCreateSampler>(get_device_proc(native.device, "vkCreateSampler"));
         const auto get_descriptor = reinterpret_cast<PFN_vkGetDescriptorEXT>(get_device_proc(native.device, "vkGetDescriptorEXT"));
+        const auto create_layout =
+            reinterpret_cast<PFN_vkCreateDescriptorSetLayout>(get_device_proc(native.device, "vkCreateDescriptorSetLayout"));
+        const auto get_layout_size =
+            reinterpret_cast<PFN_vkGetDescriptorSetLayoutSizeEXT>(get_device_proc(native.device, "vkGetDescriptorSetLayoutSizeEXT"));
+        const auto get_binding_offset = reinterpret_cast<PFN_vkGetDescriptorSetLayoutBindingOffsetEXT>(
+            get_device_proc(native.device, "vkGetDescriptorSetLayoutBindingOffsetEXT"));
         const auto create_buffer = reinterpret_cast<PFN_vkCreateBuffer>(get_device_proc(native.device, "vkCreateBuffer"));
         const auto get_buffer_requirements =
             reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(get_device_proc(native.device, "vkGetBufferMemoryRequirements"));
@@ -487,15 +509,45 @@ namespace sogen::test
             reinterpret_cast<PFN_vkGetBufferDeviceAddress>(get_device_proc(native.device, "vkGetBufferDeviceAddress"));
         ASSERT_NE(native.destroy_device, nullptr);
         ASSERT_NE(native.destroy_sampler, nullptr);
+        ASSERT_NE(native.destroy_layout, nullptr);
         ASSERT_NE(native.destroy_buffer, nullptr);
         ASSERT_NE(native.free_memory, nullptr);
         ASSERT_NE(create_sampler, nullptr);
         ASSERT_NE(get_descriptor, nullptr);
+        ASSERT_NE(create_layout, nullptr);
+        ASSERT_NE(get_layout_size, nullptr);
+        ASSERT_NE(get_binding_offset, nullptr);
         ASSERT_NE(create_buffer, nullptr);
         ASSERT_NE(get_buffer_requirements, nullptr);
         ASSERT_NE(allocate_memory, nullptr);
         ASSERT_NE(bind_buffer_memory, nullptr);
         ASSERT_NE(get_buffer_address, nullptr);
+
+        std::array<VkDescriptorSetLayoutBinding, 2> layout_bindings{};
+        layout_bindings[0].binding = 0;
+        layout_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        layout_bindings[0].descriptorCount = 2;
+        layout_bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        layout_bindings[1].binding = 3;
+        layout_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        layout_bindings[1].descriptorCount = 1;
+        layout_bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo layout_info{};
+        layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layout_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+        layout_info.bindingCount = static_cast<uint32_t>(layout_bindings.size());
+        layout_info.pBindings = layout_bindings.data();
+        ASSERT_EQ(create_layout(native.device, &layout_info, nullptr, &native.layout), VK_SUCCESS);
+        VkDeviceSize layout_size = 0;
+        VkDeviceSize sampler_offset = UINT64_MAX;
+        VkDeviceSize uniform_offset = UINT64_MAX;
+        get_layout_size(native.device, native.layout, &layout_size);
+        get_binding_offset(native.device, native.layout, 0, &sampler_offset);
+        get_binding_offset(native.device, native.layout, 3, &uniform_offset);
+        EXPECT_GE(layout_size, sampler_offset + 2 * descriptor_properties.samplerDescriptorSize);
+        EXPECT_GE(layout_size, uniform_offset + descriptor_properties.uniformBufferDescriptorSize);
+        std::cout << "Native " << device_properties.deviceName << " descriptorBuffer layoutSize=" << layout_size
+                  << " samplerBinding0Offset=" << sampler_offset << " uniformBinding3Offset=" << uniform_offset << '\n';
 
         VkSamplerCreateInfo sampler_info{};
         sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -585,6 +637,78 @@ namespace sogen::test
         std::cout << "Native " << device_properties.deviceName << " vkGetDescriptorEXT samplerSize=" << sampler_size
                   << " samplerBytes=" << print_bytes(sampler_first) << " uniformBufferSize=" << uniform_size
                   << " uniformBufferBytes=" << print_bytes(uniform_first) << '\n';
+    }
+
+    TEST(VulkanDescriptorBufferWireTest, HostBridgeRejectsUnadvertisedExtensionAndLeavesOutputUntouched)
+    {
+        vulkan_host host;
+        ASSERT_TRUE(host.available());
+        uint64_t instance = 0;
+        ASSERT_EQ(host.create_instance(instance), VK_SUCCESS);
+        ASSERT_NE(instance, 0u);
+
+        uint32_t count = 0;
+        ASSERT_EQ(host.enumerate_physical_devices(instance, {}, count), VK_SUCCESS);
+        std::vector<uint64_t> physical_devices(count);
+        ASSERT_EQ(host.enumerate_physical_devices(instance, physical_devices, count), VK_SUCCESS);
+        uint64_t amd_physical = 0;
+        for (const uint64_t physical : physical_devices)
+        {
+            VkPhysicalDeviceProperties properties{};
+            ASSERT_EQ(host.get_physical_device_properties(physical, &properties, sizeof(properties), false), VK_SUCCESS);
+            if (properties.vendorID == 0x1002)
+            {
+                amd_physical = physical;
+                break;
+            }
+        }
+        ASSERT_NE(amd_physical, 0u) << "RX 6700 host adapter is required for this native bridge test";
+
+        const gpu_bridge::device_queue_create_entry queue{.queue_family_index = 0, .queue_count = 1};
+        constexpr char extension[] = VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME;
+        constexpr char empty[] = "";
+        uint64_t device = 0;
+        EXPECT_EQ(host.create_device(amd_physical, &queue, 1, extension, sizeof(extension), 1, empty, 0, 0, device),
+                  VK_ERROR_EXTENSION_NOT_PRESENT);
+        EXPECT_EQ(device, 0u);
+
+        ASSERT_EQ(host.create_device(amd_physical, &queue, 1, empty, 0, 0, empty, 0, 0, device), VK_SUCCESS);
+        ASSERT_NE(device, 0u);
+        const wire::get_info sample{
+            .type = VK_DESCRIPTOR_TYPE_SAMPLER,
+            .kind = wire::payload_kind::sampler,
+            .present = true,
+            .values = {0x1234u, 0, 0},
+        };
+        const auto encoded = wire::encode(sample);
+        std::array<std::byte, 16> output{};
+        output.fill(std::byte{0x5a});
+        EXPECT_EQ(host.get_descriptor(device, encoded, output), VK_ERROR_EXTENSION_NOT_PRESENT);
+        EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](std::byte byte) { return byte == std::byte{0x5a}; }));
+        uint64_t layout_size = UINT64_MAX;
+        uint64_t binding_offset = UINT64_MAX;
+        EXPECT_EQ(host.get_descriptor_set_layout_size(device, 0x1234, layout_size), VK_ERROR_INITIALIZATION_FAILED);
+        EXPECT_EQ(host.get_descriptor_set_layout_binding_offset(device, 0x1234, 3, binding_offset), VK_ERROR_INITIALIZATION_FAILED);
+        EXPECT_EQ(layout_size, 0u);
+        EXPECT_EQ(binding_offset, 0u);
+        const vulkan_host::descriptor_binding binding{
+            .binding = 3,
+            .descriptor_type = VK_DESCRIPTOR_TYPE_SAMPLER,
+            .descriptor_count = 1,
+            .stage_flags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .binding_flags = 0,
+        };
+        uint64_t layout = 0;
+        ASSERT_EQ(host.create_descriptor_set_layout(device, 0, std::span{&binding, 1}, layout), VK_SUCCESS);
+        ASSERT_NE(layout, 0u);
+        EXPECT_EQ(host.get_descriptor_set_layout_size(device, layout, layout_size), VK_ERROR_EXTENSION_NOT_PRESENT);
+        EXPECT_EQ(host.get_descriptor_set_layout_binding_offset(device, layout, 3, binding_offset),
+                  VK_ERROR_EXTENSION_NOT_PRESENT);
+        EXPECT_EQ(layout_size, 0u);
+        EXPECT_EQ(binding_offset, 0u);
+        host.destroy_descriptor_set_layout(device, layout);
+        host.destroy_device(device);
+        host.destroy_instance(instance);
     }
 
 }

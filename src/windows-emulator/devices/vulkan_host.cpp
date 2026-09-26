@@ -18,6 +18,7 @@
 #include <vulkan/vulkan_core.h>
 
 #include <gpu_bridge_protocol.hpp>
+#include <vk_descriptor_buffer_wire.hpp>
 #include <native_wsi_wire.hpp>
 #include "native_present_sync.hpp"
 #include <chrono>
@@ -409,6 +410,14 @@ namespace sogen
             PFN_vkDestroyPipelineLayout destroy_pipeline_layout{};
             PFN_vkCreateDescriptorSetLayout create_descriptor_set_layout{};
             PFN_vkGetDescriptorSetLayoutSupport get_descriptor_set_layout_support{};
+            PFN_vkGetDescriptorEXT get_descriptor{};
+            PFN_vkGetDescriptorSetLayoutSizeEXT get_descriptor_set_layout_size{};
+            PFN_vkGetDescriptorSetLayoutBindingOffsetEXT get_descriptor_set_layout_binding_offset{};
+            VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer_properties{};
+            bool descriptor_buffer_extension{};
+            bool descriptor_buffer_feature{};
+            bool descriptor_buffer_null_descriptor{};
+            bool robust_buffer_access{};
             PFN_vkDestroyDescriptorSetLayout destroy_descriptor_set_layout{};
             PFN_vkCreateDescriptorPool create_descriptor_pool{};
             PFN_vkDestroyDescriptorPool destroy_descriptor_pool{};
@@ -680,6 +689,8 @@ namespace sogen
         {
             VkDescriptorSetLayout handle{};
             uint64_t device_id{};
+            uint32_t flags{};
+            std::vector<uint32_t> bindings;
         };
 
         struct descriptor_pool_data
@@ -2729,11 +2740,23 @@ namespace sogen
             instance->second.get_physical_device_properties2(pd->second.handle, &multi_draw_properties2);
             data.max_multi_draw_count = multi_draw.maxMultiDrawCount;
         }
+        data.descriptor_buffer_extension = enabled_extension(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+        data.robust_buffer_access = features2.features.robustBufferAccess == VK_TRUE;
         data.buffer_marker_extension = enabled_extension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
         data.memory_priority_extension = enabled_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
         data.pageable_memory_extension = enabled_extension(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
         for (const auto* feature = static_cast<const VkBaseInStructure*>(features2.pNext); feature; feature = feature->pNext)
         {
+            if (feature->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT)
+            {
+                data.descriptor_buffer_feature =
+                    reinterpret_cast<const VkPhysicalDeviceDescriptorBufferFeaturesEXT*>(feature)->descriptorBuffer == VK_TRUE;
+            }
+            if (feature->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT)
+            {
+                data.descriptor_buffer_null_descriptor =
+                    reinterpret_cast<const VkPhysicalDeviceRobustness2FeaturesEXT*>(feature)->nullDescriptor == VK_TRUE;
+            }
             if (feature->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT)
             {
                 data.multi_draw_feature =
@@ -2761,6 +2784,16 @@ namespace sogen
                 data.memory_priority_feature =
                     reinterpret_cast<const VkPhysicalDeviceMemoryPriorityFeaturesEXT*>(feature)->memoryPriority == VK_TRUE;
             }
+        }
+
+        if (data.descriptor_buffer_extension && data.descriptor_buffer_feature &&
+            instance->second.get_physical_device_properties2)
+        {
+            data.descriptor_buffer_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT;
+            VkPhysicalDeviceProperties2 descriptor_properties{};
+            descriptor_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            descriptor_properties.pNext = &data.descriptor_buffer_properties;
+            instance->second.get_physical_device_properties2(pd->second.handle, &descriptor_properties);
         }
 
         if (const auto gdpa = instance->second.get_device_proc_addr)
@@ -2956,6 +2989,14 @@ namespace sogen
             data.create_pipeline_layout = reinterpret_cast<PFN_vkCreatePipelineLayout>(resolve("vkCreatePipelineLayout"));
             data.destroy_pipeline_layout = reinterpret_cast<PFN_vkDestroyPipelineLayout>(resolve("vkDestroyPipelineLayout"));
             data.create_descriptor_set_layout = reinterpret_cast<PFN_vkCreateDescriptorSetLayout>(resolve("vkCreateDescriptorSetLayout"));
+            if (data.descriptor_buffer_extension && data.descriptor_buffer_feature)
+            {
+                data.get_descriptor = reinterpret_cast<PFN_vkGetDescriptorEXT>(resolve("vkGetDescriptorEXT"));
+                data.get_descriptor_set_layout_size =
+                    reinterpret_cast<PFN_vkGetDescriptorSetLayoutSizeEXT>(resolve("vkGetDescriptorSetLayoutSizeEXT"));
+                data.get_descriptor_set_layout_binding_offset = reinterpret_cast<PFN_vkGetDescriptorSetLayoutBindingOffsetEXT>(
+                    resolve("vkGetDescriptorSetLayoutBindingOffsetEXT"));
+            }
             data.get_descriptor_set_layout_support =
                 reinterpret_cast<PFN_vkGetDescriptorSetLayoutSupport>(resolve("vkGetDescriptorSetLayoutSupport"));
             if (!data.get_descriptor_set_layout_support)
@@ -4374,9 +4415,13 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
 
-        buf->second.memory_id = memory;
-        buf->second.memory_offset = offset;
-        return dev->second.bind_buffer_memory(dev->second.handle, buf->second.handle, mem->second.handle, offset);
+        const VkResult result = dev->second.bind_buffer_memory(dev->second.handle, buf->second.handle, mem->second.handle, offset);
+        if (result == VK_SUCCESS)
+        {
+            buf->second.memory_id = memory;
+            buf->second.memory_offset = offset;
+        }
+        return result;
     }
 
     int32_t vulkan_host::cmd_fill_buffer(uint64_t command_buffer, uint64_t buffer, uint64_t offset, uint64_t size, uint32_t data)
@@ -7525,6 +7570,11 @@ namespace sogen
         {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
+        if ((flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT) &&
+            (!dev->second.descriptor_buffer_extension || !dev->second.descriptor_buffer_feature))
+        {
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
 
         std::vector<VkDescriptorSetLayoutBinding> vk_bindings;
         std::vector<VkDescriptorBindingFlags> vk_binding_flags;
@@ -7561,8 +7611,322 @@ namespace sogen
         }
 
         const uint64_t id = this->impl_->next_id++;
-        this->impl_->descriptor_set_layouts.emplace(id, impl::descriptor_set_layout_data{.handle = layout, .device_id = device});
+        impl::descriptor_set_layout_data retained{.handle = layout, .device_id = device, .flags = flags};
+        if (flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT)
+        {
+            retained.bindings.reserve(bindings.size());
+            for (const auto& binding : bindings)
+            {
+                retained.bindings.push_back(binding.binding);
+            }
+        }
+        this->impl_->descriptor_set_layouts.emplace(id, std::move(retained));
         out_layout = id;
+        return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::get_descriptor(uint64_t device, std::span<const std::byte> encoded_info, std::span<std::byte> output)
+    {
+        namespace wire = gpu_bridge::descriptor_buffer_wire;
+        if (encoded_info.size() != wire::get_info_byte_count || output.empty() || output.size() > wire::max_descriptor_bytes)
+        {
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
+
+        const auto dev = this->impl_->devices.find(device);
+        if (dev == this->impl_->devices.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
+        const auto& native = dev->second;
+        if (!native.descriptor_buffer_extension || !native.descriptor_buffer_feature || !native.get_descriptor)
+        {
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+
+        wire::get_info info{};
+        try
+        {
+            info = wire::decode(encoded_info, native.descriptor_buffer_null_descriptor);
+        }
+        catch (const std::invalid_argument&)
+        {
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
+
+        const auto& sizes = native.descriptor_buffer_properties;
+        size_t native_size = 0;
+        switch (info.type)
+        {
+        case VK_DESCRIPTOR_TYPE_SAMPLER:
+            native_size = sizes.samplerDescriptorSize;
+            break;
+        case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+            native_size = sizes.combinedImageSamplerDescriptorSize;
+            break;
+        case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            native_size = sizes.sampledImageDescriptorSize;
+            break;
+        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+            native_size = sizes.storageImageDescriptorSize;
+            break;
+        case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+            native_size = sizes.inputAttachmentDescriptorSize;
+            break;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+            native_size =
+                native.robust_buffer_access ? sizes.robustUniformTexelBufferDescriptorSize : sizes.uniformTexelBufferDescriptorSize;
+            break;
+        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+            native_size =
+                native.robust_buffer_access ? sizes.robustStorageTexelBufferDescriptorSize : sizes.storageTexelBufferDescriptorSize;
+            break;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            native_size = native.robust_buffer_access ? sizes.robustUniformBufferDescriptorSize : sizes.uniformBufferDescriptorSize;
+            break;
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            native_size = native.robust_buffer_access ? sizes.robustStorageBufferDescriptorSize : sizes.storageBufferDescriptorSize;
+            break;
+        case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+        case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_NV:
+            // The bridge does not own acceleration-structure objects yet. A raw guest address
+            // cannot be proven to belong to this device, so do not submit it to the driver.
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        default:
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
+        try
+        {
+            wire::validate_descriptor_data_size(output.size(), native_size);
+        }
+        catch (const std::invalid_argument&)
+        {
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
+
+        VkSampler sampler = VK_NULL_HANDLE;
+        VkDescriptorImageInfo image{};
+        VkDescriptorAddressInfoEXT address{};
+        VkDescriptorGetInfoEXT native_info{};
+        native_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT;
+        native_info.type = info.type;
+
+        const auto owned_sampler = [&](uint64_t id, VkSampler& out) {
+            if (id == 0)
+            {
+                out = VK_NULL_HANDLE;
+                return true;
+            }
+            const auto found = this->impl_->samplers.find(id);
+            if (found == this->impl_->samplers.end() || found->second.device_id != device)
+            {
+                return false;
+            }
+            out = found->second.handle;
+            return true;
+        };
+        const auto owned_image_view = [&](uint64_t id, VkImageView& out) {
+            if (id == 0)
+            {
+                out = VK_NULL_HANDLE;
+                return true;
+            }
+            const auto found = this->impl_->image_views.find(id);
+            if (found == this->impl_->image_views.end() || found->second.device_id != device)
+            {
+                return false;
+            }
+            out = found->second.handle;
+            return true;
+        };
+
+        switch (info.kind)
+        {
+        case wire::payload_kind::sampler:
+            if (!owned_sampler(info.values[0], sampler))
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            native_info.data.pSampler = &sampler;
+            break;
+        case wire::payload_kind::image:
+            if (!owned_sampler(info.values[0], image.sampler) || !owned_image_view(info.values[1], image.imageView))
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            image.imageLayout = translate_layout(static_cast<VkImageLayout>(info.values[2]));
+            switch (info.type)
+            {
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+                native_info.data.pCombinedImageSampler = &image;
+                break;
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+                native_info.data.pSampledImage = &image;
+                break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+                native_info.data.pStorageImage = &image;
+                break;
+            case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+                native_info.data.pInputAttachmentImage = &image;
+                break;
+            default:
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            break;
+        case wire::payload_kind::address: {
+            address.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT;
+            address.address = info.values[0];
+            address.range = info.present ? info.values[1] : VK_WHOLE_SIZE;
+            address.format = static_cast<VkFormat>(info.values[2]);
+            const bool texel_buffer =
+                info.type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || info.type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+            if (texel_buffer && address.address != 0 && address.format == VK_FORMAT_UNDEFINED)
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            if (address.address == 0)
+            {
+                if (!native.descriptor_buffer_null_descriptor || address.range != VK_WHOLE_SIZE)
+                {
+                    return VK_ERROR_VALIDATION_FAILED_EXT;
+                }
+            }
+            else
+            {
+                if (address.range == 0 || address.range == VK_WHOLE_SIZE || !native.get_buffer_device_address)
+                {
+                    return VK_ERROR_VALIDATION_FAILED_EXT;
+                }
+                VkBufferUsageFlags required_usage = 0;
+                switch (info.type)
+                {
+                case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+                    required_usage = VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
+                    break;
+                case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+                    required_usage = VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
+                    break;
+                case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+                    required_usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+                    break;
+                case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                    required_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+                    break;
+                default:
+                    return VK_ERROR_VALIDATION_FAILED_EXT;
+                }
+                bool belongs_to_device = false;
+                for (const auto& [id, buffer] : this->impl_->buffers)
+                {
+                    if (buffer.device_id != device || buffer.memory_id == 0 ||
+                        !(buffer.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) || !(buffer.usage & required_usage))
+                    {
+                        continue;
+                    }
+                    VkBufferDeviceAddressInfo query{};
+                    query.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+                    query.buffer = buffer.handle;
+                    const uint64_t base = native.get_buffer_device_address(native.handle, &query);
+                    if (base != 0 && address.address >= base && address.address - base < buffer.size &&
+                        address.range <= buffer.size - (address.address - base))
+                    {
+                        belongs_to_device = true;
+                        break;
+                    }
+                }
+                if (!belongs_to_device)
+                {
+                    return VK_ERROR_VALIDATION_FAILED_EXT;
+                }
+            }
+            switch (info.type)
+            {
+            case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+                native_info.data.pUniformTexelBuffer = &address;
+                break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+                native_info.data.pStorageTexelBuffer = &address;
+                break;
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+                native_info.data.pUniformBuffer = &address;
+                break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                native_info.data.pStorageBuffer = &address;
+                break;
+            default:
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            break;
+        }
+        case wire::payload_kind::acceleration_structure:
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        native.get_descriptor(native.handle, &native_info, output.size(), output.data());
+        return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::get_descriptor_set_layout_size(uint64_t device, uint64_t layout, uint64_t& out_size)
+    {
+        out_size = 0;
+        const auto dev = this->impl_->devices.find(device);
+        const auto set_layout = this->impl_->descriptor_set_layouts.find(layout);
+        if (dev == this->impl_->devices.end() || set_layout == this->impl_->descriptor_set_layouts.end() ||
+            set_layout->second.device_id != device)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
+        if (!dev->second.descriptor_buffer_extension || !dev->second.descriptor_buffer_feature ||
+            !dev->second.get_descriptor_set_layout_size)
+        {
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+        constexpr uint32_t forbidden =
+            VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR | VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT;
+        if (!(set_layout->second.flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT) ||
+            (set_layout->second.flags & forbidden))
+        {
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
+        dev->second.get_descriptor_set_layout_size(dev->second.handle, set_layout->second.handle, &out_size);
+        return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::get_descriptor_set_layout_binding_offset(uint64_t device, uint64_t layout, uint32_t binding, uint64_t& out_offset)
+    {
+        out_offset = 0;
+        const auto dev = this->impl_->devices.find(device);
+        const auto set_layout = this->impl_->descriptor_set_layouts.find(layout);
+        if (dev == this->impl_->devices.end() || set_layout == this->impl_->descriptor_set_layouts.end() ||
+            set_layout->second.device_id != device)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
+        if (!dev->second.descriptor_buffer_extension || !dev->second.descriptor_buffer_feature ||
+            !dev->second.get_descriptor_set_layout_binding_offset)
+        {
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+        constexpr uint32_t forbidden =
+            VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR | VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT;
+        if (!(set_layout->second.flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT) ||
+            (set_layout->second.flags & forbidden) ||
+            std::ranges::find(set_layout->second.bindings, binding) == set_layout->second.bindings.end())
+        {
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
+        dev->second.get_descriptor_set_layout_binding_offset(dev->second.handle, set_layout->second.handle, binding, &out_offset);
         return VK_SUCCESS;
     }
 

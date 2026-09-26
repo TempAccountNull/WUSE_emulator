@@ -544,6 +544,12 @@ namespace sogen
                                              uint64_t& out_layout);
         int32_t get_descriptor_set_layout_support(uint64_t device, uint32_t flags, std::span<const descriptor_binding> bindings,
                                                   uint32_t& supported, uint32_t& max_variable_descriptor_count);
+        // Decodes a bounded, pointer-free VkDescriptorGetInfoEXT packet; resolves owned host
+        // objects and writes exactly the native descriptor-size bytes on success.
+        int32_t get_descriptor(uint64_t device, std::span<const std::byte> encoded_info, std::span<std::byte> output);
+        int32_t get_descriptor_set_layout_size(uint64_t device, uint64_t layout, uint64_t& out_size);
+        int32_t get_descriptor_set_layout_binding_offset(uint64_t device, uint64_t layout, uint32_t binding,
+                                                         uint64_t& out_offset);
         void destroy_descriptor_set_layout(uint64_t device, uint64_t layout);
         int32_t create_descriptor_pool(uint64_t device, uint32_t max_sets, uint32_t flags, uint32_t max_inline_uniform_block_bindings,
                                        std::span<const descriptor_pool_size> sizes, uint64_t& out_pool);

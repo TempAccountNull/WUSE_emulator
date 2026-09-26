@@ -6990,6 +6990,87 @@ extern "C"
                            pPushConstantsInfo->size, pPushConstantsInfo->pValues);
     }
 
+    VKAPI_ATTR void VKAPI_CALL vkGetDescriptorSetLayoutSizeEXT(VkDevice device, VkDescriptorSetLayout layout,
+                                                               VkDeviceSize* pLayoutSizeInBytes)
+    {
+        if (passthrough_active())
+        {
+            const auto native = g_real_get_device_proc_addr ? reinterpret_cast<PFN_vkGetDescriptorSetLayoutSizeEXT>(
+                                                                  g_real_get_device_proc_addr(device, "vkGetDescriptorSetLayoutSizeEXT"))
+                                                            : nullptr;
+            if (native)
+            {
+                native(device, layout, pLayoutSizeInBytes);
+            }
+            return;
+        }
+        {
+            std::lock_guard lock(g_descriptor_buffer_devices_mutex);
+            if (!g_descriptor_buffer_devices.contains(to_object_id(device)))
+            {
+                shim_log("vulkan-shim: vkGetDescriptorSetLayoutSizeEXT called without enabled bridge capability\n");
+                return;
+            }
+        }
+        if (!pLayoutSizeInBytes)
+        {
+            shim_log("vulkan-shim: vkGetDescriptorSetLayoutSizeEXT received null output\n");
+            return;
+        }
+        const gb::get_descriptor_set_layout_size_request request{.device = to_object_id(device), .layout = to_object_id(layout)};
+        gb::descriptor_layout_value_response response{};
+        DWORD returned = 0;
+        if (!bridge_call(gb::ioctl_get_descriptor_set_layout_size, &request, sizeof(request), &response, sizeof(response), &returned) ||
+            returned != sizeof(response) || response.vk_result != VK_SUCCESS)
+        {
+            shim_log("vulkan-shim: vkGetDescriptorSetLayoutSizeEXT host query failed\n");
+            return;
+        }
+        *pLayoutSizeInBytes = response.value;
+    }
+
+    VKAPI_ATTR void VKAPI_CALL vkGetDescriptorSetLayoutBindingOffsetEXT(VkDevice device, VkDescriptorSetLayout layout, uint32_t binding,
+                                                                        VkDeviceSize* pOffset)
+    {
+        if (passthrough_active())
+        {
+            const auto native = g_real_get_device_proc_addr
+                                    ? reinterpret_cast<PFN_vkGetDescriptorSetLayoutBindingOffsetEXT>(
+                                          g_real_get_device_proc_addr(device, "vkGetDescriptorSetLayoutBindingOffsetEXT"))
+                                    : nullptr;
+            if (native)
+            {
+                native(device, layout, binding, pOffset);
+            }
+            return;
+        }
+        {
+            std::lock_guard lock(g_descriptor_buffer_devices_mutex);
+            if (!g_descriptor_buffer_devices.contains(to_object_id(device)))
+            {
+                shim_log("vulkan-shim: vkGetDescriptorSetLayoutBindingOffsetEXT called without enabled bridge capability\n");
+                return;
+            }
+        }
+        if (!pOffset)
+        {
+            shim_log("vulkan-shim: vkGetDescriptorSetLayoutBindingOffsetEXT received null output\n");
+            return;
+        }
+        const gb::get_descriptor_set_layout_binding_offset_request request{
+            .device = to_object_id(device), .layout = to_object_id(layout), .binding = binding, .reserved = 0};
+        gb::descriptor_layout_value_response response{};
+        DWORD returned = 0;
+        if (!bridge_call(gb::ioctl_get_descriptor_set_layout_binding_offset, &request, sizeof(request), &response, sizeof(response),
+                         &returned) ||
+            returned != sizeof(response) || response.vk_result != VK_SUCCESS)
+        {
+            shim_log("vulkan-shim: vkGetDescriptorSetLayoutBindingOffsetEXT host query failed\n");
+            return;
+        }
+        *pOffset = response.value;
+    }
+
     VKAPI_ATTR void VKAPI_CALL vkGetDescriptorEXT(VkDevice device, const VkDescriptorGetInfoEXT* pDescriptorInfo, size_t dataSize,
                                                   void* pDescriptor)
     {
@@ -7529,11 +7610,18 @@ extern "C"
                                                : g_real_get_instance_proc_addr(VK_NULL_HANDLE, pName);
         }
 
-        if (pName && std::strcmp(pName, "vkGetDescriptorEXT") == 0)
+        if (pName && (std::strcmp(pName, "vkGetDescriptorEXT") == 0 ||
+                      std::strcmp(pName, "vkGetDescriptorSetLayoutSizeEXT") == 0 ||
+                      std::strcmp(pName, "vkGetDescriptorSetLayoutBindingOffsetEXT") == 0))
         {
             std::lock_guard lock(g_descriptor_buffer_devices_mutex);
-            return g_descriptor_buffer_devices.contains(to_object_id(device)) ? reinterpret_cast<PFN_vkVoidFunction>(vkGetDescriptorEXT)
-                                                                              : nullptr;
+            if (!g_descriptor_buffer_devices.contains(to_object_id(device)))
+                return nullptr;
+            if (std::strcmp(pName, "vkGetDescriptorEXT") == 0)
+                return reinterpret_cast<PFN_vkVoidFunction>(vkGetDescriptorEXT);
+            if (std::strcmp(pName, "vkGetDescriptorSetLayoutSizeEXT") == 0)
+                return reinterpret_cast<PFN_vkVoidFunction>(vkGetDescriptorSetLayoutSizeEXT);
+            return reinterpret_cast<PFN_vkVoidFunction>(vkGetDescriptorSetLayoutBindingOffsetEXT);
         }
         if (pName && (std::strcmp(pName, "vkCmdWriteBufferMarkerAMD") == 0 || std::strcmp(pName, "vkCmdWriteBufferMarker2AMD") == 0))
         {

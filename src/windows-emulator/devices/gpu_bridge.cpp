@@ -358,6 +358,12 @@ namespace sogen
                     return handle_create_descriptor_set_layout(win_emu, context);
                 case gpu_bridge::ioctl_get_descriptor_set_layout_support:
                     return handle_get_descriptor_set_layout_support(win_emu, context);
+                case gpu_bridge::ioctl_get_descriptor:
+                    return handle_get_descriptor(win_emu, context);
+                case gpu_bridge::ioctl_get_descriptor_set_layout_size:
+                    return handle_get_descriptor_set_layout_size(win_emu, context);
+                case gpu_bridge::ioctl_get_descriptor_set_layout_binding_offset:
+                    return handle_get_descriptor_set_layout_binding_offset(win_emu, context);
                 case gpu_bridge::ioctl_destroy_descriptor_set_layout:
                     return handle_destroy_descriptor_set_layout(win_emu, context);
                 case gpu_bridge::ioctl_create_descriptor_pool:
@@ -2968,6 +2974,68 @@ namespace sogen
                 uint64_t layout = gpu_bridge::null_object;
                 const int32_t result = this->vulkan_.create_descriptor_set_layout(request.device, request.flags, bindings, layout);
                 return write_output(win_emu, context, gpu_bridge::object_response{.vk_result = result, .reserved = 0, .object = layout});
+            }
+
+            NTSTATUS handle_get_descriptor(windows_emulator& win_emu, const io_device_context& context)
+            {
+                using request_t = gpu_bridge::get_descriptor_request;
+                using response_t = gpu_bridge::get_descriptor_response;
+                // vk_descriptor_buffer_wire.hpp encodes one fixed 40-byte tagged payload; the host
+                // never receives a guest VkDescriptorGetInfoEXT or a nested guest pointer.
+                constexpr size_t wire_bytes = 40;
+                request_t request{};
+                if (context.input_buffer_length != sizeof(request_t) + wire_bytes || !read_input(win_emu, context, request) ||
+                    request.wire_size != wire_bytes || request.data_size == 0 || request.data_size > gpu_bridge::max_get_descriptor_bytes)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                const size_t response_bytes = sizeof(response_t) + request.data_size;
+                if (!context.output_buffer || context.output_buffer_length < response_bytes)
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+
+                std::array<std::byte, wire_bytes> wire{};
+                win_emu.emu().read_memory(context.input_buffer + sizeof(request_t), wire.data(), wire.size());
+                std::vector<std::byte> native_bytes(request.data_size);
+                const int32_t result = this->vulkan_.get_descriptor(request.device, wire, native_bytes);
+                const response_t response{.vk_result = result, .data_size = result == 0 ? request.data_size : 0};
+                emulator_object<response_t>{win_emu.emu(), context.output_buffer}.write(response);
+                if (result == 0)
+                {
+                    win_emu.emu().write_memory(context.output_buffer + sizeof(response_t), native_bytes.data(), native_bytes.size());
+                    set_information(context, static_cast<ULONG>(response_bytes));
+                }
+                else
+                {
+                    set_information(context, static_cast<ULONG>(sizeof(response_t)));
+                }
+                return STATUS_SUCCESS;
+            }
+
+            NTSTATUS handle_get_descriptor_set_layout_size(windows_emulator& win_emu, const io_device_context& context)
+            {
+                gpu_bridge::get_descriptor_set_layout_size_request request{};
+                if (context.input_buffer_length != sizeof(request) || !read_input(win_emu, context, request))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                gpu_bridge::descriptor_layout_value_response response{};
+                response.vk_result = this->vulkan_.get_descriptor_set_layout_size(request.device, request.layout, response.value);
+                return write_output(win_emu, context, response);
+            }
+
+            NTSTATUS handle_get_descriptor_set_layout_binding_offset(windows_emulator& win_emu, const io_device_context& context)
+            {
+                gpu_bridge::get_descriptor_set_layout_binding_offset_request request{};
+                if (context.input_buffer_length != sizeof(request) || !read_input(win_emu, context, request) || request.reserved != 0)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                gpu_bridge::descriptor_layout_value_response response{};
+                response.vk_result =
+                    this->vulkan_.get_descriptor_set_layout_binding_offset(request.device, request.layout, request.binding, response.value);
+                return write_output(win_emu, context, response);
             }
 
             NTSTATUS handle_get_descriptor_set_layout_support(windows_emulator& win_emu, const io_device_context& context)
