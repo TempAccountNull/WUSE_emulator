@@ -47,6 +47,8 @@ namespace sogen::test
 
         auto& waiting = add_thread();
         waiting.suspended = 1;
+        waiting.apc_alertable = true;
+        waiting.pending_apcs.push_back({.apc_routine = 0x123400});
         EXPECT_EQ(invoke(), nt_status_no_yield_performed);
         EXPECT_FALSE(vcpu.switch_thread.load());
     }

@@ -767,7 +767,7 @@ namespace sogen
             bool can_switch = false;
             for (auto& candidate : c.proc.threads | std::views::values)
             {
-                if (&candidate == c.vcpu.active_thread)
+                if (&candidate == c.vcpu.active_thread || candidate.is_terminated() || candidate.suspended > 0)
                 {
                     continue;
                 }
