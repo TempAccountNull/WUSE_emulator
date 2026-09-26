@@ -8,6 +8,7 @@
 namespace sogen
 {
 
+    inline constexpr NTSTATUS nt_status_no_yield_performed = static_cast<NTSTATUS>(0x40000024);
     struct completion_state;
 
     struct user_callback_result

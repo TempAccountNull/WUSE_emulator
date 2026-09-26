@@ -157,7 +157,8 @@ namespace sogen::test
     }
 
     inline windows_emulator create_sample_emulator(emulator_settings settings, const sample_configuration& config = {},
-                                                   emulator_callbacks callbacks = {}, emulator_interfaces interfaces = {})
+                                                   emulator_callbacks callbacks = {}, emulator_interfaces interfaces = {},
+                                                   const size_t vcpu_count = 1)
     {
         const auto is_verbose = enable_verbose_logging();
 
@@ -191,7 +192,7 @@ namespace sogen::test
         }
 
         return windows_emulator{
-            create_x86_64_emulator_from_environment(),
+            create_x86_64_emulator_from_environment(vcpu_count),
             get_sample_app_settings(config),
             settings,
             std::move(callbacks),

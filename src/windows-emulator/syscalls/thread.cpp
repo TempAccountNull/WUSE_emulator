@@ -761,6 +761,42 @@ namespace sogen
 
         NTSTATUS handle_NtYieldExecution(const syscall_context& c)
         {
+            // Windows only yields when another ready thread can run on this processor.
+            // Avoid leaving the JIT and saving/restoring the same guest context when
+            // every other thread is waiting or already owned by another vCPU.
+            bool can_switch = false;
+            for (auto& candidate : c.proc.threads | std::views::values)
+            {
+                if (&candidate == c.vcpu.active_thread)
+                {
+                    continue;
+                }
+
+                bool owned_elsewhere = false;
+                for (size_t i = 0; i < c.win_emu.vcpu_count(); ++i)
+                {
+                    if (i != c.vcpu.cpu.index() && c.win_emu.vcpu(i).active_thread == &candidate)
+                    {
+                        owned_elsewhere = true;
+                        break;
+                    }
+                }
+                if (owned_elsewhere)
+                {
+                    continue;
+                }
+
+                if (candidate.is_thread_ready(c.win_emu) || (candidate.apc_alertable && !candidate.pending_apcs.empty()))
+                {
+                    can_switch = true;
+                    break;
+                }
+            }
+
+            if (!can_switch)
+            {
+                return nt_status_no_yield_performed;
+            }
             c.win_emu.yield_thread(c.vcpu);
             return STATUS_SUCCESS;
         }
