@@ -912,6 +912,9 @@ namespace sogen::test
         win_emu.emu().write_memory(caller, loop.data(), loop.size());
         win_emu.emu().reg(x86_register::rip, caller);
         win_emu.emu().start(0x20000);
+        // Direct CPU runs bypass perform_thread_switch(), which normally consumes the
+        // time-slice stop before scheduling another quantum.
+        win_emu.vcpu(0).cpu.acknowledge_stop();
         win_emu.emu().start(0x20000);
         const auto count = win_emu.get_executed_instructions();
         ASSERT_EQ(count, 0x40000U);
