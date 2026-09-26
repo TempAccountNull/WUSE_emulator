@@ -206,6 +206,14 @@ namespace sogen
         std::string error{};
     };
 
+    struct fault_stack_word_snapshot
+    {
+        uint64_t address{};
+        std::optional<uint64_t> value{};
+        std::optional<fault_address_snapshot> value_location{};
+        std::string error{};
+    };
+
     struct fault_stack_snapshot
     {
         std::optional<uint32_t> pointer_bits{};
@@ -216,6 +224,7 @@ namespace sogen
         std::optional<uint64_t> address{};
         std::optional<uint64_t> value{};
         std::optional<fault_address_snapshot> value_location{};
+        std::vector<fault_stack_word_snapshot> words{};
         std::string error{};
     };
 

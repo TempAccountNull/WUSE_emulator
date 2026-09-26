@@ -1056,6 +1056,23 @@ namespace sogen
                         value.object_field("valueLocation",
                                            [&](auto& location) { write_fault_address(location, *event.stack_slot.value_location); });
                     }
+                    value.array_field("words", [&](const auto& emit) {
+                        for (const auto& word : event.stack_slot.words)
+                        {
+                            emit([&](std::string& output) {
+                                json_object_builder entry{output};
+                                entry.hex_field("address", word.address);
+                                entry.optional_hex_field("value", word.value);
+                                entry.field("error", word.error);
+                                if (word.value_location)
+                                {
+                                    entry.object_field("valueLocation", [&](auto& location) {
+                                        write_fault_address(location, *word.value_location);
+                                    });
+                                }
+                            });
+                        }
+                    });
                 });
             }
 

@@ -438,6 +438,34 @@ namespace sogen
                 slot.value = value;
                 slot.value_location = capture_address(win, value);
             }
+            // A stack slot is not necessarily a return address. Preserve a bounded raw
+            // window so a later fault can be attributed without guessing a call chain.
+            // The 32-bit descriptor path validates only the first slot; do not read past
+            // that descriptor's limit using a flat linear-address assumption.
+            if (*event.code_bits == 64U && slot.address_bits == 64U)
+            {
+                constexpr size_t word_count = 16;
+                slot.words.reserve(word_count);
+                for (size_t index = 0; index < word_count; ++index)
+                {
+                    const auto offset = index * sizeof(uint64_t);
+                    if (*slot.address > std::numeric_limits<uint64_t>::max() - offset)
+                    {
+                        break;
+                    }
+                    fault_stack_word_snapshot word{.address = *slot.address + offset};
+                    uint64_t word_value{};
+                    if (passive_read(win.memory, word.address, &word_value, sizeof(word_value), word.error))
+                    {
+                        word.value = word_value;
+                        if (word_value)
+                        {
+                            word.value_location = capture_address(win, word_value);
+                        }
+                    }
+                    slot.words.push_back(std::move(word));
+                }
+            }
         }
         catch (const std::exception& error)
         {

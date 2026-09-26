@@ -281,6 +281,18 @@ namespace sogen
                             {
                                 this->log_.print(color::yellow, "  Stack slot: %s\n", e.stack_slot.error.c_str());
                             }
+                            if (!e.stack_slot.words.empty())
+                            {
+                                this->log_.print(color::yellow, "  Stack words (raw, not unwound frames):\n");
+                                for (const auto& word : e.stack_slot.words)
+                                {
+                                    this->log_.print(color::gray, "    [%s] = %s%s%s\n", fault_hex(word.address).c_str(),
+                                                     word.value ? fault_hex(*word.value).c_str() : "<unreadable>",
+                                                     word.value_location || !word.error.empty() ? " " : "",
+                                                     word.value_location ? fault_location(*word.value_location).c_str()
+                                                                         : word.error.c_str());
+                                }
+                            }
                             std::string registers;
                             size_t count = 0;
                             for (const auto& reg : e.registers)

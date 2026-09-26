@@ -605,8 +605,14 @@ namespace sogen::test
         win_emu.current_thread().executed_instructions = 2;
         win_emu.emu().reg(x86_register::rip, caller);
         win_emu.emu().write_memory<uint64_t>(stack, 0x1122334455667788ULL);
+        win_emu.emu().write_memory<uint64_t>(stack + 8, caller + 2);
         win_emu.callbacks.on_memory_violate(0, 8, memory_operation::read, memory_violation_type::unmapped);
         ASSERT_EQ(violations.size(), 1U);
+        ASSERT_EQ(violations[0].stack_slot.words.size(), 16U);
+        EXPECT_EQ(violations[0].stack_slot.words[0].value, 0x1122334455667788ULL);
+        EXPECT_EQ(violations[0].stack_slot.words[1].value, caller + 2);
+        ASSERT_TRUE(violations[0].stack_slot.words[1].value_location);
+        EXPECT_TRUE(violations[0].stack_slot.words[1].value_location->module_rva.has_value());
         win_emu.emu().reg(x86_register::rip, callee);
         win_emu.emu().write_memory<uint64_t>(stack, 0);
         const auto before = win_emu.emu().save_registers();
@@ -621,6 +627,7 @@ namespace sogen::test
         auto console = create_console_reporter(log, {});
         console->report(violations[0]);
         EXPECT_NE(text.find("Stack slot64"), std::string::npos);
+        EXPECT_NE(text.find("Stack words (raw, not unwound frames)"), std::string::npos);
         EXPECT_NE(text.find("0x1122334455667788"), std::string::npos);
         EXPECT_NE(text.find("Last tracked (fault CS)"), std::string::npos);
         EXPECT_EQ(text.find("near-null execute"), std::string::npos);
@@ -652,6 +659,7 @@ namespace sogen::test
         EXPECT_NE(json.find("\"widthSource\":\"fault_cs_default_near_return_operand\""), std::string::npos);
         EXPECT_NE(json.find("\"addressSource\":\"64_bit_rsp\""), std::string::npos);
         EXPECT_NE(json.find("\"value\":\"0x1122334455667788\""), std::string::npos);
+        EXPECT_NE(json.find("\"words\":["), std::string::npos);
         EXPECT_NE(json.find("\"prev\":"), std::string::npos);
         EXPECT_EQ(json.find("returnAddress"), std::string::npos);
         EXPECT_EQ(win_emu.emu().save_registers(), before);
