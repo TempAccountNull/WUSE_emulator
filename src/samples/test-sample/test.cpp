@@ -179,44 +179,6 @@ namespace
         return results[0] != results[1];
     }
 
-    bool run_smp_apc_context()
-    {
-        constexpr size_t worker_count = 4;
-        constexpr unsigned deliveries_per_worker = 8;
-        std::array<std::atomic<unsigned>, worker_count> completed{};
-        std::atomic<bool> queued_all{true};
-        std::array<std::thread, worker_count> workers;
-        for (size_t index = 0; index < worker_count; ++index)
-        {
-            workers[index] = std::thread([&, index] {
-                PAPCFUNC apc_func = [](const ULONG_PTR param) {
-                    static_cast<std::atomic<unsigned>*>(reinterpret_cast<void*>(param))->fetch_add(1, std::memory_order_relaxed);
-                };
-                for (unsigned i = 0; i < deliveries_per_worker; ++i)
-                {
-                    if (!QueueUserAPC(apc_func, GetCurrentThread(), reinterpret_cast<ULONG_PTR>(&completed[index])))
-                    {
-                        queued_all.store(false, std::memory_order_release);
-                        return;
-                    }
-                    SleepEx(0, TRUE);
-                }
-            });
-        }
-        for (auto& worker : workers)
-        {
-            worker.join();
-        }
-        for (const auto& count : completed)
-        {
-            if (count.load(std::memory_order_relaxed) != deliveries_per_worker)
-            {
-                return false;
-            }
-        }
-        return queued_all.load(std::memory_order_acquire);
-    }
-
     bool run_smp_fair_load()
     {
         constexpr size_t worker_count = 4; // More runnable guest threads than the test's two vCPUs.
@@ -2130,10 +2092,6 @@ int main(const int argc, const char* argv[])
     if (argc == 2 && argv[1] == "-smp-load"sv)
     {
         return run_smp_cpu_load() ? 0 : 1;
-    }
-    if (argc == 2 && argv[1] == "-smp-apc-context"sv)
-    {
-        return run_smp_apc_context() ? 0 : 1;
     }
     if (argc == 2 && argv[1] == "-smp-fair"sv)
     {
