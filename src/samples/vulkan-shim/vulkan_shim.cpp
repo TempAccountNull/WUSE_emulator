@@ -16,6 +16,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <string_view>
 #include <type_traits>
@@ -36,8 +37,10 @@
 #include <vk_synchronization.hpp>
 #include <vk_queue_submit.hpp>
 #include <vk_dynamic_state.hpp>
+#include <vk_descriptor_buffer_wire.hpp>
 
 namespace gb = sogen::gpu_bridge;
+namespace dbw = sogen::gpu_bridge::descriptor_buffer_wire;
 
 namespace
 {
@@ -149,7 +152,7 @@ namespace
     // Flushes the coalesced descriptor-set updates (see vkUpdateDescriptorSets); defined below.
     void flush_descriptor_updates();
 
-    bool bridge_call(uint32_t code, const void* in, DWORD in_len, void* out, DWORD out_len)
+    bool bridge_call(uint32_t code, const void* in, DWORD in_len, void* out, DWORD out_len, DWORD* bytes_returned = nullptr)
     {
         // Every other bridge call may make the host observe descriptor state (record, submit, ...), so drain
         // pending updates first to keep host state identical to the un-batched path.
@@ -167,6 +170,10 @@ namespace
         DWORD returned = 0;
         if (DeviceIoControl(handle, code, const_cast<void*>(in), in_len, out, out_len, &returned, nullptr) != FALSE)
         {
+            if (bytes_returned)
+            {
+                *bytes_returned = returned;
+            }
             return true;
         }
 
@@ -254,6 +261,14 @@ namespace
     std::mutex g_buffer_marker_devices_mutex;
     std::unordered_set<gb::object_id> g_multi_draw_devices;
     std::mutex g_multi_draw_devices_mutex;
+
+    struct descriptor_buffer_device_state
+    {
+        bool null_descriptor_enabled;
+    };
+
+    std::unordered_map<gb::object_id, descriptor_buffer_device_state> g_descriptor_buffer_devices;
+    std::mutex g_descriptor_buffer_devices_mutex;
 
     struct mapped_range
     {
@@ -810,6 +825,7 @@ extern "C"
         uint32_t extension_count = 0;
         bool buffer_marker_enabled = false;
         bool multi_draw_extension_enabled = false;
+        bool descriptor_buffer_extension_enabled = false;
         if (pCreateInfo && pCreateInfo->ppEnabledExtensionNames)
         {
             for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i)
@@ -821,6 +837,7 @@ extern "C"
                 }
                 buffer_marker_enabled |= std::strcmp(name, VK_AMD_BUFFER_MARKER_EXTENSION_NAME) == 0;
                 multi_draw_extension_enabled |= std::strcmp(name, VK_EXT_MULTI_DRAW_EXTENSION_NAME) == 0;
+                descriptor_buffer_extension_enabled |= std::strcmp(name, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME) == 0;
                 const auto* bytes = reinterpret_cast<const std::byte*>(name);
                 extension_blob.insert(extension_blob.end(), bytes, bytes + std::strlen(name) + 1);
                 ++extension_count;
@@ -847,6 +864,8 @@ extern "C"
 
         bool have_features2 = false;
         bool multi_draw_feature_enabled = false;
+        bool descriptor_buffer_feature_enabled = false;
+        bool null_descriptor_feature_enabled = false;
         if (pCreateInfo)
         {
             for (const auto* next = static_cast<const VkBaseInStructure*>(pCreateInfo->pNext); next; next = next->pNext)
@@ -858,8 +877,17 @@ extern "C"
                 append_record(next->sType, reinterpret_cast<const uint8_t*>(next) + gb::feature_chain_header_size);
                 if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT)
                 {
-                    multi_draw_feature_enabled =
-                        reinterpret_cast<const VkPhysicalDeviceMultiDrawFeaturesEXT*>(next)->multiDraw == VK_TRUE;
+                    multi_draw_feature_enabled = reinterpret_cast<const VkPhysicalDeviceMultiDrawFeaturesEXT*>(next)->multiDraw == VK_TRUE;
+                }
+                if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT)
+                {
+                    descriptor_buffer_feature_enabled =
+                        reinterpret_cast<const VkPhysicalDeviceDescriptorBufferFeaturesEXT*>(next)->descriptorBuffer == VK_TRUE;
+                }
+                if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_KHR)
+                {
+                    null_descriptor_feature_enabled =
+                        reinterpret_cast<const VkPhysicalDeviceRobustness2FeaturesKHR*>(next)->nullDescriptor == VK_TRUE;
                 }
                 have_features2 = have_features2 || next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
             }
@@ -912,17 +940,26 @@ extern "C"
                 g_buffer_marker2_devices.insert(response.device);
             }
         }
-        if (multi_draw_extension_enabled && multi_draw_feature_enabled &&
-            (response.reserved & gb::device_cap_multi_draw))
+        if (multi_draw_extension_enabled && multi_draw_feature_enabled && (response.reserved & gb::device_cap_multi_draw))
         {
             std::lock_guard lock(g_multi_draw_devices_mutex);
             g_multi_draw_devices.insert(response.device);
+        }
+        if (descriptor_buffer_extension_enabled && descriptor_buffer_feature_enabled &&
+            (response.reserved & gb::device_cap_descriptor_buffer))
+        {
+            std::lock_guard lock(g_descriptor_buffer_devices_mutex);
+            g_descriptor_buffer_devices.emplace(response.device, descriptor_buffer_device_state{null_descriptor_feature_enabled});
         }
         return VK_SUCCESS;
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice device, const VkAllocationCallbacks*)
     {
+        {
+            std::lock_guard lock(g_descriptor_buffer_devices_mutex);
+            g_descriptor_buffer_devices.erase(to_object_id(device));
+        }
         {
             std::lock_guard lock(g_multi_draw_devices_mutex);
             g_multi_draw_devices.erase(to_object_id(device));
@@ -6545,14 +6582,12 @@ extern "C"
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdDrawMultiEXT(VkCommandBuffer commandBuffer, uint32_t drawCount,
-                                                                        const VkMultiDrawInfoEXT* pVertexInfo,
-                                                                        uint32_t instanceCount, uint32_t firstInstance,
-                                                                        uint32_t stride)
+                                                                       const VkMultiDrawInfoEXT* pVertexInfo, uint32_t instanceCount,
+                                                                       uint32_t firstInstance, uint32_t stride)
     {
         const auto id = to_object_id(commandBuffer);
         constexpr size_t limit = 256 * 1024 * 1024;
-        if ((drawCount && !pVertexInfo) ||
-            (drawCount > 1 && (stride < sizeof(VkMultiDrawInfoEXT) || stride % 4 != 0)))
+        if ((drawCount && !pVertexInfo) || (drawCount > 1 && (stride < sizeof(VkMultiDrawInfoEXT) || stride % 4 != 0)))
         {
             fail_recorded_command(id, VK_ERROR_INITIALIZATION_FAILED);
             return;
@@ -6670,14 +6705,14 @@ extern "C"
         record_command(request.command_buffer, gb::command::cmd_draw_indexed, &request, sizeof(request));
     }
 
-    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdDrawMultiIndexedEXT(
-        VkCommandBuffer commandBuffer, uint32_t drawCount, const VkMultiDrawIndexedInfoEXT* pIndexInfo,
-        uint32_t instanceCount, uint32_t firstInstance, uint32_t stride, const int32_t* pVertexOffset)
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer, uint32_t drawCount,
+                                                                              const VkMultiDrawIndexedInfoEXT* pIndexInfo,
+                                                                              uint32_t instanceCount, uint32_t firstInstance,
+                                                                              uint32_t stride, const int32_t* pVertexOffset)
     {
         const auto id = to_object_id(commandBuffer);
         constexpr size_t limit = 256 * 1024 * 1024;
-        if ((drawCount && !pIndexInfo) ||
-            (drawCount > 1 && (stride < sizeof(VkMultiDrawIndexedInfoEXT) || stride % 4 != 0)))
+        if ((drawCount && !pIndexInfo) || (drawCount > 1 && (stride < sizeof(VkMultiDrawIndexedInfoEXT) || stride % 4 != 0)))
         {
             fail_recorded_command(id, VK_ERROR_INITIALIZATION_FAILED);
             return;
@@ -6953,6 +6988,78 @@ extern "C"
 
         vkCmdPushConstants(commandBuffer, pPushConstantsInfo->layout, pPushConstantsInfo->stageFlags, pPushConstantsInfo->offset,
                            pPushConstantsInfo->size, pPushConstantsInfo->pValues);
+    }
+
+    VKAPI_ATTR void VKAPI_CALL vkGetDescriptorEXT(VkDevice device, const VkDescriptorGetInfoEXT* pDescriptorInfo, size_t dataSize,
+                                                  void* pDescriptor)
+    {
+        if (passthrough_active())
+        {
+            const auto native = g_real_get_device_proc_addr
+                                    ? reinterpret_cast<PFN_vkGetDescriptorEXT>(g_real_get_device_proc_addr(device, "vkGetDescriptorEXT"))
+                                    : nullptr;
+            if (native)
+            {
+                native(device, pDescriptorInfo, dataSize, pDescriptor);
+            }
+            return;
+        }
+
+        bool null_descriptor_enabled = false;
+        {
+            std::lock_guard lock(g_descriptor_buffer_devices_mutex);
+            const auto found = g_descriptor_buffer_devices.find(to_object_id(device));
+            if (found == g_descriptor_buffer_devices.end())
+            {
+                shim_log("vulkan-shim: vkGetDescriptorEXT called without enabled bridge capability\n");
+                return;
+            }
+            null_descriptor_enabled = found->second.null_descriptor_enabled;
+        }
+        if (!pDescriptorInfo || !pDescriptor || dataSize == 0 || dataSize > gb::max_get_descriptor_bytes)
+        {
+            shim_log("vulkan-shim: vkGetDescriptorEXT received invalid input or dataSize\n");
+            return;
+        }
+
+        try
+        {
+            const auto info =
+                dbw::snapshot(*pDescriptorInfo, [](auto handle) -> uint64_t { return to_object_id(handle); }, null_descriptor_enabled);
+            const auto encoded = dbw::encode(info, null_descriptor_enabled);
+            gb::get_descriptor_request request{
+                .device = to_object_id(device),
+                .data_size = static_cast<uint32_t>(dataSize),
+                .wire_size = static_cast<uint32_t>(encoded.size()),
+            };
+            std::array<std::byte, sizeof(request) + dbw::get_info_byte_count> input{};
+            std::memcpy(input.data(), &request, sizeof(request));
+            std::memcpy(input.data() + sizeof(request), encoded.data(), encoded.size());
+
+            std::vector<std::byte> output(sizeof(gb::get_descriptor_response) + dataSize);
+            DWORD returned = 0;
+            if (!bridge_call(gb::ioctl_get_descriptor, input.data(), static_cast<DWORD>(input.size()), output.data(),
+                             static_cast<DWORD>(output.size()), &returned) ||
+                returned != output.size())
+            {
+                shim_log("vulkan-shim: vkGetDescriptorEXT bridge failed or returned a truncated descriptor\n");
+                return;
+            }
+            gb::get_descriptor_response response{};
+            std::memcpy(&response, output.data(), sizeof(response));
+            if (response.vk_result != VK_SUCCESS || response.data_size != dataSize)
+            {
+                shim_log("vulkan-shim: vkGetDescriptorEXT host rejected descriptor input or native dataSize\n");
+                return;
+            }
+            std::memcpy(pDescriptor, output.data() + sizeof(response), dataSize);
+        }
+        catch (const std::exception& error)
+        {
+            std::array<char, 256> message{};
+            std::snprintf(message.data(), message.size(), "vulkan-shim: vkGetDescriptorEXT marshal failed: %.180s\n", error.what());
+            shim_log(message.data());
+        }
     }
 
     __declspec(dllexport) VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice, const char* pName);
@@ -7422,6 +7529,12 @@ extern "C"
                                                : g_real_get_instance_proc_addr(VK_NULL_HANDLE, pName);
         }
 
+        if (pName && std::strcmp(pName, "vkGetDescriptorEXT") == 0)
+        {
+            std::lock_guard lock(g_descriptor_buffer_devices_mutex);
+            return g_descriptor_buffer_devices.contains(to_object_id(device)) ? reinterpret_cast<PFN_vkVoidFunction>(vkGetDescriptorEXT)
+                                                                              : nullptr;
+        }
         if (pName && (std::strcmp(pName, "vkCmdWriteBufferMarkerAMD") == 0 || std::strcmp(pName, "vkCmdWriteBufferMarker2AMD") == 0))
         {
             std::lock_guard lock(g_buffer_marker_devices_mutex);
@@ -7431,8 +7544,7 @@ extern "C"
                 return nullptr;
             }
         }
-        if (pName && (std::strcmp(pName, "vkCmdDrawMultiEXT") == 0 ||
-                      std::strcmp(pName, "vkCmdDrawMultiIndexedEXT") == 0))
+        if (pName && (std::strcmp(pName, "vkCmdDrawMultiEXT") == 0 || std::strcmp(pName, "vkCmdDrawMultiIndexedEXT") == 0))
         {
             std::lock_guard lock(g_multi_draw_devices_mutex);
             if (!g_multi_draw_devices.contains(to_object_id(device)))
