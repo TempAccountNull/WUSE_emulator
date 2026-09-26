@@ -902,7 +902,7 @@ namespace sogen::icicle
                 this->kick_peers(self->index());
                 return;
             }
-            this->pause_peers_and([&] {
+            this->pause_memory_mutation_and([&] {
                 std::lock_guard lock(this->host_view_mutex_);
                 for (auto& vcpu : this->vcpus_)
                 {
@@ -940,7 +940,7 @@ namespace sogen::icicle
             if (!caller_is_vcpu)
             {
                 // External/setup mutator: pause peers, allocate on the master, share into the rest directly.
-                this->pause_peers_and([&] {
+                this->pause_memory_mutation_and([&] {
                     map_fresh(this->emu_, 0, true);
                     for (size_t i = 1; i < this->vcpus_.size(); ++i)
                     {
@@ -1043,7 +1043,7 @@ namespace sogen::icicle
                 this->kick_peers(self->index());
                 return;
             }
-            this->pause_peers_and([&] {
+            this->pause_memory_mutation_and([&] {
                 std::lock_guard lock(this->host_view_mutex_);
                 for (auto& vcpu : this->vcpus_)
                 {
@@ -1073,7 +1073,7 @@ namespace sogen::icicle
             if (this->vcpus_.size() == 1 || !caller_is_vcpu)
             {
                 bool ok = true;
-                this->pause_peers_and([&] {
+                this->pause_memory_mutation_and([&] {
                     for (auto& vcpu : this->vcpus_)
                     {
                         ok = (icicle_map_shared_memory(vcpu->handle(), address, source, size, perm) != 0) && ok;
@@ -1183,7 +1183,7 @@ namespace sogen::icicle
                 this->kick_peers(self->index());
                 return;
             }
-            this->pause_peers_and([&] {
+            this->pause_memory_mutation_and([&] {
                 std::lock_guard lock(this->host_view_mutex_);
                 for (auto& vcpu : this->vcpus_)
                 {
@@ -1669,7 +1669,7 @@ namespace sogen::icicle
             }
             if (!caller_is_vcpu)
             {
-                this->pause_peers_and([&] {
+                this->pause_memory_mutation_and([&] {
                     std::lock_guard lock(this->host_view_mutex_);
                     for (auto& vcpu : this->vcpus_)
                     {
@@ -3100,6 +3100,18 @@ namespace sogen::icicle
             this->run_with_vcpus_paused(std::forward<Fn>(fn));
         }
 
+        template <typename Fn>
+        void pause_memory_mutation_and(Fn&& fn)
+        {
+            this->pause_peers_and([this, &fn] {
+                for (auto& vcpu : this->vcpus_)
+                {
+                    this->drain_pending_memory_ops(*vcpu);
+                }
+                fn();
+            });
+        }
+
         // 6.5 routing rule: a mutation requested by a running vCPU or an explicitly bound
         // scheduler worker (including host work between quanta that may hold the BEL) applies to
         // its OWN VM now and queues the op for each peer, drained on the peer's thread at
@@ -3653,6 +3665,66 @@ namespace sogen::icicle
                     }
                 }
                 this->complete_op(op.ticket);
+            }
+        }
+
+        void drain_pending_memory_ops(icicle_vcpu& v)
+        {
+            if (t_draining_own_queue)
+            {
+                return;
+            }
+            std::vector<pending_op> ops;
+            {
+                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                auto& queue = this->pending_ops_[v.index()];
+                std::vector<pending_op> deferred;
+                ops.reserve(queue.size());
+                deferred.reserve(queue.size());
+                for (auto& op : queue)
+                {
+                    const auto kind = op.kind;
+                    // Hook ops may destroy callback captures that re-enter the external pause.
+                    if (kind == pending_op_kind::map || kind == pending_op_kind::unmap || kind == pending_op_kind::protect ||
+                        kind == pending_op_kind::invalidate)
+                    {
+                        ops.push_back(std::move(op));
+                    }
+                    else
+                    {
+                        deferred.push_back(std::move(op));
+                    }
+                }
+                queue = std::move(deferred);
+            }
+            if (ops.empty())
+            {
+                return;
+            }
+            t_draining_own_queue = true;
+            const auto clear = utils::finally([] { t_draining_own_queue = false; });
+            size_t next = 0;
+            try
+            {
+                for (; next < ops.size(); ++next)
+                {
+                    auto& op = ops[next];
+                    op.apply(v.handle());
+                    this->record_pending_applied(v.index(), op);
+                    this->complete_op(op.ticket);
+                }
+            }
+            catch (...)
+            {
+                std::lock_guard<std::mutex> lock(this->pending_mutex_);
+                auto& queue = this->pending_ops_[v.index()];
+                std::vector<pending_op> restored;
+                restored.reserve(queue.size() + ops.size() - next);
+                std::merge(std::make_move_iterator(ops.begin() + next), std::make_move_iterator(ops.end()),
+                           std::make_move_iterator(queue.begin()), std::make_move_iterator(queue.end()), std::back_inserter(restored),
+                           [](const pending_op& left, const pending_op& right) { return left.ticket < right.ticket; });
+                queue = std::move(restored);
+                throw;
             }
         }
 

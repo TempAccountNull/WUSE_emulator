@@ -7,6 +7,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -114,6 +116,136 @@ namespace sogen::test
         EXPECT_EQ(external_error, nullptr);
         EXPECT_TRUE(external_done.load(std::memory_order_acquire));
         EXPECT_TRUE(emu->smp_op_applied(issued));
+    }
+
+    TEST(IcicleSmp, ExternalReleaseDrainsOwnerPendingMapBeforeUnmap)
+    {
+        constexpr uint64_t address = 0x5edb400000;
+        constexpr size_t page_size = 0x1000;
+        auto emu = icicle::create_x86_64_emulator(2);
+        memory_manager memory(*emu);
+
+        emu->set_scheduler_worker_context(0, true);
+        {
+            const auto clear = utils::finally([&] { emu->set_scheduler_worker_context(0, false); });
+            ASSERT_TRUE(memory.allocate_memory(address, page_size, memory_permission::read_write));
+        }
+        const auto pending_map = emu->smp_op_watermark();
+        ASSERT_GT(pending_map, 0U);
+        ASSERT_FALSE(emu->smp_op_applied(pending_map));
+
+        bool released = false;
+        EXPECT_NO_THROW(released = memory.release_memory(address, 0));
+        EXPECT_TRUE(released);
+        EXPECT_TRUE(emu->smp_op_applied(pending_map));
+        ASSERT_NO_THROW(emu->sync_worker_context(1));
+        uint64_t value{};
+        EXPECT_FALSE(emu->try_read_memory(address, &value, sizeof(value)));
+    }
+
+    TEST(IcicleSmp, ExternalRemapDrainsOwnerPendingUnmapBeforeMap)
+    {
+        constexpr uint64_t address = 0x5edb410000;
+        constexpr size_t page_size = 0x1000;
+        constexpr uint64_t marker = 0x81a2b3c4d5e6f708;
+        auto emu = icicle::create_x86_64_emulator(2);
+        memory_manager memory(*emu);
+        ASSERT_TRUE(memory.allocate_memory(address, page_size, memory_permission::read_write));
+
+        emu->set_scheduler_worker_context(0, true);
+        {
+            const auto clear = utils::finally([&] { emu->set_scheduler_worker_context(0, false); });
+            ASSERT_TRUE(memory.release_memory(address, 0));
+        }
+        const auto pending_unmap = emu->smp_op_watermark();
+        ASSERT_GT(pending_unmap, 0U);
+        ASSERT_FALSE(emu->smp_op_applied(pending_unmap));
+
+        bool remapped = false;
+        EXPECT_NO_THROW(remapped = memory.allocate_memory(address, page_size, memory_permission::read_write));
+        ASSERT_TRUE(remapped);
+        EXPECT_TRUE(emu->smp_op_applied(pending_unmap));
+        ASSERT_NO_THROW(emu->sync_worker_context(1));
+        ASSERT_NO_THROW(emu->write_memory(address, &marker, sizeof(marker)));
+        emu->set_scheduler_worker_context(1, true);
+        {
+            const auto clear = utils::finally([&] { emu->set_scheduler_worker_context(1, false); });
+            uint64_t value{};
+            ASSERT_TRUE(emu->try_read_memory(address, &value, sizeof(value)));
+            EXPECT_EQ(value, marker);
+        }
+    }
+
+    TEST(IcicleSmp, ExternalMemoryDrainLetsQueuedHookDestructorReenter)
+    {
+        constexpr uint64_t nested_address = 0x5edb420000;
+        constexpr uint64_t queued_address = 0x5edb430000;
+        constexpr size_t page_size = 0x1000;
+        auto emu = icicle::create_x86_64_emulator(2);
+        memory_manager memory(*emu);
+        const auto code = memory.allocate_memory(page_size, memory_permission::all);
+        ASSERT_NE(code, 0U);
+
+        std::atomic_bool finished{false};
+        std::thread watchdog([&] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!finished.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            if (!finished.load(std::memory_order_acquire))
+            {
+                std::fputs("queued hook destructor reentry timed out\n", stderr);
+                std::fflush(stderr);
+                std::_Exit(124);
+            }
+        });
+        const auto stop_watchdog = utils::finally([&] {
+            finished.store(true, std::memory_order_release);
+            watchdog.join();
+        });
+
+        std::atomic_bool destroyed{false};
+        std::atomic_bool nested_mapped{false};
+        std::atomic_bool destroyed_under_pause{false};
+        std::atomic_bool nested_threw{false};
+        auto lifetime = std::shared_ptr<int>(new int(1), [&](int* value) {
+            delete value;
+            destroyed_under_pause.store(external_pause_started(*emu), std::memory_order_release);
+            try
+            {
+                nested_mapped.store(memory.allocate_memory(nested_address, page_size, memory_permission::read_write),
+                                    std::memory_order_release);
+            }
+            catch (const std::exception& e)
+            {
+                std::fprintf(stderr, "nested map threw: %s\n", e.what());
+                nested_threw.store(true, std::memory_order_release);
+            }
+            destroyed.store(true, std::memory_order_release);
+        });
+        auto* hook = emu->hook_memory_execution(code, [hold = std::move(lifetime)](cpu_interface&, uint64_t) {});
+        ASSERT_NE(hook, nullptr);
+
+        emu->set_scheduler_worker_context(0, true);
+        {
+            const auto clear = utils::finally([&] { emu->set_scheduler_worker_context(0, false); });
+            emu->delete_hook(hook);
+            ASSERT_TRUE(memory.allocate_memory(queued_address, page_size, memory_permission::read_write));
+        }
+        ASSERT_FALSE(destroyed.load(std::memory_order_acquire));
+        const auto pending_map = emu->smp_op_watermark();
+        ASSERT_FALSE(emu->smp_op_applied(pending_map));
+
+        ASSERT_TRUE(memory.release_memory(queued_address, 0));
+        EXPECT_FALSE(emu->smp_op_applied(pending_map));
+        EXPECT_FALSE(destroyed.load(std::memory_order_acquire));
+        ASSERT_NO_THROW(emu->sync_worker_context(1));
+        EXPECT_TRUE(emu->smp_op_applied(pending_map));
+        EXPECT_TRUE(destroyed.load(std::memory_order_acquire));
+        EXPECT_FALSE(destroyed_under_pause.load(std::memory_order_acquire));
+        EXPECT_FALSE(nested_threw.load(std::memory_order_acquire));
+        EXPECT_TRUE(nested_mapped.load(std::memory_order_acquire));
     }
 
     TEST(IcicleSmp, ExternalPauseDoesNotBlockParkedOwnerLocalUnmap)
