@@ -673,6 +673,15 @@ impl PageData {
         assert!(offset.checked_add(len).is_some_and(|end| end <= PAGE_SIZE));
         if self.smp_shared.load(Ordering::Acquire) != 0 {
             let end = offset + len;
+            if offset % 8 == 0 && len % 8 == 0 {
+                let mask = u64::from_ne_bytes([bit; 8]);
+                for word in offset / 8..end / 8 {
+                    if self.shared_perm_word(word).load(Ordering::Acquire) & mask != 0 {
+                        return true;
+                    }
+                }
+                return false;
+            }
             let mut cursor = offset;
             while cursor < end {
                 let bytes = self.shared_perm_word(cursor / 8).load(Ordering::Acquire).to_ne_bytes();
@@ -1027,8 +1036,47 @@ fn smp_code_epoch_only_enabled() -> bool {
 
 #[cfg(test)]
 mod shared_slot_tests {
-    use super::{PageData, PhysicalMemory};
+    use super::{Page, PageData, PhysicalMemory, PAGE_SIZE};
+    use crate::perm;
     use std::sync::Arc;
+
+    #[test]
+    #[ignore = "manual timing comparison for eight peer aliases"]
+    fn shared_page_alias_scan_benchmark() {
+        const PAGES: usize = 4096;
+        let data = (0..PAGES).map(|_| Arc::new(PageData::default())).collect::<Vec<_>>();
+        for page in &data {
+            std::hint::black_box(Page::from_shared(Arc::clone(page)));
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..8 {
+            for page in &data {
+                std::hint::black_box(Page::from_shared(Arc::clone(page)));
+            }
+        }
+        eprintln!("shared alias scan: pages={PAGES} peers=8 elapsed={:?}", started.elapsed());
+    }
+
+    #[test]
+    fn aligned_shared_permission_scan_matches_bytewise_reads() {
+        let mut memory = PhysicalMemory::new(8);
+        let data = Arc::new(PageData::default());
+        let index = memory.alloc_shared(Arc::clone(&data)).unwrap();
+        assert!(memory.get(index).smp_shared);
+
+        let ranges = [(0, PAGE_SIZE), (8, 16), (4088, 8), (1, 15), (7, 9), (0, 0)];
+        for &position in &[0, 7, 8, 23, 4088, 4095] {
+            data.set_shared_perm_preserving_cache(position, 1, perm::MAP | perm::EXEC);
+            for &(offset, len) in &ranges {
+                for bit in [perm::EXEC, perm::READ, perm::MAP] {
+                    let expected = (offset..offset + len).any(|i| data.load_perm(i) & bit != 0);
+                    assert_eq!(data.any_perm_bit(offset, len, bit), expected,
+                        "position={position} offset={offset} len={len} bit={bit}");
+                }
+            }
+            data.set_shared_perm_preserving_cache(position, 1, perm::NONE);
+        }
+    }
 
     #[test]
     fn freeing_and_reusing_shared_slot_does_not_copy_peer_data() {
