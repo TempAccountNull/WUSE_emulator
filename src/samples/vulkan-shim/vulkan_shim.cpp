@@ -244,6 +244,8 @@ namespace
     std::unordered_set<gb::object_id> g_buffer_marker_devices;
     std::unordered_set<gb::object_id> g_buffer_marker2_devices;
     std::mutex g_buffer_marker_devices_mutex;
+    std::unordered_set<gb::object_id> g_multi_draw_devices;
+    std::mutex g_multi_draw_devices_mutex;
 
     struct mapped_range
     {
@@ -362,6 +364,16 @@ namespace
         catch (const std::bad_alloc&)
         {
             stream.error = VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+
+    void fail_recorded_command(gb::object_id command_buffer, VkResult error)
+    {
+        std::lock_guard<std::mutex> lock(g_command_streams_mutex);
+        auto& stream = g_command_streams[command_buffer];
+        if (stream.error == VK_SUCCESS)
+        {
+            stream.error = error;
         }
     }
 
@@ -789,6 +801,7 @@ extern "C"
         std::vector<std::byte> extension_blob;
         uint32_t extension_count = 0;
         bool buffer_marker_enabled = false;
+        bool multi_draw_extension_enabled = false;
         if (pCreateInfo && pCreateInfo->ppEnabledExtensionNames)
         {
             for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i)
@@ -799,6 +812,7 @@ extern "C"
                     continue;
                 }
                 buffer_marker_enabled |= std::strcmp(name, VK_AMD_BUFFER_MARKER_EXTENSION_NAME) == 0;
+                multi_draw_extension_enabled |= std::strcmp(name, VK_EXT_MULTI_DRAW_EXTENSION_NAME) == 0;
                 const auto* bytes = reinterpret_cast<const std::byte*>(name);
                 extension_blob.insert(extension_blob.end(), bytes, bytes + std::strlen(name) + 1);
                 ++extension_count;
@@ -824,6 +838,7 @@ extern "C"
         };
 
         bool have_features2 = false;
+        bool multi_draw_feature_enabled = false;
         if (pCreateInfo)
         {
             for (const auto* next = static_cast<const VkBaseInStructure*>(pCreateInfo->pNext); next; next = next->pNext)
@@ -833,6 +848,11 @@ extern "C"
                     continue;
                 }
                 append_record(next->sType, reinterpret_cast<const uint8_t*>(next) + gb::feature_chain_header_size);
+                if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT)
+                {
+                    multi_draw_feature_enabled =
+                        reinterpret_cast<const VkPhysicalDeviceMultiDrawFeaturesEXT*>(next)->multiDraw == VK_TRUE;
+                }
                 have_features2 = have_features2 || next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
             }
             if (!have_features2 && pCreateInfo->pEnabledFeatures)
@@ -884,11 +904,21 @@ extern "C"
                 g_buffer_marker2_devices.insert(response.device);
             }
         }
+        if (multi_draw_extension_enabled && multi_draw_feature_enabled &&
+            (response.reserved & gb::device_cap_multi_draw))
+        {
+            std::lock_guard lock(g_multi_draw_devices_mutex);
+            g_multi_draw_devices.insert(response.device);
+        }
         return VK_SUCCESS;
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice device, const VkAllocationCallbacks*)
     {
+        {
+            std::lock_guard lock(g_multi_draw_devices_mutex);
+            g_multi_draw_devices.erase(to_object_id(device));
+        }
         {
             std::lock_guard lock(g_buffer_marker_devices_mutex);
             g_buffer_marker_devices.erase(to_object_id(device));
@@ -6491,6 +6521,43 @@ extern "C"
         record_command(request.command_buffer, gb::command::cmd_draw, &request, sizeof(request));
     }
 
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdDrawMultiEXT(VkCommandBuffer commandBuffer, uint32_t drawCount,
+                                                                        const VkMultiDrawInfoEXT* pVertexInfo,
+                                                                        uint32_t instanceCount, uint32_t firstInstance,
+                                                                        uint32_t stride)
+    {
+        const auto id = to_object_id(commandBuffer);
+        constexpr size_t limit = 256 * 1024 * 1024;
+        if ((drawCount && !pVertexInfo) ||
+            (drawCount > 1 && (stride < sizeof(VkMultiDrawInfoEXT) || stride % 4 != 0)))
+        {
+            fail_recorded_command(id, VK_ERROR_INITIALIZATION_FAILED);
+            return;
+        }
+        if (drawCount > (limit - sizeof(gb::cmd_draw_multi_request)) / sizeof(gb::multi_draw_info) ||
+            (drawCount && static_cast<uint64_t>(drawCount - 1) * stride + sizeof(VkMultiDrawInfoEXT) > SIZE_MAX))
+        {
+            fail_recorded_command(id, VK_ERROR_OUT_OF_HOST_MEMORY);
+            return;
+        }
+        gb::cmd_draw_multi_request request{};
+        request.command_buffer = id;
+        request.draw_count = drawCount;
+        request.instance_count = instanceCount;
+        request.first_instance = firstInstance;
+        std::vector<uint8_t> message(sizeof(request) + static_cast<size_t>(drawCount) * sizeof(gb::multi_draw_info));
+        std::memcpy(message.data(), &request, sizeof(request));
+        const auto* source = reinterpret_cast<const uint8_t*>(pVertexInfo);
+        for (uint32_t i = 0; i < drawCount; ++i)
+        {
+            VkMultiDrawInfoEXT entry{};
+            std::memcpy(&entry, source + static_cast<size_t>(i) * stride, sizeof(entry));
+            const gb::multi_draw_info wire{entry.firstVertex, entry.vertexCount};
+            std::memcpy(message.data() + sizeof(request) + static_cast<size_t>(i) * sizeof(wire), &wire, sizeof(wire));
+        }
+        record_command(id, gb::command::cmd_draw_multi, message.data(), message.size());
+    }
+
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t firstBinding,
                                                                             uint32_t bindingCount, const VkBuffer* pBuffers,
                                                                             const VkDeviceSize* pOffsets)
@@ -6578,6 +6645,44 @@ extern "C"
         request.vertex_offset = vertexOffset;
         request.first_instance = firstInstance;
         record_command(request.command_buffer, gb::command::cmd_draw_indexed, &request, sizeof(request));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdDrawMultiIndexedEXT(
+        VkCommandBuffer commandBuffer, uint32_t drawCount, const VkMultiDrawIndexedInfoEXT* pIndexInfo,
+        uint32_t instanceCount, uint32_t firstInstance, uint32_t stride, const int32_t* pVertexOffset)
+    {
+        const auto id = to_object_id(commandBuffer);
+        constexpr size_t limit = 256 * 1024 * 1024;
+        if ((drawCount && !pIndexInfo) ||
+            (drawCount > 1 && (stride < sizeof(VkMultiDrawIndexedInfoEXT) || stride % 4 != 0)))
+        {
+            fail_recorded_command(id, VK_ERROR_INITIALIZATION_FAILED);
+            return;
+        }
+        if (drawCount > (limit - sizeof(gb::cmd_draw_multi_indexed_request)) / sizeof(gb::multi_draw_indexed_info) ||
+            (drawCount && static_cast<uint64_t>(drawCount - 1) * stride + sizeof(VkMultiDrawIndexedInfoEXT) > SIZE_MAX))
+        {
+            fail_recorded_command(id, VK_ERROR_OUT_OF_HOST_MEMORY);
+            return;
+        }
+        gb::cmd_draw_multi_indexed_request request{};
+        request.command_buffer = id;
+        request.draw_count = drawCount;
+        request.instance_count = instanceCount;
+        request.first_instance = firstInstance;
+        request.has_vertex_offset = pVertexOffset != nullptr;
+        request.vertex_offset = pVertexOffset ? *pVertexOffset : 0;
+        std::vector<uint8_t> message(sizeof(request) + static_cast<size_t>(drawCount) * sizeof(gb::multi_draw_indexed_info));
+        std::memcpy(message.data(), &request, sizeof(request));
+        const auto* source = reinterpret_cast<const uint8_t*>(pIndexInfo);
+        for (uint32_t i = 0; i < drawCount; ++i)
+        {
+            VkMultiDrawIndexedInfoEXT entry{};
+            std::memcpy(&entry, source + static_cast<size_t>(i) * stride, sizeof(entry));
+            const gb::multi_draw_indexed_info wire{entry.firstIndex, entry.indexCount, entry.vertexOffset};
+            std::memcpy(message.data() + sizeof(request) + static_cast<size_t>(i) * sizeof(wire), &wire, sizeof(wire));
+        }
+        record_command(id, gb::command::cmd_draw_multi_indexed, message.data(), message.size());
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,
@@ -7140,6 +7245,8 @@ extern "C"
             {.name = "vkCmdExecuteCommands", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdExecuteCommands)},
             {.name = "vkCmdBindPipeline", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBindPipeline)},
             {.name = "vkCmdDraw", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdDraw)},
+            {.name = "vkCmdDrawMultiEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdDrawMultiEXT)},
+            {.name = "vkCmdDrawMultiIndexedEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdDrawMultiIndexedEXT)},
             {.name = "vkCmdDispatch", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdDispatch)},
             {.name = "vkCmdDispatchIndirect", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdDispatchIndirect)},
             {.name = "vkCmdBlitImage2", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBlitImage2)},
@@ -7297,6 +7404,15 @@ extern "C"
             std::lock_guard lock(g_buffer_marker_devices_mutex);
             if (!g_buffer_marker_devices.contains(to_object_id(device)) ||
                 (std::strcmp(pName, "vkCmdWriteBufferMarker2AMD") == 0 && !g_buffer_marker2_devices.contains(to_object_id(device))))
+            {
+                return nullptr;
+            }
+        }
+        if (pName && (std::strcmp(pName, "vkCmdDrawMultiEXT") == 0 ||
+                      std::strcmp(pName, "vkCmdDrawMultiIndexedEXT") == 0))
+        {
+            std::lock_guard lock(g_multi_draw_devices_mutex);
+            if (!g_multi_draw_devices.contains(to_object_id(device)))
             {
                 return nullptr;
             }

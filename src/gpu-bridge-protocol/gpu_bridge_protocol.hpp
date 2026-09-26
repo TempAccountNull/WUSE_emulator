@@ -214,6 +214,8 @@ namespace sogen::gpu_bridge
         cmd_begin_conditional_rendering = 0x8B2,
         cmd_end_conditional_rendering = 0x8B3,
         cmd_write_buffer_marker = 0x8B4,
+        cmd_draw_multi = 0x8B5,
+        cmd_draw_multi_indexed = 0x8B6,
         cmd_synchronization = 0x8C0,
         get_event_status_owned = 0x8C1,
         cmd_copy_image_to_buffer_full = 0x8D0,
@@ -597,6 +599,7 @@ namespace sogen::gpu_bridge
     };
 
     inline constexpr uint32_t device_cap_buffer_marker2 = 1u << 0;
+    inline constexpr uint32_t device_cap_multi_draw = 1u << 1;
 
     struct create_device_response
     {
@@ -2031,6 +2034,39 @@ namespace sogen::gpu_bridge
         uint32_t first_instance;
     };
 
+    struct multi_draw_info
+    {
+        uint32_t first_vertex;
+        uint32_t vertex_count;
+    };
+
+    struct multi_draw_indexed_info
+    {
+        uint32_t first_index;
+        uint32_t index_count;
+        int32_t vertex_offset;
+    };
+
+    struct cmd_draw_multi_request
+    {
+        object_id command_buffer;
+        uint32_t draw_count;
+        uint32_t instance_count;
+        uint32_t first_instance;
+        uint32_t reserved;
+    };
+
+    struct cmd_draw_multi_indexed_request
+    {
+        object_id command_buffer;
+        uint32_t draw_count;
+        uint32_t instance_count;
+        uint32_t first_instance;
+        uint32_t has_vertex_offset;
+        int32_t vertex_offset;
+        uint32_t reserved;
+    };
+
     // One bound vertex buffer (trailing-array element of cmd_bind_vertex_buffers_request).
     struct vertex_buffer_binding
     {
@@ -2426,6 +2462,10 @@ namespace sogen::gpu_bridge
     static_assert(sizeof(allocate_memory_request) == 32, "wire layout drift");
     static_assert(sizeof(bind_buffer_memory_request) == 32, "wire layout drift");
     static_assert(sizeof(cmd_draw_request) == 24, "wire layout drift");
+    static_assert(sizeof(multi_draw_info) == 8, "wire layout drift");
+    static_assert(sizeof(multi_draw_indexed_info) == 12, "wire layout drift");
+    static_assert(sizeof(cmd_draw_multi_request) == 24, "wire layout drift");
+    static_assert(sizeof(cmd_draw_multi_indexed_request) == 32, "wire layout drift");
     static_assert(sizeof(cmd_bind_pipeline_request) == 24, "wire layout drift");
     static_assert(sizeof(cmd_dispatch_request) == 24, "wire layout drift");
     static_assert(sizeof(cmd_dispatch_indirect_request) == 24, "wire layout drift");

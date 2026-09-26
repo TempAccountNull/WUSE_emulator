@@ -54,6 +54,9 @@ namespace sogen::gpu_bridge
             return sizeof(VkPhysicalDeviceVulkan13Properties);
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT:
             return sizeof(VkPhysicalDeviceRobustness2PropertiesEXT);
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT:
+            static_assert(offsetof(VkPhysicalDeviceMultiDrawPropertiesEXT, maxMultiDrawCount) == feature_chain_header_size);
+            return sizeof(VkPhysicalDeviceMultiDrawPropertiesEXT);
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT:
             return sizeof(VkPhysicalDeviceTransformFeedbackPropertiesEXT);
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_PROPERTIES_EXT:
@@ -81,6 +84,10 @@ namespace sogen::gpu_bridge
 
     inline size_t property_body_size(const VkStructureType type)
     {
+        if (type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT)
+        {
+            return sizeof(VkPhysicalDeviceMultiDrawPropertiesEXT::maxMultiDrawCount);
+        }
         const size_t total = property_struct_size(type);
         return total > feature_chain_header_size ? total - feature_chain_header_size : 0;
     }

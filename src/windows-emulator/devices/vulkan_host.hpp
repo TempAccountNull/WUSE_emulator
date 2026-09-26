@@ -207,6 +207,7 @@ namespace sogen
         // Records vkCmdFillBuffer into the (recording) command buffer.
         int32_t cmd_fill_buffer(uint64_t command_buffer, uint64_t buffer, uint64_t offset, uint64_t size, uint32_t data);
         bool supports_buffer_marker2(uint64_t device) const;
+        bool supports_multi_draw(uint64_t device) const;
         int32_t cmd_write_buffer_marker(uint64_t command_buffer, uint64_t buffer, uint64_t offset, uint64_t stage, uint32_t marker,
                                         bool synchronization2);
 
@@ -661,6 +662,21 @@ namespace sogen
         int32_t cmd_dispatch_indirect(uint64_t command_buffer, uint64_t buffer, uint64_t offset);
         int32_t cmd_draw(uint64_t command_buffer, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
                          uint32_t first_instance);
+        struct multi_draw_info
+        {
+            uint32_t first_vertex;
+            uint32_t vertex_count;
+        };
+        struct multi_draw_indexed_info
+        {
+            uint32_t first_index;
+            uint32_t index_count;
+            int32_t vertex_offset;
+        };
+        int32_t cmd_draw_multi(uint64_t command_buffer, std::span<const multi_draw_info> draws, uint32_t instance_count,
+                               uint32_t first_instance);
+        int32_t cmd_draw_multi_indexed(uint64_t command_buffer, std::span<const multi_draw_indexed_info> draws,
+                                       uint32_t instance_count, uint32_t first_instance, const int32_t* vertex_offset);
         // Binds `count` vertex buffers (parallel buffer-id / offset arrays) starting at first_binding.
         int32_t cmd_bind_vertex_buffers(uint64_t command_buffer, uint32_t first_binding, uint32_t count, const uint64_t* buffer_ids,
                                         const uint64_t* offsets);

@@ -61,7 +61,6 @@ namespace sogen
             std::string_view{"VK_EXT_depth_bias_control"},
             std::string_view{"VK_EXT_descriptor_buffer"},
             std::string_view{"VK_EXT_descriptor_heap"},
-            std::string_view{"VK_EXT_multi_draw"},
             std::string_view{"VK_EXT_present_timing"},
             std::string_view{"VK_KHR_device_fault"},
             std::string_view{"VK_KHR_present_wait"},
@@ -431,6 +430,11 @@ namespace sogen
             PFN_vkCmdDispatch cmd_dispatch{};
             PFN_vkCmdDispatchIndirect cmd_dispatch_indirect{};
             PFN_vkCmdDraw cmd_draw{};
+            PFN_vkCmdDrawMultiEXT cmd_draw_multi{};
+            PFN_vkCmdDrawMultiIndexedEXT cmd_draw_multi_indexed{};
+            bool multi_draw_extension{};
+            bool multi_draw_feature{};
+            uint32_t max_multi_draw_count{};
             PFN_vkCmdBindVertexBuffers cmd_bind_vertex_buffers{};
             PFN_vkCmdBindVertexBuffers2 cmd_bind_vertex_buffers2{};
             PFN_vkCmdBindIndexBuffer cmd_bind_index_buffer{};
@@ -2396,11 +2400,27 @@ namespace sogen
             return std::ranges::any_of(extensions, [&](const char* enabled) { return std::strcmp(enabled, name) == 0; });
         };
         data.conditional_rendering_extension = enabled_extension(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+        data.multi_draw_extension = enabled_extension(VK_EXT_MULTI_DRAW_EXTENSION_NAME);
+        if (data.multi_draw_extension && instance->second.get_physical_device_properties2)
+        {
+            VkPhysicalDeviceMultiDrawPropertiesEXT multi_draw{};
+            multi_draw.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT;
+            VkPhysicalDeviceProperties2 multi_draw_properties2{};
+            multi_draw_properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            multi_draw_properties2.pNext = &multi_draw;
+            instance->second.get_physical_device_properties2(pd->second.handle, &multi_draw_properties2);
+            data.max_multi_draw_count = multi_draw.maxMultiDrawCount;
+        }
         data.buffer_marker_extension = enabled_extension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
         data.memory_priority_extension = enabled_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
         data.pageable_memory_extension = enabled_extension(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
         for (const auto* feature = static_cast<const VkBaseInStructure*>(features2.pNext); feature; feature = feature->pNext)
         {
+            if (feature->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT)
+            {
+                data.multi_draw_feature =
+                    reinterpret_cast<const VkPhysicalDeviceMultiDrawFeaturesEXT*>(feature)->multiDraw == VK_TRUE;
+            }
             if (feature->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT)
             {
                 const auto* conditional = reinterpret_cast<const VkPhysicalDeviceConditionalRenderingFeaturesEXT*>(feature);
@@ -2649,6 +2669,9 @@ namespace sogen
             data.cmd_dispatch = reinterpret_cast<PFN_vkCmdDispatch>(resolve("vkCmdDispatch"));
             data.cmd_dispatch_indirect = reinterpret_cast<PFN_vkCmdDispatchIndirect>(resolve("vkCmdDispatchIndirect"));
             data.cmd_draw = reinterpret_cast<PFN_vkCmdDraw>(resolve("vkCmdDraw"));
+            data.cmd_draw_multi = reinterpret_cast<PFN_vkCmdDrawMultiEXT>(resolve("vkCmdDrawMultiEXT"));
+            data.cmd_draw_multi_indexed =
+                reinterpret_cast<PFN_vkCmdDrawMultiIndexedEXT>(resolve("vkCmdDrawMultiIndexedEXT"));
             data.cmd_bind_vertex_buffers = reinterpret_cast<PFN_vkCmdBindVertexBuffers>(resolve("vkCmdBindVertexBuffers"));
             data.cmd_bind_vertex_buffers2 = reinterpret_cast<PFN_vkCmdBindVertexBuffers2>(resolve("vkCmdBindVertexBuffers2"));
             data.cmd_bind_index_buffer = reinterpret_cast<PFN_vkCmdBindIndexBuffer>(resolve("vkCmdBindIndexBuffer"));
@@ -4045,6 +4068,13 @@ namespace sogen
         const auto dev = this->impl_->devices.find(device);
         return dev != this->impl_->devices.end() && dev->second.buffer_marker_extension && dev->second.synchronization2_feature &&
                dev->second.cmd_write_buffer_marker2;
+    }
+
+    bool vulkan_host::supports_multi_draw(uint64_t device) const
+    {
+        const auto dev = this->impl_->devices.find(device);
+        return dev != this->impl_->devices.end() && dev->second.multi_draw_extension && dev->second.multi_draw_feature &&
+               dev->second.max_multi_draw_count > 0 && dev->second.cmd_draw_multi && dev->second.cmd_draw_multi_indexed;
     }
 
     int32_t vulkan_host::cmd_write_buffer_marker(uint64_t command_buffer, uint64_t buffer, uint64_t offset, uint64_t stage, uint32_t marker,
@@ -8296,6 +8326,72 @@ namespace sogen
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         dev->second.cmd_draw(cb->second.handle, vertex_count, instance_count, first_vertex, first_instance);
+        return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::cmd_draw_multi(uint64_t command_buffer, std::span<const multi_draw_info> draws,
+                                        uint32_t instance_count, uint32_t first_instance)
+    {
+        const auto cb = this->impl_->command_buffers.find(command_buffer);
+        if (cb == this->impl_->command_buffers.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
+        if (dev == this->impl_->devices.end() || !supports_multi_draw(cb->second.device_id))
+        {
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        if (draws.size() > dev->second.max_multi_draw_count)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        std::vector<VkMultiDrawInfoEXT> native;
+        native.reserve(draws.size());
+        for (const auto& draw : draws)
+        {
+            native.push_back({.firstVertex = draw.first_vertex, .vertexCount = draw.vertex_count});
+        }
+        dev->second.cmd_draw_multi(cb->second.handle, static_cast<uint32_t>(native.size()), native.data(), instance_count,
+                                   first_instance, sizeof(VkMultiDrawInfoEXT));
+        return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::cmd_draw_multi_indexed(uint64_t command_buffer, std::span<const multi_draw_indexed_info> draws,
+                                                uint32_t instance_count, uint32_t first_instance,
+                                                const int32_t* vertex_offset)
+    {
+        const auto cb = this->impl_->command_buffers.find(command_buffer);
+        if (cb == this->impl_->command_buffers.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
+        if (dev == this->impl_->devices.end() || !supports_multi_draw(cb->second.device_id))
+        {
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        if (draws.size() > dev->second.max_multi_draw_count)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        std::vector<VkMultiDrawIndexedInfoEXT> native;
+        native.reserve(draws.size());
+        for (const auto& draw : draws)
+        {
+            native.push_back({.firstIndex = draw.first_index, .indexCount = draw.index_count,
+                              .vertexOffset = draw.vertex_offset});
+        }
+        dev->second.cmd_draw_multi_indexed(cb->second.handle, static_cast<uint32_t>(native.size()), native.data(),
+                                           instance_count, first_instance, sizeof(VkMultiDrawIndexedInfoEXT), vertex_offset);
         return VK_SUCCESS;
     }
 

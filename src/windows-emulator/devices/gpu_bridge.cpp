@@ -1159,7 +1159,10 @@ namespace sogen
 
                 const response_t response{
                     .vk_result = result,
-                    .reserved = result == 0 && this->vulkan_.supports_buffer_marker2(device) ? gpu_bridge::device_cap_buffer_marker2 : 0,
+                    .reserved = result == 0
+                                    ? (this->vulkan_.supports_buffer_marker2(device) ? gpu_bridge::device_cap_buffer_marker2 : 0) |
+                                          (this->vulkan_.supports_multi_draw(device) ? gpu_bridge::device_cap_multi_draw : 0)
+                                    : 0,
                     .device = device,
                 };
                 emulator_object<response_t>{win_emu.emu(), context.output_buffer}.write(response);
@@ -3714,6 +3717,40 @@ namespace sogen
                     }
                     return this->vulkan_.cmd_draw(req.command_buffer, req.vertex_count, req.instance_count, req.first_vertex,
                                                   req.first_instance);
+                }
+                case gpu_bridge::command::cmd_draw_multi: {
+                    gpu_bridge::cmd_draw_multi_request req{};
+                    if (!read(req) || req.draw_count > (size - sizeof(req)) / sizeof(gpu_bridge::multi_draw_info))
+                    {
+                        return vk_error_initialization_failed;
+                    }
+                    std::vector<vulkan_host::multi_draw_info> draws;
+                    draws.reserve(req.draw_count);
+                    for (uint32_t i = 0; i < req.draw_count; ++i)
+                    {
+                        gpu_bridge::multi_draw_info item{};
+                        std::memcpy(&item, payload + sizeof(req) + static_cast<size_t>(i) * sizeof(item), sizeof(item));
+                        draws.push_back({item.first_vertex, item.vertex_count});
+                    }
+                    return this->vulkan_.cmd_draw_multi(req.command_buffer, draws, req.instance_count, req.first_instance);
+                }
+                case gpu_bridge::command::cmd_draw_multi_indexed: {
+                    gpu_bridge::cmd_draw_multi_indexed_request req{};
+                    if (!read(req) || req.has_vertex_offset > 1 ||
+                        req.draw_count > (size - sizeof(req)) / sizeof(gpu_bridge::multi_draw_indexed_info))
+                    {
+                        return vk_error_initialization_failed;
+                    }
+                    std::vector<vulkan_host::multi_draw_indexed_info> draws;
+                    draws.reserve(req.draw_count);
+                    for (uint32_t i = 0; i < req.draw_count; ++i)
+                    {
+                        gpu_bridge::multi_draw_indexed_info item{};
+                        std::memcpy(&item, payload + sizeof(req) + static_cast<size_t>(i) * sizeof(item), sizeof(item));
+                        draws.push_back({item.first_index, item.index_count, item.vertex_offset});
+                    }
+                    return this->vulkan_.cmd_draw_multi_indexed(req.command_buffer, draws, req.instance_count,
+                                                                req.first_instance, req.has_vertex_offset ? &req.vertex_offset : nullptr);
                 }
                 case gpu_bridge::command::cmd_bind_vertex_buffers: {
                     gpu_bridge::cmd_bind_vertex_buffers_request req{};

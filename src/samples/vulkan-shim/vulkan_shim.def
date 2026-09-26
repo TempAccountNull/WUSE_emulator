@@ -50,6 +50,8 @@ EXPORTS
     vkCmdDispatch
     vkCmdDispatchIndirect
     vkCmdDraw
+    vkCmdDrawMultiEXT
+    vkCmdDrawMultiIndexedEXT
     vkCmdDrawIndexed
     vkCmdDrawIndexedIndirect
     vkCmdDrawIndexedIndirectCount

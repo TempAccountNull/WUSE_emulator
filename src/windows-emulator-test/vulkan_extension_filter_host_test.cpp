@@ -85,7 +85,6 @@ namespace sogen::test
                                              "VK_EXT_depth_bias_control",
                                              "VK_EXT_descriptor_buffer",
                                              "VK_EXT_descriptor_heap",
-                                             "VK_EXT_multi_draw",
                                              "VK_EXT_present_timing",
                                              "VK_KHR_device_fault",
                                              "VK_KHR_present_wait",
