@@ -653,7 +653,8 @@ impl PageData {
                     for byte in &mut bytes[start_byte..end_byte] {
                         *byte = update(*byte);
                     }
-                    Some(u64::from_ne_bytes(bytes))
+                    let updated = u64::from_ne_bytes(bytes);
+                    (updated != old).then_some(updated)
                 },
             );
             word += 1;

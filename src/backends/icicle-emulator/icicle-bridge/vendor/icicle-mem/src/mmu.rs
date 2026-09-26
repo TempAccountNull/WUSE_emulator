@@ -2107,34 +2107,41 @@ mod smp_code_epoch_tests {
         use std::time::Instant;
 
         const EXISTING: u64 = 4096;
-        const CAPTURED: u64 = 2131;
+        let captured: u64 = std::env::var("SOGEN_BENCH_CAPTURED_PAGES")
+            .ok().and_then(|value| value.parse().ok()).unwrap_or(2131);
         const HIGH: u64 = 0x8000_0000;
         const MIDDLE: u64 = 0x4000_0000;
-        let pages = (0..CAPTURED)
-            .map(|_| std::sync::Arc::new(PageData::default()))
-            .collect::<Vec<_>>();
+        // Reuse backing for large metadata-only runs so a 217,856-page map does not
+        // allocate gigabytes of guest bytes just to measure the mapping structures.
+        let shared = std::sync::Arc::new(PageData::default());
+        let pages = (0..captured).map(|_| shared.clone()).collect::<Vec<_>>();
         let prepare = || {
             let mut mem = Mmu::default();
+            assert!(mem.set_capacity((EXISTING + captured + 2) as usize));
             for i in 0..EXISTING {
                 assert!(mem.map_smp_shared_fresh(HIGH + i * 0x1000, perm::READ | perm::WRITE));
             }
             mem
         };
 
-        let mut serial = prepare();
-        let started = Instant::now();
-        for (i, page) in pages.iter().enumerate() {
-            assert!(serial.map_smp_shared(MIDDLE + i as u64 * 0x1000, page.clone()));
-        }
-        let serial_time = started.elapsed();
+        let serial_time = if captured <= 4096 {
+            let mut serial = prepare();
+            let started = Instant::now();
+            for (i, page) in pages.iter().enumerate() {
+                assert!(serial.map_smp_shared(MIDDLE + i as u64 * 0x1000, page.clone()));
+            }
+            Some((serial.mapping.len(), started.elapsed()))
+        } else { None };
 
         let mut batch = prepare();
         let started = Instant::now();
         assert!(batch.map_smp_shared_pages(MIDDLE, &pages));
         let batch_time = started.elapsed();
-        assert_eq!(serial.mapping.len(), batch.mapping.len());
-        assert_eq!(batch.mapping.len(), (EXISTING + CAPTURED) as usize);
-        eprintln!("middle insert: existing={EXISTING} captured={CAPTURED} mappings={} serial={serial_time:?} batch={batch_time:?}", batch.mapping.len());
+        if let Some((serial_len, _)) = serial_time {
+            assert_eq!(serial_len, batch.mapping.len());
+        }
+        assert_eq!(batch.mapping.len(), (EXISTING + captured) as usize);
+        eprintln!("middle insert: existing={EXISTING} captured={captured} mappings={} serial={serial_time:?} batch={batch_time:?}", batch.mapping.len());
     }
 }
 
