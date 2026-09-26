@@ -2467,6 +2467,30 @@ mod smp_atomic_perm_tests {
     }
 
     #[test]
+    fn shared_permission_word_boundary_checks_both_access_directions() {
+        const BASE: u8 = perm::READ | perm::MAP | perm::INIT;
+        let mut page = PageData::default();
+        page.perm.fill(BASE | perm::WRITE);
+        page.smp_shared.store(1, Ordering::Release);
+
+        for offset in [0, physical::PAGE_SIZE - 16] {
+            assert_eq!(page.read::<16>(offset as u64, perm::READ), Ok([0; 16]));
+
+            page.set_shared_perm_preserving_cache(offset + 8, 1, perm::MAP | perm::INIT | perm::WRITE);
+            assert_eq!(page.read::<16>(offset as u64, perm::READ), Err(MemError::ReadViolation));
+            page.set_shared_perm_preserving_cache(offset + 8, 1, BASE | perm::WRITE);
+
+            page.set_shared_perm_preserving_cache(offset + 7, 1, BASE);
+            assert_eq!(page.write::<16>(offset as u64, [0x5a; 16], perm::WRITE), Err(MemError::WriteViolation));
+            assert_eq!(page.read::<16>(offset as u64, perm::READ), Ok([0; 16]));
+            page.set_shared_perm_preserving_cache(offset + 7, 1, BASE | perm::WRITE);
+
+            assert_eq!(page.write::<16>(offset as u64, [0x5a; 16], perm::WRITE), Ok(()));
+            assert_eq!(page.read::<16>(offset as u64, perm::READ), Ok([0x5a; 16]));
+        }
+    }
+
+    #[test]
     fn concurrent_code_cache_marking_survives_shared_protection() {
         const BASE: u8 = perm::READ | perm::MAP | perm::INIT;
         let mut page = PageData::default();

@@ -607,6 +607,21 @@ impl PageData {
         self.shared_perm_word(offset / 8).load(Ordering::Acquire).to_ne_bytes()[offset % 8]
     }
 
+    #[inline(always)]
+    fn load_shared_perm_bytes<const N: usize>(&self, offset: usize) -> [u8; N] {
+        debug_assert!(offset + N <= PAGE_SIZE);
+        let mut permissions = [0; N];
+        let mut copied = 0;
+        while copied < N {
+            let first = (offset + copied) % 8;
+            let count = (N - copied).min(8 - first);
+            let word = self.shared_perm_word((offset + copied) / 8).load(Ordering::Acquire).to_ne_bytes();
+            permissions[copied..copied + count].copy_from_slice(&word[first..first + count]);
+            copied += count;
+        }
+        permissions
+    }
+
     fn update_shared_perm_range(&self, offset: usize, len: usize, update: impl Fn(u8) -> u8) {
         assert!(self.smp_shared.load(Ordering::Acquire) != 0);
         assert!(offset.checked_add(len).is_some_and(|end| end <= PAGE_SIZE));
@@ -894,9 +909,7 @@ impl PageData {
         // Safety: `offset..offset + N` is always in-bounds.
         unsafe {
             if self.smp_shared.load(Ordering::Acquire) != 0 {
-                let permissions = std::array::from_fn(|i| {
-                    self.load_shared_perm_byte(offset + i)
-                });
+                let permissions = self.load_shared_perm_bytes::<N>(offset);
                 perm::check_bytes::<N>(permissions, perm | perm::MAP)?;
             } else {
                 perm::check_bytes::<N>(
@@ -922,9 +935,7 @@ impl PageData {
         // Safety: `offset..offset + N` is always in-bounds.
         unsafe {
             if self.smp_shared.load(Ordering::Acquire) != 0 {
-                let permissions = std::array::from_fn(|i| {
-                    self.load_shared_perm_byte(offset + i)
-                });
+                let permissions = self.load_shared_perm_bytes::<N>(offset);
                 perm::check_bytes::<N>(permissions, perm | perm::MAP)?;
             } else {
                 perm::check_bytes::<N>(
