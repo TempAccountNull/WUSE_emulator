@@ -285,6 +285,11 @@ namespace sogen::test
         EXPECT_EQ(sizeof(gb::descriptor_buffer_binding_wire), 32u);
         EXPECT_EQ(sizeof(gb::cmd_set_descriptor_buffer_offsets_request), 32u);
         EXPECT_EQ(sizeof(gb::descriptor_buffer_offset_wire), 16u);
+        EXPECT_EQ(static_cast<uint32_t>(gb::command::cmd_bind_descriptor_buffer_embedded_samplers), 0x8bcu);
+        EXPECT_EQ(sizeof(gb::cmd_bind_descriptor_buffer_embedded_samplers_request), 24u);
+        EXPECT_EQ(sizeof(gb::descriptor_layout_immutable_trailer), 8u);
+        EXPECT_EQ(sizeof(gb::immutable_sampler_ref), 16u);
+        EXPECT_EQ(gb::max_immutable_sampler_refs, 4096u);
         EXPECT_EQ(gb::max_descriptor_buffer_bindings, 256u);
         constexpr gb::descriptor_buffer_binding_wire legacy{
             .usage = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT,
@@ -293,8 +298,7 @@ namespace sogen::test
         constexpr gb::descriptor_buffer_binding_wire flags2{
             .usage = 0,
             .flags = gb::descriptor_binding_has_usage_2,
-            .usage_2 = VK_BUFFER_USAGE_2_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
-                       VK_BUFFER_USAGE_2_MEMORY_DECOMPRESSION_BIT_EXT,
+            .usage_2 = VK_BUFFER_USAGE_2_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT | VK_BUFFER_USAGE_2_MEMORY_DECOMPRESSION_BIT_EXT,
         };
         static_assert(gb::descriptor_buffer_effective_usage(legacy) == VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT);
         static_assert(gb::descriptor_buffer_effective_usage(flags2) == flags2.usage_2);
@@ -316,6 +320,8 @@ namespace sogen::test
             VkDevice device{};
             VkSampler sampler{};
             VkDescriptorSetLayout layout{};
+            VkDescriptorSetLayout embedded_layout{};
+            VkDescriptorSetLayout empty_embedded_layout{};
             VkBuffer buffer{};
             VkDeviceMemory memory{};
             VkPipelineLayout pipeline_layout{};
@@ -346,6 +352,14 @@ namespace sogen::test
                 if (memory && free_memory)
                 {
                     free_memory(device, memory, nullptr);
+                }
+                if (embedded_layout && destroy_layout)
+                {
+                    destroy_layout(device, embedded_layout, nullptr);
+                }
+                if (empty_embedded_layout && destroy_layout)
+                {
+                    destroy_layout(device, empty_embedded_layout, nullptr);
                 }
                 if (sampler && destroy_sampler)
                 {
@@ -490,7 +504,7 @@ namespace sogen::test
         uint32_t queue_family = queue_count;
         for (uint32_t i = 0; i < queue_count; ++i)
         {
-            if (queues[i].queueCount)
+            if (queues[i].queueCount && (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT))
             {
                 queue_family = i;
                 break;
@@ -536,6 +550,8 @@ namespace sogen::test
             reinterpret_cast<PFN_vkCmdBindDescriptorBuffersEXT>(get_device_proc(native.device, "vkCmdBindDescriptorBuffersEXT"));
         const auto cmd_set_descriptor_buffer_offsets =
             reinterpret_cast<PFN_vkCmdSetDescriptorBufferOffsetsEXT>(get_device_proc(native.device, "vkCmdSetDescriptorBufferOffsetsEXT"));
+        const auto cmd_bind_embedded_samplers = reinterpret_cast<PFN_vkCmdBindDescriptorBufferEmbeddedSamplersEXT>(
+            get_device_proc(native.device, "vkCmdBindDescriptorBufferEmbeddedSamplersEXT"));
         native.destroy_sampler = reinterpret_cast<PFN_vkDestroySampler>(get_device_proc(native.device, "vkDestroySampler"));
         native.destroy_layout =
             reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(get_device_proc(native.device, "vkDestroyDescriptorSetLayout"));
@@ -566,6 +582,7 @@ namespace sogen::test
         ASSERT_NE(end_command_buffer, nullptr);
         ASSERT_NE(cmd_bind_descriptor_buffers, nullptr);
         ASSERT_NE(cmd_set_descriptor_buffer_offsets, nullptr);
+        ASSERT_NE(cmd_bind_embedded_samplers, nullptr);
         ASSERT_NE(native.destroy_sampler, nullptr);
         ASSERT_NE(native.destroy_layout, nullptr);
         ASSERT_NE(native.destroy_buffer, nullptr);
@@ -617,6 +634,31 @@ namespace sogen::test
         sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sampler_info.maxLod = 1.0f;
         ASSERT_EQ(create_sampler(native.device, &sampler_info, nullptr, &native.sampler), VK_SUCCESS);
+        ASSERT_GT(descriptor_properties.maxEmbeddedImmutableSamplers, 0u);
+        VkDescriptorSetLayoutBinding embedded_binding{};
+        embedded_binding.binding = 0;
+        embedded_binding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        embedded_binding.descriptorCount = 1;
+        embedded_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        embedded_binding.pImmutableSamplers = &native.sampler;
+        VkDescriptorSetLayoutCreateInfo embedded_info{};
+        embedded_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        embedded_info.flags =
+            VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT | VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT;
+        VkDescriptorSetLayoutBinding zero_count_binding{};
+        zero_count_binding.binding = 7;
+        zero_count_binding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        zero_count_binding.descriptorCount = 0;
+        zero_count_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        const std::array<VkDescriptorSetLayoutBinding, 2> embedded_bindings{embedded_binding, zero_count_binding};
+        embedded_info.bindingCount = static_cast<uint32_t>(embedded_bindings.size());
+        embedded_info.pBindings = embedded_bindings.data();
+        ASSERT_EQ(create_layout(native.device, &embedded_info, nullptr, &native.embedded_layout), VK_SUCCESS);
+        embedded_info.bindingCount = 0;
+        embedded_info.pBindings = nullptr;
+        ASSERT_EQ(create_layout(native.device, &embedded_info, nullptr, &native.empty_embedded_layout), VK_SUCCESS);
+        std::cout << "Native " << device_properties.deviceName
+                  << " accepts embedded sampler layouts with a zero-count binding and with no bindings" << '\n';
         VkDescriptorGetInfoEXT sampler_descriptor{};
         sampler_descriptor.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT;
         sampler_descriptor.type = VK_DESCRIPTOR_TYPE_SAMPLER;
@@ -669,8 +711,9 @@ namespace sogen::test
 
         VkPipelineLayoutCreateInfo pipeline_layout_info{};
         pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pipeline_layout_info.setLayoutCount = 1;
-        pipeline_layout_info.pSetLayouts = &native.layout;
+        const std::array<VkDescriptorSetLayout, 2> set_layouts{native.layout, native.embedded_layout};
+        pipeline_layout_info.setLayoutCount = static_cast<uint32_t>(set_layouts.size());
+        pipeline_layout_info.pSetLayouts = set_layouts.data();
         ASSERT_EQ(create_pipeline_layout(native.device, &pipeline_layout_info, nullptr, &native.pipeline_layout), VK_SUCCESS);
         VkCommandPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -695,11 +738,13 @@ namespace sogen::test
         const VkDeviceSize descriptor_offset = 0;
         cmd_set_descriptor_buffer_offsets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, native.pipeline_layout, 0, 1, &buffer_index,
                                           &descriptor_offset);
+        cmd_bind_embedded_samplers(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, native.pipeline_layout, 1);
         ASSERT_EQ(end_command_buffer(command_buffer), VK_SUCCESS);
         std::cout << "Native " << device_properties.deviceName
                   << " recorded vkCmdBindDescriptorBuffersEXT and "
                      "vkCmdSetDescriptorBufferOffsetsEXT with address="
-                  << std::hex << buffer_address << std::dec << " layoutSize=" << layout_size << " offset=" << descriptor_offset << '\n';
+                  << std::hex << buffer_address << std::dec << " layoutSize=" << layout_size << " offset=" << descriptor_offset
+                  << " embeddedSamplerSet=1" << '\n';
 
         VkDescriptorAddressInfoEXT uniform_address{};
         uniform_address.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT;
@@ -795,11 +840,28 @@ namespace sogen::test
         ASSERT_EQ(host.create_descriptor_set_layout(device, 0, std::span{&binding, 1}, layout), VK_SUCCESS);
         ASSERT_NE(layout, 0u);
         EXPECT_EQ(host.get_descriptor_set_layout_size(device, layout, layout_size), VK_ERROR_EXTENSION_NOT_PRESENT);
-        EXPECT_EQ(host.get_descriptor_set_layout_binding_offset(device, layout, 3, binding_offset),
-                  VK_ERROR_EXTENSION_NOT_PRESENT);
+        EXPECT_EQ(host.get_descriptor_set_layout_binding_offset(device, layout, 3, binding_offset), VK_ERROR_EXTENSION_NOT_PRESENT);
         EXPECT_EQ(layout_size, 0u);
         EXPECT_EQ(binding_offset, 0u);
         host.destroy_descriptor_set_layout(device, layout);
+        uint64_t sampler = 0;
+        ASSERT_EQ(host.create_sampler(device, VK_FILTER_NEAREST, VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                      VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                      VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_FALSE, VK_COMPARE_OP_ALWAYS, VK_FALSE,
+                                      VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, 0.0f, 1.0f, 0.0f, 1.0f, sampler),
+                  VK_SUCCESS);
+        ASSERT_NE(sampler, 0u);
+        const vulkan_host::immutable_sampler_ref valid_ref{.binding_index = 0, .array_element = 0, .sampler = sampler};
+        const vulkan_host::immutable_sampler_ref foreign_ref{.binding_index = 0, .array_element = 0, .sampler = UINT64_MAX};
+        uint64_t immutable_layout = 0;
+        EXPECT_EQ(host.create_descriptor_set_layout(device, 0, std::span{&binding, 1}, immutable_layout, std::span{&foreign_ref, 1}),
+                  VK_ERROR_VALIDATION_FAILED_EXT);
+        EXPECT_EQ(immutable_layout, 0u);
+        ASSERT_EQ(host.create_descriptor_set_layout(device, 0, std::span{&binding, 1}, immutable_layout, std::span{&valid_ref, 1}),
+                  VK_SUCCESS);
+        ASSERT_NE(immutable_layout, 0u);
+        host.destroy_descriptor_set_layout(device, immutable_layout);
+        host.destroy_sampler(device, sampler);
         host.destroy_device(device);
         host.destroy_instance(instance);
     }

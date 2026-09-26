@@ -5465,6 +5465,11 @@ extern "C"
                                                                                      const VkAllocationCallbacks*,
                                                                                      VkDescriptorSetLayout* pSetLayout)
     {
+        if (!pCreateInfo || !pSetLayout || pCreateInfo->bindingCount > gb::max_immutable_sampler_refs ||
+            (pCreateInfo->bindingCount && !pCreateInfo->pBindings))
+        {
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
         gb::create_descriptor_set_layout_request header{};
         header.device = to_object_id(device);
         header.binding_count = pCreateInfo->bindingCount;
@@ -5480,8 +5485,35 @@ extern "C"
             }
         }
 
-        std::vector<uint8_t> message(sizeof(header) +
-                                     static_cast<size_t>(header.binding_count) * sizeof(gb::descriptor_set_layout_binding));
+        std::vector<gb::immutable_sampler_ref> immutable_refs;
+        for (uint32_t i = 0; i < header.binding_count; ++i)
+        {
+            const auto& binding = pCreateInfo->pBindings[i];
+            if ((binding.descriptorType != VK_DESCRIPTOR_TYPE_SAMPLER &&
+                 binding.descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ||
+                !binding.pImmutableSamplers)
+            {
+                continue;
+            }
+            if (binding.descriptorCount > gb::max_immutable_sampler_refs - immutable_refs.size())
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            for (uint32_t element = 0; element < binding.descriptorCount; ++element)
+            {
+                const auto sampler = to_object_id(binding.pImmutableSamplers[element]);
+                if (sampler == 0)
+                {
+                    return VK_ERROR_VALIDATION_FAILED_EXT;
+                }
+                immutable_refs.push_back({.binding_index = i, .array_element = element, .sampler = sampler});
+            }
+        }
+        const size_t base_bytes = sizeof(header) + static_cast<size_t>(header.binding_count) * sizeof(gb::descriptor_set_layout_binding);
+        const size_t trailer_bytes = immutable_refs.empty() ? 0
+                                                            : sizeof(gb::descriptor_layout_immutable_trailer) +
+                                                                  immutable_refs.size() * sizeof(gb::immutable_sampler_ref);
+        std::vector<uint8_t> message(base_bytes + trailer_bytes);
         std::memcpy(message.data(), &header, sizeof(header));
         for (uint32_t i = 0; i < header.binding_count; ++i)
         {
@@ -5496,6 +5528,14 @@ extern "C"
                 wire.binding_flags = binding_flags->pBindingFlags[i];
             }
             std::memcpy(message.data() + sizeof(header) + i * sizeof(wire), &wire, sizeof(wire));
+        }
+        if (!immutable_refs.empty())
+        {
+            const gb::descriptor_layout_immutable_trailer trailer{.magic = gb::descriptor_layout_immutable_magic,
+                                                                  .ref_count = static_cast<uint32_t>(immutable_refs.size())};
+            std::memcpy(message.data() + base_bytes, &trailer, sizeof(trailer));
+            std::memcpy(message.data() + base_bytes + sizeof(trailer), immutable_refs.data(),
+                        immutable_refs.size() * sizeof(immutable_refs.front()));
         }
 
         gb::object_response response{};
@@ -7178,6 +7218,20 @@ extern "C"
         record_command(command_id, gb::command::cmd_set_descriptor_buffer_offsets, packet.data(), packet.size());
     }
 
+    VKAPI_ATTR void VKAPI_CALL vkCmdBindDescriptorBufferEmbeddedSamplersEXT(VkCommandBuffer commandBuffer,
+                                                                            VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout,
+                                                                            uint32_t set)
+    {
+        const auto command_id = to_object_id(commandBuffer);
+        const gb::cmd_bind_descriptor_buffer_embedded_samplers_request request{
+            .command_buffer = command_id,
+            .pipeline_layout = to_object_id(layout),
+            .bind_point = static_cast<uint32_t>(pipelineBindPoint),
+            .set = set,
+        };
+        record_command(command_id, gb::command::cmd_bind_descriptor_buffer_embedded_samplers, &request, sizeof(request));
+    }
+
     VKAPI_ATTR void VKAPI_CALL vkGetDescriptorSetLayoutSizeEXT(VkDevice device, VkDescriptorSetLayout layout,
                                                                VkDeviceSize* pLayoutSizeInBytes)
     {
@@ -7829,13 +7883,19 @@ extern "C"
                 {"vkCmdEndDebugUtilsLabelEXT", reinterpret_cast<PFN_vkVoidFunction>(vkCmdEndDebugUtilsLabelEXT)},
             };
             for (const auto& function : functions)
-                if (std::strcmp(pName, function.name) == 0) return function.function;
+            {
+                if (std::strcmp(pName, function.name) == 0)
+                {
+                    return function.function;
+                }
+            }
             return nullptr;
         }
         if (pName &&
             (std::strcmp(pName, "vkGetDescriptorEXT") == 0 || std::strcmp(pName, "vkGetDescriptorSetLayoutSizeEXT") == 0 ||
              std::strcmp(pName, "vkGetDescriptorSetLayoutBindingOffsetEXT") == 0 ||
-             std::strcmp(pName, "vkCmdBindDescriptorBuffersEXT") == 0 || std::strcmp(pName, "vkCmdSetDescriptorBufferOffsetsEXT") == 0))
+             std::strcmp(pName, "vkCmdBindDescriptorBuffersEXT") == 0 || std::strcmp(pName, "vkCmdSetDescriptorBufferOffsetsEXT") == 0 ||
+             std::strcmp(pName, "vkCmdBindDescriptorBufferEmbeddedSamplersEXT") == 0))
         {
             std::lock_guard lock(g_descriptor_buffer_devices_mutex);
             if (!g_descriptor_buffer_devices.contains(to_object_id(device)))
@@ -7858,7 +7918,11 @@ extern "C"
             {
                 return reinterpret_cast<PFN_vkVoidFunction>(vkCmdBindDescriptorBuffersEXT);
             }
-            return reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetDescriptorBufferOffsetsEXT);
+            if (std::strcmp(pName, "vkCmdSetDescriptorBufferOffsetsEXT") == 0)
+            {
+                return reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetDescriptorBufferOffsetsEXT);
+            }
+            return reinterpret_cast<PFN_vkVoidFunction>(vkCmdBindDescriptorBufferEmbeddedSamplersEXT);
         }
         if (pName && (std::strcmp(pName, "vkCmdWriteBufferMarkerAMD") == 0 || std::strcmp(pName, "vkCmdWriteBufferMarker2AMD") == 0))
         {

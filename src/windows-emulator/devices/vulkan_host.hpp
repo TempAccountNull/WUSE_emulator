@@ -558,8 +558,14 @@ namespace sogen
             std::span<const std::byte> inline_uniform_data;
         };
 
+        struct immutable_sampler_ref
+        {
+            uint32_t binding_index;
+            uint32_t array_element;
+            uint64_t sampler;
+        };
         int32_t create_descriptor_set_layout(uint64_t device, uint32_t flags, std::span<const descriptor_binding> bindings,
-                                             uint64_t& out_layout);
+                                             uint64_t& out_layout, std::span<const immutable_sampler_ref> immutable_samplers = {});
         int32_t get_descriptor_set_layout_support(uint64_t device, uint32_t flags, std::span<const descriptor_binding> bindings,
                                                   uint32_t& supported, uint32_t& max_variable_descriptor_count);
         // Decodes a bounded, pointer-free VkDescriptorGetInfoEXT packet; resolves owned host
@@ -573,6 +579,8 @@ namespace sogen
         int32_t cmd_bind_descriptor_buffers(uint64_t command_buffer, std::span<const std::byte> wire, uint32_t binding_count);
         int32_t cmd_set_descriptor_buffer_offsets(uint64_t command_buffer, uint64_t pipeline_layout, uint32_t bind_point,
                                                   uint32_t first_set, std::span<const std::byte> wire, uint32_t set_count);
+        int32_t cmd_bind_descriptor_buffer_embedded_samplers(uint64_t command_buffer, uint64_t pipeline_layout,
+                                                             uint32_t bind_point, uint32_t set);
         void destroy_descriptor_set_layout(uint64_t device, uint64_t layout);
         int32_t create_descriptor_pool(uint64_t device, uint32_t max_sets, uint32_t flags, uint32_t max_inline_uniform_block_bindings,
                                        std::span<const descriptor_pool_size> sizes, uint64_t& out_pool);

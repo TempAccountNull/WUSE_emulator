@@ -3053,10 +3053,48 @@ namespace sogen
                     return STATUS_INVALID_PARAMETER;
                 }
 
+                if (request.binding_count > gpu_bridge::max_immutable_sampler_refs)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                const size_t bindings_bytes =
+                    static_cast<size_t>(request.binding_count) * sizeof(gpu_bridge::descriptor_set_layout_binding);
+                const size_t trailer_offset = sizeof(request_t) + bindings_bytes;
+                if (context.input_buffer_length < trailer_offset)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
                 std::vector<gpu_bridge::descriptor_set_layout_binding> wire;
                 if (!read_trailing_array(win_emu, context, sizeof(request_t), request.binding_count, wire))
                 {
                     return STATUS_INVALID_PARAMETER;
+                }
+                std::vector<vulkan_host::immutable_sampler_ref> immutable_refs;
+                if (context.input_buffer_length != trailer_offset)
+                {
+                    gpu_bridge::descriptor_layout_immutable_trailer trailer{};
+                    if (context.input_buffer_length < trailer_offset + sizeof(trailer))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    win_emu.emu().read_memory(context.input_buffer + trailer_offset, &trailer, sizeof(trailer));
+                    if (trailer.magic != gpu_bridge::descriptor_layout_immutable_magic || trailer.ref_count == 0 ||
+                        trailer.ref_count > gpu_bridge::max_immutable_sampler_refs ||
+                        context.input_buffer_length - trailer_offset - sizeof(trailer) !=
+                            static_cast<size_t>(trailer.ref_count) * sizeof(gpu_bridge::immutable_sampler_ref))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    std::vector<gpu_bridge::immutable_sampler_ref> refs;
+                    if (!read_trailing_array(win_emu, context, trailer_offset + sizeof(trailer), trailer.ref_count, refs))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    immutable_refs.reserve(refs.size());
+                    for (const auto& ref : refs)
+                    {
+                        immutable_refs.push_back({ref.binding_index, ref.array_element, ref.sampler});
+                    }
                 }
 
                 std::vector<vulkan_host::descriptor_binding> bindings(wire.size());
@@ -3072,7 +3110,8 @@ namespace sogen
                 }
 
                 uint64_t layout = gpu_bridge::null_object;
-                const int32_t result = this->vulkan_.create_descriptor_set_layout(request.device, request.flags, bindings, layout);
+                const int32_t result =
+                    this->vulkan_.create_descriptor_set_layout(request.device, request.flags, bindings, layout, immutable_refs);
                 return write_output(win_emu, context, gpu_bridge::object_response{.vk_result = result, .reserved = 0, .object = layout});
             }
 
@@ -3543,6 +3582,15 @@ namespace sogen
                     return this->vulkan_.cmd_set_descriptor_buffer_offsets(req.command_buffer, req.pipeline_layout, req.bind_point,
                                                                            req.first_set, {payload + sizeof(req), size - sizeof(req)},
                                                                            req.set_count);
+                }
+                case gpu_bridge::command::cmd_bind_descriptor_buffer_embedded_samplers: {
+                    gpu_bridge::cmd_bind_descriptor_buffer_embedded_samplers_request req{};
+                    if (!read(req) || size != sizeof(req))
+                    {
+                        return vk_error_initialization_failed;
+                    }
+                    return this->vulkan_.cmd_bind_descriptor_buffer_embedded_samplers(req.command_buffer, req.pipeline_layout,
+                                                                                      req.bind_point, req.set);
                 }
                 case gpu_bridge::command::cmd_set_viewport: {
                     gpu_bridge::cmd_set_viewport_request req{};

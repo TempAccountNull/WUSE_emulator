@@ -221,6 +221,7 @@ namespace sogen::gpu_bridge
         get_descriptor_set_layout_binding_offset = 0x8B9,
         cmd_bind_descriptor_buffers = 0x8BA,
         cmd_set_descriptor_buffer_offsets = 0x8BB,
+        cmd_bind_descriptor_buffer_embedded_samplers = 0x8BC,
         debug_utils_capabilities = 0x8E0,
         debug_utils_messenger = 0x8E1,
         debug_utils_command = 0x8E2,
@@ -2357,6 +2358,24 @@ namespace sogen::gpu_bridge
         // descriptor_set_layout_binding bindings[binding_count];
     };
 
+    inline constexpr uint32_t descriptor_layout_immutable_magic = 0x494d5344; // D S M I, little-endian
+    inline constexpr uint32_t max_immutable_sampler_refs = 4096;
+
+    // Optional trailer after descriptor_set_layout_binding[binding_count] in the existing
+    // create_descriptor_set_layout packet. No guest VkSampler pointer crosses the bridge.
+    struct descriptor_layout_immutable_trailer
+    {
+        uint32_t magic;
+        uint32_t ref_count;
+    };
+
+    struct immutable_sampler_ref
+    {
+        uint32_t binding_index;
+        uint32_t array_element;
+        object_id sampler;
+    };
+
     inline constexpr uint32_t max_get_descriptor_bytes = 64 * 1024;
 
     struct get_descriptor_request
@@ -2436,6 +2455,14 @@ namespace sogen::gpu_bridge
         uint32_t buffer_index;
         uint32_t reserved;
         uint64_t offset;
+    };
+
+    struct cmd_bind_descriptor_buffer_embedded_samplers_request
+    {
+        object_id command_buffer;
+        object_id pipeline_layout;
+        uint32_t bind_point;
+        uint32_t set;
     };
 
     struct get_descriptor_set_layout_support_request
@@ -2660,6 +2687,8 @@ namespace sogen::gpu_bridge
     static_assert(sizeof(cmd_set_stencil_op_request) == 32, "wire layout drift");
     static_assert(sizeof(cmd_set_dynamic_u32_request) == 16, "wire layout drift");
     static_assert(sizeof(descriptor_set_layout_binding) == 20, "wire layout drift");
+    static_assert(sizeof(descriptor_layout_immutable_trailer) == 8, "wire layout drift");
+    static_assert(sizeof(immutable_sampler_ref) == 16, "wire layout drift");
     static_assert(sizeof(get_descriptor_request) == 16, "wire layout drift");
     static_assert(sizeof(get_descriptor_response) == 8, "wire layout drift");
     static_assert(sizeof(get_descriptor_set_layout_size_request) == 16, "wire layout drift");
@@ -2669,6 +2698,7 @@ namespace sogen::gpu_bridge
     static_assert(sizeof(descriptor_buffer_binding_wire) == 32, "wire layout drift");
     static_assert(sizeof(cmd_set_descriptor_buffer_offsets_request) == 32, "wire layout drift");
     static_assert(sizeof(descriptor_buffer_offset_wire) == 16, "wire layout drift");
+    static_assert(sizeof(cmd_bind_descriptor_buffer_embedded_samplers_request) == 24, "wire layout drift");
     static_assert(sizeof(get_descriptor_set_layout_support_request) == 16, "wire layout drift");
     static_assert(sizeof(descriptor_set_layout_support_response) == 12, "wire layout drift");
     static_assert(sizeof(cmd_bind_descriptor_sets_request) == 32, "wire layout drift");

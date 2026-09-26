@@ -461,6 +461,7 @@ namespace sogen
             PFN_vkGetDescriptorSetLayoutBindingOffsetEXT get_descriptor_set_layout_binding_offset{};
             PFN_vkCmdBindDescriptorBuffersEXT cmd_bind_descriptor_buffers{};
             PFN_vkCmdSetDescriptorBufferOffsetsEXT cmd_set_descriptor_buffer_offsets{};
+            PFN_vkCmdBindDescriptorBufferEmbeddedSamplersEXT cmd_bind_descriptor_buffer_embedded_samplers{};
             VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer_properties{};
             bool descriptor_buffer_extension{};
             bool descriptor_buffer_feature{};
@@ -3117,6 +3118,8 @@ namespace sogen
                     reinterpret_cast<PFN_vkCmdBindDescriptorBuffersEXT>(resolve("vkCmdBindDescriptorBuffersEXT"));
                 data.cmd_set_descriptor_buffer_offsets =
                     reinterpret_cast<PFN_vkCmdSetDescriptorBufferOffsetsEXT>(resolve("vkCmdSetDescriptorBufferOffsetsEXT"));
+                data.cmd_bind_descriptor_buffer_embedded_samplers = reinterpret_cast<PFN_vkCmdBindDescriptorBufferEmbeddedSamplersEXT>(
+                    resolve("vkCmdBindDescriptorBufferEmbeddedSamplersEXT"));
             }
             data.get_descriptor_set_layout_support =
                 reinterpret_cast<PFN_vkGetDescriptorSetLayoutSupport>(resolve("vkGetDescriptorSetLayoutSupport"));
@@ -7697,7 +7700,7 @@ namespace sogen
     }
 
     int32_t vulkan_host::create_descriptor_set_layout(uint64_t device, uint32_t flags, std::span<const descriptor_binding> bindings,
-                                                      uint64_t& out_layout)
+                                                      uint64_t& out_layout, std::span<const immutable_sampler_ref> immutable_samplers)
     {
         out_layout = 0;
         const auto dev = this->impl_->devices.find(device);
@@ -7709,7 +7712,8 @@ namespace sogen
         {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
-        if ((flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT) &&
+        if ((flags & (VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT |
+                      VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT)) &&
             (!dev->second.descriptor_buffer_extension || !dev->second.descriptor_buffer_feature))
         {
             return VK_ERROR_EXTENSION_NOT_PRESENT;
@@ -7728,6 +7732,64 @@ namespace sogen
             vb.stageFlags = b.stage_flags;
             vk_bindings.push_back(vb);
             vk_binding_flags.push_back(b.binding_flags);
+        }
+
+        if (immutable_samplers.size() > gpu_bridge::max_immutable_sampler_refs)
+        {
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
+        const bool embedded = (flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT) != 0;
+        if (embedded && !(flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT))
+        {
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
+        std::vector<std::vector<VkSampler>> native_immutable(bindings.size());
+        for (const auto& ref : immutable_samplers)
+        {
+            if (ref.binding_index >= bindings.size())
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            const auto& binding = bindings[ref.binding_index];
+            if ((binding.descriptor_type != VK_DESCRIPTOR_TYPE_SAMPLER &&
+                 binding.descriptor_type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ||
+                ref.array_element >= binding.descriptor_count || ref.sampler == 0)
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            const auto sampler = this->impl_->samplers.find(ref.sampler);
+            if (sampler == this->impl_->samplers.end() || sampler->second.device_id != device)
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            auto& slots = native_immutable[ref.binding_index];
+            if (slots.empty())
+            {
+                slots.resize(binding.descriptor_count, VK_NULL_HANDLE);
+            }
+            if (slots[ref.array_element] != VK_NULL_HANDLE)
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            slots[ref.array_element] = sampler->second.handle;
+        }
+        for (size_t i = 0; i < bindings.size(); ++i)
+        {
+            const auto& binding = bindings[i];
+            const auto& slots = native_immutable[i];
+            if (embedded && (binding.descriptor_type != VK_DESCRIPTOR_TYPE_SAMPLER || binding.descriptor_count > 1 ||
+                             (binding.descriptor_count == 1 && slots.size() != 1)))
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            if (!slots.empty())
+            {
+                if (std::ranges::find(slots, VK_NULL_HANDLE) != slots.end())
+                {
+                    return VK_ERROR_VALIDATION_FAILED_EXT;
+                }
+                vk_bindings[i].pImmutableSamplers = slots.data();
+            }
         }
 
         VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags{};
@@ -8254,6 +8316,41 @@ namespace sogen
         dev->second.cmd_set_descriptor_buffer_offsets(
             cb->second.handle, static_cast<VkPipelineBindPoint>(bind_point), layout->second.handle, first_set, set_count,
             indices.empty() ? nullptr : indices.data(), offsets.empty() ? nullptr : offsets.data());
+        return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::cmd_bind_descriptor_buffer_embedded_samplers(uint64_t command_buffer, uint64_t pipeline_layout,
+                                                                      uint32_t bind_point, uint32_t set)
+    {
+        const auto cb = this->impl_->command_buffers.find(command_buffer);
+        if (cb == this->impl_->command_buffers.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        const auto dev = this->impl_->devices.find(cb->second.device_id);
+        const auto layout = this->impl_->pipeline_layouts.find(pipeline_layout);
+        if (dev == this->impl_->devices.end() || layout == this->impl_->pipeline_layouts.end() ||
+            layout->second.device_id != cb->second.device_id)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
+        if (!dev->second.descriptor_buffer_extension || !dev->second.descriptor_buffer_feature ||
+            !dev->second.cmd_bind_descriptor_buffer_embedded_samplers)
+        {
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+        if ((bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS && bind_point != VK_PIPELINE_BIND_POINT_COMPUTE) ||
+            set >= layout->second.descriptor_set_flags.size() ||
+            !(layout->second.descriptor_set_flags[set] & VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT))
+        {
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
+        dev->second.cmd_bind_descriptor_buffer_embedded_samplers(cb->second.handle, static_cast<VkPipelineBindPoint>(bind_point),
+                                                                 layout->second.handle, set);
         return VK_SUCCESS;
     }
 
