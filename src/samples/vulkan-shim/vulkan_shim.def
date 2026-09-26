@@ -216,6 +216,9 @@ EXPORTS
     vkMapMemory
     vkMergePipelineCaches
     vkQueuePresentKHR
+    vkQueueBeginDebugUtilsLabelEXT
+    vkQueueEndDebugUtilsLabelEXT
+    vkQueueInsertDebugUtilsLabelEXT
     vkQueueBindSparse
     vkQueueSubmit
     vkQueueWaitIdle
@@ -226,6 +229,8 @@ EXPORTS
     vkResetQueryPool
     vkResetFences
     vkSubmitDebugUtilsMessageEXT
+    vkSetDebugUtilsObjectNameEXT
+    vkSetDebugUtilsObjectTagEXT
     vkUnmapMemory
     vkUpdateDescriptorSets
     vkWaitForFences

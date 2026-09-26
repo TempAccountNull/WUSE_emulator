@@ -1076,6 +1076,7 @@ namespace
 }
 
 bool test_dynamic_commands(PFN_vkGetInstanceProcAddr get, VkInstance instance, VkPhysicalDevice physical, uint32_t family);
+bool test_debug_utils_entrypoints(PFN_vkGetInstanceProcAddr get_instance_proc, HMODULE module);
 
 int main(int argc, char** argv)
 {
@@ -1095,6 +1096,10 @@ int main(int argc, char** argv)
     {
         std::printf("[shim-test] no vkGetInstanceProcAddr export\n");
         return 2;
+    }
+    if (!test_debug_utils_entrypoints(get_instance_proc, mod))
+    {
+        return 3;
     }
 
     const auto write_timestamp2 = reinterpret_cast<PFN_vkCmdWriteTimestamp2>(get_instance_proc(nullptr, "vkCmdWriteTimestamp2"));
