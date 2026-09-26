@@ -82,7 +82,6 @@ namespace sogen::test
                                              "VK_NV_low_latency2",
                                              "VK_EXT_hdr_metadata",
                                              "VK_KHR_maintenance6",
-                                             "VK_AMD_buffer_marker",
                                              "VK_EXT_depth_bias_control",
                                              "VK_EXT_descriptor_buffer",
                                              "VK_EXT_descriptor_heap",
@@ -197,8 +196,7 @@ namespace sogen::test
         VkBool32 conditional_supported = VK_FALSE;
         VkBool32 inherited_supported = VK_FALSE;
         std::memcpy(&conditional_supported, feature_query.data() + sizeof(feature_record), sizeof(conditional_supported));
-        std::memcpy(&inherited_supported, feature_query.data() + sizeof(feature_record) + sizeof(VkBool32),
-                    sizeof(inherited_supported));
+        std::memcpy(&inherited_supported, feature_query.data() + sizeof(feature_record) + sizeof(VkBool32), sizeof(inherited_supported));
         if (conditional_supported != VK_TRUE)
         {
             GTEST_SKIP() << "AMD Vulkan driver does not enable conditional rendering";
@@ -259,15 +257,13 @@ namespace sogen::test
         uint64_t secondary = 0;
         if (inherited_supported == VK_TRUE)
         {
-            ASSERT_EQ(host.allocate_command_buffer(owned.device, owned.pool, VK_COMMAND_BUFFER_LEVEL_SECONDARY, secondary),
-                      VK_SUCCESS);
+            ASSERT_EQ(host.allocate_command_buffer(owned.device, owned.pool, VK_COMMAND_BUFFER_LEVEL_SECONDARY, secondary), VK_SUCCESS);
             ASSERT_EQ(host.begin_command_buffer(secondary, 0, true, 0, {}, 0, 0, 1, 0, false, true), VK_SUCCESS);
             ASSERT_EQ(host.end_command_buffer(secondary), VK_SUCCESS);
         }
 
         ASSERT_EQ(host.begin_command_buffer(command_buffer, 0, false, 0, {}, 0, 0, 1, 0), VK_SUCCESS);
-        EXPECT_EQ(host.begin_command_buffer(command_buffer, 0, false, 0, {}, 0, 0, 1, 0, false, true),
-                  VK_ERROR_FEATURE_NOT_PRESENT);
+        EXPECT_EQ(host.begin_command_buffer(command_buffer, 0, false, 0, {}, 0, 0, 1, 0, false, true), VK_ERROR_FEATURE_NOT_PRESENT);
         EXPECT_EQ(host.cmd_begin_conditional_rendering(command_buffer, 0, 0, 0), VK_ERROR_INITIALIZATION_FAILED);
         EXPECT_EQ(host.cmd_begin_conditional_rendering(command_buffer, owned.buffer, 2, 0), VK_ERROR_INITIALIZATION_FAILED);
         EXPECT_EQ(host.cmd_begin_conditional_rendering(command_buffer, owned.buffer, 8, 0), VK_ERROR_INITIALIZATION_FAILED);

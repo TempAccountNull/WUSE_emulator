@@ -58,7 +58,6 @@ namespace sogen
             std::string_view{"VK_NV_low_latency2"},              //
             std::string_view{"VK_EXT_hdr_metadata"},             // no host swapchain HDR metadata path, including readback
             std::string_view{"VK_KHR_maintenance6"},             // four required bridge commands are not implemented
-            std::string_view{"VK_AMD_buffer_marker"},
             std::string_view{"VK_EXT_depth_bias_control"},
             std::string_view{"VK_EXT_descriptor_buffer"},
             std::string_view{"VK_EXT_descriptor_heap"},
@@ -336,6 +335,10 @@ namespace sogen
             PFN_vkGetBufferMemoryRequirements get_buffer_memory_requirements{};
             PFN_vkBindBufferMemory bind_buffer_memory{};
             PFN_vkCmdFillBuffer cmd_fill_buffer{};
+            PFN_vkCmdWriteBufferMarkerAMD cmd_write_buffer_marker{};
+            PFN_vkCmdWriteBufferMarker2AMD cmd_write_buffer_marker2{};
+            bool buffer_marker_extension{};
+            bool synchronization2_feature{};
             PFN_vkCreateImage create_image{};
             PFN_vkDestroyImage destroy_image{};
             PFN_vkGetImageMemoryRequirements get_image_memory_requirements{};
@@ -2393,6 +2396,7 @@ namespace sogen
             return std::ranges::any_of(extensions, [&](const char* enabled) { return std::strcmp(enabled, name) == 0; });
         };
         data.conditional_rendering_extension = enabled_extension(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+        data.buffer_marker_extension = enabled_extension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
         data.memory_priority_extension = enabled_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
         data.pageable_memory_extension = enabled_extension(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
         for (const auto* feature = static_cast<const VkBaseInStructure*>(features2.pNext); feature; feature = feature->pNext)
@@ -2402,6 +2406,17 @@ namespace sogen
                 const auto* conditional = reinterpret_cast<const VkPhysicalDeviceConditionalRenderingFeaturesEXT*>(feature);
                 data.conditional_rendering_feature = conditional->conditionalRendering == VK_TRUE;
                 data.inherited_conditional_rendering_feature = conditional->inheritedConditionalRendering == VK_TRUE;
+            }
+            if (feature->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES)
+            {
+                data.synchronization2_feature =
+                    reinterpret_cast<const VkPhysicalDeviceSynchronization2Features*>(feature)->synchronization2 == VK_TRUE;
+            }
+            if (feature->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
+            {
+                data.synchronization2_feature =
+                    data.synchronization2_feature ||
+                    reinterpret_cast<const VkPhysicalDeviceVulkan13Features*>(feature)->synchronization2 == VK_TRUE;
             }
             if (feature->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT)
             {
@@ -2477,6 +2492,11 @@ namespace sogen
                 reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(resolve("vkGetBufferMemoryRequirements"));
             data.bind_buffer_memory = reinterpret_cast<PFN_vkBindBufferMemory>(resolve("vkBindBufferMemory"));
             data.cmd_fill_buffer = reinterpret_cast<PFN_vkCmdFillBuffer>(resolve("vkCmdFillBuffer"));
+            if (data.buffer_marker_extension)
+            {
+                data.cmd_write_buffer_marker = reinterpret_cast<PFN_vkCmdWriteBufferMarkerAMD>(resolve("vkCmdWriteBufferMarkerAMD"));
+                data.cmd_write_buffer_marker2 = reinterpret_cast<PFN_vkCmdWriteBufferMarker2AMD>(resolve("vkCmdWriteBufferMarker2AMD"));
+            }
             data.create_image = reinterpret_cast<PFN_vkCreateImage>(resolve("vkCreateImage"));
             data.destroy_image = reinterpret_cast<PFN_vkDestroyImage>(resolve("vkDestroyImage"));
             data.get_image_memory_requirements =
@@ -2852,8 +2872,8 @@ namespace sogen
 
     int32_t vulkan_host::begin_command_buffer(uint64_t command_buffer, uint32_t flags, bool is_secondary, uint32_t view_mask,
                                               std::span<const uint32_t> color_formats, uint32_t depth_format, uint32_t stencil_format,
-                                              uint32_t rasterization_samples, uint32_t rendering_flags,
-                                              bool rendering_info_present, bool conditional_rendering_enabled)
+                                              uint32_t rasterization_samples, uint32_t rendering_flags, bool rendering_info_present,
+                                              bool conditional_rendering_enabled)
     {
         const auto cb = this->impl_->command_buffers.find(command_buffer);
         if (cb == this->impl_->command_buffers.end())
@@ -2872,8 +2892,7 @@ namespace sogen
         }
 
         if (conditional_rendering_enabled &&
-            (!is_secondary || !dev->second.conditional_rendering_extension ||
-             !dev->second.inherited_conditional_rendering_feature))
+            (!is_secondary || !dev->second.conditional_rendering_extension || !dev->second.inherited_conditional_rendering_feature))
         {
             return VK_ERROR_FEATURE_NOT_PRESENT;
         }
@@ -4018,6 +4037,49 @@ namespace sogen
         }
 
         dev->second.cmd_fill_buffer(cb->second.handle, buf->second.handle, offset, size, data);
+        return VK_SUCCESS;
+    }
+
+    bool vulkan_host::supports_buffer_marker2(uint64_t device) const
+    {
+        const auto dev = this->impl_->devices.find(device);
+        return dev != this->impl_->devices.end() && dev->second.buffer_marker_extension && dev->second.synchronization2_feature &&
+               dev->second.cmd_write_buffer_marker2;
+    }
+
+    int32_t vulkan_host::cmd_write_buffer_marker(uint64_t command_buffer, uint64_t buffer, uint64_t offset, uint64_t stage, uint32_t marker,
+                                                 bool synchronization2)
+    {
+        const auto cb = this->impl_->command_buffers.find(command_buffer);
+        const auto buf = this->impl_->buffers.find(buffer);
+        if (cb == this->impl_->command_buffers.end() || buf == this->impl_->buffers.end() ||
+            buf->second.device_id != cb->second.device_id || !(buf->second.usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT) ||
+            !buf->second.memory_id || offset % sizeof(marker) != 0 || offset > buf->second.size ||
+            buf->second.size - offset < sizeof(marker) || !std::has_single_bit(stage) || (!synchronization2 && stage > UINT32_MAX))
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev != this->impl_->devices.end() && dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
+        if (dev == this->impl_->devices.end() || !dev->second.buffer_marker_extension ||
+            (synchronization2 && (!dev->second.synchronization2_feature || !dev->second.cmd_write_buffer_marker2)) ||
+            (!synchronization2 && !dev->second.cmd_write_buffer_marker))
+        {
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        if (synchronization2)
+        {
+            dev->second.cmd_write_buffer_marker2(cb->second.handle, static_cast<VkPipelineStageFlags2>(stage), buf->second.handle, offset,
+                                                 marker);
+        }
+        else
+        {
+            dev->second.cmd_write_buffer_marker(cb->second.handle, static_cast<VkPipelineStageFlagBits>(stage), buf->second.handle, offset,
+                                                marker);
+        }
         return VK_SUCCESS;
     }
 

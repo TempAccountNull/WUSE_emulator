@@ -45,8 +45,9 @@ namespace sogen
                     static std::atomic_bool logged{false};
                     if (!logged.exchange(true, std::memory_order_relaxed))
                     {
-                        win_emu.log.warn("[gpu-bridge] presentation requested=%s effective=readback (vcpus=%u; native WSI requires UI owner)\n",
-                                         option, win_emu.vcpu_count());
+                        win_emu.log.warn(
+                            "[gpu-bridge] presentation requested=%s effective=readback (vcpus=%u; native WSI requires UI owner)\n", option,
+                            win_emu.vcpu_count());
                     }
                 }
                 this->native_wsi_ = mode != "readback";
@@ -1158,7 +1159,7 @@ namespace sogen
 
                 const response_t response{
                     .vk_result = result,
-                    .reserved = 0,
+                    .reserved = result == 0 && this->vulkan_.supports_buffer_marker2(device) ? gpu_bridge::device_cap_buffer_marker2 : 0,
                     .device = device,
                 };
                 emulator_object<response_t>{win_emu.emu(), context.output_buffer}.write(response);
@@ -3948,6 +3949,15 @@ namespace sogen
                         return vk_error_initialization_failed;
                     }
                     return this->vulkan_.cmd_fill_buffer(req.command_buffer, req.buffer, req.offset, req.size, req.data);
+                }
+                case gpu_bridge::command::cmd_write_buffer_marker: {
+                    gpu_bridge::cmd_write_buffer_marker_request req{};
+                    if (!read(req) || req.variant > 1)
+                    {
+                        return vk_error_initialization_failed;
+                    }
+                    return this->vulkan_.cmd_write_buffer_marker(req.command_buffer, req.buffer, req.offset, req.stage, req.marker,
+                                                                 req.variant == 1);
                 }
                 case gpu_bridge::command::cmd_pipeline_barrier: {
                     gpu_bridge::cmd_pipeline_barrier_request req{};

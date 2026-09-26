@@ -141,8 +141,8 @@ namespace sogen
         // is_secondary supplies the dynamic-rendering inheritance (attachment formats) the secondary renders to.
         int32_t begin_command_buffer(uint64_t command_buffer, uint32_t flags, bool is_secondary, uint32_t view_mask,
                                      std::span<const uint32_t> color_formats, uint32_t depth_format, uint32_t stencil_format,
-                                     uint32_t rasterization_samples, uint32_t rendering_flags,
-                                     bool rendering_info_present = false, bool conditional_rendering_enabled = false);
+                                     uint32_t rasterization_samples, uint32_t rendering_flags, bool rendering_info_present = false,
+                                     bool conditional_rendering_enabled = false);
         int32_t cmd_execute_commands(uint64_t command_buffer, std::span<const uint64_t> secondaries);
         int32_t end_command_buffer(uint64_t command_buffer);
         int32_t reset_command_pool(uint64_t device, uint64_t pool, uint32_t flags);
@@ -206,6 +206,9 @@ namespace sogen
 
         // Records vkCmdFillBuffer into the (recording) command buffer.
         int32_t cmd_fill_buffer(uint64_t command_buffer, uint64_t buffer, uint64_t offset, uint64_t size, uint32_t data);
+        bool supports_buffer_marker2(uint64_t device) const;
+        int32_t cmd_write_buffer_marker(uint64_t command_buffer, uint64_t buffer, uint64_t offset, uint64_t stage, uint32_t marker,
+                                        bool synchronization2);
 
         // Maps host-visible memory, copies [offset, offset+size) into out, and unmaps. Used to read
         // GPU results back to the guest (the guest never sees a host pointer).

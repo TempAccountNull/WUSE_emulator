@@ -241,6 +241,9 @@ namespace
     // it back on unmap so writes persist. allocationSize is tracked here to resolve VK_WHOLE_SIZE.
     std::unordered_map<gb::object_id, uint64_t> g_memory_sizes;
     std::mutex g_memory_sizes_mutex;
+    std::unordered_set<gb::object_id> g_buffer_marker_devices;
+    std::unordered_set<gb::object_id> g_buffer_marker2_devices;
+    std::mutex g_buffer_marker_devices_mutex;
 
     struct mapped_range
     {
@@ -785,6 +788,7 @@ extern "C"
         // Marshal the enabled device-extension names (NUL-terminated, concatenated).
         std::vector<std::byte> extension_blob;
         uint32_t extension_count = 0;
+        bool buffer_marker_enabled = false;
         if (pCreateInfo && pCreateInfo->ppEnabledExtensionNames)
         {
             for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i)
@@ -794,6 +798,7 @@ extern "C"
                 {
                     continue;
                 }
+                buffer_marker_enabled |= std::strcmp(name, VK_AMD_BUFFER_MARKER_EXTENSION_NAME) == 0;
                 const auto* bytes = reinterpret_cast<const std::byte*>(name);
                 extension_blob.insert(extension_blob.end(), bytes, bytes + std::strlen(name) + 1);
                 ++extension_count;
@@ -870,11 +875,25 @@ extern "C"
         }
 
         *pDevice = to_handle<VkDevice>(response.device);
+        if (buffer_marker_enabled)
+        {
+            std::lock_guard lock(g_buffer_marker_devices_mutex);
+            g_buffer_marker_devices.insert(response.device);
+            if (response.reserved & gb::device_cap_buffer_marker2)
+            {
+                g_buffer_marker2_devices.insert(response.device);
+            }
+        }
         return VK_SUCCESS;
     }
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice device, const VkAllocationCallbacks*)
     {
+        {
+            std::lock_guard lock(g_buffer_marker_devices_mutex);
+            g_buffer_marker_devices.erase(to_object_id(device));
+            g_buffer_marker2_devices.erase(to_object_id(device));
+        }
         if (native_wsi_enabled())
         {
             native_destroy(nw::operation::destroy_device, to_object_id(device));
@@ -995,8 +1014,7 @@ extern "C"
                 }
                 else if (next->sType == VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_CONDITIONAL_RENDERING_INFO_EXT)
                 {
-                    const auto* conditional =
-                        reinterpret_cast<const VkCommandBufferInheritanceConditionalRenderingInfoEXT*>(next);
+                    const auto* conditional = reinterpret_cast<const VkCommandBufferInheritanceConditionalRenderingInfoEXT*>(next);
                     request.inherit_conditional_rendering_enabled = conditional->conditionalRenderingEnable == VK_TRUE;
                 }
             }
@@ -3117,6 +3135,32 @@ extern "C"
         request.size = size;
         request.data = data;
         record_command(request.command_buffer, gb::command::cmd_fill_buffer, &request, sizeof(request));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdWriteBufferMarkerAMD(VkCommandBuffer commandBuffer,
+                                                                               VkPipelineStageFlagBits pipelineStage, VkBuffer dstBuffer,
+                                                                               VkDeviceSize dstOffset, uint32_t marker)
+    {
+        gb::cmd_write_buffer_marker_request request{};
+        request.command_buffer = to_object_id(commandBuffer);
+        request.buffer = to_object_id(dstBuffer);
+        request.offset = dstOffset;
+        request.stage = static_cast<uint64_t>(pipelineStage);
+        request.marker = marker;
+        record_command(request.command_buffer, gb::command::cmd_write_buffer_marker, &request, sizeof(request));
+    }
+
+    __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkCmdWriteBufferMarker2AMD(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 stage,
+                                                                                VkBuffer dstBuffer, VkDeviceSize dstOffset, uint32_t marker)
+    {
+        gb::cmd_write_buffer_marker_request request{};
+        request.command_buffer = to_object_id(commandBuffer);
+        request.buffer = to_object_id(dstBuffer);
+        request.offset = dstOffset;
+        request.stage = stage;
+        request.marker = marker;
+        request.variant = 1;
+        record_command(request.command_buffer, gb::command::cmd_write_buffer_marker, &request, sizeof(request));
     }
 
     __declspec(dllexport) VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice device, const VkImageCreateInfo* pCreateInfo,
@@ -6973,6 +7017,8 @@ extern "C"
             {.name = "vkBindImageMemory2", .func = reinterpret_cast<PFN_vkVoidFunction>(vkBindImageMemory2)},
             {.name = "vkBindImageMemory2KHR", .func = reinterpret_cast<PFN_vkVoidFunction>(vkBindImageMemory2)},
             {.name = "vkCmdFillBuffer", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdFillBuffer)},
+            {.name = "vkCmdWriteBufferMarkerAMD", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdWriteBufferMarkerAMD)},
+            {.name = "vkCmdWriteBufferMarker2AMD", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdWriteBufferMarker2AMD)},
             {.name = "vkCreateImage", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateImage)},
             {.name = "vkDestroyImage", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyImage)},
             {.name = "vkGetImageMemoryRequirements", .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetImageMemoryRequirements)},
@@ -7246,6 +7292,15 @@ extern "C"
                                                : g_real_get_instance_proc_addr(VK_NULL_HANDLE, pName);
         }
 
+        if (pName && (std::strcmp(pName, "vkCmdWriteBufferMarkerAMD") == 0 || std::strcmp(pName, "vkCmdWriteBufferMarker2AMD") == 0))
+        {
+            std::lock_guard lock(g_buffer_marker_devices_mutex);
+            if (!g_buffer_marker_devices.contains(to_object_id(device)) ||
+                (std::strcmp(pName, "vkCmdWriteBufferMarker2AMD") == 0 && !g_buffer_marker2_devices.contains(to_object_id(device))))
+            {
+                return nullptr;
+            }
+        }
         return vkGetInstanceProcAddr(VK_NULL_HANDLE, pName);
     }
 

@@ -71,6 +71,8 @@ EXPORTS
     vkCmdEndRendering
     vkCmdExecuteCommands
     vkCmdFillBuffer
+    vkCmdWriteBufferMarkerAMD
+    vkCmdWriteBufferMarker2AMD
     vkCmdPipelineBarrier
     vkCmdPushConstants
     vkCmdPushConstants2KHR

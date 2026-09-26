@@ -213,6 +213,7 @@ namespace sogen::gpu_bridge
         get_multisample_properties = 0x8B1,
         cmd_begin_conditional_rendering = 0x8B2,
         cmd_end_conditional_rendering = 0x8B3,
+        cmd_write_buffer_marker = 0x8B4,
         cmd_synchronization = 0x8C0,
         get_event_status_owned = 0x8C1,
         cmd_copy_image_to_buffer_full = 0x8D0,
@@ -594,6 +595,8 @@ namespace sogen::gpu_bridge
         uint32_t feature_blob_size;
         uint32_t reserved;
     };
+
+    inline constexpr uint32_t device_cap_buffer_marker2 = 1u << 0;
 
     struct create_device_response
     {
@@ -1055,6 +1058,16 @@ namespace sogen::gpu_bridge
         uint64_t size;   // VkDeviceSize (VK_WHOLE_SIZE allowed)
         uint32_t data;   // 32-bit value broadcast across the range
         uint32_t reserved;
+    };
+
+    struct cmd_write_buffer_marker_request
+    {
+        object_id command_buffer;
+        object_id buffer;
+        uint64_t offset;
+        uint64_t stage;
+        uint32_t marker;
+        uint32_t variant;
     };
 
     // ioctl_download_memory: in (out = `size` raw bytes read from host-mapped memory)
@@ -2440,6 +2453,7 @@ namespace sogen::gpu_bridge
     static_assert(sizeof(cmd_begin_query_request) == 24, "wire layout drift");
     static_assert(sizeof(cmd_end_query_request) == 24, "wire layout drift");
     static_assert(sizeof(cmd_begin_conditional_rendering_request) == 32, "wire layout drift");
+    static_assert(sizeof(cmd_write_buffer_marker_request) == 40, "wire layout drift");
     static_assert(sizeof(cmd_end_conditional_rendering_request) == 8, "wire layout drift");
     static_assert(sizeof(cmd_begin_query_indexed_request) == 32, "wire layout drift");
     static_assert(sizeof(cmd_end_query_indexed_request) == 24, "wire layout drift");
