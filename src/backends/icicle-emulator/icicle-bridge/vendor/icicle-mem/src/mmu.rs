@@ -574,6 +574,11 @@ impl Mmu {
     /// An overlapping range is rejected before any page is mapped. On allocation failure, retain
     /// the successfully allocated prefix, as repeated `map_smp_shared` did.
     pub fn map_smp_shared_pages(&mut self, address: u64, pages: &[std::sync::Arc<PageData>]) -> bool {
+        static MAP_PHASE_PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let profile = *MAP_PHASE_PROFILE.get_or_init(|| {
+            std::env::var("SOGEN_ICICLE_MAP_PHASE_PROFILE").ok().as_deref() == Some("1")
+        });
+        let started = profile.then(std::time::Instant::now);
         if !self.can_map_smp_page_range(address, pages.len()) {
             let overlap = u64::try_from(pages.len())
                 .ok()
@@ -586,6 +591,7 @@ impl Mmu {
             );
             return false;
         }
+        let preflight_done = started.map(|_| std::time::Instant::now());
 
         let page_size = self.page_size();
         let mut entries = Vec::with_capacity(pages.len());
@@ -613,6 +619,7 @@ impl Mmu {
             let mapping = PhysicalMapping { addr: start, index, shared_perm: 0 };
             entries.push((start, last, MemoryMapping::Physical(mapping)));
         }
+        let pages_done = started.map(|_| std::time::Instant::now());
 
         if !entries.is_empty() {
             // Every entry is one page, addresses are increasing, and PhysicalMapping.addr makes
@@ -620,6 +627,19 @@ impl Mmu {
             assert!(self.mapping.insert_disjoint_batch(&entries));
             self.mapping_changed = true;
             self.clear_tlb();
+        }
+        if let (Some(started), Some(preflight_done), Some(pages_done)) = (started, preflight_done, pages_done) {
+            let finished = std::time::Instant::now();
+            if pages.len() >= 4096 && finished.duration_since(started).as_millis() >= 100 {
+                eprintln!(
+                    "[ICICLEMAP] address={address:#x} pages={} mapped={} success={} preflight_ms={} pages_ms={} insert_tlb_ms={} total_ms={}",
+                    pages.len(), entries.len(), success,
+                    preflight_done.duration_since(started).as_millis(),
+                    pages_done.duration_since(preflight_done).as_millis(),
+                    finished.duration_since(pages_done).as_millis(),
+                    finished.duration_since(started).as_millis()
+                );
+            }
         }
         success
     }
