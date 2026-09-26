@@ -32,6 +32,16 @@ namespace sogen::test
         auto emu = icicle::create_x86_64_emulator(vcpu_count);
         ASSERT_EQ(emu->vcpu_count(), vcpu_count);
         memory_manager memory(*emu);
+        // Optional middle-insert topology: populate mappings above the captured
+        // range so each serial page insertion shifts existing map entries.
+        // The setup is outside the measured owner/peer map windows.
+        const auto* middle = std::getenv("SOGEN_SMP_LARGE_MAP_MIDDLE");
+        if (middle && std::strcmp(middle, "1") == 0)
+        {
+            constexpr uint64_t high_region = 0x80000000;
+            constexpr size_t high_size = 16 * 1024 * 1024;
+            ASSERT_TRUE(memory.allocate_memory(high_region, high_size, memory_permission::read_write));
+        }
         const auto code = memory.allocate_memory(0x1000, memory_permission::all);
         const auto trigger_data = memory.allocate_memory(0x1000, memory_permission::read_write);
         ASSERT_NE(code, 0U);
@@ -112,8 +122,7 @@ namespace sogen::test
             for (size_t i = 1; i < vcpu_count; ++i)
             {
                 std::cout << "[SMP-LARGE-MAP] peer=" << i << " peer_map_calls=" << profile[i].peer_map_calls
-                          << " peer_map_pages=" << profile[i].peer_map_pages
-                          << " peer_map_total_ms=" << profile[i].peer_map_nanos / 1000000
+                          << " peer_map_pages=" << profile[i].peer_map_pages << " peer_map_total_ms=" << profile[i].peer_map_nanos / 1000000
                           << " peer_map_max_ms=" << profile[i].peer_map_max_nanos / 1000000 << '\n';
                 EXPECT_EQ(profile[i].peer_map_calls, 1U);
                 EXPECT_EQ(profile[i].peer_map_pages, region_size / page_size);
