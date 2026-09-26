@@ -10,10 +10,6 @@ namespace
 
     bool debug_utils_supported_by_bridge()
     {
-        // Native loader support is insufficient; keep this hidden until the full guest/host
-        // callback path passes a fresh emulator test.
-        constexpr bool guest_bridge_validated = false;
-        if (!guest_bridge_validated) return false;
         gb::debug_utils_capabilities_response response{};
         return bridge_call(gb::ioctl_debug_utils_capabilities, nullptr, 0, &response, sizeof(response)) && response.available != 0;
     }
