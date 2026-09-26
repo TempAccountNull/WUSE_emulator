@@ -5,6 +5,9 @@
 #include "../windows_emulator.hpp"
 
 #include <gpu_bridge_protocol.hpp>
+#include <vk_debug_utils_callback_relay.hpp>
+#include <vk_debug_utils_command_wire.hpp>
+#include <vk_debug_utils_messenger_wire.hpp>
 #include <native_wsi_wire.hpp>
 #include <platform/ui_owned_completion.hpp>
 #include <atomic>
@@ -28,6 +31,16 @@ namespace sogen
             void create(windows_emulator& win_emu, const io_device_creation_data&) override
             {
                 this->memory_ = &win_emu.memory;
+                this->vulkan_.set_debug_utils_sink([this](vulkan_host::debug_utils_delivery delivered) {
+                    const uint32_t tid = delivered.guest_thread_id;
+                    return this->debug_callbacks_.push(
+                        tid, gpu_bridge::debug_utils_callback_relay::delivery{
+                                 .instance_id = delivered.instance_id,
+                                 .callback_address = delivered.callback_address,
+                                 .user_data = delivered.user_data,
+                                 .guest_pointer_bytes = delivered.guest_pointer_bytes,
+                                 .packet = std::move(delivered.packet)});
+                });
                 const char* option = std::getenv("SOGEN_VULKAN_PRESENT");
                 const std::string_view requested_mode = option && *option ? option : "readback";
                 if (requested_mode != "readback" && requested_mode != "native" && requested_mode != "direct" &&
@@ -115,6 +128,15 @@ namespace sogen
 
             NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& context) override
             {
+                // A replayed/delayed device-pump IOCTL has no issuing guest thread. Preserve
+                // that existing path and only relay callbacks for syscall-originated IOCTLs.
+                const uint32_t guest_tid = context.vcpu && context.vcpu->active_thread ? context.vcpu->active_thread->id : 0;
+                const uint32_t previous_debug_tid = vulkan_host::exchange_debug_utils_guest_thread(guest_tid);
+                struct restore_debug_tid
+                {
+                    uint32_t previous;
+                    ~restore_debug_tid() { vulkan_host::exchange_debug_utils_guest_thread(previous); }
+                } restore{previous_debug_tid};
                 if (this->native_wsi_ && !this->native_dispatch_->queue->owner_matches_current())
                 {
                     return STATUS_NOT_SUPPORTED;
@@ -144,6 +166,14 @@ namespace sogen
                 }
                 switch (context.io_control_code)
                 {
+                case gpu_bridge::ioctl_debug_utils_capabilities:
+                    return handle_debug_utils_capabilities(win_emu, context);
+                case gpu_bridge::ioctl_debug_utils_messenger:
+                    return handle_debug_utils_messenger(win_emu, context);
+                case gpu_bridge::ioctl_debug_utils_command:
+                    return handle_debug_utils_command(win_emu, context);
+                case gpu_bridge::ioctl_debug_utils_poll:
+                    return handle_debug_utils_poll(win_emu, context);
                 case gpu_bridge::ioctl_get_version:
                     return handle_get_version(win_emu, context);
                 case gpu_bridge::ioctl_create_instance:
@@ -479,6 +509,7 @@ namespace sogen
             };
 
             std::shared_ptr<presentation_activity> presentation_activity_{std::make_shared<presentation_activity>()};
+            gpu_bridge::debug_utils_callback_relay::queue debug_callbacks_;
 #include "native_wsi_bridge.inc"
             std::shared_ptr<vulkan_host> vulkan_owner_{
                 new vulkan_host(), [dispatch = this->native_dispatch_](vulkan_host* host) {
@@ -665,6 +696,61 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
+            NTSTATUS handle_debug_utils_capabilities(windows_emulator& win_emu, const io_device_context& context)
+            {
+                if (context.input_buffer_length != 0) return STATUS_INVALID_PARAMETER;
+                return write_output(win_emu, context, gpu_bridge::debug_utils_capabilities_response{
+                                                          .available = this->vulkan_.debug_utils_available() ? 1u : 0u});
+            }
+
+            NTSTATUS handle_debug_utils_messenger(windows_emulator& win_emu, const io_device_context& context)
+            {
+                if (!context.input_buffer || context.input_buffer_length < gpu_bridge::debug_utils_messenger_wire::header_size ||
+                    context.input_buffer_length > gpu_bridge::debug_utils_messenger_wire::max_packet_bytes)
+                    return STATUS_INVALID_PARAMETER;
+                std::vector<std::byte> packet(context.input_buffer_length);
+                win_emu.emu().read_memory(context.input_buffer, packet.data(), packet.size());
+                uint64_t messenger{};
+                const int32_t result = this->vulkan_.debug_utils_messenger(packet, messenger);
+                return write_output(win_emu, context, gpu_bridge::object_response{.vk_result = result, .reserved = 0, .object = messenger});
+            }
+
+            NTSTATUS handle_debug_utils_command(windows_emulator& win_emu, const io_device_context& context)
+            {
+                if (!context.input_buffer || context.input_buffer_length < 64 ||
+                    context.input_buffer_length > gpu_bridge::debug_utils_command_wire::max_packet_bytes)
+                    return STATUS_INVALID_PARAMETER;
+                std::vector<std::byte> packet(context.input_buffer_length);
+                win_emu.emu().read_memory(context.input_buffer, packet.data(), packet.size());
+                const int32_t result = this->vulkan_.debug_utils_command(packet);
+                return write_output(win_emu, context, gpu_bridge::result_response{.vk_result = result, .reserved = 0});
+            }
+
+            NTSTATUS handle_debug_utils_poll(windows_emulator& win_emu, const io_device_context& context)
+            {
+                if (!context.vcpu || !context.vcpu->active_thread || context.input_buffer_length != 0 || !context.output_buffer ||
+                    context.output_buffer_length < sizeof(gpu_bridge::debug_utils_poll_response) +
+                                                       gpu_bridge::debug_utils_wire::max_packet_bytes)
+                    return STATUS_BUFFER_TOO_SMALL;
+                gpu_bridge::debug_utils_callback_relay::delivery delivered;
+                if (!this->debug_callbacks_.pop(context.thread().id, delivered))
+                {
+                    return write_output(win_emu, context, gpu_bridge::debug_utils_poll_response{});
+                }
+                const gpu_bridge::debug_utils_poll_response response{
+                    .pending = 1,
+                    .guest_pointer_bytes = delivered.guest_pointer_bytes,
+                    .instance_id = delivered.instance_id,
+                    .callback_address = delivered.callback_address,
+                    .user_data = delivered.user_data,
+                    .packet_size = static_cast<uint32_t>(delivered.packet.size()),
+                    .reserved = 0};
+                emulator_object<gpu_bridge::debug_utils_poll_response>{win_emu.emu(), context.output_buffer}.write(response);
+                win_emu.emu().write_memory(context.output_buffer + sizeof(response), delivered.packet.data(), delivered.packet.size());
+                set_information(context, static_cast<ULONG>(sizeof(response) + delivered.packet.size()));
+                return STATUS_SUCCESS;
+            }
+
             NTSTATUS handle_create_instance(windows_emulator& win_emu, const io_device_context& context)
             {
                 constexpr auto response_size = static_cast<ULONG>(sizeof(gpu_bridge::create_instance_response));
@@ -674,8 +760,22 @@ namespace sogen
                     return STATUS_BUFFER_TOO_SMALL;
                 }
 
+                bool debug_utils_enabled = false;
+                std::vector<std::byte> callback;
+                if (context.input_buffer_length)
+                {
+                    gpu_bridge::debug_utils_instance_request request{};
+                    if (!read_input(win_emu, context, request) || request.enabled > 1 ||
+                        request.callback_size > gpu_bridge::debug_utils_messenger_wire::max_packet_bytes ||
+                        context.input_buffer_length != sizeof(request) + request.callback_size)
+                        return STATUS_INVALID_PARAMETER;
+                    debug_utils_enabled = request.enabled != 0;
+                    callback.resize(request.callback_size);
+                    if (!callback.empty())
+                        win_emu.emu().read_memory(context.input_buffer + sizeof(request), callback.data(), callback.size());
+                }
                 uint64_t instance = gpu_bridge::null_object;
-                const int32_t result = this->vulkan_.create_instance(instance);
+                const int32_t result = this->vulkan_.create_instance(instance, debug_utils_enabled, callback);
 
                 const gpu_bridge::create_instance_response response{
                     .vk_result = result,
@@ -3380,6 +3480,8 @@ namespace sogen
 
                 switch (static_cast<gpu_bridge::command>(command))
                 {
+                case gpu_bridge::command::debug_utils_command:
+                    return this->vulkan_.debug_utils_command(std::span(payload, size));
                 case gpu_bridge::command::begin_command_buffer: {
                     gpu_bridge::begin_command_buffer_request req{};
                     if (!read(req))
@@ -3420,6 +3522,27 @@ namespace sogen
                         std::memcpy(secondaries.data(), payload + sizeof(req), ids_bytes);
                     }
                     return this->vulkan_.cmd_execute_commands(req.command_buffer, secondaries);
+                }
+                case gpu_bridge::command::cmd_bind_descriptor_buffers: {
+                    gpu_bridge::cmd_bind_descriptor_buffers_request req{};
+                    if (!read(req) || req.reserved != 0 || req.binding_count > gpu_bridge::max_descriptor_buffer_bindings ||
+                        size - sizeof(req) != static_cast<size_t>(req.binding_count) * sizeof(gpu_bridge::descriptor_buffer_binding_wire))
+                    {
+                        return vk_error_initialization_failed;
+                    }
+                    return this->vulkan_.cmd_bind_descriptor_buffers(req.command_buffer, {payload + sizeof(req), size - sizeof(req)},
+                                                                     req.binding_count);
+                }
+                case gpu_bridge::command::cmd_set_descriptor_buffer_offsets: {
+                    gpu_bridge::cmd_set_descriptor_buffer_offsets_request req{};
+                    if (!read(req) || req.reserved != 0 || req.set_count > gpu_bridge::max_descriptor_buffer_bindings ||
+                        size - sizeof(req) != static_cast<size_t>(req.set_count) * sizeof(gpu_bridge::descriptor_buffer_offset_wire))
+                    {
+                        return vk_error_initialization_failed;
+                    }
+                    return this->vulkan_.cmd_set_descriptor_buffer_offsets(req.command_buffer, req.pipeline_layout, req.bind_point,
+                                                                           req.first_set, {payload + sizeof(req), size - sizeof(req)},
+                                                                           req.set_count);
                 }
                 case gpu_bridge::command::cmd_set_viewport: {
                     gpu_bridge::cmd_set_viewport_request req{};

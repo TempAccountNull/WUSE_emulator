@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -52,9 +53,26 @@ namespace sogen
         // Resolves ownership from a live swapchain; only reads properties cached at device creation.
         bool get_swapchain_render_device(uint64_t device, uint64_t swapchain, render_device_info& out) const;
 
+        struct debug_utils_delivery
+        {
+            uint32_t guest_thread_id{};
+            uint64_t instance_id{};
+            uint64_t callback_address{};
+            uint64_t user_data{};
+            uint32_t guest_pointer_bytes{};
+            std::vector<std::byte> packet;
+        };
+        using debug_utils_sink = std::function<bool(debug_utils_delivery)>;
+        bool debug_utils_available() const;
+        void set_debug_utils_sink(debug_utils_sink sink);
+        static uint32_t exchange_debug_utils_guest_thread(uint32_t guest_thread_id);
+        int32_t debug_utils_messenger(std::span<const std::byte> packet, uint64_t& out_messenger);
+        int32_t debug_utils_command(std::span<const std::byte> packet);
+
         // Creates a bare instance (no layers/extensions). out_instance is set to a fresh object id
         // on success, or 0 on failure.
-        int32_t create_instance(uint64_t& out_instance);
+        int32_t create_instance(uint64_t& out_instance, bool debug_utils_enabled = false,
+                                std::span<const std::byte> creation_callback = {});
         // Reports the version used for this native instance, not the loader's maximum supported version.
         int32_t get_instance_api_version(uint64_t instance, uint32_t& out_version) const;
         void destroy_instance(uint64_t instance);
@@ -550,6 +568,11 @@ namespace sogen
         int32_t get_descriptor_set_layout_size(uint64_t device, uint64_t layout, uint64_t& out_size);
         int32_t get_descriptor_set_layout_binding_offset(uint64_t device, uint64_t layout, uint32_t binding,
                                                          uint64_t& out_offset);
+        // Serialized VkDescriptorBufferBindingInfoEXT / (index, offset) arrays; guest pointers
+        // and pNext links are rebuilt only after host ownership checks.
+        int32_t cmd_bind_descriptor_buffers(uint64_t command_buffer, std::span<const std::byte> wire, uint32_t binding_count);
+        int32_t cmd_set_descriptor_buffer_offsets(uint64_t command_buffer, uint64_t pipeline_layout, uint32_t bind_point,
+                                                  uint32_t first_set, std::span<const std::byte> wire, uint32_t set_count);
         void destroy_descriptor_set_layout(uint64_t device, uint64_t layout);
         int32_t create_descriptor_pool(uint64_t device, uint32_t max_sets, uint32_t flags, uint32_t max_inline_uniform_block_bindings,
                                        std::span<const descriptor_pool_size> sizes, uint64_t& out_pool);

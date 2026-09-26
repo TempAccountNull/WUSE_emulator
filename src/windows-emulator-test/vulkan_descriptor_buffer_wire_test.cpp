@@ -279,6 +279,28 @@ namespace sogen::test
         EXPECT_EQ(sizeof(gb::get_descriptor_set_layout_size_request), 16u);
         EXPECT_EQ(sizeof(gb::get_descriptor_set_layout_binding_offset_request), 24u);
         EXPECT_EQ(sizeof(gb::descriptor_layout_value_response), 16u);
+        EXPECT_EQ(static_cast<uint32_t>(gb::command::cmd_bind_descriptor_buffers), 0x8bau);
+        EXPECT_EQ(static_cast<uint32_t>(gb::command::cmd_set_descriptor_buffer_offsets), 0x8bbu);
+        EXPECT_EQ(sizeof(gb::cmd_bind_descriptor_buffers_request), 16u);
+        EXPECT_EQ(sizeof(gb::descriptor_buffer_binding_wire), 32u);
+        EXPECT_EQ(sizeof(gb::cmd_set_descriptor_buffer_offsets_request), 32u);
+        EXPECT_EQ(sizeof(gb::descriptor_buffer_offset_wire), 16u);
+        EXPECT_EQ(gb::max_descriptor_buffer_bindings, 256u);
+        constexpr gb::descriptor_buffer_binding_wire legacy{
+            .usage = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT,
+            .usage_2 = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT,
+        };
+        constexpr gb::descriptor_buffer_binding_wire flags2{
+            .usage = 0,
+            .flags = gb::descriptor_binding_has_usage_2,
+            .usage_2 = VK_BUFFER_USAGE_2_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+                       VK_BUFFER_USAGE_2_MEMORY_DECOMPRESSION_BIT_EXT,
+        };
+        static_assert(gb::descriptor_buffer_effective_usage(legacy) == VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT);
+        static_assert(gb::descriptor_buffer_effective_usage(flags2) == flags2.usage_2);
+        EXPECT_GT(gb::descriptor_buffer_effective_usage(flags2), UINT32_MAX);
+        EXPECT_EQ(gb::descriptor_buffer_effective_usage(flags2) & VK_BUFFER_USAGE_2_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT,
+                  VK_BUFFER_USAGE_2_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT);
         const gb::get_descriptor_request request{.device = 7, .data_size = 16, .wire_size = wire::get_info_byte_count};
         EXPECT_EQ(request.device, 7u);
         EXPECT_EQ(request.data_size, 16u);
@@ -296,6 +318,10 @@ namespace sogen::test
             VkDescriptorSetLayout layout{};
             VkBuffer buffer{};
             VkDeviceMemory memory{};
+            VkPipelineLayout pipeline_layout{};
+            VkCommandPool command_pool{};
+            PFN_vkDestroyPipelineLayout destroy_pipeline_layout{};
+            PFN_vkDestroyCommandPool destroy_command_pool{};
             PFN_vkDestroyInstance destroy_instance{};
             PFN_vkDestroyDevice destroy_device{};
             PFN_vkDestroySampler destroy_sampler{};
@@ -305,6 +331,14 @@ namespace sogen::test
 
             ~native_context()
             {
+                if (command_pool && destroy_command_pool)
+                {
+                    destroy_command_pool(device, command_pool, nullptr);
+                }
+                if (pipeline_layout && destroy_pipeline_layout)
+                {
+                    destroy_pipeline_layout(device, pipeline_layout, nullptr);
+                }
                 if (buffer && destroy_buffer)
                 {
                     destroy_buffer(device, buffer, nullptr);
@@ -487,6 +521,21 @@ namespace sogen::test
         ASSERT_EQ(create_device(rx6700, &device_info, nullptr, &native.device), VK_SUCCESS);
 
         native.destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(get_device_proc(native.device, "vkDestroyDevice"));
+        native.destroy_pipeline_layout =
+            reinterpret_cast<PFN_vkDestroyPipelineLayout>(get_device_proc(native.device, "vkDestroyPipelineLayout"));
+        native.destroy_command_pool = reinterpret_cast<PFN_vkDestroyCommandPool>(get_device_proc(native.device, "vkDestroyCommandPool"));
+        const auto create_pipeline_layout =
+            reinterpret_cast<PFN_vkCreatePipelineLayout>(get_device_proc(native.device, "vkCreatePipelineLayout"));
+        const auto create_command_pool = reinterpret_cast<PFN_vkCreateCommandPool>(get_device_proc(native.device, "vkCreateCommandPool"));
+        const auto allocate_command_buffers =
+            reinterpret_cast<PFN_vkAllocateCommandBuffers>(get_device_proc(native.device, "vkAllocateCommandBuffers"));
+        const auto begin_command_buffer =
+            reinterpret_cast<PFN_vkBeginCommandBuffer>(get_device_proc(native.device, "vkBeginCommandBuffer"));
+        const auto end_command_buffer = reinterpret_cast<PFN_vkEndCommandBuffer>(get_device_proc(native.device, "vkEndCommandBuffer"));
+        const auto cmd_bind_descriptor_buffers =
+            reinterpret_cast<PFN_vkCmdBindDescriptorBuffersEXT>(get_device_proc(native.device, "vkCmdBindDescriptorBuffersEXT"));
+        const auto cmd_set_descriptor_buffer_offsets =
+            reinterpret_cast<PFN_vkCmdSetDescriptorBufferOffsetsEXT>(get_device_proc(native.device, "vkCmdSetDescriptorBufferOffsetsEXT"));
         native.destroy_sampler = reinterpret_cast<PFN_vkDestroySampler>(get_device_proc(native.device, "vkDestroySampler"));
         native.destroy_layout =
             reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(get_device_proc(native.device, "vkDestroyDescriptorSetLayout"));
@@ -508,6 +557,15 @@ namespace sogen::test
         const auto get_buffer_address =
             reinterpret_cast<PFN_vkGetBufferDeviceAddress>(get_device_proc(native.device, "vkGetBufferDeviceAddress"));
         ASSERT_NE(native.destroy_device, nullptr);
+        ASSERT_NE(native.destroy_pipeline_layout, nullptr);
+        ASSERT_NE(native.destroy_command_pool, nullptr);
+        ASSERT_NE(create_pipeline_layout, nullptr);
+        ASSERT_NE(create_command_pool, nullptr);
+        ASSERT_NE(allocate_command_buffers, nullptr);
+        ASSERT_NE(begin_command_buffer, nullptr);
+        ASSERT_NE(end_command_buffer, nullptr);
+        ASSERT_NE(cmd_bind_descriptor_buffers, nullptr);
+        ASSERT_NE(cmd_set_descriptor_buffer_offsets, nullptr);
         ASSERT_NE(native.destroy_sampler, nullptr);
         ASSERT_NE(native.destroy_layout, nullptr);
         ASSERT_NE(native.destroy_buffer, nullptr);
@@ -575,7 +633,8 @@ namespace sogen::test
         VkBufferCreateInfo buffer_info{};
         buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         buffer_info.size = 256;
-        buffer_info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        buffer_info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                            VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT | VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT;
         buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ASSERT_EQ(create_buffer(native.device, &buffer_info, nullptr, &native.buffer), VK_SUCCESS);
         VkMemoryRequirements requirements{};
@@ -607,6 +666,40 @@ namespace sogen::test
         address_info.buffer = native.buffer;
         const VkDeviceAddress buffer_address = get_buffer_address(native.device, &address_info);
         ASSERT_NE(buffer_address, 0u);
+
+        VkPipelineLayoutCreateInfo pipeline_layout_info{};
+        pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipeline_layout_info.setLayoutCount = 1;
+        pipeline_layout_info.pSetLayouts = &native.layout;
+        ASSERT_EQ(create_pipeline_layout(native.device, &pipeline_layout_info, nullptr, &native.pipeline_layout), VK_SUCCESS);
+        VkCommandPoolCreateInfo pool_info{};
+        pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_info.queueFamilyIndex = queue_family;
+        ASSERT_EQ(create_command_pool(native.device, &pool_info, nullptr, &native.command_pool), VK_SUCCESS);
+        VkCommandBufferAllocateInfo command_info{};
+        command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        command_info.commandPool = native.command_pool;
+        command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        command_info.commandBufferCount = 1;
+        VkCommandBuffer command_buffer{};
+        ASSERT_EQ(allocate_command_buffers(native.device, &command_info, &command_buffer), VK_SUCCESS);
+        VkCommandBufferBeginInfo begin_info{};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        ASSERT_EQ(begin_command_buffer(command_buffer, &begin_info), VK_SUCCESS);
+        VkDescriptorBufferBindingInfoEXT binding_info{};
+        binding_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT;
+        binding_info.address = buffer_address;
+        binding_info.usage = VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT | VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT;
+        cmd_bind_descriptor_buffers(command_buffer, 1, &binding_info);
+        const uint32_t buffer_index = 0;
+        const VkDeviceSize descriptor_offset = 0;
+        cmd_set_descriptor_buffer_offsets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, native.pipeline_layout, 0, 1, &buffer_index,
+                                          &descriptor_offset);
+        ASSERT_EQ(end_command_buffer(command_buffer), VK_SUCCESS);
+        std::cout << "Native " << device_properties.deviceName
+                  << " recorded vkCmdBindDescriptorBuffersEXT and "
+                     "vkCmdSetDescriptorBufferOffsetsEXT with address="
+                  << std::hex << buffer_address << std::dec << " layoutSize=" << layout_size << " offset=" << descriptor_offset << '\n';
 
         VkDescriptorAddressInfoEXT uniform_address{};
         uniform_address.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT;

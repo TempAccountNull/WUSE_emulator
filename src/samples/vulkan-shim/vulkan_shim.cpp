@@ -12,6 +12,10 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
+#include <iterator>
+#include <ranges>
+#include <span>
 #include <array>
 #include <bit>
 #include <cstdio>
@@ -38,6 +42,10 @@
 #include <vk_queue_submit.hpp>
 #include <vk_dynamic_state.hpp>
 #include <vk_descriptor_buffer_wire.hpp>
+#include <vk_debug_utils_callback_relay.hpp>
+#include <vk_debug_utils_command_wire.hpp>
+#include <vk_debug_utils_messenger_wire.hpp>
+#include <vk_debug_utils_wire.hpp>
 
 namespace gb = sogen::gpu_bridge;
 namespace dbw = sogen::gpu_bridge::descriptor_buffer_wire;
@@ -67,6 +75,8 @@ namespace
     HMODULE g_real_loader = nullptr;
 
     void shim_log(const char* message); // defined below
+    std::atomic_uint32_t g_debug_callback_count{};
+    void drain_debug_utils_callbacks(); // defined in vulkan_shim_debug_utils.inc
 
     HMODULE self_module()
     {
@@ -174,6 +184,10 @@ namespace
             {
                 *bytes_returned = returned;
             }
+            // The native callback was deep-copied while this IOCTL held the emulator lock.
+            // Invoke it now, on the originating guest thread, before returning to the game.
+            if (code != gb::ioctl_update_descriptor_sets_batch && code != gb::ioctl_debug_utils_poll)
+                drain_debug_utils_callbacks();
             return true;
         }
 
@@ -547,6 +561,7 @@ namespace
 }
 
 #include "native_wsi_shim.inc"
+#include "vulkan_shim_debug_utils.inc"
 
 extern "C"
 {
@@ -570,8 +585,41 @@ extern "C"
             }
         }
 
+        bool debug_enabled = false;
+        if (pCreateInfo && pCreateInfo->ppEnabledExtensionNames)
+        {
+            for (uint32_t index = 0; index < pCreateInfo->enabledExtensionCount; ++index)
+                debug_enabled |= pCreateInfo->ppEnabledExtensionNames[index] &&
+                                 std::strcmp(pCreateInfo->ppEnabledExtensionNames[index], VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
+        }
+        if (debug_enabled && !debug_utils_supported_by_bridge())
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        std::vector<std::byte> creation_callback;
+        if (debug_enabled && pCreateInfo)
+        {
+            uint32_t chain_length = 0;
+            for (auto* next = static_cast<const VkBaseInStructure*>(pCreateInfo->pNext); next && chain_length++ < 256; next = next->pNext)
+            {
+                if (next->sType != VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT) continue;
+                auto callback = *reinterpret_cast<const VkDebugUtilsMessengerCreateInfoEXT*>(next);
+                callback.pNext = nullptr;
+                try { creation_callback = gb::debug_utils_messenger_wire::marshal_create(0, 0, callback, sizeof(void*)); }
+                catch (const std::exception&) { return VK_ERROR_INITIALIZATION_FAILED; }
+                break;
+            }
+            if (chain_length >= 256) return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        gb::debug_utils_instance_request header{.enabled = debug_enabled ? 1u : 0u,
+                                                .callback_size = static_cast<uint32_t>(creation_callback.size())};
+        std::vector<std::byte> packet(sizeof(header) + creation_callback.size());
+        std::memcpy(packet.data(), &header, sizeof(header));
+        if (!creation_callback.empty()) std::memcpy(packet.data() + sizeof(header), creation_callback.data(), creation_callback.size());
+        if (!creation_callback.empty()) g_debug_callback_count.fetch_add(1, std::memory_order_release);
         gb::create_instance_response response{};
-        if (!bridge_call(gb::ioctl_create_instance, nullptr, 0, &response, sizeof(response)))
+        const bool created = bridge_call(gb::ioctl_create_instance, packet.data(), static_cast<DWORD>(packet.size()),
+                                         &response, sizeof(response));
+        if (!creation_callback.empty()) g_debug_callback_count.fetch_sub(1, std::memory_order_release);
+        if (!created)
         {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
@@ -582,6 +630,12 @@ extern "C"
         }
 
         *pInstance = to_handle<VkInstance>(response.instance);
+        if (debug_enabled)
+        {
+            std::lock_guard lock(g_debug_utils_mutex);
+            g_debug_utils_instances.insert(response.instance);
+            if (!creation_callback.empty()) g_debug_utils_creation_callbacks.insert(response.instance);
+        }
         return VK_SUCCESS;
     }
 
@@ -595,7 +649,32 @@ extern "C"
 
         gb::destroy_instance_request request{};
         request.instance = to_object_id(instance);
+        bool chained_callback = false;
+        {
+            std::lock_guard lock(g_debug_utils_mutex);
+            chained_callback = g_debug_utils_creation_callbacks.contains(request.instance);
+        }
+        if (chained_callback) g_debug_callback_count.fetch_add(1, std::memory_order_release);
         bridge_call(gb::ioctl_destroy_instance, &request, sizeof(request), nullptr, 0);
+        if (chained_callback) g_debug_callback_count.fetch_sub(1, std::memory_order_release);
+        {
+            std::lock_guard lock(g_debug_utils_mutex);
+            g_debug_utils_instances.erase(request.instance);
+            g_debug_utils_creation_callbacks.erase(request.instance);
+            for (auto item = g_debug_utils_devices.begin(); item != g_debug_utils_devices.end();)
+                item = item->second == request.instance ? g_debug_utils_devices.erase(item) : std::next(item);
+            for (auto item = g_debug_utils_physical_instances.begin(); item != g_debug_utils_physical_instances.end();)
+                item = item->second == request.instance ? g_debug_utils_physical_instances.erase(item) : std::next(item);
+            for (auto item = g_debug_utils_messengers.begin(); item != g_debug_utils_messengers.end();)
+            {
+                if (item->second == request.instance)
+                {
+                    g_debug_callback_count.fetch_sub(1, std::memory_order_release);
+                    item = g_debug_utils_messengers.erase(item);
+                }
+                else ++item;
+            }
+        }
     }
 
     // The instance-level enumeration commands are resolved (and required) by loaders such as DXVK
@@ -676,8 +755,10 @@ extern "C"
             {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_SURFACE_SPEC_VERSION},
             {VK_KHR_WIN32_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_SPEC_VERSION},
             {VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME, VK_KHR_GET_SURFACE_CAPABILITIES_2_SPEC_VERSION},
+            {VK_EXT_DEBUG_UTILS_EXTENSION_NAME, VK_EXT_DEBUG_UTILS_SPEC_VERSION},
         };
-        const uint32_t available = native_wsi_enabled() ? 3u : 2u;
+        const uint32_t base = native_wsi_enabled() ? 3u : 2u;
+        const uint32_t available = base + (debug_utils_supported_by_bridge() ? 1u : 0u);
 
         if (!pPropertyCount)
         {
@@ -693,7 +774,7 @@ extern "C"
         const uint32_t to_copy = std::min(*pPropertyCount, available);
         for (uint32_t i = 0; i < to_copy; ++i)
         {
-            pProperties[i] = extensions[i];
+            pProperties[i] = i == base ? extensions[3] : extensions[i];
         }
         *pPropertyCount = to_copy;
         return to_copy < available ? VK_INCOMPLETE : VK_SUCCESS;
@@ -734,6 +815,8 @@ extern "C"
         for (uint32_t i = 0; i < written; ++i)
         {
             pDevices[i] = to_handle<VkPhysicalDevice>(ids[i]);
+            std::lock_guard lock(g_debug_utils_mutex);
+            g_debug_utils_physical_instances[ids[i]] = request.instance;
         }
 
         *pCount = written;
@@ -931,6 +1014,12 @@ extern "C"
         }
 
         *pDevice = to_handle<VkDevice>(response.device);
+        {
+            std::lock_guard lock(g_debug_utils_mutex);
+            const auto origin = g_debug_utils_physical_instances.find(request.physical_device);
+            if (origin != g_debug_utils_physical_instances.end() && g_debug_utils_instances.contains(origin->second))
+                g_debug_utils_devices.emplace(response.device, origin->second);
+        }
         if (buffer_marker_enabled)
         {
             std::lock_guard lock(g_buffer_marker_devices_mutex);
@@ -956,6 +1045,10 @@ extern "C"
 
     __declspec(dllexport) VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice device, const VkAllocationCallbacks*)
     {
+        {
+            std::lock_guard lock(g_debug_utils_mutex);
+            g_debug_utils_devices.erase(to_object_id(device));
+        }
         {
             std::lock_guard lock(g_descriptor_buffer_devices_mutex);
             g_descriptor_buffer_devices.erase(to_object_id(device));
@@ -6990,6 +7083,101 @@ extern "C"
                            pPushConstantsInfo->size, pPushConstantsInfo->pValues);
     }
 
+    VKAPI_ATTR void VKAPI_CALL vkCmdBindDescriptorBuffersEXT(VkCommandBuffer commandBuffer, uint32_t bufferCount,
+                                                             const VkDescriptorBufferBindingInfoEXT* pBindingInfos)
+    {
+        const auto command_id = to_object_id(commandBuffer);
+        if (bufferCount > gb::max_descriptor_buffer_bindings || (bufferCount && !pBindingInfos))
+        {
+            fail_recorded_command(command_id, VK_ERROR_VALIDATION_FAILED_EXT);
+            return;
+        }
+        std::vector<gb::descriptor_buffer_binding_wire> bindings;
+        bindings.reserve(bufferCount);
+        for (uint32_t i = 0; i < bufferCount; ++i)
+        {
+            const auto& source = pBindingInfos[i];
+            if (source.sType != VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT)
+            {
+                fail_recorded_command(command_id, VK_ERROR_VALIDATION_FAILED_EXT);
+                return;
+            }
+            gb::descriptor_buffer_binding_wire entry{};
+            entry.address = source.address;
+            entry.usage = source.usage;
+            entry.usage_2 = source.usage;
+            uint32_t chain_count = 0;
+            for (const auto* next = static_cast<const VkBaseInStructure*>(source.pNext); next; next = next->pNext)
+            {
+                if (++chain_count > 2)
+                {
+                    fail_recorded_command(command_id, VK_ERROR_VALIDATION_FAILED_EXT);
+                    return;
+                }
+                if (next->sType == VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO &&
+                    !(entry.flags & gb::descriptor_binding_has_usage_2))
+                {
+                    entry.flags |= gb::descriptor_binding_has_usage_2;
+                    entry.usage_2 = reinterpret_cast<const VkBufferUsageFlags2CreateInfo*>(next)->usage;
+                }
+                else if (next->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_PUSH_DESCRIPTOR_BUFFER_HANDLE_EXT &&
+                         !(entry.flags & gb::descriptor_binding_has_push_buffer))
+                {
+                    entry.flags |= gb::descriptor_binding_has_push_buffer;
+                    entry.push_buffer =
+                        to_object_id(reinterpret_cast<const VkDescriptorBufferBindingPushDescriptorBufferHandleEXT*>(next)->buffer);
+                }
+                else
+                {
+                    fail_recorded_command(command_id, VK_ERROR_VALIDATION_FAILED_EXT);
+                    return;
+                }
+            }
+            bindings.push_back(entry);
+        }
+        const gb::cmd_bind_descriptor_buffers_request request{.command_buffer = command_id, .binding_count = bufferCount, .reserved = 0};
+        std::vector<std::byte> packet(sizeof(request) + bindings.size() * sizeof(bindings.front()));
+        std::memcpy(packet.data(), &request, sizeof(request));
+        if (!bindings.empty())
+        {
+            std::memcpy(packet.data() + sizeof(request), bindings.data(), bindings.size() * sizeof(bindings.front()));
+        }
+        record_command(command_id, gb::command::cmd_bind_descriptor_buffers, packet.data(), packet.size());
+    }
+
+    VKAPI_ATTR void VKAPI_CALL vkCmdSetDescriptorBufferOffsetsEXT(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint,
+                                                                  VkPipelineLayout layout, uint32_t firstSet, uint32_t setCount,
+                                                                  const uint32_t* pBufferIndices, const VkDeviceSize* pOffsets)
+    {
+        const auto command_id = to_object_id(commandBuffer);
+        if (setCount > gb::max_descriptor_buffer_bindings || (setCount && (!pBufferIndices || !pOffsets)) ||
+            firstSet > UINT32_MAX - setCount)
+        {
+            fail_recorded_command(command_id, VK_ERROR_VALIDATION_FAILED_EXT);
+            return;
+        }
+        const gb::cmd_set_descriptor_buffer_offsets_request request{
+            .command_buffer = command_id,
+            .pipeline_layout = to_object_id(layout),
+            .bind_point = static_cast<uint32_t>(pipelineBindPoint),
+            .first_set = firstSet,
+            .set_count = setCount,
+            .reserved = 0,
+        };
+        std::vector<gb::descriptor_buffer_offset_wire> offsets(setCount);
+        for (uint32_t i = 0; i < setCount; ++i)
+        {
+            offsets[i] = {.buffer_index = pBufferIndices[i], .reserved = 0, .offset = pOffsets[i]};
+        }
+        std::vector<std::byte> packet(sizeof(request) + offsets.size() * sizeof(offsets.front()));
+        std::memcpy(packet.data(), &request, sizeof(request));
+        if (!offsets.empty())
+        {
+            std::memcpy(packet.data() + sizeof(request), offsets.data(), offsets.size() * sizeof(offsets.front()));
+        }
+        record_command(command_id, gb::command::cmd_set_descriptor_buffer_offsets, packet.data(), packet.size());
+    }
+
     VKAPI_ATTR void VKAPI_CALL vkGetDescriptorSetLayoutSizeEXT(VkDevice device, VkDescriptorSetLayout layout,
                                                                VkDeviceSize* pLayoutSizeInBytes)
     {
@@ -7172,6 +7360,10 @@ extern "C"
             return g_real_get_instance_proc_addr(instance, pName);
         }
 
+        if (debug_utils_function_name(pName) &&
+            (!instance || !debug_utils_instance_enabled(to_object_id(instance))))
+            return nullptr;
+
         struct entry
         {
             const char* name;
@@ -7182,6 +7374,17 @@ extern "C"
             {.name = "vkGetInstanceProcAddr", .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetInstanceProcAddr)},
             {.name = "vkGetDeviceProcAddr", .func = reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceProcAddr)},
             {.name = "vkCreateInstance", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateInstance)},
+            {.name = "vkCreateDebugUtilsMessengerEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCreateDebugUtilsMessengerEXT)},
+            {.name = "vkDestroyDebugUtilsMessengerEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyDebugUtilsMessengerEXT)},
+            {.name = "vkSubmitDebugUtilsMessageEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkSubmitDebugUtilsMessageEXT)},
+            {.name = "vkSetDebugUtilsObjectNameEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkSetDebugUtilsObjectNameEXT)},
+            {.name = "vkSetDebugUtilsObjectTagEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkSetDebugUtilsObjectTagEXT)},
+            {.name = "vkQueueBeginDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkQueueBeginDebugUtilsLabelEXT)},
+            {.name = "vkQueueInsertDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkQueueInsertDebugUtilsLabelEXT)},
+            {.name = "vkQueueEndDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkQueueEndDebugUtilsLabelEXT)},
+            {.name = "vkCmdBeginDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdBeginDebugUtilsLabelEXT)},
+            {.name = "vkCmdInsertDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdInsertDebugUtilsLabelEXT)},
+            {.name = "vkCmdEndDebugUtilsLabelEXT", .func = reinterpret_cast<PFN_vkVoidFunction>(vkCmdEndDebugUtilsLabelEXT)},
             {.name = "vkDestroyInstance", .func = reinterpret_cast<PFN_vkVoidFunction>(vkDestroyInstance)},
             {.name = "vkEnumerateInstanceVersion", .func = reinterpret_cast<PFN_vkVoidFunction>(vkEnumerateInstanceVersion)},
             {.name = "vkEnumerateInstanceLayerProperties",
@@ -7610,18 +7813,52 @@ extern "C"
                                                : g_real_get_instance_proc_addr(VK_NULL_HANDLE, pName);
         }
 
-        if (pName && (std::strcmp(pName, "vkGetDescriptorEXT") == 0 ||
-                      std::strcmp(pName, "vkGetDescriptorSetLayoutSizeEXT") == 0 ||
-                      std::strcmp(pName, "vkGetDescriptorSetLayoutBindingOffsetEXT") == 0))
+        if (debug_utils_function_name(pName) && !debug_utils_device_enabled(to_object_id(device)))
+            return nullptr;
+        if (pName && debug_utils_function_name(pName))
+        {
+            struct named_function { const char* name; PFN_vkVoidFunction function; };
+            static const named_function functions[] = {
+                {"vkSetDebugUtilsObjectNameEXT", reinterpret_cast<PFN_vkVoidFunction>(vkSetDebugUtilsObjectNameEXT)},
+                {"vkSetDebugUtilsObjectTagEXT", reinterpret_cast<PFN_vkVoidFunction>(vkSetDebugUtilsObjectTagEXT)},
+                {"vkQueueBeginDebugUtilsLabelEXT", reinterpret_cast<PFN_vkVoidFunction>(vkQueueBeginDebugUtilsLabelEXT)},
+                {"vkQueueInsertDebugUtilsLabelEXT", reinterpret_cast<PFN_vkVoidFunction>(vkQueueInsertDebugUtilsLabelEXT)},
+                {"vkQueueEndDebugUtilsLabelEXT", reinterpret_cast<PFN_vkVoidFunction>(vkQueueEndDebugUtilsLabelEXT)},
+                {"vkCmdBeginDebugUtilsLabelEXT", reinterpret_cast<PFN_vkVoidFunction>(vkCmdBeginDebugUtilsLabelEXT)},
+                {"vkCmdInsertDebugUtilsLabelEXT", reinterpret_cast<PFN_vkVoidFunction>(vkCmdInsertDebugUtilsLabelEXT)},
+                {"vkCmdEndDebugUtilsLabelEXT", reinterpret_cast<PFN_vkVoidFunction>(vkCmdEndDebugUtilsLabelEXT)},
+            };
+            for (const auto& function : functions)
+                if (std::strcmp(pName, function.name) == 0) return function.function;
+            return nullptr;
+        }
+        if (pName &&
+            (std::strcmp(pName, "vkGetDescriptorEXT") == 0 || std::strcmp(pName, "vkGetDescriptorSetLayoutSizeEXT") == 0 ||
+             std::strcmp(pName, "vkGetDescriptorSetLayoutBindingOffsetEXT") == 0 ||
+             std::strcmp(pName, "vkCmdBindDescriptorBuffersEXT") == 0 || std::strcmp(pName, "vkCmdSetDescriptorBufferOffsetsEXT") == 0))
         {
             std::lock_guard lock(g_descriptor_buffer_devices_mutex);
             if (!g_descriptor_buffer_devices.contains(to_object_id(device)))
+            {
                 return nullptr;
+            }
             if (std::strcmp(pName, "vkGetDescriptorEXT") == 0)
+            {
                 return reinterpret_cast<PFN_vkVoidFunction>(vkGetDescriptorEXT);
+            }
             if (std::strcmp(pName, "vkGetDescriptorSetLayoutSizeEXT") == 0)
+            {
                 return reinterpret_cast<PFN_vkVoidFunction>(vkGetDescriptorSetLayoutSizeEXT);
-            return reinterpret_cast<PFN_vkVoidFunction>(vkGetDescriptorSetLayoutBindingOffsetEXT);
+            }
+            if (std::strcmp(pName, "vkGetDescriptorSetLayoutBindingOffsetEXT") == 0)
+            {
+                return reinterpret_cast<PFN_vkVoidFunction>(vkGetDescriptorSetLayoutBindingOffsetEXT);
+            }
+            if (std::strcmp(pName, "vkCmdBindDescriptorBuffersEXT") == 0)
+            {
+                return reinterpret_cast<PFN_vkVoidFunction>(vkCmdBindDescriptorBuffersEXT);
+            }
+            return reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetDescriptorBufferOffsetsEXT);
         }
         if (pName && (std::strcmp(pName, "vkCmdWriteBufferMarkerAMD") == 0 || std::strcmp(pName, "vkCmdWriteBufferMarker2AMD") == 0))
         {

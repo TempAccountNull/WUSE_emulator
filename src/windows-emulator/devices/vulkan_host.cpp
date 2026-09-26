@@ -12,6 +12,8 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+#include <type_traits>
+#include <utility>
 #include <ranges>
 
 #define VK_NO_PROTOTYPES
@@ -19,6 +21,9 @@
 
 #include <gpu_bridge_protocol.hpp>
 #include <vk_descriptor_buffer_wire.hpp>
+#include <vk_debug_utils_command_wire.hpp>
+#include <vk_debug_utils_messenger_wire.hpp>
+#include <vk_debug_utils_wire.hpp>
 #include <native_wsi_wire.hpp>
 #include "native_present_sync.hpp"
 #include <chrono>
@@ -46,6 +51,7 @@ namespace sogen
 {
     namespace
     {
+        thread_local uint32_t debug_utils_current_guest_thread{};
         // Extensions whose entry points the bridge does not marshal. They must never reach the guest: a guest
         // that sees them enables them and then calls into nothing. DXVK, for instance, creates shared textures
         // as soon as it sees VK_KHR_external_memory_win32 and crashes when the shim has no implementation.
@@ -238,8 +244,48 @@ namespace sogen
         PFN_vkCreateInstance create_instance{};
         PFN_vkEnumerateInstanceVersion enumerate_instance_version{};
 
+        struct debug_callback_state
+        {
+            impl* owner{};
+            uint64_t instance_id{};
+            uint64_t callback_address{};
+            uint64_t user_data{};
+            uint32_t guest_pointer_bytes{};
+        };
+
+        static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                                                              VkDebugUtilsMessageTypeFlagsEXT types,
+                                                              const VkDebugUtilsMessengerCallbackDataEXT* data,
+                                                              void* opaque)
+        {
+            auto* state = static_cast<debug_callback_state*>(opaque);
+            if (!state || !data || !state->owner || !state->owner->debug_sink || !debug_utils_current_guest_thread)
+                return VK_FALSE;
+            try
+            {
+                vulkan_host::debug_utils_delivery delivery{};
+                delivery.guest_thread_id = debug_utils_current_guest_thread;
+                delivery.instance_id = state->instance_id;
+                delivery.callback_address = state->callback_address;
+                delivery.user_data = state->user_data;
+                delivery.guest_pointer_bytes = state->guest_pointer_bytes;
+                delivery.packet = gpu_bridge::debug_utils_wire::encode(severity, types, *data);
+                if (!state->owner->debug_sink(std::move(delivery)))
+                    std::fprintf(stderr, "[gpu-bridge] debug-utils callback queue full; message not delivered\n");
+            }
+            catch (...)
+            {
+                std::fprintf(stderr, "[gpu-bridge] debug-utils callback serialization failed\n");
+            }
+            return VK_FALSE;
+        }
+
+        debug_utils_sink debug_sink;
+
         struct instance_data
         {
+            bool debug_utils_enabled{};
+            std::shared_ptr<debug_callback_state> creation_callback;
             VkInstance handle{};
             uint32_t api_version{};
             bool native_surface_khr{}, native_surface_ext{};
@@ -413,6 +459,8 @@ namespace sogen
             PFN_vkGetDescriptorEXT get_descriptor{};
             PFN_vkGetDescriptorSetLayoutSizeEXT get_descriptor_set_layout_size{};
             PFN_vkGetDescriptorSetLayoutBindingOffsetEXT get_descriptor_set_layout_binding_offset{};
+            PFN_vkCmdBindDescriptorBuffersEXT cmd_bind_descriptor_buffers{};
+            PFN_vkCmdSetDescriptorBufferOffsetsEXT cmd_set_descriptor_buffer_offsets{};
             VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer_properties{};
             bool descriptor_buffer_extension{};
             bool descriptor_buffer_feature{};
@@ -524,6 +572,14 @@ namespace sogen
             bool present_in_flight{};
         };
 
+        struct messenger_data
+        {
+            VkDebugUtilsMessengerEXT handle{};
+            uint64_t instance_id{};
+            std::shared_ptr<debug_callback_state> callback;
+        };
+
+        std::unordered_map<uint64_t, messenger_data> messengers;
         std::unordered_map<uint64_t, instance_data> instances;
         std::unordered_map<uint64_t, physical_device_data> physical_devices;
         std::unordered_map<VkPhysicalDevice, uint64_t> physical_device_ids;
@@ -556,6 +612,7 @@ namespace sogen
             uint64_t device_id{};
             uint64_t pool_id{};
             std::vector<indirect_draw_page> multi_draw_pages;
+            std::vector<VkDeviceSize> descriptor_buffer_remaining_bytes;
         };
 
         struct fence_data
@@ -671,6 +728,7 @@ namespace sogen
         {
             VkPipelineLayout handle{};
             uint64_t device_id{};
+            std::vector<uint32_t> descriptor_set_flags;
         };
 
         struct pipeline_data
@@ -1437,6 +1495,14 @@ namespace sogen
                 }
             }
 
+            for (auto& [id, messenger] : this->messengers)
+            {
+                const auto instance = this->instances.find(messenger.instance_id);
+                if (instance == this->instances.end()) continue;
+                const auto destroy = this->load_instance_proc<PFN_vkDestroyDebugUtilsMessengerEXT>(
+                    instance->second.handle, "vkDestroyDebugUtilsMessengerEXT");
+                if (destroy) destroy(instance->second.handle, messenger.handle, nullptr);
+            }
             for (auto& [id, instance] : this->instances)
             {
                 if (instance.handle && instance.destroy_instance)
@@ -1533,13 +1599,43 @@ namespace sogen
         return this->impl_->create_instance != nullptr;
     }
 
-    int32_t vulkan_host::create_instance(uint64_t& out_instance)
+    int32_t vulkan_host::create_instance(uint64_t& out_instance, bool debug_utils_enabled,
+                                         std::span<const std::byte> creation_callback_packet)
     {
         out_instance = 0;
 
         if (!this->available())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        if (debug_utils_enabled && !this->debug_utils_available())
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        std::shared_ptr<impl::debug_callback_state> creation_callback;
+        VkDebugUtilsMessengerCreateInfoEXT callback_info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+        if (!creation_callback_packet.empty())
+        {
+            if (!debug_utils_enabled) return VK_ERROR_EXTENSION_NOT_PRESENT;
+            try
+            {
+                const auto request = gpu_bridge::debug_utils_messenger_wire::decode(creation_callback_packet);
+                if (request.op != gpu_bridge::debug_utils_messenger_wire::operation::create ||
+                    !(request.flags & gpu_bridge::debug_utils_messenger_wire::flag_instance_chain))
+                    return VK_ERROR_INITIALIZATION_FAILED;
+                creation_callback = std::make_shared<impl::debug_callback_state>();
+                creation_callback->owner = this->impl_.get();
+                creation_callback->callback_address = request.callback_address;
+                creation_callback->user_data = request.user_data;
+                creation_callback->guest_pointer_bytes = request.guest_pointer_bytes;
+                callback_info.messageSeverity = request.severity;
+                callback_info.messageType = request.types;
+                callback_info.pfnUserCallback = impl::debug_callback;
+                callback_info.pUserData = creation_callback.get();
+            }
+            catch (const std::exception&)
+            {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
         }
 
         uint32_t api_version = VK_API_VERSION_1_0;
@@ -1576,6 +1672,12 @@ namespace sogen
             create_info.ppEnabledExtensionNames = native_extensions.names.data();
         }
 
+        if (debug_utils_enabled)
+            native_extensions.names.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        create_info.enabledExtensionCount = static_cast<uint32_t>(native_extensions.names.size());
+        create_info.ppEnabledExtensionNames = native_extensions.names.data();
+        if (creation_callback) create_info.pNext = &callback_info;
+
         VkInstance instance{};
         const VkResult result = this->impl_->create_instance(&create_info, nullptr, &instance);
         if (result != VK_SUCCESS)
@@ -1586,6 +1688,8 @@ namespace sogen
         impl::instance_data data{};
         data.handle = instance;
         data.api_version = api_version;
+        data.debug_utils_enabled = debug_utils_enabled;
+        data.creation_callback = std::move(creation_callback);
         data.native_surface_khr = native_extensions.khr;
         data.native_surface_ext = native_extensions.ext;
         data.destroy_instance = this->impl_->load_instance_proc<PFN_vkDestroyInstance>(instance, "vkDestroyInstance");
@@ -1628,7 +1732,8 @@ namespace sogen
         data.get_device_proc_addr = this->impl_->load_instance_proc<PFN_vkGetDeviceProcAddr>(instance, "vkGetDeviceProcAddr");
 
         const uint64_t id = this->impl_->next_id++;
-        this->impl_->instances.emplace(id, data);
+        if (data.creation_callback) data.creation_callback->instance_id = id;
+        this->impl_->instances.emplace(id, std::move(data));
         out_instance = id;
         return VK_SUCCESS;
     }
@@ -1694,6 +1799,18 @@ namespace sogen
                     ++surface;
                 }
             }
+        }
+
+        for (auto messenger = this->impl_->messengers.begin(); messenger != this->impl_->messengers.end();)
+        {
+            if (messenger->second.instance_id == instance)
+            {
+                const auto destroy = this->impl_->load_instance_proc<PFN_vkDestroyDebugUtilsMessengerEXT>(
+                    it->second.handle, "vkDestroyDebugUtilsMessengerEXT");
+                if (destroy) destroy(it->second.handle, messenger->second.handle, nullptr);
+                messenger = this->impl_->messengers.erase(messenger);
+            }
+            else ++messenger;
         }
 
         if (it->second.handle && it->second.destroy_instance)
@@ -2996,6 +3113,10 @@ namespace sogen
                     reinterpret_cast<PFN_vkGetDescriptorSetLayoutSizeEXT>(resolve("vkGetDescriptorSetLayoutSizeEXT"));
                 data.get_descriptor_set_layout_binding_offset = reinterpret_cast<PFN_vkGetDescriptorSetLayoutBindingOffsetEXT>(
                     resolve("vkGetDescriptorSetLayoutBindingOffsetEXT"));
+                data.cmd_bind_descriptor_buffers =
+                    reinterpret_cast<PFN_vkCmdBindDescriptorBuffersEXT>(resolve("vkCmdBindDescriptorBuffersEXT"));
+                data.cmd_set_descriptor_buffer_offsets =
+                    reinterpret_cast<PFN_vkCmdSetDescriptorBufferOffsetsEXT>(resolve("vkCmdSetDescriptorBufferOffsetsEXT"));
             }
             data.get_descriptor_set_layout_support =
                 reinterpret_cast<PFN_vkGetDescriptorSetLayoutSupport>(resolve("vkGetDescriptorSetLayoutSupport"));
@@ -3329,7 +3450,10 @@ namespace sogen
 
         const VkResult result = dev->second.begin_command_buffer(cb->second.handle, &info);
         if (result == VK_SUCCESS)
+        {
             impl::release_indirect_pages(dev->second, cb->second);
+            cb->second.descriptor_buffer_remaining_bytes.clear();
+        }
         return result;
     }
 
@@ -3411,7 +3535,10 @@ namespace sogen
             for (auto& [id, cb] : this->impl_->command_buffers)
             {
                 if (cb.pool_id == pool)
+                {
                     impl::release_indirect_pages(dev->second, cb);
+                    cb.descriptor_buffer_remaining_bytes.clear();
+                }
             }
         }
         return result;
@@ -3437,7 +3564,10 @@ namespace sogen
 
         const VkResult result = dev->second.reset_command_buffer(cb->second.handle, flags);
         if (result == VK_SUCCESS)
+        {
             impl::release_indirect_pages(dev->second, cb->second);
+            cb->second.descriptor_buffer_remaining_bytes.clear();
+        }
         return result;
     }
 
@@ -7532,7 +7662,16 @@ namespace sogen
         }
 
         const uint64_t id = this->impl_->next_id++;
-        this->impl_->pipeline_layouts.emplace(id, impl::pipeline_layout_data{.handle = layout, .device_id = device});
+        impl::pipeline_layout_data retained{.handle = layout, .device_id = device};
+        if (dev->second.descriptor_buffer_extension && dev->second.descriptor_buffer_feature)
+        {
+            retained.descriptor_set_flags.reserve(set_layouts.size());
+            for (const uint64_t layout_id : set_layouts)
+            {
+                retained.descriptor_set_flags.push_back(this->impl_->descriptor_set_layouts.at(layout_id).flags);
+            }
+        }
+        this->impl_->pipeline_layouts.emplace(id, std::move(retained));
         out_layout = id;
         return VK_SUCCESS;
     }
@@ -7927,6 +8066,194 @@ namespace sogen
             return VK_ERROR_VALIDATION_FAILED_EXT;
         }
         dev->second.get_descriptor_set_layout_binding_offset(dev->second.handle, set_layout->second.handle, binding, &out_offset);
+        return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::cmd_bind_descriptor_buffers(uint64_t command_buffer, std::span<const std::byte> wire, uint32_t binding_count)
+    {
+        using entry_t = gpu_bridge::descriptor_buffer_binding_wire;
+        if (binding_count > gpu_bridge::max_descriptor_buffer_bindings ||
+            wire.size() != static_cast<size_t>(binding_count) * sizeof(entry_t))
+        {
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
+        const auto cb = this->impl_->command_buffers.find(command_buffer);
+        if (cb == this->impl_->command_buffers.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev == this->impl_->devices.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
+        const auto& native = dev->second;
+        if (!native.descriptor_buffer_extension || !native.descriptor_buffer_feature || !native.cmd_bind_descriptor_buffers ||
+            !native.get_buffer_device_address)
+        {
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+        const auto& properties = native.descriptor_buffer_properties;
+        if (binding_count > properties.maxDescriptorBufferBindings || properties.descriptorBufferOffsetAlignment == 0)
+        {
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
+
+        std::vector<VkDescriptorBufferBindingInfoEXT> bindings(binding_count);
+        std::vector<VkBufferUsageFlags2CreateInfo> usage2(binding_count);
+        std::vector<VkDescriptorBufferBindingPushDescriptorBufferHandleEXT> push_handles(binding_count);
+        std::vector<VkDeviceSize> remaining(binding_count);
+        constexpr VkBufferUsageFlags descriptor_mask = VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
+                                                       VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+                                                       VK_BUFFER_USAGE_PUSH_DESCRIPTORS_DESCRIPTOR_BUFFER_BIT_EXT;
+        uint32_t sampler_count = 0, resource_count = 0, push_count = 0;
+        for (uint32_t i = 0; i < binding_count; ++i)
+        {
+            entry_t entry{};
+            std::memcpy(&entry, wire.data() + static_cast<size_t>(i) * sizeof(entry), sizeof(entry));
+            if ((entry.flags & ~(gpu_bridge::descriptor_binding_has_usage_2 | gpu_bridge::descriptor_binding_has_push_buffer)) != 0 ||
+                (!(entry.flags & gpu_bridge::descriptor_binding_has_usage_2) && entry.usage_2 != entry.usage))
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            const VkBufferUsageFlags2 effective_usage = gpu_bridge::descriptor_buffer_effective_usage(entry);
+            const auto descriptor_usage = effective_usage & static_cast<VkBufferUsageFlags2>(descriptor_mask);
+            if (descriptor_usage == 0 || entry.address == 0 || entry.address % properties.descriptorBufferOffsetAlignment != 0)
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            sampler_count += (descriptor_usage & VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT) != 0;
+            resource_count += (descriptor_usage & VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT) != 0;
+            push_count += (descriptor_usage & VK_BUFFER_USAGE_PUSH_DESCRIPTORS_DESCRIPTOR_BUFFER_BIT_EXT) != 0;
+            if (sampler_count > properties.maxSamplerDescriptorBufferBindings ||
+                resource_count > properties.maxResourceDescriptorBufferBindings || push_count > 1)
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            const bool has_push_handle = (entry.flags & gpu_bridge::descriptor_binding_has_push_buffer) != 0;
+            if (has_push_handle != (entry.push_buffer != 0) ||
+                (has_push_handle && (properties.bufferlessPushDescriptors == VK_TRUE ||
+                                     !(descriptor_usage & VK_BUFFER_USAGE_PUSH_DESCRIPTORS_DESCRIPTOR_BUFFER_BIT_EXT))) ||
+                (!has_push_handle && (descriptor_usage & VK_BUFFER_USAGE_PUSH_DESCRIPTORS_DESCRIPTOR_BUFFER_BIT_EXT) &&
+                 properties.bufferlessPushDescriptors == VK_FALSE))
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+
+            const impl::buffer_data* backing = nullptr;
+            for (const auto& [id, buffer] : this->impl_->buffers)
+            {
+                if (buffer.device_id != cb->second.device_id || buffer.memory_id == 0 ||
+                    !(buffer.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) || (buffer.usage & descriptor_usage) != descriptor_usage)
+                {
+                    continue;
+                }
+                VkBufferDeviceAddressInfo query{};
+                query.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+                query.buffer = buffer.handle;
+                const uint64_t base = native.get_buffer_device_address(native.handle, &query);
+                if (base != 0 && entry.address >= base && entry.address - base < buffer.size)
+                {
+                    backing = &buffer;
+                    remaining[i] = buffer.size - (entry.address - base);
+                    break;
+                }
+            }
+            if (!backing)
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            bindings[i].sType = VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT;
+            bindings[i].address = entry.address;
+            bindings[i].usage = entry.usage;
+            if (entry.flags & gpu_bridge::descriptor_binding_has_usage_2)
+            {
+                usage2[i].sType = VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO;
+                usage2[i].usage = entry.usage_2;
+                bindings[i].pNext = &usage2[i];
+            }
+            if (has_push_handle)
+            {
+                const auto found = this->impl_->buffers.find(entry.push_buffer);
+                if (found == this->impl_->buffers.end() || found->second.device_id != cb->second.device_id ||
+                    found->second.handle != backing->handle)
+                {
+                    return VK_ERROR_VALIDATION_FAILED_EXT;
+                }
+                push_handles[i].sType = VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_PUSH_DESCRIPTOR_BUFFER_HANDLE_EXT;
+                push_handles[i].pNext = bindings[i].pNext;
+                push_handles[i].buffer = found->second.handle;
+                bindings[i].pNext = &push_handles[i];
+            }
+        }
+        native.cmd_bind_descriptor_buffers(cb->second.handle, binding_count, bindings.empty() ? nullptr : bindings.data());
+        cb->second.descriptor_buffer_remaining_bytes = std::move(remaining);
+        return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::cmd_set_descriptor_buffer_offsets(uint64_t command_buffer, uint64_t pipeline_layout, uint32_t bind_point,
+                                                           uint32_t first_set, std::span<const std::byte> wire, uint32_t set_count)
+    {
+        using entry_t = gpu_bridge::descriptor_buffer_offset_wire;
+        if (set_count > gpu_bridge::max_descriptor_buffer_bindings || wire.size() != static_cast<size_t>(set_count) * sizeof(entry_t))
+        {
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
+        const auto cb = this->impl_->command_buffers.find(command_buffer);
+        if (cb == this->impl_->command_buffers.end())
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        const auto dev = this->impl_->devices.find(cb->second.device_id);
+        const auto layout = this->impl_->pipeline_layouts.find(pipeline_layout);
+        if (dev == this->impl_->devices.end() || layout == this->impl_->pipeline_layouts.end() ||
+            layout->second.device_id != cb->second.device_id)
+        {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (dev->second.native_presentation_failed)
+        {
+            return VK_ERROR_DEVICE_LOST;
+        }
+        if (!dev->second.descriptor_buffer_extension || !dev->second.descriptor_buffer_feature ||
+            !dev->second.cmd_set_descriptor_buffer_offsets)
+        {
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+        if ((bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS && bind_point != VK_PIPELINE_BIND_POINT_COMPUTE) ||
+            first_set > layout->second.descriptor_set_flags.size() || set_count > layout->second.descriptor_set_flags.size() - first_set)
+        {
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
+        const auto alignment = dev->second.descriptor_buffer_properties.descriptorBufferOffsetAlignment;
+        if (alignment == 0)
+        {
+            return VK_ERROR_VALIDATION_FAILED_EXT;
+        }
+
+        std::vector<uint32_t> indices(set_count);
+        std::vector<VkDeviceSize> offsets(set_count);
+        for (uint32_t i = 0; i < set_count; ++i)
+        {
+            entry_t entry{};
+            std::memcpy(&entry, wire.data() + static_cast<size_t>(i) * sizeof(entry), sizeof(entry));
+            if (entry.reserved != 0 ||
+                !(layout->second.descriptor_set_flags[first_set + i] & VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT) ||
+                entry.buffer_index >= cb->second.descriptor_buffer_remaining_bytes.size() || entry.offset % alignment != 0 ||
+                entry.offset > cb->second.descriptor_buffer_remaining_bytes[entry.buffer_index])
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+            indices[i] = entry.buffer_index;
+            offsets[i] = entry.offset;
+        }
+        dev->second.cmd_set_descriptor_buffer_offsets(
+            cb->second.handle, static_cast<VkPipelineBindPoint>(bind_point), layout->second.handle, first_set, set_count,
+            indices.empty() ? nullptr : indices.data(), offsets.empty() ? nullptr : offsets.data());
         return VK_SUCCESS;
     }
 
@@ -9976,5 +10303,6 @@ namespace sogen
         return VK_SUCCESS;
     }
 
+#include "vulkan_host_debug_utils.inc"
 #include "vulkan_native_wsi.inc"
 }

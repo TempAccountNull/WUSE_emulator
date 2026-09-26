@@ -16,7 +16,7 @@ namespace sogen::gpu_bridge
     // Identifies a valid bridge and lets the guest detect a host that speaks a different
     // protocol revision before issuing any further commands.
     inline constexpr uint32_t protocol_magic = 0x55504753; // 'SGPU'
-    inline constexpr uint32_t protocol_version = 30;
+    inline constexpr uint32_t protocol_version = 31;
 
     // Windows IOCTL encoding: CTL_CODE(DeviceType, Function, Method, Access).
     //   value = (DeviceType << 16) | (Access << 14) | (Function << 2) | Method
@@ -219,6 +219,12 @@ namespace sogen::gpu_bridge
         get_descriptor = 0x8B7,
         get_descriptor_set_layout_size = 0x8B8,
         get_descriptor_set_layout_binding_offset = 0x8B9,
+        cmd_bind_descriptor_buffers = 0x8BA,
+        cmd_set_descriptor_buffer_offsets = 0x8BB,
+        debug_utils_capabilities = 0x8E0,
+        debug_utils_messenger = 0x8E1,
+        debug_utils_command = 0x8E2,
+        debug_utils_poll = 0x8E3,
         cmd_synchronization = 0x8C0,
         get_event_status_owned = 0x8C1,
         cmd_copy_image_to_buffer_full = 0x8D0,
@@ -227,6 +233,34 @@ namespace sogen::gpu_bridge
         allocate_memory_full = 0x8D3,
         queue_submit_full = 0x8DE,
     };
+
+    inline constexpr uint32_t ioctl_debug_utils_capabilities = make_ioctl(static_cast<uint32_t>(command::debug_utils_capabilities));
+    inline constexpr uint32_t ioctl_debug_utils_messenger = make_ioctl(static_cast<uint32_t>(command::debug_utils_messenger));
+    inline constexpr uint32_t ioctl_debug_utils_command = make_ioctl(static_cast<uint32_t>(command::debug_utils_command));
+    inline constexpr uint32_t ioctl_debug_utils_poll = make_ioctl(static_cast<uint32_t>(command::debug_utils_poll));
+
+    // Debug-utils callback data itself is encoded by vk_debug_utils_wire.hpp. All pointers are
+    // copied before crossing this boundary and callback addresses remain opaque guest values.
+    struct debug_utils_instance_request
+    {
+        uint32_t enabled;
+        uint32_t callback_size;
+    };
+    struct debug_utils_capabilities_response
+    {
+        uint32_t available;
+    };
+    struct debug_utils_poll_response
+    {
+        uint32_t pending;
+        uint32_t guest_pointer_bytes;
+        uint64_t instance_id;
+        uint64_t callback_address;
+        uint64_t user_data;
+        uint32_t packet_size;
+        uint32_t reserved;
+    };
+    static_assert(sizeof(debug_utils_poll_response) == 40);
 
     inline constexpr uint32_t ioctl_get_event_status_owned = make_ioctl(static_cast<uint32_t>(command::get_event_status_owned));
 
@@ -2359,6 +2393,51 @@ namespace sogen::gpu_bridge
         uint64_t value;
     };
 
+    inline constexpr uint32_t max_descriptor_buffer_bindings = 256;
+    inline constexpr uint32_t descriptor_binding_has_usage_2 = 1u << 0;
+    inline constexpr uint32_t descriptor_binding_has_push_buffer = 1u << 1;
+
+    struct cmd_bind_descriptor_buffers_request
+    {
+        object_id command_buffer;
+        uint32_t binding_count;
+        uint32_t reserved;
+        // descriptor_buffer_binding_wire bindings[binding_count]
+    };
+
+    struct descriptor_buffer_binding_wire
+    {
+        uint64_t address;
+        uint32_t usage;
+        uint32_t flags;
+        uint64_t usage_2;
+        object_id push_buffer;
+    };
+
+    // VkBufferUsageFlags2CreateInfo in pNext supersedes the legacy 32-bit usage field.
+    [[nodiscard]] inline constexpr uint64_t descriptor_buffer_effective_usage(const descriptor_buffer_binding_wire& entry)
+    {
+        return (entry.flags & descriptor_binding_has_usage_2) ? entry.usage_2 : entry.usage;
+    }
+
+    struct cmd_set_descriptor_buffer_offsets_request
+    {
+        object_id command_buffer;
+        object_id pipeline_layout;
+        uint32_t bind_point;
+        uint32_t first_set;
+        uint32_t set_count;
+        uint32_t reserved;
+        // descriptor_buffer_offset_wire offsets[set_count]
+    };
+
+    struct descriptor_buffer_offset_wire
+    {
+        uint32_t buffer_index;
+        uint32_t reserved;
+        uint64_t offset;
+    };
+
     struct get_descriptor_set_layout_support_request
     {
         object_id device;
@@ -2586,6 +2665,10 @@ namespace sogen::gpu_bridge
     static_assert(sizeof(get_descriptor_set_layout_size_request) == 16, "wire layout drift");
     static_assert(sizeof(get_descriptor_set_layout_binding_offset_request) == 24, "wire layout drift");
     static_assert(sizeof(descriptor_layout_value_response) == 16, "wire layout drift");
+    static_assert(sizeof(cmd_bind_descriptor_buffers_request) == 16, "wire layout drift");
+    static_assert(sizeof(descriptor_buffer_binding_wire) == 32, "wire layout drift");
+    static_assert(sizeof(cmd_set_descriptor_buffer_offsets_request) == 32, "wire layout drift");
+    static_assert(sizeof(descriptor_buffer_offset_wire) == 16, "wire layout drift");
     static_assert(sizeof(get_descriptor_set_layout_support_request) == 16, "wire layout drift");
     static_assert(sizeof(descriptor_set_layout_support_response) == 12, "wire layout drift");
     static_assert(sizeof(cmd_bind_descriptor_sets_request) == 32, "wire layout drift");
