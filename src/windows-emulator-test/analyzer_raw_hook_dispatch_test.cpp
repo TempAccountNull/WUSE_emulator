@@ -40,6 +40,8 @@ namespace sogen::test
         std::atomic<unsigned> overlaps{};
         std::atomic<unsigned> wrong_cpu{};
         const std::set<std::string, std::less<>> modules{};
+        analysis_hook_profile profile{};
+        profile.enabled = true;
         ASSERT_NE(watch_object<PEB64>(win, modules, object, true,
                                       [&](const object_access_info&) {
                                           const auto cpu_index = win.active_cpu().index();
@@ -55,7 +57,7 @@ namespace sogen::test
                                           ++hits[cpu_index];
                                           std::this_thread::yield();
                                           --active_callbacks;
-                                      }),
+                                      }, &profile),
                   nullptr);
 
         std::atomic<unsigned> ready{};
@@ -71,7 +73,7 @@ namespace sogen::test
             }
             try
             {
-                cpu.start(2000);
+                cpu.start(4096);
             }
             catch (const std::exception& error)
             {
@@ -94,5 +96,8 @@ namespace sogen::test
         EXPECT_GT(hits[1].load(), 0U);
         EXPECT_EQ(wrong_cpu.load(), 0U);
         EXPECT_EQ(overlaps.load(), 0U);
+        EXPECT_GT(profile.object_callback.samples.load(), 0U);
+        EXPECT_EQ(profile.object_lock_wait.samples.load(), profile.object_callback.samples.load());
+        EXPECT_LE(profile.object_lock_wait.max_nanos.load(), profile.object_callback.max_nanos.load());
     }
 }

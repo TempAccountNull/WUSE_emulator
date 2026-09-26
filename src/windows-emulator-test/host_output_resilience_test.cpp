@@ -249,6 +249,7 @@ namespace sogen
             sampled_analysis_timer<analysis_profile_channel::object_callback> timer{&profile, &profile.object_callback};
         }
         EXPECT_EQ(profile.object_callback.samples.load(), 1U);
+        profile.object_lock_wait.record(23);
         profile.object_report.record(42);
 
         const auto path = unique_path("sogen-hook-profile", ".jsonl");
@@ -267,6 +268,9 @@ namespace sogen
         const auto status_text = read_text(status);
         EXPECT_NE(status_text.find("\"hook_profile\""), std::string::npos) << status_text;
         EXPECT_NE(status_text.find("\"sample_period\":\"1024\""), std::string::npos) << status_text;
+        EXPECT_NE(status_text.find("\"object_lock_wait\":{\"samples\":\"1\",\"sampled_nanos\":\"23\",\"max_nanos\":\"23\"}"),
+                  std::string::npos)
+            << status_text;
         EXPECT_NE(status_text.find("\"object_report\":{\"samples\":\"1\",\"sampled_nanos\":\"42\",\"max_nanos\":\"42\"}"),
                   std::string::npos)
             << status_text;

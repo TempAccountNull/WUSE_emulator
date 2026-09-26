@@ -40,6 +40,7 @@ namespace sogen
                                            profile](cpu_interface& cpu, const uint64_t address, const void*, const size_t size) {
                                               sampled_analysis_timer<analysis_profile_channel::object_callback> timer{
                                                   profile, profile ? &profile->object_callback : nullptr};
+                                              std::chrono::steady_clock::duration lock_wait{};
                                               emu.dispatch_on_cpu(cpu, [&] {
                                                   const auto rip = emu.active_cpu().read_instruction_pointer();
                                                   const auto* mod = emu.mod_manager.find_by_address(rip);
@@ -105,7 +106,13 @@ namespace sogen
 
                                                       offset = member_end;
                                                   }
-                                              });
+                                              },
+                                              timer.sampled() ? &lock_wait : nullptr);
+                                              if (timer.sampled())
+                                              {
+                                                  profile->object_lock_wait.record(static_cast<uint64_t>(
+                                                      std::chrono::duration_cast<std::chrono::nanoseconds>(lock_wait).count()));
+                                              }
                                           });
     }
 

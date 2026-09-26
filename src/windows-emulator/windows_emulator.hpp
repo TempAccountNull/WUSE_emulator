@@ -1,6 +1,8 @@
 #pragma once
 #include "std_include.hpp"
 
+#include <chrono>
+
 #include <arch_emulator.hpp>
 
 #include <stop_reason.hpp>
@@ -298,13 +300,18 @@ namespace sogen
         // for hooks installed outside setup_hooks (e.g. the analyzer's cpuid hook) which otherwise run
         // lock-free and would observe only the facade/vCPU 0 when vcpu_count > 1.
         template <typename Function>
-        auto dispatch_on_cpu(cpu_interface& cpu, Function&& fn)
+        auto dispatch_on_cpu(cpu_interface& cpu, Function&& fn, std::chrono::steady_clock::duration* lock_wait = nullptr)
         {
             if (!cpu.has_guest_cpu_context())
             {
                 throw std::logic_error("A host memory callback has no guest CPU context");
             }
+            const auto started = lock_wait ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const std::scoped_lock lock(this->kernel_lock_);
+            if (lock_wait)
+            {
+                *lock_wait = std::chrono::steady_clock::now() - started;
+            }
             const scoped_dispatch dispatch(*this, this->vcpu(cpu.index()));
             return std::forward<Function>(fn)();
         }

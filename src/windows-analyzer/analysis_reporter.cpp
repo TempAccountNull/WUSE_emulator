@@ -652,6 +652,7 @@ namespace sogen
                                     });
                                 };
                                 write_duration("object_callback", profile->object_callback);
+                                write_duration("object_lock_wait", profile->object_lock_wait);
                                 write_duration("environment_callback", profile->environment_callback);
                                 write_duration("object_report", profile->object_report);
                                 write_duration("environment_report", profile->environment_report);

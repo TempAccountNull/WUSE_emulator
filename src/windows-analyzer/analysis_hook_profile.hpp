@@ -38,6 +38,7 @@ namespace sogen
 
         bool enabled{};
         sampled_analysis_duration object_callback{};
+        sampled_analysis_duration object_lock_wait{};
         sampled_analysis_duration environment_callback{};
         sampled_analysis_duration object_report{};
         sampled_analysis_duration environment_report{};
@@ -74,6 +75,11 @@ namespace sogen
 
         sampled_analysis_timer(const sampled_analysis_timer&) = delete;
         sampled_analysis_timer& operator=(const sampled_analysis_timer&) = delete;
+
+        bool sampled() const noexcept
+        {
+            return this->sampled_;
+        }
 
       private:
         sampled_analysis_duration* duration_{};
