@@ -226,6 +226,8 @@ namespace sogen
         int32_t cmd_fill_buffer(uint64_t command_buffer, uint64_t buffer, uint64_t offset, uint64_t size, uint32_t data);
         bool supports_buffer_marker2(uint64_t device) const;
         bool supports_multi_draw(uint64_t device) const;
+        bool supports_descriptor_buffer(uint64_t device) const;
+        bool supports_descriptor_buffer_v2(uint64_t device) const;
         int32_t cmd_write_buffer_marker(uint64_t command_buffer, uint64_t buffer, uint64_t offset, uint64_t stage, uint32_t marker,
                                         bool synchronization2);
 
@@ -581,6 +583,10 @@ namespace sogen
                                                   uint32_t first_set, std::span<const std::byte> wire, uint32_t set_count);
         int32_t cmd_bind_descriptor_buffer_embedded_samplers(uint64_t command_buffer, uint64_t pipeline_layout,
                                                              uint32_t bind_point, uint32_t set);
+        int32_t cmd_set_descriptor_buffer_offsets2(uint64_t command_buffer, uint64_t pipeline_layout, uint32_t stage_flags,
+                                                   uint32_t first_set, std::span<const std::byte> wire, uint32_t set_count);
+        int32_t cmd_bind_descriptor_buffer_embedded_samplers2(uint64_t command_buffer, uint64_t pipeline_layout,
+                                                              uint32_t stage_flags, uint32_t set);
         void destroy_descriptor_set_layout(uint64_t device, uint64_t layout);
         int32_t create_descriptor_pool(uint64_t device, uint32_t max_sets, uint32_t flags, uint32_t max_inline_uniform_block_bindings,
                                        std::span<const descriptor_pool_size> sizes, uint64_t& out_pool);

@@ -282,6 +282,7 @@ namespace
     };
 
     std::unordered_map<gb::object_id, descriptor_buffer_device_state> g_descriptor_buffer_devices;
+    std::unordered_set<gb::object_id> g_descriptor_buffer_v2_devices;
     std::mutex g_descriptor_buffer_devices_mutex;
 
     struct mapped_range
@@ -916,6 +917,7 @@ extern "C"
         bool buffer_marker_enabled = false;
         bool multi_draw_extension_enabled = false;
         bool descriptor_buffer_extension_enabled = false;
+        bool maintenance6_extension_enabled = false;
         if (pCreateInfo && pCreateInfo->ppEnabledExtensionNames)
         {
             for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i)
@@ -928,6 +930,7 @@ extern "C"
                 buffer_marker_enabled |= std::strcmp(name, VK_AMD_BUFFER_MARKER_EXTENSION_NAME) == 0;
                 multi_draw_extension_enabled |= std::strcmp(name, VK_EXT_MULTI_DRAW_EXTENSION_NAME) == 0;
                 descriptor_buffer_extension_enabled |= std::strcmp(name, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME) == 0;
+                maintenance6_extension_enabled |= std::strcmp(name, VK_KHR_MAINTENANCE_6_EXTENSION_NAME) == 0;
                 const auto* bytes = reinterpret_cast<const std::byte*>(name);
                 extension_blob.insert(extension_blob.end(), bytes, bytes + std::strlen(name) + 1);
                 ++extension_count;
@@ -955,6 +958,7 @@ extern "C"
         bool have_features2 = false;
         bool multi_draw_feature_enabled = false;
         bool descriptor_buffer_feature_enabled = false;
+        bool maintenance6_feature_enabled = false;
         bool null_descriptor_feature_enabled = false;
         if (pCreateInfo)
         {
@@ -973,6 +977,11 @@ extern "C"
                 {
                     descriptor_buffer_feature_enabled =
                         reinterpret_cast<const VkPhysicalDeviceDescriptorBufferFeaturesEXT*>(next)->descriptorBuffer == VK_TRUE;
+                }
+                if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES)
+                {
+                    maintenance6_feature_enabled =
+                        reinterpret_cast<const VkPhysicalDeviceMaintenance6Features*>(next)->maintenance6 == VK_TRUE;
                 }
                 if (next->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_KHR)
                 {
@@ -1046,6 +1055,9 @@ extern "C"
         {
             std::lock_guard lock(g_descriptor_buffer_devices_mutex);
             g_descriptor_buffer_devices.emplace(response.device, descriptor_buffer_device_state{null_descriptor_feature_enabled});
+            if (maintenance6_extension_enabled && maintenance6_feature_enabled &&
+                (response.reserved & gb::device_cap_maintenance6_descriptor_buffer))
+                g_descriptor_buffer_v2_devices.insert(response.device);
         }
         return VK_SUCCESS;
     }
@@ -1059,6 +1071,7 @@ extern "C"
         {
             std::lock_guard lock(g_descriptor_buffer_devices_mutex);
             g_descriptor_buffer_devices.erase(to_object_id(device));
+            g_descriptor_buffer_v2_devices.erase(to_object_id(device));
         }
         {
             std::lock_guard lock(g_multi_draw_devices_mutex);
@@ -7288,6 +7301,50 @@ extern "C"
         record_command(command_id, gb::command::cmd_bind_descriptor_buffer_embedded_samplers, &request, sizeof(request));
     }
 
+    VKAPI_ATTR void VKAPI_CALL vkCmdSetDescriptorBufferOffsets2EXT(
+        VkCommandBuffer commandBuffer, const VkSetDescriptorBufferOffsetsInfoEXT* pSetDescriptorBufferOffsetsInfo)
+    {
+        const auto command_id = to_object_id(commandBuffer);
+        const auto* info = pSetDescriptorBufferOffsetsInfo;
+        if (!info || info->sType != VK_STRUCTURE_TYPE_SET_DESCRIPTOR_BUFFER_OFFSETS_INFO_EXT || info->pNext ||
+            info->layout == VK_NULL_HANDLE || info->stageFlags == 0 ||
+            info->setCount == 0 || info->setCount > gb::max_descriptor_buffer_bindings ||
+            !info->pBufferIndices || !info->pOffsets ||
+            info->firstSet > UINT32_MAX - info->setCount)
+        {
+            fail_recorded_command(command_id, VK_ERROR_VALIDATION_FAILED_EXT);
+            return;
+        }
+        const gb::cmd_set_descriptor_buffer_offsets2_request request{
+            .command_buffer = command_id, .pipeline_layout = to_object_id(info->layout),
+            .stage_flags = info->stageFlags, .first_set = info->firstSet, .set_count = info->setCount};
+        std::vector<gb::descriptor_buffer_offset_wire> offsets(info->setCount);
+        for (uint32_t i = 0; i < info->setCount; ++i)
+            offsets[i] = {.buffer_index = info->pBufferIndices[i], .reserved = 0, .offset = info->pOffsets[i]};
+        std::vector<std::byte> packet(sizeof(request) + offsets.size() * sizeof(offsets.front()));
+        std::memcpy(packet.data(), &request, sizeof(request));
+        if (!offsets.empty())
+            std::memcpy(packet.data() + sizeof(request), offsets.data(), offsets.size() * sizeof(offsets.front()));
+        record_command(command_id, gb::command::cmd_set_descriptor_buffer_offsets2, packet.data(), packet.size());
+    }
+
+    VKAPI_ATTR void VKAPI_CALL vkCmdBindDescriptorBufferEmbeddedSamplers2EXT(
+        VkCommandBuffer commandBuffer, const VkBindDescriptorBufferEmbeddedSamplersInfoEXT* pBindDescriptorBufferEmbeddedSamplersInfo)
+    {
+        const auto command_id = to_object_id(commandBuffer);
+        const auto* info = pBindDescriptorBufferEmbeddedSamplersInfo;
+        if (!info || info->sType != VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_BUFFER_EMBEDDED_SAMPLERS_INFO_EXT ||
+            info->pNext || info->layout == VK_NULL_HANDLE || info->stageFlags == 0)
+        {
+            fail_recorded_command(command_id, VK_ERROR_VALIDATION_FAILED_EXT);
+            return;
+        }
+        const gb::cmd_bind_descriptor_buffer_embedded_samplers2_request request{
+            .command_buffer = command_id, .pipeline_layout = to_object_id(info->layout),
+            .stage_flags = info->stageFlags, .set = info->set};
+        record_command(command_id, gb::command::cmd_bind_descriptor_buffer_embedded_samplers2, &request, sizeof(request));
+    }
+
     VKAPI_ATTR void VKAPI_CALL vkGetDescriptorSetLayoutSizeEXT(VkDevice device, VkDescriptorSetLayout layout,
                                                                VkDeviceSize* pLayoutSizeInBytes)
     {
@@ -7946,6 +8003,16 @@ extern "C"
                 }
             }
             return nullptr;
+        }
+        if (pName && (std::strcmp(pName, "vkCmdSetDescriptorBufferOffsets2EXT") == 0 ||
+                      std::strcmp(pName, "vkCmdBindDescriptorBufferEmbeddedSamplers2EXT") == 0))
+        {
+            std::lock_guard lock(g_descriptor_buffer_devices_mutex);
+            if (!g_descriptor_buffer_v2_devices.contains(to_object_id(device)))
+                return nullptr;
+            return std::strcmp(pName, "vkCmdSetDescriptorBufferOffsets2EXT") == 0
+                       ? reinterpret_cast<PFN_vkVoidFunction>(vkCmdSetDescriptorBufferOffsets2EXT)
+                       : reinterpret_cast<PFN_vkVoidFunction>(vkCmdBindDescriptorBufferEmbeddedSamplers2EXT);
         }
         if (pName &&
             (std::strcmp(pName, "vkGetDescriptorEXT") == 0 || std::strcmp(pName, "vkGetDescriptorSetLayoutSizeEXT") == 0 ||

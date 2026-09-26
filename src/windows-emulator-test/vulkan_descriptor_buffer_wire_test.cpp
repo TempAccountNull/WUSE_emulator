@@ -470,12 +470,18 @@ namespace sogen::test
         {
             GTEST_SKIP() << "RX 6700 lacks VK_EXT_descriptor_buffer";
         }
+        ASSERT_TRUE(std::any_of(extensions.begin(), extensions.end(), [](const auto& extension) {
+            return std::strcmp(extension.extensionName, VK_KHR_MAINTENANCE_6_EXTENSION_NAME) == 0;
+        })) << "RX 6700 lacks VK_KHR_maintenance6";
 
         VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_features{};
         descriptor_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT;
         VkPhysicalDeviceBufferDeviceAddressFeatures address_features{};
         address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
         descriptor_features.pNext = &address_features;
+        VkPhysicalDeviceMaintenance6Features maintenance_features{};
+        maintenance_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES;
+        address_features.pNext = &maintenance_features;
         VkPhysicalDeviceFeatures2 features{};
         features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         features.pNext = &descriptor_features;
@@ -484,6 +490,7 @@ namespace sogen::test
         {
             GTEST_SKIP() << "RX 6700 descriptorBuffer or bufferDeviceAddress feature unavailable";
         }
+        ASSERT_EQ(maintenance_features.maintenance6, VK_TRUE) << "RX 6700 maintenance6 feature unavailable";
 
         VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_properties{};
         descriptor_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT;
@@ -523,15 +530,20 @@ namespace sogen::test
         VkPhysicalDeviceBufferDeviceAddressFeatures enabled_address_features{};
         enabled_address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
         enabled_address_features.bufferDeviceAddress = VK_TRUE;
+        VkPhysicalDeviceMaintenance6Features enabled_maintenance_features{};
+        enabled_maintenance_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES;
+        enabled_maintenance_features.maintenance6 = VK_TRUE;
+        enabled_address_features.pNext = &enabled_maintenance_features;
         enabled_descriptor_features.pNext = &enabled_address_features;
-        const char* descriptor_extension = VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME;
+        const std::array<const char*, 2> enabled_extensions{VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
+                                                             VK_KHR_MAINTENANCE_6_EXTENSION_NAME};
         VkDeviceCreateInfo device_info{};
         device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         device_info.pNext = &enabled_descriptor_features;
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
-        device_info.enabledExtensionCount = 1;
-        device_info.ppEnabledExtensionNames = &descriptor_extension;
+        device_info.enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size());
+        device_info.ppEnabledExtensionNames = enabled_extensions.data();
         ASSERT_EQ(create_device(rx6700, &device_info, nullptr, &native.device), VK_SUCCESS);
 
         native.destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(get_device_proc(native.device, "vkDestroyDevice"));
@@ -552,6 +564,10 @@ namespace sogen::test
             reinterpret_cast<PFN_vkCmdSetDescriptorBufferOffsetsEXT>(get_device_proc(native.device, "vkCmdSetDescriptorBufferOffsetsEXT"));
         const auto cmd_bind_embedded_samplers = reinterpret_cast<PFN_vkCmdBindDescriptorBufferEmbeddedSamplersEXT>(
             get_device_proc(native.device, "vkCmdBindDescriptorBufferEmbeddedSamplersEXT"));
+        const auto cmd_set_descriptor_buffer_offsets2 = reinterpret_cast<PFN_vkCmdSetDescriptorBufferOffsets2EXT>(
+            get_device_proc(native.device, "vkCmdSetDescriptorBufferOffsets2EXT"));
+        const auto cmd_bind_embedded_samplers2 = reinterpret_cast<PFN_vkCmdBindDescriptorBufferEmbeddedSamplers2EXT>(
+            get_device_proc(native.device, "vkCmdBindDescriptorBufferEmbeddedSamplers2EXT"));
         native.destroy_sampler = reinterpret_cast<PFN_vkDestroySampler>(get_device_proc(native.device, "vkDestroySampler"));
         native.destroy_layout =
             reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(get_device_proc(native.device, "vkDestroyDescriptorSetLayout"));
@@ -583,6 +599,8 @@ namespace sogen::test
         ASSERT_NE(cmd_bind_descriptor_buffers, nullptr);
         ASSERT_NE(cmd_set_descriptor_buffer_offsets, nullptr);
         ASSERT_NE(cmd_bind_embedded_samplers, nullptr);
+        ASSERT_NE(cmd_set_descriptor_buffer_offsets2, nullptr) << "RX 6700 v2 offsets PFN unavailable";
+        ASSERT_NE(cmd_bind_embedded_samplers2, nullptr) << "RX 6700 v2 embedded samplers PFN unavailable";
         ASSERT_NE(native.destroy_sampler, nullptr);
         ASSERT_NE(native.destroy_layout, nullptr);
         ASSERT_NE(native.destroy_buffer, nullptr);
@@ -739,12 +757,27 @@ namespace sogen::test
         cmd_set_descriptor_buffer_offsets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, native.pipeline_layout, 0, 1, &buffer_index,
                                           &descriptor_offset);
         cmd_bind_embedded_samplers(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, native.pipeline_layout, 1);
+        VkSetDescriptorBufferOffsetsInfoEXT offset_info{};
+        offset_info.sType = VK_STRUCTURE_TYPE_SET_DESCRIPTOR_BUFFER_OFFSETS_INFO_EXT;
+        offset_info.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+        offset_info.layout = native.pipeline_layout;
+        offset_info.firstSet = 0;
+        offset_info.setCount = 1;
+        offset_info.pBufferIndices = &buffer_index;
+        offset_info.pOffsets = &descriptor_offset;
+        cmd_set_descriptor_buffer_offsets2(command_buffer, &offset_info);
+        VkBindDescriptorBufferEmbeddedSamplersInfoEXT embedded2_info{};
+        embedded2_info.sType = VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_BUFFER_EMBEDDED_SAMPLERS_INFO_EXT;
+        embedded2_info.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+        embedded2_info.layout = native.pipeline_layout;
+        embedded2_info.set = 1;
+        cmd_bind_embedded_samplers2(command_buffer, &embedded2_info);
         ASSERT_EQ(end_command_buffer(command_buffer), VK_SUCCESS);
         std::cout << "Native " << device_properties.deviceName
                   << " recorded vkCmdBindDescriptorBuffersEXT and "
                      "vkCmdSetDescriptorBufferOffsetsEXT with address="
                   << std::hex << buffer_address << std::dec << " layoutSize=" << layout_size << " offset=" << descriptor_offset
-                  << " embeddedSamplerSet=1" << '\n';
+                  << " embeddedSamplerSet=1 and both maintenance6 v2 PFNs" << '\n';
 
         VkDescriptorAddressInfoEXT uniform_address{};
         uniform_address.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT;
@@ -862,6 +895,23 @@ namespace sogen::test
         ASSERT_NE(immutable_layout, 0u);
         host.destroy_descriptor_set_layout(device, immutable_layout);
         host.destroy_sampler(device, sampler);
+        EXPECT_FALSE(host.supports_descriptor_buffer(device));
+        EXPECT_FALSE(host.supports_descriptor_buffer_v2(device));
+        uint64_t pipeline_layout = 0, command_pool = 0, command_buffer = 0;
+        ASSERT_EQ(host.create_pipeline_layout(device, 0, 0, {}, pipeline_layout), VK_SUCCESS);
+        ASSERT_EQ(host.create_command_pool(device, 0, 0, command_pool), VK_SUCCESS);
+        ASSERT_EQ(host.allocate_command_buffer(device, command_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, command_buffer), VK_SUCCESS);
+        const gpu_bridge::descriptor_buffer_offset_wire offset{.buffer_index = 0, .offset = 0};
+        const auto* bytes = reinterpret_cast<const std::byte*>(&offset);
+        EXPECT_EQ(host.cmd_set_descriptor_buffer_offsets2(command_buffer, pipeline_layout,
+                                                          VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                                          {bytes, sizeof(offset)}, 1), VK_ERROR_EXTENSION_NOT_PRESENT);
+        EXPECT_EQ(host.cmd_bind_descriptor_buffer_embedded_samplers2(command_buffer, pipeline_layout,
+                                                                     VK_SHADER_STAGE_FRAGMENT_BIT, 0),
+                  VK_ERROR_EXTENSION_NOT_PRESENT);
+        host.free_command_buffer(device, command_pool, command_buffer);
+        host.destroy_command_pool(device, command_pool);
+        host.destroy_pipeline_layout(device, pipeline_layout);
         host.destroy_device(device);
         host.destroy_instance(instance);
     }

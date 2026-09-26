@@ -1267,7 +1267,13 @@ namespace sogen
                     .vk_result = result,
                     .reserved = result == 0
                                     ? (this->vulkan_.supports_buffer_marker2(device) ? gpu_bridge::device_cap_buffer_marker2 : 0) |
-                                          (this->vulkan_.supports_multi_draw(device) ? gpu_bridge::device_cap_multi_draw : 0)
+                                          (this->vulkan_.supports_multi_draw(device) ? gpu_bridge::device_cap_multi_draw : 0) |
+                                          (this->vulkan_.supports_descriptor_buffer(device)
+                                               ? gpu_bridge::device_cap_descriptor_buffer
+                                               : 0) |
+                                          (this->vulkan_.supports_descriptor_buffer_v2(device)
+                                               ? gpu_bridge::device_cap_maintenance6_descriptor_buffer
+                                               : 0)
                                     : 0,
                     .device = device,
                 };
@@ -3609,6 +3615,26 @@ namespace sogen
                     }
                     return this->vulkan_.cmd_bind_descriptor_buffer_embedded_samplers(req.command_buffer, req.pipeline_layout,
                                                                                       req.bind_point, req.set);
+                }
+                case gpu_bridge::command::cmd_set_descriptor_buffer_offsets2: {
+                    gpu_bridge::cmd_set_descriptor_buffer_offsets2_request req{};
+                    if (!read(req) || req.reserved != 0 || req.set_count > gpu_bridge::max_descriptor_buffer_bindings ||
+                        size - sizeof(req) != static_cast<size_t>(req.set_count) * sizeof(gpu_bridge::descriptor_buffer_offset_wire))
+                    {
+                        return vk_error_initialization_failed;
+                    }
+                    return this->vulkan_.cmd_set_descriptor_buffer_offsets2(req.command_buffer, req.pipeline_layout,
+                                                                            req.stage_flags, req.first_set,
+                                                                            {payload + sizeof(req), size - sizeof(req)}, req.set_count);
+                }
+                case gpu_bridge::command::cmd_bind_descriptor_buffer_embedded_samplers2: {
+                    gpu_bridge::cmd_bind_descriptor_buffer_embedded_samplers2_request req{};
+                    if (!read(req) || size != sizeof(req))
+                    {
+                        return vk_error_initialization_failed;
+                    }
+                    return this->vulkan_.cmd_bind_descriptor_buffer_embedded_samplers2(req.command_buffer, req.pipeline_layout,
+                                                                                       req.stage_flags, req.set);
                 }
                 case gpu_bridge::command::cmd_set_viewport: {
                     gpu_bridge::cmd_set_viewport_request req{};

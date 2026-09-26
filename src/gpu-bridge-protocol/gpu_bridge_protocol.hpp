@@ -223,6 +223,8 @@ namespace sogen::gpu_bridge
         cmd_bind_descriptor_buffers = 0x8BA,
         cmd_set_descriptor_buffer_offsets = 0x8BB,
         cmd_bind_descriptor_buffer_embedded_samplers = 0x8BC,
+        cmd_set_descriptor_buffer_offsets2 = 0x8BD,
+        cmd_bind_descriptor_buffer_embedded_samplers2 = 0x8BE,
         debug_utils_capabilities = 0x8E0,
         debug_utils_messenger = 0x8E1,
         debug_utils_command = 0x8E2,
@@ -645,6 +647,7 @@ namespace sogen::gpu_bridge
     inline constexpr uint32_t device_cap_buffer_marker2 = 1u << 0;
     inline constexpr uint32_t device_cap_multi_draw = 1u << 1;
     inline constexpr uint32_t device_cap_descriptor_buffer = 1u << 2;
+    inline constexpr uint32_t device_cap_maintenance6_descriptor_buffer = 1u << 3;
 
     struct create_device_response
     {
@@ -2465,6 +2468,31 @@ namespace sogen::gpu_bridge
         uint32_t bind_point;
         uint32_t set;
     };
+
+    // VK_KHR_maintenance6 descriptor-buffer v2 commands take stageFlags, not a bind point.
+    // pNext is explicitly unsupported while dynamicPipelineLayout is not exposed by Sogen.
+    // The offsets request is followed by set_count descriptor_buffer_offset_wire entries.
+    struct cmd_set_descriptor_buffer_offsets2_request
+    {
+        object_id command_buffer;
+        object_id pipeline_layout;
+        uint32_t stage_flags;
+        uint32_t first_set;
+        uint32_t set_count;
+        uint32_t reserved;
+    };
+
+    struct cmd_bind_descriptor_buffer_embedded_samplers2_request
+    {
+        object_id command_buffer;
+        object_id pipeline_layout;
+        uint32_t stage_flags;
+        uint32_t set;
+    };
+    static_assert(sizeof(cmd_set_descriptor_buffer_offsets2_request) == 32 &&
+                  offsetof(cmd_set_descriptor_buffer_offsets2_request, stage_flags) == 16);
+    static_assert(sizeof(cmd_bind_descriptor_buffer_embedded_samplers2_request) == 24 &&
+                  offsetof(cmd_bind_descriptor_buffer_embedded_samplers2_request, stage_flags) == 16);
 
     struct get_descriptor_set_layout_support_request
     {
