@@ -119,7 +119,10 @@ impl PhysicalMemory {
     }
 
     pub fn free(&mut self, index: Index) {
-        self.get_mut(index).data_mut().data.external = None;
+        let page = self.get_mut(index);
+        if !page.smp_shared {
+            page.data_mut().data.external = None;
+        }
         self.free.push(index);
     }
 
@@ -166,8 +169,20 @@ impl PhysicalMemory {
     /// Allocate a page slot backed by an existing shared `Arc<PageData>` (SMP). The slot is marked
     /// `smp_shared` so writes go straight through to the shared bytes (no copy-on-write).
     pub fn alloc_shared(&mut self, data: Arc<PageData>) -> Option<Index> {
-        let index = self.alloc()?;
-        self.allocated[index.0 as usize] = Page::from_shared(data);
+        let index = match self.free.pop() {
+            Some(index) => {
+                self.allocated[index.0 as usize] = Page::from_shared(data);
+                index
+            }
+            None => {
+                if self.allocated.len() >= self.capacity {
+                    tracing::warn!("Guest exceeded memory limit {}", self.capacity);
+                    return None;
+                }
+                self.allocated.push(Page::from_shared(data));
+                Index((self.allocated.len() - 1).try_into().unwrap())
+            }
+        };
         Some(index)
     }
 
@@ -1008,4 +1023,26 @@ pub fn is_aligned<const N: usize>(value: u64) -> bool {
 fn smp_code_epoch_only_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("SOGEN_SMP_CODE_EPOCH_ONLY").as_deref() != Ok("0"))
+}
+
+#[cfg(test)]
+mod shared_slot_tests {
+    use super::{PageData, PhysicalMemory};
+    use std::sync::Arc;
+
+    #[test]
+    fn freeing_and_reusing_shared_slot_does_not_copy_peer_data() {
+        let mut memory = PhysicalMemory::new(8);
+        let original = Arc::new(PageData::default());
+        let index = memory.alloc_shared(Arc::clone(&original)).unwrap();
+        assert_eq!(Arc::strong_count(&original), 2);
+
+        memory.free(index);
+        assert_eq!(Arc::strong_count(&original), 2);
+
+        let replacement = Arc::new(PageData::default());
+        assert_eq!(memory.alloc_shared(Arc::clone(&replacement)), Some(index));
+        assert_eq!(Arc::strong_count(&original), 1);
+        assert!(Arc::ptr_eq(&memory.share_page_data(index), &replacement));
+    }
 }
