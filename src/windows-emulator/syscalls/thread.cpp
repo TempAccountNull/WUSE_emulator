@@ -898,16 +898,28 @@ namespace sogen
                     const auto previous_rsp = c.emu.reg<uint64_t>(x86_register::rsp);
                     const auto* previous_module = c.win_emu.mod_manager.find_by_address(previous_rip);
                     const auto* target_module = c.win_emu.mod_manager.find_by_address(context.Rip);
+                    uint64_t frame20 = 0;
+                    uint64_t frame68 = 0;
+                    const bool frame20_valid =
+                        context.Rbp <= std::numeric_limits<uint64_t>::max() - 0x20 &&
+                        c.emu.try_read_memory(context.Rbp + 0x20, &frame20, sizeof(frame20));
+                    const bool frame68_valid =
+                        context.Rbp <= std::numeric_limits<uint64_t>::max() - 0x68 &&
+                        c.emu.try_read_memory(context.Rbp + 0x68, &frame68, sizeof(frame68));
                     c.win_emu.log.info(
                         "[NTCONTDIAG] ordinal=%u tid=%u vcpu=%zu old_rip=0x%llX old_rsp=0x%llX "
-                        "old_module=%s old_rva=0x%llX target_rip=0x%llX target_rsp=0x%llX eflags=0x%08X "
+                        "old_module=%s old_rva=0x%llX target_rip=0x%llX target_rsp=0x%llX target_rbp=0x%llX "
+                        "frame20_valid=%u frame20=0x%llX frame68_valid=%u frame68=0x%llX eflags=0x%08X "
                         "target_module=%s target_rva=0x%llX flags=0x%08X\n",
                         ordinal + 1, c.vcpu.active_thread ? c.vcpu.active_thread->id : 0, c.emu.index(),
                         static_cast<unsigned long long>(previous_rip), static_cast<unsigned long long>(previous_rsp),
                         previous_module ? previous_module->name.c_str() : "<unmapped>",
                         static_cast<unsigned long long>(previous_module ? previous_rip - previous_module->image_base : 0),
                         static_cast<unsigned long long>(context.Rip), static_cast<unsigned long long>(context.Rsp),
-                        context.EFlags, target_module ? target_module->name.c_str() : "<unmapped>",
+                        static_cast<unsigned long long>(context.Rbp), static_cast<unsigned>(frame20_valid),
+                        static_cast<unsigned long long>(frame20), static_cast<unsigned>(frame68_valid),
+                        static_cast<unsigned long long>(frame68), context.EFlags,
+                        target_module ? target_module->name.c_str() : "<unmapped>",
                         static_cast<unsigned long long>(target_module ? context.Rip - target_module->image_base : 0),
                         argument.ContinueFlags);
                 }
