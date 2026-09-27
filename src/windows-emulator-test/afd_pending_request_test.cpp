@@ -11,6 +11,7 @@
 #include <chrono>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -39,6 +40,9 @@ namespace sogen::test
             std::vector<std::byte> outgoing;
             bool send_blocked{true};
             bool connect_blocked{};
+            bool listening{};
+            bool connected{};
+            std::optional<network::address> next_accepted_remote{};
             uint32_t disconnect_mode{};
             int last_error{};
         };
@@ -72,7 +76,12 @@ namespace sogen::test
 
             bool is_listening() override
             {
-                return false;
+                return state->listening;
+            }
+
+            bool is_connected() override
+            {
+                return state->connected;
             }
 
             std::optional<network::address> get_local_address() override
@@ -93,17 +102,27 @@ namespace sogen::test
                     return false;
                 }
                 state->last_error = 0;
+                state->connected = true;
                 return true;
             }
 
             bool listen(int) override
             {
+                state->listening = true;
                 return true;
             }
 
-            std::unique_ptr<network::i_socket> accept(network::address&) override
+            std::unique_ptr<network::i_socket> accept(network::address& remote) override
             {
-                return {};
+                if (!state->next_accepted_remote)
+                {
+                    state->last_error = SERR(EWOULDBLOCK);
+                    return {};
+                }
+                remote = *state->next_accepted_remote;
+                state->next_accepted_remote.reset();
+                state->last_error = 0;
+                return std::make_unique<pending_test_socket>(state);
             }
 
             sent_size send(std::span<const std::byte> bytes) override
@@ -539,6 +558,153 @@ namespace sogen::test
                                 [](const std::byte value) { return value == std::byte{0}; }));
         EXPECT_TRUE(std::all_of(bytes.begin() + sizeof(AFD_ENUM_NETWORK_EVENTS_INFO), bytes.end(),
                                 [](const std::byte value) { return value == std::byte{0xa5}; }));
+    }
+
+    TEST_P(AfdPendingRequestTest, AcceptShortBuffersMatchNativeStatusAndLeaveIosbUntouched)
+    {
+        constexpr uint64_t input = memory + 0x800;
+        constexpr uint64_t output = memory + 0x880;
+        constexpr uint64_t iosb = memory + 0x100;
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{
+            .Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+        const auto invoke = [&](const ULONG code, const uint32_t input_length, const uint32_t output_length) {
+            emu.memory.write_memory(iosb, &initial, sizeof(initial));
+            emu.memory.set_memory(input, 0, sizeof(AFD_ACCEPT_INFO));
+            emu.memory.set_memory(output, 0xa5, 32);
+            io_device_context context{emu.memory};
+            context.io_control_code = code;
+            context.io_status_block = {emu.memory, iosb};
+            context.input_buffer = input;
+            context.input_buffer_length = input_length;
+            context.output_buffer = output;
+            context.output_buffer_length = output_length;
+            const auto result = device->execute_ioctl(emu, context);
+            const auto block = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb);
+            EXPECT_EQ(block.Status, initial.Status);
+            EXPECT_EQ(block.Information, initial.Information);
+            const auto bytes = emu.memory.read_memory(output, 32);
+            EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(),
+                                    [](const std::byte value) { return value == std::byte{0xa5}; }));
+            return result;
+        };
+
+        // Windows x64: 0/4/8 bytes -> INVALID_PARAMETER; 12/16 -> BUFFER_TOO_SMALL.
+        for (const auto length : {0u, 4u, 8u})
+        {
+            EXPECT_EQ(invoke(0x1200c, 0, length), STATUS_INVALID_PARAMETER);
+        }
+        for (const auto length : {12u, 16u})
+        {
+            EXPECT_EQ(invoke(0x1200c, 0, length), STATUS_BUFFER_TOO_SMALL);
+        }
+        // With enough output, a non-listening socket is an invalid request.
+        EXPECT_EQ(invoke(0x1200c, 0, 20), STATUS_INVALID_PARAMETER);
+
+        // Native AFD_ACCEPT rejects every input size below its 16-byte structure.
+        for (const auto length : {0u, 1u, 4u, 8u, 12u, 15u})
+        {
+            EXPECT_EQ(invoke(0x12010, length, 0), STATUS_INVALID_PARAMETER);
+        }
+        EXPECT_EQ(invoke(0x12010, sizeof(AFD_ACCEPT_INFO), 0), STATUS_INVALID_PARAMETER);
+    }
+
+    TEST_P(AfdPendingRequestTest, WaitForListenIpv6MatchesNativeResponseAndPendingContract)
+    {
+        const std::array<uint32_t, 12> ipv6_creation{0, 0, 0, 0, 0, 0, 0, 0, 23, 1, 6, 0};
+        emu.memory.write_memory(memory, ipv6_creation.data(), sizeof(ipv6_creation));
+        device = create_afd_endpoint({.is_32_bit = GetParam()});
+        device->create(emu, {.buffer = memory, .length = sizeof(ipv6_creation)});
+        socket->listening = true;
+        network::address remote{};
+        remote.set_ipv6({});
+        remote.set_port(4567);
+        socket->next_accepted_remote = remote;
+        constexpr uint64_t output = memory + 0x880;
+        constexpr uint64_t iosb = memory + 0x100;
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{
+            .Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+        const auto invoke = [&](const uint32_t length) {
+            emu.memory.write_memory(iosb, &initial, sizeof(initial));
+            emu.memory.set_memory(output, 0xa5, 40);
+            io_device_context context{emu.memory};
+            context.io_control_code = 0x1200c;
+            context.io_status_block = {emu.memory, iosb};
+            context.output_buffer = output;
+            context.output_buffer_length = length;
+            return device->execute_ioctl(emu, context);
+        };
+        EXPECT_EQ(invoke(31), STATUS_BUFFER_TOO_SMALL);
+        EXPECT_EQ(emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb).Status, initial.Status);
+        EXPECT_TRUE(socket->next_accepted_remote.has_value());
+        EXPECT_EQ(invoke(32), STATUS_SUCCESS);
+        const auto completed = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb);
+        EXPECT_EQ(completed.Status, STATUS_SUCCESS);
+        EXPECT_EQ(completed.Information, 32u);
+        EXPECT_EQ(emu.memory.read_memory<LONG>(output), 1);
+        EXPECT_EQ(emu.memory.read_memory<uint16_t>(output + sizeof(LONG)), 23u);
+        EXPECT_EQ(emu.memory.read_memory<uint64_t>(output + 32), 0xa5a5a5a5a5a5a5a5ull);
+        EXPECT_EQ(invoke(32), STATUS_PENDING);
+        const auto pending = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb);
+        EXPECT_EQ(pending.Status, initial.Status);
+        EXPECT_EQ(pending.Information, initial.Information);
+    }
+
+    TEST_P(AfdPendingRequestTest, AcceptValidatesTargetBeforeSequenceAndPreservesIosbOnFailure)
+    {
+        emu.process.is_wow64_process = GetParam();
+        socket->listening = true;
+        network::address remote{};
+        remote.set_ipv4(0x7f000001);
+        remote.set_port(4567);
+        socket->next_accepted_remote = remote;
+        constexpr uint64_t input = memory + 0x800;
+        constexpr uint64_t output = memory + 0x880;
+        constexpr uint64_t iosb = memory + 0x100;
+        io_device_context wait{emu.memory};
+        wait.io_control_code = 0x1200c;
+        wait.io_status_block = {emu.memory, iosb};
+        wait.output_buffer = output;
+        wait.output_buffer_length = 20;
+        ASSERT_EQ(device->execute_ioctl(emu, wait), STATUS_SUCCESS);
+        const auto sequence = emu.memory.read_memory<LONG>(output);
+        ASSERT_EQ(sequence, 1);
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{
+            .Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+        const auto invoke = [&](const LONG value, const handle target) {
+            const AFD_ACCEPT_INFO request{.Sequence = value, .AcceptHandle = target};
+            emu.memory.write_memory(input, &request, sizeof(request));
+            emu.memory.write_memory(iosb, &initial, sizeof(initial));
+            io_device_context context{emu.memory};
+            context.io_control_code = 0x12010;
+            context.io_status_block = {emu.memory, iosb};
+            context.input_buffer = input;
+            context.input_buffer_length = sizeof(request);
+            return device->execute_ioctl(emu, context);
+        };
+        EXPECT_EQ(invoke(sequence + 1, handle{.bits = 0xffff}), STATUS_INVALID_HANDLE);
+        EXPECT_EQ(emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb).Status, initial.Status);
+
+        const auto store_target = [&](const uint32_t type, const uint32_t protocol) {
+            const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, type, protocol, 0};
+            emu.memory.write_memory(memory + 0x900, creation.data(), sizeof(creation));
+            return emu.process.devices.store(io_device_container{
+                u"Afd\\Endpoint", emu, {.buffer = memory + 0x900, .length = sizeof(creation)}});
+        };
+        const auto udp = store_target(2, 17);
+        ASSERT_NE(emu.process.devices.get(udp), nullptr);
+        EXPECT_EQ(invoke(sequence, udp), STATUS_INVALID_PARAMETER);
+        EXPECT_EQ(emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb).Status, initial.Status);
+        const auto tcp = store_target(1, 6);
+        ASSERT_NE(emu.process.devices.get(tcp), nullptr);
+        socket->connected = true;
+        EXPECT_EQ(invoke(sequence, tcp), STATUS_INVALID_PARAMETER);
+        EXPECT_EQ(emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb).Status, initial.Status);
+        socket->connected = false;
+        EXPECT_EQ(invoke(sequence, tcp), STATUS_SUCCESS);
+        const auto completed = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb);
+        EXPECT_EQ(completed.Status, STATUS_SUCCESS);
+        EXPECT_EQ(completed.Information, 0u);
+        EXPECT_EQ(invoke(sequence, tcp), STATUS_INVALID_PARAMETER);
     }
 
     TEST_P(AfdPendingRequestTest, PendingIoStatusBlockRetainsCallerFieldsUntilCompletion)

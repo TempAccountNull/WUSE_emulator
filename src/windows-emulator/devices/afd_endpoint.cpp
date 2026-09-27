@@ -552,7 +552,7 @@ namespace sogen
             std::optional<afd_creation_data> creation_data{};
 
             std::unordered_map<LONG, pending_connection> pending_connections_{};
-            LONG next_sequence_{0};
+            LONG next_sequence_{1};
 
             std::optional<handle> event_select_event_{};
             ULONG event_select_mask_{0};
@@ -889,8 +889,10 @@ namespace sogen
 
             bool skips_immediate_completion(const io_device_context& c, const NTSTATUS status) const override
             {
-                return _AFD_REQUEST(c.io_control_code) == AFD_SEND &&
-                       (status == STATUS_PIPE_DISCONNECTED || status == STATUS_LOCAL_DISCONNECT);
+                const auto request = _AFD_REQUEST(c.io_control_code);
+                return (request == AFD_SEND && (status == STATUS_PIPE_DISCONNECTED || status == STATUS_LOCAL_DISCONNECT)) ||
+                       (request == AFD_WAIT_FOR_LISTEN && status == STATUS_BUFFER_TOO_SMALL) ||
+                       (request == AFD_ACCEPT && status == STATUS_INVALID_HANDLE);
             }
 
             NTSTATUS dispatch_ioctl(windows_emulator& win_emu, const io_device_context& c, const ULONG request)
@@ -1240,9 +1242,22 @@ namespace sogen
                     throw std::runtime_error("Invalid AFD endpoint socket!");
                 }
 
-                if (c.output_buffer_length < sizeof(AFD_LISTEN_RESPONSE_INFO))
+                // Native AFD rejects tiny output buffers before reporting the
+                // minimum response size. Both failures leave the IOSB untouched.
+                if (c.output_buffer_length < 12)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                const size_t address_size = this->creation_data && this->creation_data->address_family == 23
+                                                ? sizeof(win_sockaddr_in6)
+                                                : sizeof(win_sockaddr_in);
+                if (c.output_buffer_length < sizeof(LONG) + address_size)
                 {
                     return STATUS_BUFFER_TOO_SMALL;
+                }
+                if (!this->s_->is_listening())
+                {
+                    return STATUS_INVALID_PARAMETER;
                 }
 
                 network::address remote_address{};
@@ -1259,11 +1274,6 @@ namespace sogen
                     return STATUS_UNSUCCESSFUL;
                 }
 
-                if (!remote_address.is_ipv4())
-                {
-                    throw std::runtime_error("Unsupported address family");
-                }
-
                 pending_connection pending{};
                 pending.remote_address = remote_address;
                 pending.accepted_socket = std::move(accepted_socket_ptr);
@@ -1271,18 +1281,16 @@ namespace sogen
                 LONG sequence = next_sequence_++;
                 pending_connections_.try_emplace(sequence, std::move(pending));
 
-                AFD_LISTEN_RESPONSE_INFO response{};
-                response.Sequence = sequence;
-
                 auto transport_buffer = convert_to_win_address(win_emu, remote_address);
-                memcpy(&response.RemoteAddress, transport_buffer.data(), sizeof(win_sockaddr));
-
-                win_emu.emu().write_memory<AFD_LISTEN_RESPONSE_INFO>(c.output_buffer, response);
+                std::vector<std::byte> response(sizeof(sequence) + transport_buffer.size());
+                memcpy(response.data(), &sequence, sizeof(sequence));
+                memcpy(response.data() + sizeof(sequence), transport_buffer.data(), transport_buffer.size());
+                win_emu.emu().write_memory(c.output_buffer, response.data(), response.size());
 
                 if (c.io_status_block)
                 {
                     status_block block{};
-                    block.Information = sizeof(AFD_LISTEN_RESPONSE_INFO);
+                    block.Information = response.size();
                     c.io_status_block.write(block);
                 }
 
@@ -1298,18 +1306,14 @@ namespace sogen
 
                 if (c.input_buffer_length < sizeof(AFD_ACCEPT_INFO))
                 {
-                    return STATUS_BUFFER_TOO_SMALL;
+                    return STATUS_INVALID_PARAMETER;
                 }
-
-                const auto accept_info = win_emu.emu().read_memory<AFD_ACCEPT_INFO>(c.input_buffer);
-
-                const auto it = pending_connections_.find(accept_info.Sequence);
-                if (it == pending_connections_.end())
+                if (!this->s_->is_listening())
                 {
                     return STATUS_INVALID_PARAMETER;
                 }
 
-                auto& accepted_socket = it->second.accepted_socket;
+                const auto accept_info = win_emu.emu().read_memory<AFD_ACCEPT_INFO>(c.input_buffer);
 
                 auto* target_device = win_emu.process.devices.get(accept_info.AcceptHandle);
                 if (!target_device)
@@ -1322,6 +1326,19 @@ namespace sogen
                 {
                     return STATUS_INVALID_HANDLE;
                 }
+                if (!target_endpoint->creation_data || target_endpoint->creation_data->type != 1 ||
+                    !target_endpoint->s_ || target_endpoint->s_->is_connected())
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                const auto it = pending_connections_.find(accept_info.Sequence);
+                if (it == pending_connections_.end())
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                auto& accepted_socket = it->second.accepted_socket;
 
                 target_endpoint->s_ = std::move(accepted_socket);
 

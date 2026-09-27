@@ -212,6 +212,18 @@ namespace sogen
             return res != SOCKET_ERROR && val == 1;
         }
 
+        bool socket_wrapper::is_connected()
+        {
+            if (!this->socket_.is_valid())
+            {
+                return false;
+            }
+
+            sockaddr_storage peer{};
+            socklen_t length = sizeof(peer);
+            return ::getpeername(this->socket_.get_socket(), reinterpret_cast<sockaddr*>(&peer), &length) == 0;
+        }
+
         std::optional<address> socket_wrapper::get_local_address()
         {
             sockaddr_storage addr{};
@@ -245,16 +257,16 @@ namespace sogen
 
         std::unique_ptr<i_socket> socket_wrapper::accept(address& address)
         {
-            sockaddr addr{};
-            socklen_t addrlen = sizeof(sockaddr);
-            const auto s = ::accept(this->socket_.get_socket(), &addr, &addrlen);
+            sockaddr_storage addr{};
+            socklen_t addrlen = sizeof(addr);
+            const auto s = ::accept(this->socket_.get_socket(), reinterpret_cast<sockaddr*>(&addr), &addrlen);
 
             if (s == INVALID_SOCKET)
             {
                 return nullptr;
             }
 
-            address.set_address(&addr, addrlen);
+            address.set_address(reinterpret_cast<sockaddr*>(&addr), addrlen);
 
             return std::make_unique<socket_wrapper>(s);
         }

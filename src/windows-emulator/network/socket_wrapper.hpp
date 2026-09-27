@@ -25,6 +25,7 @@ namespace sogen
             uint32_t partial_disconnect(uint32_t mode, int64_t timeout) override;
             bool is_ready(bool in_poll) override;
             bool is_listening() override;
+            bool is_connected() override;
 
             std::optional<address> get_local_address() override;
 

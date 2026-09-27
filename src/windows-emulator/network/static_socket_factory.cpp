@@ -282,6 +282,10 @@ namespace sogen
                     {
                         return this->listening;
                     }
+                    bool is_connected() override
+                    {
+                        return this->pipe != nullptr;
+                    }
 
                     std::optional<address> get_local_address() override
                     {

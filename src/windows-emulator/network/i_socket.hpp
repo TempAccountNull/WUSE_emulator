@@ -37,6 +37,7 @@ namespace sogen
 
             virtual bool is_ready(bool in_poll) = 0;
             virtual bool is_listening() = 0;
+            virtual bool is_connected() { return false; }
 
             virtual std::optional<address> get_local_address() = 0;
 
