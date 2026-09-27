@@ -1438,10 +1438,9 @@ namespace sogen
         const auto activity = this->emu().vcpu_activity();
         const auto smp_profile = this->emu().smp_profile();
         const auto jit_profile = this->emu().jit_profile();
-        if (activity.empty())
-        {
-            return; // backend does not report activity (e.g. WHP) - nothing truthful to publish
-        }
+        // WHP does not report retired instructions. Still publish scheduler thread
+        // ownership and opt-in profiles without inventing instruction counts.
+        const bool instruction_counts_available = !activity.empty();
 
         double elapsed_seconds = 0.0;
         if (this->activity_status_last_.time_since_epoch().count() != 0)
@@ -1468,9 +1467,11 @@ namespace sogen
                                .count();
         char buf[512];
 
-        std::snprintf(buf, sizeof(buf), "\"t\":%lld,\"vcpu_count\":%zu,\"total_instructions\":%llu,\"elapsed_seconds\":%.3f",
-                      static_cast<long long>(stamp), activity.size(), static_cast<unsigned long long>(total_instructions),
-                      elapsed_seconds);
+        std::snprintf(buf, sizeof(buf), "\"t\":%lld,\"vcpu_count\":%zu,\"instruction_counts_available\":%s,\"total_instructions\":",
+                      static_cast<long long>(stamp), this->vcpus_.size(), instruction_counts_available ? "true" : "false");
+        json += buf;
+        json += instruction_counts_available ? std::to_string(total_instructions) : "null";
+        std::snprintf(buf, sizeof(buf), ",\"elapsed_seconds\":%.3f", elapsed_seconds);
         json += buf;
 
         uint64_t total_previous = 0;
@@ -1500,12 +1501,33 @@ namespace sogen
 
             this->activity_status_prev_instructions_[i] = entry.instructions;
         }
+        if (!instruction_counts_available)
+        {
+            for (size_t i = 0; i < this->vcpus_.size(); ++i)
+            {
+                const auto& vcpu = *this->vcpus_[i];
+                const auto* owner = vcpu.active_thread;
+                const auto running = vcpu.running.load(std::memory_order_relaxed);
+                std::snprintf(buf, sizeof(buf),
+                              "%s{\"i\":%zu,\"rip\":null,\"module\":null,\"instructions\":null,\"mips\":null,\"active\":%s,\"tid\":%u,\"running\":%s,\"idle\":%s}",
+                              i == 0 ? "" : ",", i, owner ? "true" : "false", owner ? owner->id : 0,
+                              running ? "true" : "false", !running && !owner ? "true" : "false");
+                json += buf;
+            }
+        }
         json += "]";
 
         const auto total_delta = total_instructions > total_previous ? total_instructions - total_previous : 0;
         const auto total_mips = elapsed_seconds > 0.0 ? static_cast<double>(total_delta) / (elapsed_seconds * 1000000.0) : 0.0;
-        std::snprintf(buf, sizeof(buf), ",\"total_mips\":%.2f", total_mips);
-        json += buf;
+        if (instruction_counts_available)
+        {
+            std::snprintf(buf, sizeof(buf), ",\"total_mips\":%.2f", total_mips);
+            json += buf;
+        }
+        else
+        {
+            json += ",\"total_mips\":null";
+        }
 
         if (this->file_reads_profile.enabled())
         {
