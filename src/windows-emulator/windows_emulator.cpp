@@ -139,6 +139,23 @@ namespace sogen
             return true;
         }
 
+        bool is_steam_api_module(const std::string_view name)
+        {
+            constexpr std::string_view expected = "steam_api64.dll";
+            if (name.size() != expected.size())
+            {
+                return false;
+            }
+            for (size_t i = 0; i < name.size(); ++i)
+            {
+                if (static_cast<char>(std::tolower(static_cast<unsigned char>(name[i]))) != expected[i])
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         bool is_dxgi_throw_module(const std::string_view name)
         {
             constexpr std::string_view expected = "dxgi.dll";
@@ -2128,6 +2145,110 @@ namespace sogen
             }
         });
 
+        // Observe the matching Dawn Steam API initializer without changing guest registers or memory.
+        // The RVAs and entry signature belong to steam_api64.dll SHA-256 39788C155DF397BA8C12415911880089FE5982F0B38F3496E4CE056779066845.
+        if (const auto* probe = std::getenv("SOGEN_STEAM_INIT_PROBE"); probe && std::strcmp(probe, "1") == 0)
+        {
+            auto seen = std::make_shared<std::array<bool, 6>>();
+            auto attempted = std::make_shared<bool>(false);
+            auto hooks = std::make_shared<std::unordered_map<uint64_t, std::array<emulator_hook*, 6>>>();
+            this->callbacks.on_module_load.add([this, seen, attempted, hooks](mapped_module& mod) {
+                if (!is_steam_api_module(mod.name) || *attempted)
+                {
+                    return;
+                }
+                *attempted = true;
+                constexpr uint64_t expected_image_size = 0x1ABEB000;
+                constexpr uint64_t entry_rva = 0x2260;
+                constexpr std::array<uint8_t, 18> expected_entry{
+                    0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0x48, 0x8B, 0x1D,
+                    0x83, 0xC3, 0x49, 0x12, 0xE8, 0x4E, 0xF4, 0x05, 0x00};
+                constexpr std::array<uint64_t, 6> site_rvas{
+                    entry_rva, 0x2295, 0x22BD, 0x22D3, 0x2303, 0x2348};
+                const bool range_valid = mod.image_base <= UINT64_MAX - site_rvas.back() &&
+                                         mod.size_of_image == expected_image_size &&
+                                         mod.find_export("SteamAPI_Init") == mod.image_base + entry_rva;
+                std::array<uint8_t, expected_entry.size()> actual_entry{};
+                const bool signature_read = range_valid &&
+                    this->emu().try_read_memory(mod.image_base + entry_rva, actual_entry.data(), actual_entry.size());
+                const bool signature_match = signature_read && actual_entry == expected_entry;
+                if (!signature_match)
+                {
+                    this->log.error(
+                        "[STEAMINITPROBE] skipped module=%s base=%#llx image_size=%#llx expected_size=%#llx "
+                        "export=%#llx signature_read=%u signature_match=0\n",
+                        mod.name.c_str(), static_cast<unsigned long long>(mod.image_base),
+                        static_cast<unsigned long long>(mod.size_of_image),
+                        static_cast<unsigned long long>(expected_image_size),
+                        static_cast<unsigned long long>(mod.find_export("SteamAPI_Init")),
+                        static_cast<unsigned>(signature_read));
+                    return;
+                }
+                std::array<emulator_hook*, site_rvas.size()> installed{};
+                const auto base = mod.image_base;
+                for (size_t site = 0; site < site_rvas.size(); ++site)
+                {
+                    installed[site] = this->emu().hook_memory_execution(
+                        base + site_rvas[site], [this, seen, site, base](cpu_interface& cpu, const uint64_t rip) {
+                            const std::scoped_lock lock(this->kernel_lock_);
+                            if ((*seen)[site])
+                            {
+                                return;
+                            }
+                            (*seen)[site] = true;
+                            auto& vcpu = this->vcpu(cpu.index());
+                            auto& acting = vcpu.cpu;
+                            const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                            const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
+                            const auto rax = acting.reg<uint64_t>(x86_register::rax);
+                            const auto eflags = acting.reg<uint32_t>(x86_register::eflags);
+                            uint64_t stack0 = 0;
+                            const bool stack0_valid = acting.try_read_memory(rsp, &stack0, sizeof(stack0));
+                            // The verified prologue is push rbx; sub rsp, 0x30.
+                            const bool return_slot_valid = site == 0 || rsp <= UINT64_MAX - 0x38;
+                            const auto return_slot = site == 0 ? rsp : return_slot_valid ? rsp + 0x38 : 0;
+                            uint64_t return_address = 0;
+                            const bool return_valid = return_slot_valid &&
+                                acting.try_read_memory(return_slot, &return_address, sizeof(return_address));
+                            const auto* caller = return_valid ? this->mod_manager.find_by_address(return_address) : nullptr;
+                            constexpr std::array<const char*, 6> names{
+                                "entry", "egress_result", "core_result", "package_trust_result", "return_false", "return_true"};
+                            this->log.error(
+                                "[STEAMINITPROBE] site=%s tid=%u vcpu=%zu rip=%#llx rva=%#llx "
+                                "rax=%#llx eflags=%#x zf=%u rsp=%#llx stack0_valid=%u stack0=%#llx "
+                                "return_valid=%u return=%#llx return_module=%s return_rva=%#llx\n",
+                                names[site], tid, cpu.index(),
+                                static_cast<unsigned long long>(rip),
+                                static_cast<unsigned long long>(rip - base),
+                                static_cast<unsigned long long>(rax), eflags,
+                                static_cast<unsigned>((eflags & 0x40u) != 0),
+                                static_cast<unsigned long long>(rsp),
+                                static_cast<unsigned>(stack0_valid),
+                                static_cast<unsigned long long>(stack0),
+                                static_cast<unsigned>(return_valid),
+                                static_cast<unsigned long long>(return_address),
+                                caller ? caller->name.c_str() : "<unmapped>",
+                                static_cast<unsigned long long>(caller ? return_address - caller->image_base : 0));
+                        });
+                }
+                hooks->emplace(base, installed);
+                this->log.error("[STEAMINITPROBE] installed module=%s base=%#llx sites=%zu\n",
+                                mod.name.c_str(), static_cast<unsigned long long>(base),
+                                static_cast<size_t>(std::ranges::count_if(installed, [](const auto* hook) { return hook != nullptr; })));
+            });
+            this->callbacks.on_module_unload.add([this, hooks](mapped_module& mod) {
+                if (auto entry = hooks->extract(mod.image_base); entry)
+                {
+                    for (auto* hook : entry.mapped())
+                    {
+                        if (hook)
+                        {
+                            this->emu().delete_hook(hook);
+                        }
+                    }
+                }
+            });
+        }
         // Exact execution hooks only: no global instruction callback or default hot-path work.
         // The first few guest C++ throws identify the caller preceding a DXVK/d3d11 terminate.
         if (const auto* probe = std::getenv("SOGEN_GUEST_CXX_THROW_PROBE"); probe && *probe == '1')
