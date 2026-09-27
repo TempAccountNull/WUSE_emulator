@@ -2145,13 +2145,14 @@ namespace sogen
             }
         });
 
-        // Observe the matching Dawn Steam API initializer without changing guest registers or memory.
-        // The RVAs and entry signature belong to steam_api64.dll SHA-256 39788C155DF397BA8C12415911880089FE5982F0B38F3496E4CE056779066845.
+        // Observe the matching Dawn Steam API initializer and its egress install path
+        // without changing guest registers or memory. RVAs and signatures belong to
+        // steam_api64.dll SHA-256 39788C155DF397BA8C12415911880089FE5982F0B38F3496E4CE056779066845.
         if (const auto* probe = std::getenv("SOGEN_STEAM_INIT_PROBE"); probe && std::strcmp(probe, "1") == 0)
         {
-            auto seen = std::make_shared<std::array<bool, 6>>();
+            auto seen = std::make_shared<std::array<uint8_t, 12>>();
             auto attempted = std::make_shared<bool>(false);
-            auto hooks = std::make_shared<std::unordered_map<uint64_t, std::array<emulator_hook*, 6>>>();
+            auto hooks = std::make_shared<std::unordered_map<uint64_t, std::array<emulator_hook*, 12>>>();
             this->callbacks.on_module_load.add([this, seen, attempted, hooks](mapped_module& mod) {
                 if (!is_steam_api_module(mod.name) || *attempted)
                 {
@@ -2163,27 +2164,56 @@ namespace sogen
                 constexpr std::array<uint8_t, 18> expected_entry{
                     0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0x48, 0x8B, 0x1D,
                     0x83, 0xC3, 0x49, 0x12, 0xE8, 0x4E, 0xF4, 0x05, 0x00};
-                constexpr std::array<uint64_t, 6> site_rvas{
-                    entry_rva, 0x2295, 0x22BD, 0x22D3, 0x2303, 0x2348};
+                constexpr std::array<uint64_t, 12> site_rvas{
+                    entry_rva, 0x2295, 0x22BD, 0x22D3, 0x2303, 0x2348,
+                    0x180850, 0x180959, 0x1809BD, 0x180A09, 0x180A7D, 0x180AC4};
+                constexpr std::array<std::array<uint8_t, 2>, 12> expected_sites{{
+                    {{0x40, 0x53}}, {{0x74, 0x6C}}, {{0x74, 0x37}}, {{0x75, 0x36}},
+                    {{0x32, 0xC0}}, {{0xB0, 0x01}}, {{0x48, 0x89}}, {{0x0F, 0x84}},
+                    {{0x74, 0x6B}}, {{0x74, 0x1F}}, {{0x48, 0x8D}}, {{0xC3, 0xCC}}}};
                 const bool range_valid = mod.image_base <= UINT64_MAX - site_rvas.back() &&
                                          mod.size_of_image == expected_image_size &&
                                          mod.find_export("SteamAPI_Init") == mod.image_base + entry_rva;
                 std::array<uint8_t, expected_entry.size()> actual_entry{};
-                const bool signature_read = range_valid &&
+                const bool entry_read = range_valid &&
                     this->emu().try_read_memory(mod.image_base + entry_rva, actual_entry.data(), actual_entry.size());
-                const bool signature_match = signature_read && actual_entry == expected_entry;
-                if (!signature_match)
+                const bool entry_match = entry_read && actual_entry == expected_entry;
+                size_t first_bad_site = site_rvas.size();
+                bool bad_site_read = false;
+                std::array<uint8_t, 2> bad_site_bytes{};
+                if (entry_match)
+                {
+                    for (size_t site = 0; site < site_rvas.size(); ++site)
+                    {
+                        std::array<uint8_t, 2> actual{};
+                        const bool read = this->emu().try_read_memory(
+                            mod.image_base + site_rvas[site], actual.data(), actual.size());
+                        if (!read || actual != expected_sites[site])
+                        {
+                            first_bad_site = site;
+                            bad_site_read = read;
+                            bad_site_bytes = actual;
+                            break;
+                        }
+                    }
+                }
+                if (!entry_match || first_bad_site != site_rvas.size())
                 {
                     this->log.error(
                         "[STEAMINITPROBE] skipped module=%s base=%#llx image_size=%#llx expected_size=%#llx "
-                        "export=%#llx signature_read=%u signature_match=0\n",
+                        "export=%#llx entry_read=%u entry_match=%u bad_site_rva=%#llx "
+                        "bad_site_read=%u bad_site_bytes=%02x%02x\n",
                         mod.name.c_str(), static_cast<unsigned long long>(mod.image_base),
                         static_cast<unsigned long long>(mod.size_of_image),
                         static_cast<unsigned long long>(expected_image_size),
                         static_cast<unsigned long long>(mod.find_export("SteamAPI_Init")),
-                        static_cast<unsigned>(signature_read));
+                        static_cast<unsigned>(entry_read), static_cast<unsigned>(entry_match),
+                        static_cast<unsigned long long>(
+                            first_bad_site < site_rvas.size() ? site_rvas[first_bad_site] : 0),
+                        static_cast<unsigned>(bad_site_read), bad_site_bytes[0], bad_site_bytes[1]);
                     return;
                 }
+
                 std::array<emulator_hook*, site_rvas.size()> installed{};
                 const auto base = mod.image_base;
                 for (size_t site = 0; site < site_rvas.size(); ++site)
@@ -2191,36 +2221,43 @@ namespace sogen
                     installed[site] = this->emu().hook_memory_execution(
                         base + site_rvas[site], [this, seen, site, base](cpu_interface& cpu, const uint64_t rip) {
                             const std::scoped_lock lock(this->kernel_lock_);
-                            if ((*seen)[site])
+                            const uint8_t limit = site == 7 ? 3 : 1; // Three loader attempts; other sites once.
+                            if ((*seen)[site] >= limit)
                             {
                                 return;
                             }
-                            (*seen)[site] = true;
+                            const auto hit = ++(*seen)[site];
                             auto& vcpu = this->vcpu(cpu.index());
                             auto& acting = vcpu.cpu;
                             const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
                             const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
                             const auto rax = acting.reg<uint64_t>(x86_register::rax);
+                            const auto rdi = acting.reg<uint64_t>(x86_register::rdi);
                             const auto eflags = acting.reg<uint32_t>(x86_register::eflags);
                             uint64_t stack0 = 0;
                             const bool stack0_valid = acting.try_read_memory(rsp, &stack0, sizeof(stack0));
-                            // The verified prologue is push rbx; sub rsp, 0x30.
-                            const bool return_slot_valid = site == 0 || rsp <= UINT64_MAX - 0x38;
-                            const auto return_slot = site == 0 ? rsp : return_slot_valid ? rsp + 0x38 : 0;
+                            // SteamAPI_Init: push rbx; sub rsp,0x30. egress::install:
+                            // push rsi; sub rsp,0x260. At each ret, RSP again holds the caller.
+                            const uint64_t return_offset = site == 0 || site == 6 || site == 11 ?
+                                0 : site < 6 ? 0x38 : 0x268;
+                            const bool return_slot_valid = rsp <= UINT64_MAX - return_offset;
+                            const auto return_slot = return_slot_valid ? rsp + return_offset : 0;
                             uint64_t return_address = 0;
                             const bool return_valid = return_slot_valid &&
                                 acting.try_read_memory(return_slot, &return_address, sizeof(return_address));
                             const auto* caller = return_valid ? this->mod_manager.find_by_address(return_address) : nullptr;
-                            constexpr std::array<const char*, 6> names{
-                                "entry", "egress_result", "core_result", "package_trust_result", "return_false", "return_true"};
+                            constexpr std::array<const char*, 12> names{
+                                "entry", "egress_result", "core_result", "package_trust_result",
+                                "return_false", "return_true", "egress_entry", "loader_result",
+                                "export_resolution_result", "detours_result", "egress_failure_cleanup", "egress_return"};
                             this->log.error(
-                                "[STEAMINITPROBE] site=%s tid=%u vcpu=%zu rip=%#llx rva=%#llx "
-                                "rax=%#llx eflags=%#x zf=%u rsp=%#llx stack0_valid=%u stack0=%#llx "
+                                "[STEAMINITPROBE] site=%s n=%u tid=%u vcpu=%zu rip=%#llx rva=%#llx "
+                                "rax=%#llx rdi=%#llx eflags=%#x zf=%u rsp=%#llx stack0_valid=%u stack0=%#llx "
                                 "return_valid=%u return=%#llx return_module=%s return_rva=%#llx\n",
-                                names[site], tid, cpu.index(),
+                                names[site], static_cast<unsigned>(hit), tid, cpu.index(),
                                 static_cast<unsigned long long>(rip),
                                 static_cast<unsigned long long>(rip - base),
-                                static_cast<unsigned long long>(rax), eflags,
+                                static_cast<unsigned long long>(rax), static_cast<unsigned long long>(rdi), eflags,
                                 static_cast<unsigned>((eflags & 0x40u) != 0),
                                 static_cast<unsigned long long>(rsp),
                                 static_cast<unsigned>(stack0_valid),
