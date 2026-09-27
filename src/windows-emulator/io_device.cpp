@@ -222,9 +222,26 @@ namespace sogen
             return result;
         }
 
+        if (this->may_return_pending() && !c.completing_pending && result == STATUS_INVALID_PARAMETER)
+        {
+            // Native AFD rejects invalid requests before completing an IRP: no IOSB update,
+            // event signal, APC, or IOCP packet is delivered.
+            if (original_io_status)
+            {
+                c.io_status_block.write(*original_io_status);
+            }
+            return result;
+        }
+
         write_io_status(c.io_status_block, result);
         complete_device_ioctl(win_emu, c, result, !c.completing_pending);
         return result;
+    }
+
+    bool io_device_container::may_return_pending() const
+    {
+        this->assert_validity();
+        return this->device_->may_return_pending();
     }
 
     NTSTATUS io_device_container::io_control(windows_emulator& win_emu, const io_device_context& context)

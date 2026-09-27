@@ -324,6 +324,48 @@ namespace sogen::test
         EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
     }
 
+    TEST_P(AfdPendingRequestTest, ImmediateInvalidRequestDoesNotCompleteApcEventOrIocp)
+    {
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+        emu.memory.write_memory(memory + 0x100, &initial, sizeof(initial));
+
+        emulator_thread issuer{emu.memory};
+        issuer.id = 0x1234;
+        const auto thread_handle = emu.process.threads.store(std::move(issuer));
+        emu.process.thread_handles_by_id.emplace(0x1234, thread_handle);
+
+        io_device_context request{emu.memory};
+        request.io_control_code = 0x120b0; // AFD_ADDRESS_LIST_QUERY with missing required input.
+        request.io_status_block = {emu.memory, memory + 0x100};
+        request.event = receive_event;
+        request.issuer_thread_id = 0x1234;
+        request.apc_routine = 0x567800;
+        request.apc_context = 0xfeed;
+        ASSERT_EQ(device->execute_ioctl(emu, request), STATUS_INVALID_PARAMETER);
+        EXPECT_EQ(status(false).Status, initial.Status);
+        EXPECT_EQ(status(false).Information, initial.Information);
+        EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+        EXPECT_TRUE(emu.process.threads.get(thread_handle)->pending_apcs.empty());
+
+        const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
+        emu.memory.write_memory(memory, creation.data(), sizeof(creation));
+        const auto endpoint_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        auto* endpoint = emu.process.devices.get(endpoint_handle);
+        ASSERT_NE(endpoint, nullptr);
+        const auto port_handle = emu.process.io_completions.store(io_completion{});
+        endpoint->completion_port = port_handle;
+        endpoint->completion_key = 0x9876;
+
+        request.apc_routine = 0;
+        request.file_handle = endpoint_handle;
+        ASSERT_EQ(endpoint->execute_ioctl(emu, request), STATUS_INVALID_PARAMETER);
+        EXPECT_EQ(status(false).Status, initial.Status);
+        EXPECT_EQ(status(false).Information, initial.Information);
+        EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+        EXPECT_TRUE(emu.process.io_completions.get(port_handle)->queue.empty());
+    }
+
     TEST_P(AfdPendingRequestTest, ReceiveAndSendCompleteIndependentlyOnSameEndpoint)
     {
         ASSERT_EQ(transfer(false), STATUS_PENDING);
@@ -476,7 +518,11 @@ namespace sogen::test
         endpoint->completion_port = port_handle;
         endpoint->completion_key = 0x9876;
 
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+        emu.memory.write_memory(memory + 0x120, &initial, sizeof(initial));
         ASSERT_EQ(transfer(true, 0, endpoint, endpoint_handle), STATUS_PENDING);
+        EXPECT_EQ(status(true).Status, initial.Status);
+        EXPECT_EQ(status(true).Information, initial.Information);
         EXPECT_TRUE(emu.process.io_completions.get(port_handle)->queue.empty());
         socket->send_blocked = false;
         endpoint->work(emu);
