@@ -47,6 +47,16 @@ namespace sogen
                 }
             }
 
+            if (value.type == handle_types::device)
+            {
+                auto* device = c.proc.devices.get(h);
+                if (device && device->ref_count == 1)
+                {
+                    // Complete pending I/O before the open device object and its retained port disappear.
+                    (void)device->cancel_pending_io(c.win_emu, 0, 0);
+                    io_completion_wait::release_handle_reference(c.proc, device->completion_port);
+                }
+            }
             if (value.type == handle_types::file)
             {
                 auto* file = c.proc.files.get(h);

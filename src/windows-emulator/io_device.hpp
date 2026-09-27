@@ -20,6 +20,9 @@ namespace sogen
 
     struct io_device_context
     {
+        handle file_handle{};
+        uint32_t issuer_thread_id{};
+        bool completing_pending{};
         handle event{};
         emulator_pointer /*PIO_APC_ROUTINE*/ apc_routine{};
         emulator_pointer apc_context{};
@@ -49,6 +52,9 @@ namespace sogen
 
         void serialize(utils::buffer_serializer& buffer) const
         {
+            buffer.write(file_handle);
+            buffer.write(issuer_thread_id);
+            buffer.write(completing_pending);
             buffer.write(event);
             buffer.write(apc_routine);
             buffer.write(apc_context);
@@ -62,6 +68,9 @@ namespace sogen
 
         void deserialize(utils::buffer_deserializer& buffer)
         {
+            buffer.read(file_handle);
+            buffer.read(issuer_thread_id);
+            buffer.read(completing_pending);
             buffer.read(event);
             buffer.read(apc_routine);
             buffer.read(apc_context);
@@ -73,6 +82,8 @@ namespace sogen
             buffer.read(output_buffer_length);
         }
     };
+
+    void complete_device_ioctl(windows_emulator& win_emu, const io_device_context& context, NTSTATUS status, bool completed_synchronously);
 
     struct io_device_creation_data
     {
@@ -117,6 +128,15 @@ namespace sogen
         virtual void work(windows_emulator& win_emu)
         {
             (void)win_emu;
+        }
+
+        // A zero filter matches every pending request on this open device object.
+        virtual uint32_t cancel_pending_io(windows_emulator& win_emu, uint64_t io_status_block, uint32_t issuer_thread_id)
+        {
+            (void)win_emu;
+            (void)io_status_block;
+            (void)issuer_thread_id;
+            return 0;
         }
 
         virtual void rebase_steady_deadlines(std::chrono::steady_clock::duration)
@@ -164,6 +184,9 @@ namespace sogen
     class io_device_container : public io_device
     {
       public:
+        handle completion_port{};
+        uint64_t completion_key{};
+        ULONG completion_notification_flags{};
         io_device_container() = default;
 
         io_device_container(std::u16string device, windows_emulator& win_emu, const io_device_creation_data& data)
@@ -175,6 +198,7 @@ namespace sogen
         }
 
         void work(windows_emulator& win_emu) override;
+        uint32_t cancel_pending_io(windows_emulator& win_emu, uint64_t io_status_block, uint32_t issuer_thread_id) override;
         void rebase_steady_deadlines(std::chrono::steady_clock::duration offset) override;
         NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& context) override;
 

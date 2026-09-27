@@ -1,5 +1,6 @@
 #include "../std_include.hpp"
 #include "../emulator_utils.hpp"
+#include "../io_completion_wait.hpp"
 #include "../syscall_utils.hpp"
 #include "utils/io.hpp"
 
@@ -130,8 +131,92 @@ namespace sogen
             auto* f = c.proc.files.get(file_handle);
             if (!f)
             {
-                if (c.proc.devices.get(file_handle))
+                if (auto* device = c.proc.devices.get(file_handle))
                 {
+                    const auto finish = [&](const NTSTATUS status) {
+                        io_status_block.write_if_valid({.Status = status, .Information = 0});
+                        return status;
+                    };
+                    if (info_class == FileCompletionInformation || info_class == FileReplaceCompletionInformation)
+                    {
+                        const bool is_32_bit = c.proc.is_wow64_process;
+                        const ULONG required = is_32_bit ? sizeof(FILE_COMPLETION_INFORMATION<EmulatorTraits<Emu32>>)
+                                                         : sizeof(FILE_COMPLETION_INFORMATION<EmulatorTraits<Emu64>>);
+                        if (length < required)
+                        {
+                            return finish(STATUS_INFO_LENGTH_MISMATCH);
+                        }
+                        if (!file_information)
+                        {
+                            return finish(STATUS_ACCESS_VIOLATION);
+                        }
+                        handle port{};
+                        uint64_t key{};
+                        if (is_32_bit)
+                        {
+                            FILE_COMPLETION_INFORMATION<EmulatorTraits<Emu32>> info{};
+                            if (!c.emu.try_read_memory(file_information, &info, sizeof(info)))
+                            {
+                                return finish(STATUS_ACCESS_VIOLATION);
+                            }
+                            port.bits = info.Port;
+                            key = info.Key;
+                        }
+                        else
+                        {
+                            FILE_COMPLETION_INFORMATION<EmulatorTraits<Emu64>> info{};
+                            if (!c.emu.try_read_memory(file_information, &info, sizeof(info)))
+                            {
+                                return finish(STATUS_ACCESS_VIOLATION);
+                            }
+                            port.bits = info.Port;
+                            key = info.Key;
+                        }
+                        if (device->completion_port.bits && info_class == FileCompletionInformation)
+                        {
+                            return finish(STATUS_INVALID_PARAMETER);
+                        }
+                        if (!port.bits && info_class == FileCompletionInformation)
+                        {
+                            return finish(STATUS_INVALID_HANDLE);
+                        }
+                        if (port.bits && !c.proc.io_completions.get(port))
+                        {
+                            return finish(STATUS_INVALID_HANDLE);
+                        }
+                        handle retained_port{};
+                        if (!io_completion_wait::retain_handle_reference(c.proc, c.vcpu.active_thread, port, retained_port))
+                        {
+                            return finish(STATUS_INVALID_HANDLE);
+                        }
+                        io_completion_wait::release_handle_reference(c.proc, device->completion_port);
+                        device->completion_port = retained_port;
+                        device->completion_key = port.bits ? key : 0;
+                        return finish(STATUS_SUCCESS);
+                    }
+                    if (info_class == FileIoCompletionNotificationInformation)
+                    {
+                        if (length < sizeof(FILE_IO_COMPLETION_NOTIFICATION_INFORMATION))
+                        {
+                            return finish(STATUS_INFO_LENGTH_MISMATCH);
+                        }
+                        if (!file_information)
+                        {
+                            return finish(STATUS_ACCESS_VIOLATION);
+                        }
+                        FILE_IO_COMPLETION_NOTIFICATION_INFORMATION info{};
+                        if (!c.emu.try_read_memory(file_information, &info, sizeof(info)))
+                        {
+                            return finish(STATUS_ACCESS_VIOLATION);
+                        }
+                        constexpr ULONG supported_flags = 0x1;
+                        if (info.Flags & ~supported_flags)
+                        {
+                            return finish(STATUS_NOT_SUPPORTED);
+                        }
+                        device->completion_notification_flags = info.Flags;
+                        return finish(STATUS_SUCCESS);
+                    }
                     return STATUS_SUCCESS;
                 }
 

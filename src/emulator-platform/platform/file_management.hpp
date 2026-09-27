@@ -350,6 +350,25 @@ namespace sogen
     };
 
     template <typename Traits>
+    struct FILE_COMPLETION_INFORMATION
+    {
+        typename Traits::HANDLE Port;
+        typename Traits::PVOID Key;
+    };
+
+    static_assert(sizeof(FILE_COMPLETION_INFORMATION<EmulatorTraits<Emu32>>) == 8);
+    static_assert(offsetof(FILE_COMPLETION_INFORMATION<EmulatorTraits<Emu32>>, Key) == 4);
+    static_assert(sizeof(FILE_COMPLETION_INFORMATION<EmulatorTraits<Emu64>>) == 16);
+    static_assert(offsetof(FILE_COMPLETION_INFORMATION<EmulatorTraits<Emu64>>, Key) == 8);
+
+    struct FILE_IO_COMPLETION_NOTIFICATION_INFORMATION
+    {
+        ULONG Flags;
+    };
+
+    static_assert(sizeof(FILE_IO_COMPLETION_NOTIFICATION_INFORMATION) == 4);
+
+    template <typename Traits>
     struct FILE_IO_COMPLETION_INFORMATION
     {
         Traits::PVOID KeyContext;

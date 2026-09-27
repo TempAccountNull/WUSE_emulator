@@ -968,6 +968,10 @@ namespace sogen
             {
                 return STATUS_INVALID_HANDLE;
             }
+            if (device->completion_port.bits && apc_routine)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
 
             if (auto* e = c.proc.events.get(event))
             {
@@ -975,6 +979,8 @@ namespace sogen
             }
 
             io_device_context context{c.emu};
+            context.file_handle = resolved_file_handle;
+            context.issuer_thread_id = c.thread().id;
             context.event = event;
             context.apc_routine = apc_routine;
             context.apc_context = apc_context;
@@ -1274,6 +1280,13 @@ namespace sogen
         NTSTATUS handle_NtCancelIoFileEx(const syscall_context& c, const handle file_handle, const uint64_t request_io_status_block,
                                          const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block)
         {
+            if (auto* device = c.proc.devices.get(file_handle))
+            {
+                const auto cancelled = device->cancel_pending_io(c.win_emu, request_io_status_block, 0);
+                const auto status = cancelled ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+                io_status_block.write({.Status = status, .Information = 0});
+                return status;
+            }
             if (!c.proc.files.get(file_handle))
             {
                 return STATUS_INVALID_HANDLE;
@@ -1286,6 +1299,12 @@ namespace sogen
         NTSTATUS handle_NtCancelIoFile(const syscall_context& c, const handle file_handle,
                                        const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block)
         {
+            if (auto* device = c.proc.devices.get(file_handle))
+            {
+                (void)device->cancel_pending_io(c.win_emu, 0, c.thread().id);
+                io_status_block.write({.Status = STATUS_SUCCESS, .Information = 0});
+                return STATUS_SUCCESS;
+            }
             if (!c.proc.files.get(file_handle))
             {
                 return STATUS_INVALID_HANDLE;

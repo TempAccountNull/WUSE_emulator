@@ -198,25 +198,29 @@ namespace sogen::test
         }
     };
 
-    TEST_F(SnapshotFile, RejectsVersionOneBeforeReadingChangedThreadLayout)
+    TEST_F(SnapshotFile, RejectsOlderVersionsBeforeReadingChangedDeviceLayout)
     {
         auto emu = sample();
         emu.setup_process_if_necessary();
-        auto old_format = snapshot::create_emulator_snapshot(emu);
-        ASSERT_GE(old_format.size(), 8U);
-        old_format[4] = std::byte{1};
-        old_format[5] = std::byte{0};
-        old_format[6] = std::byte{0};
-        old_format[7] = std::byte{0};
+        for (const uint8_t version : {uint8_t{1}, uint8_t{2}})
+        {
+            auto old_format = snapshot::create_emulator_snapshot(emu);
+            ASSERT_GE(old_format.size(), 8U);
+            old_format[4] = std::byte{version};
+            old_format[5] = std::byte{0};
+            old_format[6] = std::byte{0};
+            old_format[7] = std::byte{0};
 
-        try
-        {
-            snapshot::load_emulator_snapshot(emu, old_format);
-            FAIL() << "Version-one snapshot was accepted";
-        }
-        catch (const std::runtime_error& e)
-        {
-            EXPECT_NE(std::string_view(e.what()).find("Unsupported snapshot version: 1"), std::string_view::npos);
+            try
+            {
+                snapshot::load_emulator_snapshot(emu, old_format);
+                FAIL() << "Older snapshot was accepted";
+            }
+            catch (const std::runtime_error& e)
+            {
+                const auto expected = "Unsupported snapshot version: " + std::to_string(version);
+                EXPECT_NE(std::string_view(e.what()).find(expected), std::string_view::npos);
+            }
         }
     }
 

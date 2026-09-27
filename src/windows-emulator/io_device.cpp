@@ -144,6 +144,63 @@ namespace sogen
         return this->vcpu->thread();
     }
 
+    void complete_device_ioctl(windows_emulator& win_emu, const io_device_context& c, const NTSTATUS status,
+                               const bool completed_synchronously)
+    {
+        if (status == STATUS_PENDING)
+        {
+            return;
+        }
+        if (c.event.bits)
+        {
+            if (auto* event = win_emu.process.events.get(c.event))
+            {
+                event->signaled = true;
+            }
+        }
+        const auto block = c.io_status_block ? c.io_status_block.read() : IO_STATUS_BLOCK<EmulatorTraits<Emu64>>{.Status = status};
+        if (c.apc_routine)
+        {
+            const auto issuer = win_emu.process.thread_handles_by_id.find(c.issuer_thread_id);
+            if (issuer != win_emu.process.thread_handles_by_id.end())
+            {
+                if (auto* thread = win_emu.process.threads.get(issuer->second))
+                {
+                    thread->pending_apcs.push_back({
+                        .flags = 0,
+                        .apc_routine = c.apc_routine,
+                        .apc_argument1 = c.apc_context,
+                        .apc_argument2 = c.io_status_block.value(),
+                        .apc_argument3 = 0,
+                        .restamp_io_status_block = win_emu.process.is_wow64_process && c.io_status_block,
+                        .io_status = static_cast<int32_t>(static_cast<ULONG>(status)),
+                        .io_information = static_cast<uint32_t>(block.Information),
+                    });
+                }
+            }
+            return;
+        }
+        const auto* file_object = win_emu.process.devices.get(c.file_handle);
+        if (!file_object || !file_object->completion_port.bits)
+        {
+            return;
+        }
+        constexpr ULONG skip_port_on_success = 0x1;
+        if (completed_synchronously &&
+            (status != STATUS_SUCCESS || (file_object->completion_notification_flags & skip_port_on_success) != 0))
+        {
+            return;
+        }
+        if (auto* port = win_emu.process.io_completions.get(file_object->completion_port))
+        {
+            io_completion_message message{};
+            message.key_context = file_object->completion_key;
+            message.apc_context = c.apc_context;
+            message.io_status_block = block;
+            port->enqueue(message);
+        }
+    }
+
     NTSTATUS io_device::execute_ioctl(windows_emulator& win_emu, const io_device_context& c)
     {
         if (c.io_status_block)
@@ -154,15 +211,9 @@ namespace sogen
         const auto result = this->io_control(win_emu, c);
         write_io_status(c.io_status_block, result);
 
-        // A synchronously-completing IOCTL must signal the optional completion event the caller passed, so a
-        // thread that issues the request and then waits on the event is released. Asynchronous devices return
-        // STATUS_PENDING and signal the event themselves once the delayed operation completes.
-        if (result != STATUS_PENDING && c.event.bits)
+        if (result != STATUS_PENDING)
         {
-            if (auto* e = win_emu.process.events.get(c.event); e)
-            {
-                e->signaled = true;
-            }
+            complete_device_ioctl(win_emu, c, result, !c.completing_pending);
         }
 
         return result;
@@ -181,6 +232,13 @@ namespace sogen
         this->device_->work(win_emu);
     }
 
+    uint32_t io_device_container::cancel_pending_io(windows_emulator& win_emu, const uint64_t io_status_block,
+                                                    const uint32_t issuer_thread_id)
+    {
+        this->assert_validity();
+        return this->device_->cancel_pending_io(win_emu, io_status_block, issuer_thread_id);
+    }
+
     void io_device_container::rebase_steady_deadlines(const std::chrono::steady_clock::duration offset)
     {
         this->assert_validity();
@@ -193,6 +251,9 @@ namespace sogen
 
         buffer.write(this->is_32_bit_);
         buffer.write_string(this->device_name_);
+        buffer.write(this->completion_port);
+        buffer.write(this->completion_key);
+        buffer.write(this->completion_notification_flags);
         this->device_->serialize(buffer);
     }
 
@@ -200,6 +261,9 @@ namespace sogen
     {
         buffer.read(this->is_32_bit_);
         buffer.read_string(this->device_name_);
+        buffer.read(this->completion_port);
+        buffer.read(this->completion_key);
+        buffer.read(this->completion_notification_flags);
 
         this->setup();
         this->device_->deserialize(buffer);
