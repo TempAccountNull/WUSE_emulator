@@ -78,6 +78,10 @@ EXPORTS
     vkCmdPipelineBarrier
     vkCmdPushConstants
     vkCmdPushConstants2KHR
+    vkCmdPushDescriptorSetKHR
+    vkCmdPushDescriptorSet2KHR
+    vkCmdPushDescriptorSetWithTemplateKHR
+    vkCmdPushDescriptorSetWithTemplate2KHR
     vkCmdSetBlendConstants
     vkCmdSetCullMode
     vkCmdSetDepthBias

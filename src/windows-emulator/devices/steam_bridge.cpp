@@ -5,6 +5,7 @@
 #include <steam_bridge_protocol.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <span>
@@ -151,6 +152,13 @@ namespace sogen
 
         std::unique_ptr<steam_backend> make_backend(windows_emulator& win_emu)
         {
+            // This opt-in test mode severs the host Steam client connection. Dawn's own in-process
+            // steam_api64.dll still initializes normally, so the result isolates any host-client dependency.
+            if (const char* mode = std::getenv("SOGEN_HOST_STEAM_BRIDGE"); mode && std::strcmp(mode, "0") == 0)
+            {
+                win_emu.log.info("[steam-bridge] host Steam bridge disabled for offline test\n");
+                return std::make_unique<null_backend>();
+            }
 #ifdef SOGEN_STEAM_REAL_BACKEND
             if (sogen_steam_backend_init())
             {

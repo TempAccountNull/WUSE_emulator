@@ -81,7 +81,6 @@ namespace sogen::test
                                              "VK_EXT_full_screen_exclusive",
                                              "VK_NV_low_latency2",
                                              "VK_EXT_hdr_metadata",
-                                             "VK_KHR_maintenance6",
                                              "VK_EXT_depth_bias_control",
                                              "VK_EXT_descriptor_buffer",
                                              "VK_EXT_descriptor_heap",

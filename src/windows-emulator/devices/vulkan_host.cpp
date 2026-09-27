@@ -64,7 +64,6 @@ namespace sogen
             std::string_view{"VK_EXT_full_screen_exclusive"},    //
             std::string_view{"VK_NV_low_latency2"},              //
             std::string_view{"VK_EXT_hdr_metadata"},             // no host swapchain HDR metadata path, including readback
-            std::string_view{"VK_KHR_maintenance6"},             // keep hidden until the complete maintenance6 family is validated
             std::string_view{"VK_EXT_depth_bias_control"},
             std::string_view{"VK_EXT_descriptor_buffer"},
             std::string_view{"VK_EXT_descriptor_heap"},
@@ -469,6 +468,7 @@ namespace sogen
             bool descriptor_buffer_feature{};
             bool maintenance6_extension{};
             bool maintenance6_feature{};
+            bool push_descriptor_extension{};
             bool descriptor_buffer_null_descriptor{};
             bool robust_buffer_access{};
             PFN_vkDestroyDescriptorSetLayout destroy_descriptor_set_layout{};
@@ -479,6 +479,8 @@ namespace sogen
             PFN_vkFreeDescriptorSets free_descriptor_sets{};
             PFN_vkUpdateDescriptorSets update_descriptor_sets{};
             PFN_vkCmdBindDescriptorSets cmd_bind_descriptor_sets{};
+            PFN_vkCmdPushDescriptorSetKHR cmd_push_descriptor_set{};
+            PFN_vkCmdPushDescriptorSet2KHR cmd_push_descriptor_set2{};
             PFN_vkCreatePipelineCache create_pipeline_cache{};
             PFN_vkDestroyPipelineCache destroy_pipeline_cache{};
             PFN_vkGetPipelineCacheData get_pipeline_cache_data{};
@@ -2901,6 +2903,7 @@ namespace sogen
         }
         data.descriptor_buffer_extension = enabled_extension(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
         data.maintenance6_extension = enabled_extension(VK_KHR_MAINTENANCE_6_EXTENSION_NAME);
+        data.push_descriptor_extension = enabled_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
         data.robust_buffer_access = features2.features.robustBufferAccess == VK_TRUE;
         data.buffer_marker_extension = enabled_extension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
         data.memory_priority_extension = enabled_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
@@ -3192,6 +3195,12 @@ namespace sogen
             data.free_descriptor_sets = reinterpret_cast<PFN_vkFreeDescriptorSets>(resolve("vkFreeDescriptorSets"));
             data.update_descriptor_sets = reinterpret_cast<PFN_vkUpdateDescriptorSets>(resolve("vkUpdateDescriptorSets"));
             data.cmd_bind_descriptor_sets = reinterpret_cast<PFN_vkCmdBindDescriptorSets>(resolve("vkCmdBindDescriptorSets"));
+            if (data.push_descriptor_extension)
+            {
+                data.cmd_push_descriptor_set = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(resolve("vkCmdPushDescriptorSetKHR"));
+                if (data.maintenance6_extension && data.maintenance6_feature)
+                    data.cmd_push_descriptor_set2 = reinterpret_cast<PFN_vkCmdPushDescriptorSet2KHR>(resolve("vkCmdPushDescriptorSet2KHR"));
+            }
             data.create_pipeline_cache = reinterpret_cast<PFN_vkCreatePipelineCache>(resolve("vkCreatePipelineCache"));
             data.destroy_pipeline_cache = reinterpret_cast<PFN_vkDestroyPipelineCache>(resolve("vkDestroyPipelineCache"));
             data.get_pipeline_cache_data = reinterpret_cast<PFN_vkGetPipelineCacheData>(resolve("vkGetPipelineCacheData"));
@@ -9922,8 +9931,7 @@ namespace sogen
     int32_t vulkan_host::cmd_bind_index_buffer(uint64_t command_buffer, uint64_t buffer, uint64_t offset, uint32_t index_type)
     {
         const auto cb = this->impl_->command_buffers.find(command_buffer);
-        const auto buf = this->impl_->buffers.find(buffer);
-        if (cb == this->impl_->command_buffers.end() || buf == this->impl_->buffers.end() || buf->second.device_id != cb->second.device_id)
+        if (cb == this->impl_->command_buffers.end())
         {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
@@ -9936,7 +9944,26 @@ namespace sogen
         {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
-        dev->second.cmd_bind_index_buffer(cb->second.handle, buf->second.handle, offset, static_cast<VkIndexType>(index_type));
+        VkBuffer handle = VK_NULL_HANDLE;
+        if (buffer == 0)
+        {
+            // VK_KHR_maintenance6 permits a null index buffer only with nullDescriptor enabled.
+            if (!dev->second.maintenance6_extension || !dev->second.maintenance6_feature ||
+                !dev->second.descriptor_buffer_null_descriptor)
+            {
+                return VK_ERROR_VALIDATION_FAILED_EXT;
+            }
+        }
+        else
+        {
+            const auto buf = this->impl_->buffers.find(buffer);
+            if (buf == this->impl_->buffers.end() || buf->second.device_id != cb->second.device_id)
+            {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            handle = buf->second.handle;
+        }
+        dev->second.cmd_bind_index_buffer(cb->second.handle, handle, offset, static_cast<VkIndexType>(index_type));
         return VK_SUCCESS;
     }
 
@@ -10100,6 +10127,123 @@ namespace sogen
         dev->second.cmd_bind_descriptor_sets(cb->second.handle, static_cast<VkPipelineBindPoint>(bind_point), layout->second.handle,
                                              first_set, static_cast<uint32_t>(handles.size()), handles.data(),
                                              static_cast<uint32_t>(dynamic_offsets.size()), dynamic_offsets.data());
+        return VK_SUCCESS;
+    }
+
+    int32_t vulkan_host::cmd_push_descriptor_set(uint64_t command_buffer, uint64_t pipeline_layout, uint32_t set,
+                                                 uint32_t stage_flags, uint32_t bind_point, bool use_maintenance6,
+                                                 std::span<const descriptor_write> writes)
+    {
+        const auto cb = this->impl_->command_buffers.find(command_buffer);
+        const auto layout = this->impl_->pipeline_layouts.find(pipeline_layout);
+        if (cb == this->impl_->command_buffers.end() || layout == this->impl_->pipeline_layouts.end() ||
+            cb->second.device_id != layout->second.device_id)
+            return VK_ERROR_INITIALIZATION_FAILED;
+        const auto dev = this->impl_->devices.find(cb->second.device_id);
+        if (dev == this->impl_->devices.end() || !dev->second.push_descriptor_extension ||
+            (use_maintenance6 ? !dev->second.cmd_push_descriptor_set2 : !dev->second.cmd_push_descriptor_set))
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        if (dev->second.native_presentation_failed)
+            return VK_ERROR_DEVICE_LOST;
+
+        std::vector<VkWriteDescriptorSet> native_writes(writes.size());
+        std::vector<VkDescriptorImageInfo> images(writes.size());
+        std::vector<VkDescriptorBufferInfo> buffers(writes.size());
+        std::vector<VkBufferView> views(writes.size());
+        std::vector<VkWriteDescriptorSetInlineUniformBlock> inline_blocks(writes.size());
+        for (size_t i = 0; i < writes.size(); ++i)
+        {
+            const auto& w = writes[i];
+            auto& native = native_writes[i];
+            native.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            native.dstSet = VK_NULL_HANDLE;
+            native.dstBinding = w.dst_binding;
+            native.dstArrayElement = w.dst_array_element;
+            native.descriptorCount = 1;
+            native.descriptorType = static_cast<VkDescriptorType>(w.descriptor_type);
+            if (w.descriptor_type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
+            {
+                auto& block = inline_blocks[i];
+                block.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK;
+                block.dataSize = static_cast<uint32_t>(w.inline_uniform_data.size());
+                block.pData = w.inline_uniform_data.data();
+                native.pNext = &block;
+                native.descriptorCount = block.dataSize;
+            }
+            else if (w.descriptor_type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+                     w.descriptor_type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)
+            {
+                if (w.buffer_or_view)
+                {
+                    const auto view = this->impl_->buffer_views.find(w.buffer_or_view);
+                    if (view == this->impl_->buffer_views.end() || view->second.device_id != cb->second.device_id)
+                        return VK_ERROR_INITIALIZATION_FAILED;
+                    views[i] = view->second.handle;
+                }
+                native.pTexelBufferView = &views[i];
+            }
+            else if (w.descriptor_type == VK_DESCRIPTOR_TYPE_SAMPLER ||
+                     w.descriptor_type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+                     w.descriptor_type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+                     w.descriptor_type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+                     w.descriptor_type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)
+            {
+                auto& image = images[i];
+                if (w.sampler)
+                {
+                    const auto sampler = this->impl_->samplers.find(w.sampler);
+                    if (sampler == this->impl_->samplers.end() || sampler->second.device_id != cb->second.device_id)
+                        return VK_ERROR_INITIALIZATION_FAILED;
+                    image.sampler = sampler->second.handle;
+                }
+                if (w.image_view)
+                {
+                    const auto view = this->impl_->image_views.find(w.image_view);
+                    if (view == this->impl_->image_views.end() || view->second.device_id != cb->second.device_id)
+                        return VK_ERROR_INITIALIZATION_FAILED;
+                    image.imageView = view->second.handle;
+                }
+                image.imageLayout = static_cast<VkImageLayout>(w.image_layout);
+                native.pImageInfo = &image;
+            }
+            else if (w.descriptor_type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+                     w.descriptor_type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                     w.descriptor_type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+                     w.descriptor_type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+            {
+                auto& buffer = buffers[i];
+                if (w.buffer_or_view)
+                {
+                    const auto found = this->impl_->buffers.find(w.buffer_or_view);
+                    if (found == this->impl_->buffers.end() || found->second.device_id != cb->second.device_id)
+                        return VK_ERROR_INITIALIZATION_FAILED;
+                    buffer.buffer = found->second.handle;
+                }
+                buffer.offset = w.offset;
+                buffer.range = w.range;
+                native.pBufferInfo = &buffer;
+            }
+            else
+                return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
+
+        if (use_maintenance6)
+        {
+            VkPushDescriptorSetInfoKHR info{};
+            info.sType = VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO_KHR;
+            info.stageFlags = stage_flags;
+            info.layout = layout->second.handle;
+            info.set = set;
+            info.descriptorWriteCount = static_cast<uint32_t>(native_writes.size());
+            info.pDescriptorWrites = native_writes.data();
+            dev->second.cmd_push_descriptor_set2(cb->second.handle, &info);
+        }
+        else
+        {
+            dev->second.cmd_push_descriptor_set(cb->second.handle, static_cast<VkPipelineBindPoint>(bind_point),
+                                               layout->second.handle, set, static_cast<uint32_t>(native_writes.size()),
+                                               native_writes.data());
+        }
         return VK_SUCCESS;
     }
 

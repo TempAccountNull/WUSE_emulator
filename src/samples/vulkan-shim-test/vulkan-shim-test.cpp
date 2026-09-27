@@ -20,6 +20,7 @@ bool test_layered_resolve_readback(PFN_vkGetInstanceProcAddr);
 bool test_memory_priority(PFN_vkGetInstanceProcAddr, VkInstance, VkPhysicalDevice, uint32_t, uint32_t);
 bool test_descriptor_buffer_properties(PFN_vkGetInstanceProcAddr, VkInstance, const VkPhysicalDevice*, uint32_t);
 int run_descriptor_buffer_properties_query(PFN_vkGetInstanceProcAddr);
+int run_maintenance6_guest_smoke(PFN_vkGetInstanceProcAddr);
 
 namespace
 {
@@ -1098,6 +1099,10 @@ int main(int argc, char** argv)
     {
         std::printf("[shim-test] no vkGetInstanceProcAddr export\n");
         return 2;
+    }
+    if (argc > 2 && std::strcmp(argv[2], "--maintenance6-only") == 0)
+    {
+        return run_maintenance6_guest_smoke(get_instance_proc);
     }
     if (argc > 2 && std::strcmp(argv[2], "--descriptor-properties-only") == 0)
     {

@@ -225,6 +225,7 @@ namespace sogen::gpu_bridge
         cmd_bind_descriptor_buffer_embedded_samplers = 0x8BC,
         cmd_set_descriptor_buffer_offsets2 = 0x8BD,
         cmd_bind_descriptor_buffer_embedded_samplers2 = 0x8BE,
+        cmd_push_descriptor_set = 0x8BF,
         debug_utils_capabilities = 0x8E0,
         debug_utils_messenger = 0x8E1,
         debug_utils_command = 0x8E2,
@@ -2604,6 +2605,21 @@ namespace sogen::gpu_bridge
         uint32_t image_layout; // image types: VkImageLayout
         uint32_t inline_uniform_data_size;
     };
+
+    // Recorded push-descriptor payload: header, write_count descriptor_write records,
+    // then inline_uniform_data_size bytes. dst_set is unused for push descriptors.
+    struct cmd_push_descriptor_set_request
+    {
+        object_id command_buffer;
+        object_id pipeline_layout;
+        uint32_t set;
+        uint32_t stage_flags; // maintenance6 stage mask
+        uint32_t bind_point; // legacy VkPipelineBindPoint
+        uint32_t write_count;
+        uint32_t inline_uniform_data_size;
+        uint32_t use_maintenance6;
+    };
+    static_assert(sizeof(cmd_push_descriptor_set_request) == 40);
 
     // Pointer-free VkCopyDescriptorSet. A record applies all writes first, then its copies in order.
     struct descriptor_copy

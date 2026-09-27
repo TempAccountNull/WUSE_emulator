@@ -4201,6 +4201,41 @@ namespace sogen
                     return this->vulkan_.cmd_bind_descriptor_sets(req.command_buffer, req.pipeline_layout, req.first_set, sets,
                                                                   req.bind_point, dynamic_offsets);
                 }
+                case gpu_bridge::command::cmd_push_descriptor_set: {
+                    gpu_bridge::cmd_push_descriptor_set_request req{};
+                    if (!read(req))
+                        return vk_error_initialization_failed;
+                    if (req.write_count > (size - sizeof(req)) / sizeof(gpu_bridge::descriptor_write))
+                        return vk_error_initialization_failed;
+                    const size_t write_bytes = static_cast<size_t>(req.write_count) * sizeof(gpu_bridge::descriptor_write);
+                    const size_t data_offset = sizeof(req) + write_bytes;
+                    if (req.inline_uniform_data_size > size - data_offset)
+                        return vk_error_initialization_failed;
+                    std::vector<vulkan_host::descriptor_write> writes(req.write_count);
+                    for (uint32_t i = 0; i < req.write_count; ++i)
+                    {
+                        gpu_bridge::descriptor_write wire{};
+                        std::memcpy(&wire, payload + sizeof(req) + static_cast<size_t>(i) * sizeof(wire), sizeof(wire));
+                        if (wire.inline_uniform_data_offset > req.inline_uniform_data_size ||
+                            wire.inline_uniform_data_size > req.inline_uniform_data_size - wire.inline_uniform_data_offset)
+                            return vk_error_initialization_failed;
+                        writes[i] = {.dst_set = 0,
+                                     .dst_binding = wire.dst_binding,
+                                     .dst_array_element = wire.dst_array_element,
+                                     .descriptor_type = wire.descriptor_type,
+                                     .buffer_or_view = wire.buffer_or_view,
+                                     .offset = wire.offset,
+                                     .range = wire.range,
+                                     .sampler = wire.sampler,
+                                     .image_view = wire.image_view,
+                                     .image_layout = wire.image_layout,
+                                     .inline_uniform_data = {payload + data_offset + wire.inline_uniform_data_offset,
+                                                             wire.inline_uniform_data_size}};
+                    }
+                    return this->vulkan_.cmd_push_descriptor_set(req.command_buffer, req.pipeline_layout, req.set,
+                                                                  req.stage_flags, req.bind_point, req.use_maintenance6 != 0,
+                                                                  writes);
+                }
                 case gpu_bridge::command::cmd_end_render_pass: {
                     gpu_bridge::cmd_end_render_pass_request req{};
                     if (!read(req))
