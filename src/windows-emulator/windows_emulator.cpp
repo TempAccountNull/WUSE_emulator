@@ -1099,6 +1099,71 @@ namespace sogen
                 }
             }
         }
+        // The 21122 Shadowkeep vhalt entry is sampled only when explicitly requested.
+        if (const char* probe = std::getenv("SOGEN_DESTINY_VHALT_PROBE"); probe && *probe == '1' &&
+            executable && executable->name == "destiny2.exe" && executable->size_of_image > 0x1310D60)
+        {
+            constexpr uint64_t vhalt_rva = 0x1310D60;
+            auto samples = std::make_shared<uint32_t>(0);
+            this->emu().hook_memory_execution(executable->image_base + vhalt_rva,
+                [this, samples](cpu_interface& cpu, const uint64_t rip) {
+                    const std::scoped_lock lock(this->kernel_lock_);
+                    if (*samples >= 8)
+                    {
+                        return;
+                    }
+                    const auto sample = ++*samples;
+                    auto& vcpu = this->vcpu(cpu.index());
+                    auto& acting = vcpu.cpu;
+                    const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                    const auto rcx = acting.reg<uint64_t>(x86_register::rcx);
+                    const auto rdx = acting.reg<uint64_t>(x86_register::rdx);
+                    const auto r8 = acting.reg<uint64_t>(x86_register::r8);
+                    const auto r9 = acting.reg<uint64_t>(x86_register::r9);
+                    const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
+                    const auto rbp = acting.reg<uint64_t>(x86_register::rbp);
+                    std::array<char, 16 * 17 + 1> stack_hex{};
+                    constexpr char digits[] = "0123456789abcdef";
+                    uint16_t stack_valid_mask = 0;
+                    uint64_t return_address = 0;
+                    for (size_t i = 0; i < 16; ++i)
+                    {
+                        uint64_t word = 0;
+                        const bool valid = rsp <= UINT64_MAX - i * sizeof(word) &&
+                            acting.try_read_memory(rsp + i * sizeof(word), &word, sizeof(word));
+                        if (valid)
+                        {
+                            stack_valid_mask |= static_cast<uint16_t>(1u << i);
+                        }
+                        if (i == 0)
+                        {
+                            return_address = word;
+                        }
+                        for (size_t nibble = 0; nibble < 16; ++nibble)
+                        {
+                            stack_hex[i * 17 + nibble] = valid ?
+                                digits[(word >> ((15 - nibble) * 4)) & 0xf] : '?';
+                        }
+                        stack_hex[i * 17 + 16] = i == 15 ? '\0' : ',';
+                    }
+                    const bool return_valid = (stack_valid_mask & 1u) != 0;
+                    const auto* caller = return_valid ? this->mod_manager.find_by_address(return_address) : nullptr;
+                    std::array<char, 129> rdx_hex{};
+                    const auto rdx_readable = capture_guest_hex(acting, rdx, rdx_hex);
+                    this->log.error(
+                        "[VHALTENTRY] n=%u tid=%u vcpu=%zu rip=%#llx rcx=%#llx rdx=%#llx r8=%#llx r9=%#llx "
+                        "rsp=%#llx rbp=%#llx return_valid=%u return=%#llx return_module=%s return_rva=%#llx "
+                        "stack_valid_mask=%#x stack_qwords=%s rdx_readable=%u/64 rdx_bytes=%s\n",
+                        sample, tid, cpu.index(), static_cast<unsigned long long>(rip),
+                        static_cast<unsigned long long>(rcx), static_cast<unsigned long long>(rdx),
+                        static_cast<unsigned long long>(r8), static_cast<unsigned long long>(r9),
+                        static_cast<unsigned long long>(rsp), static_cast<unsigned long long>(rbp),
+                        static_cast<unsigned>(return_valid), static_cast<unsigned long long>(return_address),
+                        caller ? caller->name.c_str() : "<unmapped>",
+                        static_cast<unsigned long long>(caller ? return_address - caller->image_base : 0),
+                        static_cast<unsigned>(stack_valid_mask), stack_hex.data(), rdx_readable, rdx_hex.data());
+                });
+        }
         const auto* ntdll = this->mod_manager.ntdll;
         const auto* win32u = this->mod_manager.win32u;
 
