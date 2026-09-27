@@ -1081,8 +1081,8 @@ namespace sogen
                                 ? this->active_pending_->connect_input
                                 : win_emu.emu().read_memory(c.input_buffer, c.input_buffer_length);
 
-                // AFD_CONNECT_INFO::RemoteAddress follows BOOLEAN + two ULONG_PTR (pointer-aligned): 24 on x64, 12 on WoW64.
-                constexpr auto address_offset = 3 * sizeof(typename Traits::ULONG_PTR);
+                // AFD_CONNECT_JOIN_INFO_TL has pointer-aligned handles before the address.
+                constexpr auto address_offset = offsetof(AFD_CONNECT_JOIN_INFO_TL<Traits>, RemoteAddress);
 
                 if (data.size() < address_offset)
                 {
@@ -2011,6 +2011,11 @@ namespace sogen
         template <typename Traits>
         struct afd_async_connect_hlp : stateless_device
         {
+            bool may_return_pending() const override
+            {
+                return true;
+            }
+
             NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& c) override
             {
                 if (c.io_control_code != 0x12007)
@@ -2018,12 +2023,14 @@ namespace sogen
                     return STATUS_NOT_SUPPORTED;
                 }
 
-                if (c.input_buffer_length < 40)
+                if (c.input_buffer_length < sizeof(AFD_CONNECT_JOIN_INFO_TL<Traits>))
                 {
                     return STATUS_BUFFER_TOO_SMALL;
                 }
 
-                const auto target_handle = win_emu.emu().read_memory<handle>(c.input_buffer + 16);
+                handle target_handle{};
+                target_handle.bits = win_emu.emu().read_memory<typename Traits::HANDLE>(
+                    c.input_buffer + offsetof(AFD_CONNECT_JOIN_INFO_TL<Traits>, ConnectEndpoint));
 
                 auto* target_device = win_emu.process.devices.get(target_handle);
                 if (!target_device)
@@ -2037,7 +2044,9 @@ namespace sogen
                     return STATUS_INVALID_HANDLE;
                 }
 
-                return target_endpoint->execute_ioctl(win_emu, c);
+                // The helper's outer execute_ioctl owns the request's IOSB and completion.
+                // Calling the endpoint wrapper here would deliver synchronous APC/IOCP twice.
+                return target_endpoint->io_control(win_emu, c);
             }
         };
     }

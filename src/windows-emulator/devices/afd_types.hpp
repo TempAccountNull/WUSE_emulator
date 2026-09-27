@@ -16,6 +16,15 @@ namespace sogen
         CHAR sa_data[14];
     };
 
+    template <typename Traits>
+    struct AFD_CONNECT_JOIN_INFO_TL
+    {
+        BOOLEAN SanActive;
+        Traits::HANDLE RootEndpoint;
+        Traits::HANDLE ConnectEndpoint;
+        win_sockaddr RemoteAddress;
+    };
+
     struct AFD_INFO
     {
         ULONG InformationClass;

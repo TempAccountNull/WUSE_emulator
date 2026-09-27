@@ -34,6 +34,7 @@ namespace sogen::test
             std::deque<std::byte> incoming;
             std::vector<std::byte> outgoing;
             bool send_blocked{true};
+            bool connect_blocked{};
             int last_error{};
         };
 
@@ -75,6 +76,12 @@ namespace sogen::test
 
             bool connect(const network::address&) override
             {
+                if (state->connect_blocked)
+                {
+                    state->last_error = SERR(EWOULDBLOCK);
+                    return false;
+                }
+                state->last_error = 0;
                 return true;
             }
 
@@ -306,6 +313,82 @@ namespace sogen::test
             return device->execute_ioctl(emu, context);
         }
     };
+
+    TEST_P(AfdPendingRequestTest, AsyncConnectHelperUsesGuestLayoutAndCompletesApcIocpOnlyOnce)
+    {
+        emu.process.is_wow64_process = GetParam();
+        const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
+        emu.memory.write_memory(memory, creation.data(), sizeof(creation));
+        const auto endpoint_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        const auto helper_handle = emu.process.devices.store(io_device_container{u"Afd\\AsyncConnectHlp", emu, {}});
+        auto* endpoint = emu.process.devices.get(endpoint_handle);
+        auto* helper = emu.process.devices.get(helper_handle);
+        ASSERT_NE(endpoint, nullptr);
+        ASSERT_NE(helper, nullptr);
+        const auto port_handle = emu.process.io_completions.store(io_completion{});
+        helper->completion_port = port_handle;
+        helper->completion_key = 0x9876;
+
+        emulator_thread issuer{emu.memory};
+        issuer.id = 0x1234;
+        const auto thread_handle = emu.process.threads.store(std::move(issuer));
+        emu.process.thread_handles_by_id.emplace(0x1234, thread_handle);
+
+        const auto submit = [&]<typename Guest>(const uint64_t apc_routine) {
+            using Traits = EmulatorTraits<Guest>;
+            AFD_CONNECT_JOIN_INFO_TL<Traits> info{};
+            info.ConnectEndpoint = static_cast<typename Traits::HANDLE>(endpoint_handle.bits);
+            info.RemoteAddress.sa_family = 2; // AF_INET
+            emu.memory.write_memory(memory + 0x800, &info, sizeof(info));
+            io_device_context context{emu.memory};
+            context.file_handle = helper_handle;
+            context.issuer_thread_id = 0x1234;
+            context.io_control_code = 0x12007;
+            context.io_status_block = {emu.memory, memory + 0x100};
+            context.event = receive_event;
+            context.apc_routine = apc_routine;
+            context.apc_context = 0xfeed;
+            context.input_buffer = memory + 0x800;
+            context.input_buffer_length = sizeof(info);
+            return helper->execute_ioctl(emu, context);
+        };
+        const auto invoke = [&](const uint64_t apc_routine) {
+            return GetParam() ? submit.template operator()<Emu32>(apc_routine) : submit.template operator()<Emu64>(apc_routine);
+        };
+
+        ASSERT_EQ(invoke(0), STATUS_SUCCESS);
+        auto* port = emu.process.io_completions.get(port_handle);
+        ASSERT_NE(port, nullptr);
+        ASSERT_EQ(port->queue.size(), 1u);
+        EXPECT_EQ(port->queue.front().key_context, 0x9876u);
+        EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+        port->queue.clear();
+        emu.process.events.get(receive_event)->signaled = false;
+
+        ASSERT_EQ(invoke(0x567800), STATUS_SUCCESS);
+        EXPECT_TRUE(port->queue.empty());
+        EXPECT_EQ(emu.process.threads.get(thread_handle)->pending_apcs.size(), 1u);
+        EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+        emu.process.events.get(receive_event)->signaled = false;
+
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+        emu.memory.write_memory(memory + 0x100, &initial, sizeof(initial));
+        socket->connect_blocked = true;
+        ASSERT_EQ(invoke(0), STATUS_PENDING);
+        EXPECT_EQ(status(false).Status, initial.Status);
+        EXPECT_EQ(status(false).Information, initial.Information);
+        EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+        EXPECT_TRUE(port->queue.empty());
+
+        socket->connect_blocked = false;
+        socket->send_blocked = false; // The test poller reports a writable socket for connect completion.
+        endpoint->work(emu);
+        EXPECT_EQ(status(false).Status, STATUS_SUCCESS);
+        EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+        ASSERT_EQ(port->queue.size(), 1u);
+        EXPECT_EQ(port->queue.front().io_status_block.Status, STATUS_SUCCESS);
+    }
 
     TEST_P(AfdPendingRequestTest, PendingIoStatusBlockRetainsCallerFieldsUntilCompletion)
     {
