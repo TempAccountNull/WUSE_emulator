@@ -40,6 +40,7 @@ namespace sogen::test
             std::vector<std::byte> outgoing;
             bool send_blocked{true};
             bool connect_blocked{};
+            bool connect_refused{};
             bool listening{};
             bool connected{};
             std::optional<network::address> next_accepted_remote{};
@@ -67,6 +68,17 @@ namespace sogen::test
             {
                 state->disconnect_mode |= mode;
                 return 0;
+            }
+
+            uint32_t sort_address_list(std::vector<network::address_sort_entry>& addresses) override
+            {
+                // The real host parity test below checks Windows policy. This
+                // deterministic test backend exercises guest pointer translation.
+                if (addresses.size() == 2)
+                {
+                    std::swap(addresses[0], addresses[1]);
+                }
+                return STATUS_SUCCESS;
             }
 
             bool is_ready(bool) override
@@ -99,6 +111,11 @@ namespace sogen::test
                 if (state->connect_blocked)
                 {
                     state->last_error = SERR(EWOULDBLOCK);
+                    return false;
+                }
+                if (state->connect_refused)
+                {
+                    state->last_error = SERR(ECONNREFUSED);
                     return false;
                 }
                 state->last_error = 0;
@@ -397,8 +414,12 @@ namespace sogen::test
             return GetParam() ? submit.template operator()<Emu32>(apc_routine) : submit.template operator()<Emu64>(apc_routine);
         };
 
-        ASSERT_EQ(invoke(0), STATUS_SUCCESS);
+        ASSERT_EQ(invoke(0), STATUS_PENDING);
         auto* port = emu.process.io_completions.get(port_handle);
+        ASSERT_NE(port, nullptr);
+        EXPECT_TRUE(port->queue.empty());
+        EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+        endpoint->work(emu);
         ASSERT_NE(port, nullptr);
         ASSERT_EQ(port->queue.size(), 1u);
         EXPECT_EQ(port->queue.front().key_context, 0x9876u);
@@ -406,7 +427,9 @@ namespace sogen::test
         port->queue.clear();
         emu.process.events.get(receive_event)->signaled = false;
 
-        ASSERT_EQ(invoke(0x567800), STATUS_SUCCESS);
+        ASSERT_EQ(invoke(0x567800), STATUS_PENDING);
+        EXPECT_TRUE(port->queue.empty());
+        endpoint->work(emu);
         EXPECT_TRUE(port->queue.empty());
         EXPECT_EQ(emu.process.threads.get(thread_handle)->pending_apcs.size(), 1u);
         EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
@@ -428,6 +451,209 @@ namespace sogen::test
         EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
         ASSERT_EQ(port->queue.size(), 1u);
         EXPECT_EQ(port->queue.front().io_status_block.Status, STATUS_SUCCESS);
+        port->queue.clear();
+        emu.process.events.get(receive_event)->signaled = false;
+
+        emu.memory.write_memory(memory + 0x100, &initial, sizeof(initial));
+        socket->connect_blocked = true;
+        ASSERT_EQ(invoke(0), STATUS_PENDING);
+        socket->connect_blocked = false;
+        socket->connect_refused = true;
+        endpoint->work(emu);
+        EXPECT_EQ(status(false).Status, STATUS_CONNECTION_REFUSED);
+        EXPECT_EQ(status(false).Information, 0u);
+        EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+        ASSERT_EQ(port->queue.size(), 1u);
+        EXPECT_EQ(port->queue.front().io_status_block.Status, STATUS_CONNECTION_REFUSED);
+    }
+
+    TEST_P(AfdPendingRequestTest, AsyncConnectHelperRejectsShortInputAndBadTargetWithoutCompletion)
+    {
+        emu.process.is_wow64_process = GetParam();
+        const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
+        emu.memory.write_memory(memory, creation.data(), sizeof(creation));
+        const auto endpoint_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        const auto helper_handle = emu.process.devices.store(io_device_container{u"Afd\\AsyncConnectHlp", emu, {}});
+        auto* helper = emu.process.devices.get(helper_handle);
+        ASSERT_NE(helper, nullptr);
+        const auto port_handle = emu.process.io_completions.store(io_completion{});
+        helper->completion_port = port_handle;
+        auto* completion_port = emu.process.io_completions.get(port_handle);
+        ASSERT_NE(completion_port, nullptr);
+
+        const auto check = [this, helper, helper_handle, endpoint_handle, completion_port]<typename Guest>() {
+            using traits = EmulatorTraits<Guest>;
+            using connect_info = AFD_CONNECT_JOIN_INFO_TL<traits>;
+            connect_info info{};
+            info.ConnectEndpoint = static_cast<typename traits::HANDLE>(endpoint_handle.bits);
+            info.RemoteAddress.sa_family = 2;
+            const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+            constexpr auto family_end = offsetof(connect_info, RemoteAddress) + sizeof(USHORT);
+            for (const auto length : {size_t{0}, family_end - 1, family_end, sizeof(connect_info) - 1})
+            {
+                emu.memory.write_memory(memory + 0x800, &info, sizeof(info));
+                emu.memory.write_memory(memory + 0x100, &initial, sizeof(initial));
+                emu.process.events.get(receive_event)->signaled = false;
+                io_device_context context{emu.memory};
+                context.file_handle = helper_handle;
+                context.io_control_code = 0x12007;
+                context.io_status_block = {emu.memory, memory + 0x100};
+                context.event = receive_event;
+                context.input_buffer = memory + 0x800;
+                context.input_buffer_length = static_cast<ULONG>(length);
+                const auto expected = length < family_end ? STATUS_INVALID_PARAMETER : STATUS_INVALID_ADDRESS;
+                EXPECT_EQ(helper->execute_ioctl(emu, context), expected);
+                EXPECT_EQ(context.io_status_block.read().Status, initial.Status);
+                EXPECT_EQ(context.io_status_block.read().Information, initial.Information);
+                EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+                EXPECT_TRUE(completion_port->queue.empty());
+            }
+
+            info.ConnectEndpoint = static_cast<typename traits::HANDLE>(0xdeadbeef);
+            emu.memory.write_memory(memory + 0x800, &info, sizeof(info));
+            emu.memory.write_memory(memory + 0x100, &initial, sizeof(initial));
+            io_device_context context{emu.memory};
+            context.file_handle = helper_handle;
+            context.io_control_code = 0x12007;
+            context.io_status_block = {emu.memory, memory + 0x100};
+            context.event = receive_event;
+            context.input_buffer = memory + 0x800;
+            context.input_buffer_length = sizeof(info);
+            EXPECT_EQ(helper->execute_ioctl(emu, context), STATUS_INVALID_HANDLE);
+            EXPECT_EQ(context.io_status_block.read().Status, initial.Status);
+            EXPECT_EQ(context.io_status_block.read().Information, initial.Information);
+            EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+            EXPECT_TRUE(completion_port->queue.empty());
+        };
+        if (GetParam())
+        {
+            check.template operator()<Emu32>();
+        }
+        else
+        {
+            check.template operator()<Emu64>();
+        }
+    }
+
+    TEST_P(AfdPendingRequestTest, TransportAddressSortMatchesNativePendingAndOutputContract)
+    {
+        struct guest_sockaddr_in6
+        {
+            uint16_t family;
+            uint16_t port;
+            uint32_t flowinfo;
+            std::array<uint8_t, 16> address;
+            uint32_t scope_id;
+        };
+
+        static_assert(sizeof(guest_sockaddr_in6) == 28);
+        constexpr uint64_t wrapper_ptr = memory + 0x800;
+        constexpr uint64_t nested_ptr = memory + 0x900;
+        constexpr uint64_t addr0_ptr = memory + 0xa00;
+        constexpr uint64_t addr1_ptr = memory + 0xa40;
+        constexpr uint64_t output_ptr = memory + 0xb00;
+        constexpr uint64_t iosb_ptr = memory + 0x100;
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+
+        const auto run = [this, &initial]<typename Guest>() {
+            using traits = EmulatorTraits<Guest>;
+            using wrapper = AFD_WINSOCK_TRANSPORT_IOCTL<traits>;
+            using list = AFD_SORT_ADDRESS_LIST<traits>;
+            using entry = AFD_SORT_SOCKET_ADDRESS<traits>;
+            constexpr uint32_t list_size = offsetof(list, Address) + 2 * sizeof(entry);
+            static_assert(sizeof(wrapper) == (std::is_same_v<Guest, Emu32> ? 24 : 32));
+            static_assert(offsetof(wrapper, InputBuffer) == 16);
+
+            guest_sockaddr_in6 mapped{.family = 23};
+            mapped.address[10] = 0xff;
+            mapped.address[11] = 0xff;
+            mapped.address[12] = 127;
+            mapped.address[15] = 1;
+            guest_sockaddr_in6 v6{.family = 23};
+            v6.address[15] = 1;
+            emu.memory.write_memory(addr0_ptr, &mapped, sizeof(mapped));
+            emu.memory.write_memory(addr1_ptr, &v6, sizeof(v6));
+            const int32_t count = 2;
+            emu.memory.write_memory(nested_ptr, &count, sizeof(count));
+            const std::array<entry, 2> guest_entries{{
+                {.Sockaddr = static_cast<typename traits::PVOID>(addr0_ptr), .SockaddrLength = 28},
+                {.Sockaddr = static_cast<typename traits::PVOID>(addr1_ptr), .SockaddrLength = 28},
+            }};
+            emu.memory.write_memory(nested_ptr + offsetof(list, Address), guest_entries.data(), sizeof(guest_entries));
+            const wrapper outer{.Type = 3,
+                                .ControlCode = 0xc8000019,
+                                .Overlapped = 1,
+                                .InputBuffer = static_cast<typename traits::PVOID>(nested_ptr),
+                                .InputBufferLength = list_size};
+            emu.memory.write_memory(wrapper_ptr, &outer, sizeof(outer));
+
+            const auto invoke = [&](const uint32_t output_length) {
+                emu.memory.write_memory(iosb_ptr, &initial, sizeof(initial));
+                emu.memory.set_memory(output_ptr, 0xa5, 64);
+                emu.process.events.get(receive_event)->signaled = false;
+                io_device_context request{emu.memory};
+                request.io_control_code = 0x120bf;
+                request.io_status_block = {emu.memory, iosb_ptr};
+                request.event = receive_event;
+                request.input_buffer = wrapper_ptr;
+                request.input_buffer_length = sizeof(outer);
+                request.output_buffer = output_ptr;
+                request.output_buffer_length = output_length;
+                return device->execute_ioctl(emu, request);
+            };
+
+            // Native: initial syscall returns PENDING; output and IOSB are untouched.
+            ASSERT_EQ(invoke(list_size), STATUS_PENDING);
+            EXPECT_EQ(emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb_ptr).Status, initial.Status);
+            EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+            EXPECT_EQ(emu.memory.read_memory<uint8_t>(output_ptr), 0xa5);
+            // A pending request owns a snapshot even if the guest reuses input memory.
+            emu.memory.set_memory(wrapper_ptr, 0, sizeof(outer));
+            emu.memory.set_memory(nested_ptr, 0, list_size);
+            emu.memory.set_memory(addr0_ptr, 0, sizeof(mapped));
+            emu.memory.set_memory(addr1_ptr, 0, sizeof(v6));
+            device->work(emu);
+            const auto final_status = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb_ptr);
+            EXPECT_EQ(final_status.Status, STATUS_SUCCESS);
+            EXPECT_EQ(final_status.Information, list_size);
+            EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+            EXPECT_EQ(emu.memory.read_memory<int32_t>(output_ptr), 2);
+            EXPECT_EQ(emu.memory.read_memory<entry>(output_ptr + offsetof(list, Address)).Sockaddr, addr1_ptr);
+            EXPECT_EQ(emu.memory.read_memory<entry>(output_ptr + offsetof(list, Address) + sizeof(entry)).Sockaddr, addr0_ptr);
+            EXPECT_EQ(emu.memory.read_memory<guest_sockaddr_in6>(addr0_ptr).address[12], 127);
+            EXPECT_EQ(emu.memory.read_memory<guest_sockaddr_in6>(addr1_ptr).address[15], 1);
+            const auto beyond = emu.memory.read_memory(output_ptr + list_size, 64 - list_size);
+            EXPECT_TRUE(std::all_of(beyond.begin(), beyond.end(), [](std::byte value) { return value == std::byte{0xa5}; }));
+
+            // Restore the request, then verify native short-output completion.
+            emu.memory.write_memory(wrapper_ptr, &outer, sizeof(outer));
+            emu.memory.write_memory(nested_ptr, &count, sizeof(count));
+            emu.memory.write_memory(nested_ptr + offsetof(list, Address), guest_entries.data(), sizeof(guest_entries));
+            ASSERT_EQ(invoke(list_size - 1), STATUS_PENDING);
+            EXPECT_EQ(emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb_ptr).Status, initial.Status);
+            device->work(emu);
+            const auto short_status = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb_ptr);
+            EXPECT_EQ(short_status.Status, STATUS_INVALID_PARAMETER);
+            EXPECT_EQ(short_status.Information, 0u);
+            EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+            const auto short_output = emu.memory.read_memory(output_ptr, 64);
+            EXPECT_TRUE(std::all_of(short_output.begin(), short_output.end(), [](std::byte value) { return value == std::byte{0xa5}; }));
+
+            // Unknown modern codes cannot silently claim success.
+            wrapper unsupported = outer;
+            unsupported.ControlCode = 0xc800001a;
+            emu.memory.write_memory(wrapper_ptr, &unsupported, sizeof(unsupported));
+            EXPECT_EQ(invoke(list_size), STATUS_NOT_SUPPORTED);
+        };
+        if (GetParam())
+        {
+            run.template operator()<Emu32>();
+        }
+        else
+        {
+            run.template operator()<Emu64>();
+        }
     }
 
     TEST_P(AfdPendingRequestTest, QueryHandlesMatchesNativeBufferAndStatusContract)
@@ -435,8 +661,8 @@ namespace sogen::test
         constexpr uint64_t input = memory + 0x800;
         constexpr uint64_t output = memory + 0x880;
         constexpr uint64_t iosb = memory + 0x100;
-        const auto expected_size = GetParam() ? sizeof(AFD_HANDLE_INFO<EmulatorTraits<Emu32>>)
-                                              : sizeof(AFD_HANDLE_INFO<EmulatorTraits<Emu64>>);
+        const auto expected_size =
+            GetParam() ? sizeof(AFD_HANDLE_INFO<EmulatorTraits<Emu32>>) : sizeof(AFD_HANDLE_INFO<EmulatorTraits<Emu64>>);
         const auto invoke = [&](const uint32_t flags, const uint32_t input_length, const uint32_t output_length) {
             emu.memory.write_memory(input, &flags, sizeof(flags));
             emu.memory.set_memory(output, 0xa5, 24);
@@ -456,10 +682,10 @@ namespace sogen::test
             EXPECT_EQ(block.Status, STATUS_SUCCESS);
             EXPECT_EQ(block.Information, expected_size);
             const auto bytes = emu.memory.read_memory(output, 24);
-            EXPECT_TRUE(std::all_of(bytes.begin(), bytes.begin() + expected_size,
-                                    [](const std::byte value) { return value == std::byte{0xff}; }));
-            EXPECT_TRUE(std::all_of(bytes.begin() + expected_size, bytes.end(),
-                                    [](const std::byte value) { return value == std::byte{0xa5}; }));
+            EXPECT_TRUE(
+                std::all_of(bytes.begin(), bytes.begin() + expected_size, [](const std::byte value) { return value == std::byte{0xff}; }));
+            EXPECT_TRUE(
+                std::all_of(bytes.begin() + expected_size, bytes.end(), [](const std::byte value) { return value == std::byte{0xa5}; }));
         }
         for (const auto flags : {0u, 4u})
         {
@@ -468,8 +694,7 @@ namespace sogen::test
             EXPECT_EQ(block.Status, STATUS_INVALID_PARAMETER);
             EXPECT_EQ(block.Information, 0u);
             const auto bytes = emu.memory.read_memory(output, 24);
-            EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(),
-                                    [](const std::byte value) { return value == std::byte{0xa5}; }));
+            EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(), [](const std::byte value) { return value == std::byte{0xa5}; }));
         }
         EXPECT_EQ(invoke(3, 3, static_cast<uint32_t>(expected_size)), STATUS_BUFFER_TOO_SMALL);
         EXPECT_EQ(invoke(3, 4, static_cast<uint32_t>(expected_size - 1)), STATUS_BUFFER_TOO_SMALL);
@@ -513,8 +738,7 @@ namespace sogen::test
         emu.process.events.get(send_event)->signaled = false;
 
         EXPECT_EQ(invoke(1, sizeof(AFD_PARTIAL_DISCONNECT_INFO), -10000000), STATUS_SUCCESS);
-        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{
-            .Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
         emu.memory.write_memory(memory + 0x120, &initial, sizeof(initial));
         EXPECT_EQ(transfer(true), STATUS_PIPE_DISCONNECTED);
         EXPECT_EQ(status(true).Status, initial.Status);
@@ -547,8 +771,7 @@ namespace sogen::test
         EXPECT_EQ(block.Status, STATUS_INVALID_PARAMETER);
         EXPECT_EQ(block.Information, 0u);
         auto bytes = emu.memory.read_memory(output, 64);
-        EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(),
-                                [](const std::byte value) { return value == std::byte{0xa5}; }));
+        EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(), [](const std::byte value) { return value == std::byte{0xa5}; }));
         EXPECT_EQ(invoke(64), STATUS_SUCCESS);
         block = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb);
         EXPECT_EQ(block.Status, STATUS_SUCCESS);
@@ -565,8 +788,7 @@ namespace sogen::test
         constexpr uint64_t input = memory + 0x800;
         constexpr uint64_t output = memory + 0x880;
         constexpr uint64_t iosb = memory + 0x100;
-        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{
-            .Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
         const auto invoke = [&](const ULONG code, const uint32_t input_length, const uint32_t output_length) {
             emu.memory.write_memory(iosb, &initial, sizeof(initial));
             emu.memory.set_memory(input, 0, sizeof(AFD_ACCEPT_INFO));
@@ -583,8 +805,7 @@ namespace sogen::test
             EXPECT_EQ(block.Status, initial.Status);
             EXPECT_EQ(block.Information, initial.Information);
             const auto bytes = emu.memory.read_memory(output, 32);
-            EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(),
-                                    [](const std::byte value) { return value == std::byte{0xa5}; }));
+            EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(), [](const std::byte value) { return value == std::byte{0xa5}; }));
             return result;
         };
 
@@ -621,8 +842,7 @@ namespace sogen::test
         socket->next_accepted_remote = remote;
         constexpr uint64_t output = memory + 0x880;
         constexpr uint64_t iosb = memory + 0x100;
-        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{
-            .Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
         const auto invoke = [&](const uint32_t length) {
             emu.memory.write_memory(iosb, &initial, sizeof(initial));
             emu.memory.set_memory(output, 0xa5, 40);
@@ -668,8 +888,7 @@ namespace sogen::test
         ASSERT_EQ(device->execute_ioctl(emu, wait), STATUS_SUCCESS);
         const auto sequence = emu.memory.read_memory<LONG>(output);
         ASSERT_EQ(sequence, 1);
-        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{
-            .Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
         const auto invoke = [&](const LONG value, const handle target) {
             const AFD_ACCEPT_INFO request{.Sequence = value, .AcceptHandle = target};
             emu.memory.write_memory(input, &request, sizeof(request));
@@ -687,8 +906,8 @@ namespace sogen::test
         const auto store_target = [&](const uint32_t type, const uint32_t protocol) {
             const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, type, protocol, 0};
             emu.memory.write_memory(memory + 0x900, creation.data(), sizeof(creation));
-            return emu.process.devices.store(io_device_container{
-                u"Afd\\Endpoint", emu, {.buffer = memory + 0x900, .length = sizeof(creation)}});
+            return emu.process.devices.store(
+                io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory + 0x900, .length = sizeof(creation)}});
         };
         const auto udp = store_target(2, 17);
         ASSERT_NE(emu.process.devices.get(udp), nullptr);
@@ -1018,11 +1237,33 @@ namespace sogen::test
     }
 
 #ifdef _WIN32
+    TEST(AfdTransportSortHostTest, WrapperUsesNativeWindowsAddressPolicy)
+    {
+        network::socket_factory initialize_winsock;
+        network::socket_wrapper wrapper{AF_INET6, SOCK_STREAM, IPPROTO_TCP};
+        std::vector<network::address_sort_entry> addresses(2);
+        addresses[0].address.sin6_family = AF_INET6;
+        addresses[0].source_index = 0;
+        auto* mapped = reinterpret_cast<uint8_t*>(&addresses[0].address.sin6_addr);
+        mapped[10] = 0xff;
+        mapped[11] = 0xff;
+        mapped[12] = 127;
+        mapped[15] = 1;
+        addresses[1].address.sin6_family = AF_INET6;
+        addresses[1].source_index = 1;
+        auto* loopback = reinterpret_cast<uint8_t*>(&addresses[1].address.sin6_addr);
+        loopback[15] = 1;
+
+        ASSERT_EQ(wrapper.sort_address_list(addresses), STATUS_SUCCESS);
+        ASSERT_EQ(addresses.size(), 2u);
+        EXPECT_EQ(addresses[0].source_index, 1u);
+        EXPECT_EQ(addresses[1].source_index, 0u);
+    }
+
     TEST(AfdPartialDisconnectHostTest, WrapperForwardsModesAndTimeoutToNativeAfd)
     {
         network::socket_factory initialize_winsock;
-        for (const auto [mode, timeout] : {std::pair<uint32_t, int64_t>{0, 0}, {2, -10000},
-                                           {8, 1}, {1, -10000000}, {4, 0}})
+        for (const auto [mode, timeout] : {std::pair<uint32_t, int64_t>{0, 0}, {2, -10000}, {8, 1}, {1, -10000000}, {4, 0}})
         {
             SOCKET listener = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             ASSERT_NE(listener, INVALID_SOCKET);
@@ -1092,8 +1333,7 @@ namespace sogen::test
     TEST(AfdPartialDisconnectHostTest, UdpExplicitSendAndReceiveRemainAvailable)
     {
         network::socket_factory initialize_winsock;
-        for (const auto [mode, expected_error] : {std::pair<uint32_t, int>{1, WSAESHUTDOWN},
-                                                  {4, WSAECONNABORTED}, {8, WSAENOTCONN}})
+        for (const auto [mode, expected_error] : {std::pair<uint32_t, int>{1, WSAESHUTDOWN}, {4, WSAECONNABORTED}, {8, WSAENOTCONN}})
         {
             SOCKET local = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             SOCKET peer = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -1120,8 +1360,8 @@ namespace sogen::test
     TEST(AfdPartialDisconnectStaticTest, UdpExplicitSendAndReceiveRemainAvailable)
     {
         const network::address peer_address{"127.0.0.1", uint16_t{20002}};
-        for (const auto [mode, expected_error] : {std::pair<uint32_t, int>{1, SERR(ESHUTDOWN)},
-                                                  {4, SERR(ECONNABORTED)}, {8, SERR(ENOTCONN)}})
+        for (const auto [mode, expected_error] :
+             {std::pair<uint32_t, int>{1, SERR(ESHUTDOWN)}, {4, SERR(ECONNABORTED)}, {8, SERR(ENOTCONN)}})
         {
             auto factory = network::create_static_socket_factory();
             auto local = factory->create_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);

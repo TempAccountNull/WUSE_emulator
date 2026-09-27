@@ -1,6 +1,7 @@
 #pragma once
 
 #include <span>
+#include <vector>
 #include <network/socket.hpp>
 
 namespace sogen
@@ -8,6 +9,12 @@ namespace sogen
 
     namespace network
     {
+        struct address_sort_entry
+        {
+            sockaddr_in6 address{};
+            uint32_t source_index{};
+        };
+
         struct i_socket
         {
             virtual ~i_socket() = default;
@@ -27,6 +34,13 @@ namespace sogen
             }
 
             virtual uint32_t query_address_list(uint16_t, std::vector<std::byte>&)
+            {
+                return 0xc00000bb;
+            }
+
+            // Sort IPv6-format destinations with the host's address policy.
+            // Unsupported backends must report failure, not fabricated output.
+            virtual uint32_t sort_address_list(std::vector<address_sort_entry>&)
             {
                 return 0xc00000bb;
             }

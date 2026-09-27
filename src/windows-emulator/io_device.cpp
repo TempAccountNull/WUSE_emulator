@@ -163,8 +163,13 @@ namespace sogen
             }
         }
         const auto block = c.io_status_block ? c.io_status_block.read() : IO_STATUS_BLOCK<EmulatorTraits<Emu64>>{.Status = status};
+        const auto* file_object = win_emu.process.devices.get(c.file_handle);
         if (c.apc_routine)
         {
+            if (completed_synchronously && file_object && file_object->get_device_name() == u"Afd\\Endpoint")
+            {
+                return;
+            }
             const auto issuer = win_emu.process.thread_handles_by_id.find(c.issuer_thread_id);
             if (issuer != win_emu.process.thread_handles_by_id.end())
             {
@@ -181,13 +186,12 @@ namespace sogen
                         .io_status = static_cast<int32_t>(static_cast<ULONG>(status)),
                         .io_information = static_cast<uint32_t>(block.Information),
                     });
-                    win_emu.network_debug.apc_queue(c.network_request_id, c.issuer_thread_id,
-                                                   static_cast<int32_t>(status), block.Information);
+                    win_emu.network_debug.apc_queue(c.network_request_id, c.issuer_thread_id, static_cast<int32_t>(status),
+                                                    block.Information);
                 }
             }
             return;
         }
-        const auto* file_object = win_emu.process.devices.get(c.file_handle);
         if (!file_object || !file_object->completion_port.bits)
         {
             return;
@@ -206,8 +210,8 @@ namespace sogen
             message.network_request_id = c.network_request_id;
             message.io_status_block = block;
             port->enqueue(message);
-            win_emu.network_debug.iocp_queue(c.network_request_id, file_object->completion_port.bits,
-                                              file_object->completion_key, static_cast<int32_t>(status), block.Information);
+            win_emu.network_debug.iocp_queue(c.network_request_id, file_object->completion_port.bits, file_object->completion_key,
+                                             static_cast<int32_t>(status), block.Information);
         }
     }
 
@@ -237,8 +241,7 @@ namespace sogen
         }
 
         if (this->may_return_pending() && !c.completing_pending &&
-            ((result == STATUS_INVALID_PARAMETER && !this->invalid_parameter_completes(c)) ||
-             this->skips_immediate_completion(c, result)))
+            ((result == STATUS_INVALID_PARAMETER && !this->invalid_parameter_completes(c)) || this->skips_immediate_completion(c, result)))
         {
             // Native AFD rejects invalid requests before completing an IRP: no IOSB update,
             // event signal, APC, or IOCP packet is delivered.

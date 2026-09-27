@@ -42,6 +42,41 @@ namespace sogen
     static_assert(sizeof(AFD_INFO) == 16);
     static_assert(offsetof(AFD_INFO, Information) == 8);
 
+    // Modern mswsock!WSPIoctl type-3 wrapper (24 bytes on x86, 32 on x64).
+    template <typename Traits>
+    struct AFD_WINSOCK_TRANSPORT_IOCTL
+    {
+        ULONG Type;
+        ULONG Reserved;
+        ULONG ControlCode;
+        BYTE Overlapped;
+        BYTE Padding[3];
+        typename Traits::PVOID InputBuffer;
+        typename Traits::SIZE_T InputBufferLength;
+    };
+    static_assert(sizeof(AFD_WINSOCK_TRANSPORT_IOCTL<EmulatorTraits<Emu32>>) == 24);
+    static_assert(sizeof(AFD_WINSOCK_TRANSPORT_IOCTL<EmulatorTraits<Emu64>>) == 32);
+    static_assert(offsetof(AFD_WINSOCK_TRANSPORT_IOCTL<EmulatorTraits<Emu32>>, InputBuffer) == 16);
+    static_assert(offsetof(AFD_WINSOCK_TRANSPORT_IOCTL<EmulatorTraits<Emu64>>, InputBuffer) == 16);
+
+    template <typename Traits>
+    struct AFD_SORT_SOCKET_ADDRESS
+    {
+        typename Traits::PVOID Sockaddr;
+        LONG SockaddrLength;
+    };
+
+    template <typename Traits>
+    struct AFD_SORT_ADDRESS_LIST
+    {
+        LONG Count;
+        AFD_SORT_SOCKET_ADDRESS<Traits> Address[1];
+    };
+    static_assert(offsetof(AFD_SORT_ADDRESS_LIST<EmulatorTraits<Emu32>>, Address) == 4);
+    static_assert(offsetof(AFD_SORT_ADDRESS_LIST<EmulatorTraits<Emu64>>, Address) == 8);
+    static_assert(sizeof(AFD_SORT_ADDRESS_LIST<EmulatorTraits<Emu32>>) == 12);
+    static_assert(sizeof(AFD_SORT_ADDRESS_LIST<EmulatorTraits<Emu64>>) == 24);
+
     struct AFD_LISTEN_INFO
     {
         BOOLEAN SanActive;

@@ -193,6 +193,91 @@ namespace sogen
             return 0xc000022d;
         }
 
+        uint32_t socket_wrapper::sort_address_list(std::vector<address_sort_entry>& addresses)
+        {
+#ifdef _WIN32
+            if (addresses.empty() || addresses.size() > 1024)
+            {
+                return 0xc000000d;
+            }
+
+            const size_t prefix = offsetof(SOCKET_ADDRESS_LIST, Address);
+            const size_t length = prefix + addresses.size() * sizeof(SOCKET_ADDRESS);
+            std::vector<std::byte> input(length);
+            std::vector<std::byte> output(length, std::byte{0xa5});
+            const auto count = static_cast<int>(addresses.size());
+            memcpy(input.data(), &count, sizeof(count));
+            for (size_t index = 0; index < addresses.size(); ++index)
+            {
+                const SOCKET_ADDRESS entry{reinterpret_cast<LPSOCKADDR>(&addresses[index].address), sizeof(sockaddr_in6)};
+                memcpy(input.data() + prefix + index * sizeof(entry), &entry, sizeof(entry));
+            }
+
+            struct transport_request
+            {
+                uint32_t type{3};
+                uint32_t reserved{};
+                uint32_t control_code{SIO_ADDRESS_LIST_SORT};
+                uint8_t overlapped{1};
+                uint8_t padding[3]{};
+                const void* nested_input{};
+                uintptr_t nested_length{};
+            };
+            static_assert(sizeof(transport_request) == 32);
+            const transport_request request{.nested_input = input.data(), .nested_length = length};
+            uint64_t information{};
+            const auto status = socket_control(this->socket_.get_socket(), 0x120bf,
+                                               std::as_bytes(std::span(&request, 1)), output, information);
+            if (status != 0)
+            {
+                return status;
+            }
+            if (information < prefix || information > output.size())
+            {
+                return 0xc000000d;
+            }
+            int returned_count{};
+            memcpy(&returned_count, output.data(), sizeof(returned_count));
+            if (returned_count < 0 || static_cast<size_t>(returned_count) > addresses.size() ||
+                information != prefix + static_cast<size_t>(returned_count) * sizeof(SOCKET_ADDRESS))
+            {
+                return 0xc000000d;
+            }
+            std::vector<address_sort_entry> sorted;
+            sorted.reserve(returned_count);
+            std::vector<bool> used(addresses.size());
+            for (int position = 0; position < returned_count; ++position)
+            {
+                SOCKET_ADDRESS entry{};
+                memcpy(&entry, output.data() + prefix + static_cast<size_t>(position) * sizeof(entry), sizeof(entry));
+                if (entry.iSockaddrLength != sizeof(sockaddr_in6))
+                {
+                    return 0xc000000d;
+                }
+                bool found = false;
+                for (size_t index = 0; index < addresses.size(); ++index)
+                {
+                    if (!used[index] && entry.lpSockaddr == reinterpret_cast<LPSOCKADDR>(&addresses[index].address))
+                    {
+                        sorted.push_back(addresses[index]);
+                        used[index] = true;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                {
+                    return 0xc000000d;
+                }
+            }
+            addresses = std::move(sorted);
+            return 0;
+#else
+            (void)addresses;
+            return 0xc00000bb;
+#endif
+        }
+
         bool socket_wrapper::is_ready(const bool in_poll)
         {
             return this->is_aborted() || this->socket_.is_ready(in_poll);

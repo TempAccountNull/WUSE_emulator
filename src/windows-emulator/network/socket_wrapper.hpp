@@ -21,6 +21,7 @@ namespace sogen
             uint32_t set_information(uint32_t information_class, uint64_t value) override;
 
             uint32_t query_address_list(uint16_t family, std::vector<std::byte>& data) override;
+            uint32_t sort_address_list(std::vector<address_sort_entry>& addresses) override;
 
             uint32_t partial_disconnect(uint32_t mode, int64_t timeout) override;
             bool is_ready(bool in_poll) override;

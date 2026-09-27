@@ -493,6 +493,10 @@ namespace sogen
                 std::vector<std::byte> connect_input{};
                 std::vector<AFD_POLL_HANDLE_INFO<Traits>> poll_handles{};
                 bool poll_captured{};
+                bool transport_sort_captured{};
+                NTSTATUS transport_sort_capture_status{STATUS_SUCCESS};
+                std::vector<network::address_sort_entry> transport_sort_addresses{};
+                std::vector<uint64_t> transport_sort_guest_pointers{};
 
                 explicit pending_request(const io_device_context& c)
                     : context(c)
@@ -522,6 +526,10 @@ namespace sogen
                     buffer.write_vector(connect_input);
                     buffer.write_vector(poll_handles);
                     buffer.write(poll_captured);
+                    buffer.write(transport_sort_captured);
+                    buffer.write(transport_sort_capture_status);
+                    buffer.write_vector(transport_sort_addresses);
+                    buffer.write_vector(transport_sort_guest_pointers);
                 }
 
                 void deserialize(utils::buffer_deserializer& buffer)
@@ -542,6 +550,14 @@ namespace sogen
                     buffer.read_vector(connect_input);
                     buffer.read_vector(poll_handles);
                     buffer.read(poll_captured);
+                    buffer.read(transport_sort_captured);
+                    buffer.read(transport_sort_capture_status);
+                    buffer.read_vector(transport_sort_addresses);
+                    buffer.read_vector(transport_sort_guest_pointers);
+                    if (transport_sort_addresses.size() > 1024 || transport_sort_guest_pointers.size() > 1024)
+                    {
+                        throw std::runtime_error("Serialized AFD sort address count exceeds limit");
+                    }
                 }
             };
 
@@ -939,12 +955,167 @@ namespace sogen
                 case AFD_PARTIAL_DISCONNECT:
                     return this->ioctl_partial_disconnect(win_emu, c);
                 case AFD_TRANSPORT_IOCTL:
-                    return STATUS_SUCCESS;
+                    return this->ioctl_transport_sort(win_emu, c);
                 default:
                     win_emu.log.error("Unsupported AFD IOCTL: 0x%X (%u)\n", static_cast<uint32_t>(c.io_control_code),
                                       static_cast<uint32_t>(request));
                     return STATUS_NOT_SUPPORTED;
                 }
+            }
+
+            NTSTATUS capture_transport_sort(windows_emulator& win_emu, const io_device_context& c,
+                                            const AFD_WINSOCK_TRANSPORT_IOCTL<Traits>& wrapper, pending_request& pending) const
+            {
+                using list = AFD_SORT_ADDRESS_LIST<Traits>;
+                using entry = AFD_SORT_SOCKET_ADDRESS<Traits>;
+                constexpr size_t prefix = offsetof(list, Address);
+                constexpr LONG max_addresses = 1024;
+                if (!wrapper.InputBuffer || wrapper.InputBufferLength < prefix + sizeof(entry))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                LONG count{};
+                if (!win_emu.memory.try_read_memory(wrapper.InputBuffer, &count, sizeof(count)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if (count <= 0 || count > max_addresses)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                const size_t list_size = prefix + static_cast<size_t>(count) * sizeof(entry);
+                if (wrapper.InputBufferLength < list_size || c.output_buffer_length < list_size)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                pending.transport_sort_addresses.reserve(count);
+                pending.transport_sort_guest_pointers.reserve(count);
+                for (LONG index = 0; index < count; ++index)
+                {
+                    entry item{};
+                    const uint64_t item_address =
+                        static_cast<uint64_t>(wrapper.InputBuffer) + prefix + static_cast<size_t>(index) * sizeof(entry);
+                    if (!win_emu.memory.try_read_memory(item_address, &item, sizeof(item)))
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if (!item.Sockaddr || item.SockaddrLength != sizeof(win_sockaddr_in6))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    win_sockaddr_in6 guest_address{};
+                    if (!win_emu.memory.try_read_memory(item.Sockaddr, &guest_address, sizeof(guest_address)))
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if (guest_address.sin6_family != 23)
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    network::address_sort_entry address{};
+                    memcpy(&address.address, &guest_address, sizeof(guest_address));
+                    address.address.sin6_family = AF_INET6;
+                    address.source_index = static_cast<uint32_t>(index);
+                    pending.transport_sort_addresses.push_back(address);
+                    pending.transport_sort_guest_pointers.push_back(item.Sockaddr);
+                }
+                return STATUS_SUCCESS;
+            }
+
+            NTSTATUS ioctl_transport_sort(windows_emulator& win_emu, const io_device_context& c)
+            {
+                if (!this->s_)
+                {
+                    return STATUS_INVALID_HANDLE;
+                }
+                if (!this->executing_delayed_ioctl_)
+                {
+                    using wrapper_type = AFD_WINSOCK_TRANSPORT_IOCTL<Traits>;
+                    if (c.input_buffer_length < sizeof(wrapper_type))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    wrapper_type wrapper{};
+                    if (!win_emu.memory.try_read_memory(c.input_buffer, &wrapper, sizeof(wrapper)))
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    constexpr uint32_t address_sort_code = 0xc8000019; // SIO_ADDRESS_LIST_SORT (ws2def.h)
+                    if (wrapper.Type != 3 || wrapper.ControlCode != address_sort_code)
+                    {
+                        win_emu.log.error("Unsupported AFD transport IOCTL type %u, Winsock code 0x%X\n", wrapper.Type,
+                                          wrapper.ControlCode);
+                        return STATUS_NOT_SUPPORTED;
+                    }
+                    const auto status = this->delay_ioctrl(c);
+                    if (status != STATUS_PENDING)
+                    {
+                        return status;
+                    }
+                    auto& pending = this->pending_requests_.back();
+                    pending.transport_sort_captured = true;
+                    pending.transport_sort_capture_status = this->capture_transport_sort(win_emu, c, wrapper, pending);
+                    return STATUS_PENDING;
+                }
+
+                if (!this->active_pending_ || !this->active_pending_->transport_sort_captured)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                auto& pending = *this->active_pending_;
+                if (pending.transport_sort_capture_status != STATUS_SUCCESS)
+                {
+                    return pending.transport_sort_capture_status;
+                }
+                auto addresses = pending.transport_sort_addresses;
+                const auto status = static_cast<NTSTATUS>(this->s_->sort_address_list(addresses));
+                if (status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+                using list = AFD_SORT_ADDRESS_LIST<Traits>;
+                using entry = AFD_SORT_SOCKET_ADDRESS<Traits>;
+                constexpr size_t prefix = offsetof(list, Address);
+                const size_t output_size = prefix + addresses.size() * sizeof(entry);
+                if (addresses.size() > pending.transport_sort_guest_pointers.size() || output_size > c.output_buffer_length)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                for (const auto& address : addresses)
+                {
+                    if (address.source_index >= pending.transport_sort_guest_pointers.size())
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    win_sockaddr_in6 guest_address{};
+                    memcpy(&guest_address, &address.address, sizeof(guest_address));
+                    guest_address.sin6_family = 23;
+                    if (!win_emu.memory.try_write_memory(pending.transport_sort_guest_pointers[address.source_index], &guest_address,
+                                                         sizeof(guest_address)))
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                }
+                const LONG count = static_cast<LONG>(addresses.size());
+                if (!win_emu.memory.try_write_memory(c.output_buffer, &count, sizeof(count)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                for (size_t index = 0; index < addresses.size(); ++index)
+                {
+                    const entry item{.Sockaddr = static_cast<typename Traits::PVOID>(
+                                         pending.transport_sort_guest_pointers[addresses[index].source_index]),
+                                     .SockaddrLength = sizeof(win_sockaddr_in6)};
+                    if (!win_emu.memory.try_write_memory(c.output_buffer + prefix + index * sizeof(entry), &item, sizeof(item)))
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                }
+                if (c.io_status_block)
+                {
+                    c.io_status_block.access([&](status_block& block) { block.Information = output_size; });
+                }
+                return STATUS_SUCCESS;
             }
 
             NTSTATUS ioctl_partial_disconnect(windows_emulator& win_emu, const io_device_context& c) const
@@ -1180,6 +1351,10 @@ namespace sogen
                     {
                         return STATUS_SUCCESS;
                     }
+                    if (error == SERR(ECONNREFUSED))
+                    {
+                        return STATUS_CONNECTION_REFUSED;
+                    }
 
                     return STATUS_UNSUCCESSFUL;
                 }
@@ -1248,9 +1423,8 @@ namespace sogen
                 {
                     return STATUS_INVALID_PARAMETER;
                 }
-                const size_t address_size = this->creation_data && this->creation_data->address_family == 23
-                                                ? sizeof(win_sockaddr_in6)
-                                                : sizeof(win_sockaddr_in);
+                const size_t address_size =
+                    this->creation_data && this->creation_data->address_family == 23 ? sizeof(win_sockaddr_in6) : sizeof(win_sockaddr_in);
                 if (c.output_buffer_length < sizeof(LONG) + address_size)
                 {
                     return STATUS_BUFFER_TOO_SMALL;
@@ -1326,8 +1500,8 @@ namespace sogen
                 {
                     return STATUS_INVALID_HANDLE;
                 }
-                if (!target_endpoint->creation_data || target_endpoint->creation_data->type != 1 ||
-                    !target_endpoint->s_ || target_endpoint->s_->is_connected())
+                if (!target_endpoint->creation_data || target_endpoint->creation_data->type != 1 || !target_endpoint->s_ ||
+                    target_endpoint->s_->is_connected())
                 {
                     return STATUS_INVALID_PARAMETER;
                 }
@@ -2137,6 +2311,11 @@ namespace sogen
                 return true;
             }
 
+            bool skips_immediate_completion(const io_device_context&, const NTSTATUS status) const override
+            {
+                return status == STATUS_INVALID_HANDLE || status == STATUS_INVALID_ADDRESS;
+            }
+
             NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& c) override
             {
                 if (c.io_control_code != 0x12007)
@@ -2144,9 +2323,14 @@ namespace sogen
                     return STATUS_NOT_SUPPORTED;
                 }
 
+                constexpr auto family_end = offsetof(AFD_CONNECT_JOIN_INFO_TL<Traits>, RemoteAddress) + sizeof(USHORT);
+                if (c.input_buffer_length < family_end)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
                 if (c.input_buffer_length < sizeof(AFD_CONNECT_JOIN_INFO_TL<Traits>))
                 {
-                    return STATUS_BUFFER_TOO_SMALL;
+                    return STATUS_INVALID_ADDRESS;
                 }
 
                 handle target_handle{};
@@ -2167,7 +2351,18 @@ namespace sogen
 
                 // The helper's outer execute_ioctl owns the request's IOSB and completion.
                 // Calling the endpoint wrapper here would deliver synchronous APC/IOCP twice.
-                return target_endpoint->io_control(win_emu, c);
+                const auto result = target_endpoint->io_control(win_emu, c);
+                if (result != STATUS_SUCCESS)
+                {
+                    return result;
+                }
+                const auto pending_status = target_endpoint->delay_ioctrl(c);
+                if (pending_status != STATUS_PENDING)
+                {
+                    return pending_status;
+                }
+                target_endpoint->pending_requests_.back().connect_input = win_emu.emu().read_memory(c.input_buffer, c.input_buffer_length);
+                return STATUS_PENDING;
             }
         };
     }

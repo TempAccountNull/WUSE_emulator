@@ -1,6 +1,7 @@
 #include "emulation_test_utils.hpp"
 #include <io_device.hpp>
 #include <syscall_utils.hpp>
+#include <array>
 
 namespace sogen::syscalls
 {
@@ -155,6 +156,30 @@ namespace sogen::test
         EXPECT_EQ(apc.apc_argument1, 0x7890u);
         EXPECT_EQ(apc.apc_argument2, c.io_status_block.value());
         EXPECT_EQ(apc.io_information, 7u);
+    }
+
+    TEST_P(DeviceCompletionTest, SynchronousAfdCompletionSignalsEventWithoutQueueingApc)
+    {
+        const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
+        emu.memory.write_memory(memory + 0x400, creation.data(), sizeof(creation));
+        const auto afd =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory + 0x400, .length = sizeof(creation)}});
+
+        event signal{};
+        signal.type = SynchronizationEvent;
+        const auto event_handle = emu.process.events.store(std::move(signal));
+
+        auto c = request();
+        auto& issuer = *emu.vcpu(0).active_thread;
+        c.file_handle = afd;
+        c.issuer_thread_id = issuer.id;
+        c.event = event_handle;
+        c.apc_routine = 0x12345000;
+        complete_device_ioctl(emu, c, STATUS_SUCCESS, true);
+
+        EXPECT_TRUE(emu.process.events.get(event_handle)->signaled);
+        EXPECT_TRUE(issuer.pending_apcs.empty());
+        EXPECT_EQ(c.io_status_block.read().Information, 7u);
     }
 
     TEST_P(DeviceCompletionTest, CancelSyscallsAcceptDevicesAndReportNoPendingRequest)
