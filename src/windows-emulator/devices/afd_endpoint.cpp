@@ -562,6 +562,7 @@ namespace sogen
             };
 
             static constexpr size_t max_pending_requests = 256;
+            static constexpr size_t max_context_bytes = 1u << 20;
             std::deque<pending_request> pending_requests_{};
             pending_request* active_pending_{};
             bool executing_delayed_ioctl_{};
@@ -575,6 +576,9 @@ namespace sogen
             ULONG triggered_events_{0};
 
             bool non_blocking_{false};
+            // AFD treats context as opaque provider-owned bytes. Distinguish an
+            // explicitly set empty context from an endpoint with no context.
+            std::optional<std::vector<std::byte>> socket_context_{};
 
             afd_endpoint()
             {
@@ -643,6 +647,59 @@ namespace sogen
 
                 const auto option_flags = win_emu.emu().read_memory<ULONG>(c.input_buffer + option_flags_offset);
                 this->non_blocking_ = (option_flags & non_blocking_flag) != 0;
+            }
+
+            NTSTATUS ioctl_set_context(windows_emulator& win_emu, const io_device_context& c)
+            {
+                if (c.input_buffer_length > max_context_bytes)
+                {
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
+                // Native AFD permits a second output pointer only when it names a
+                // subrange of the input buffer (used by AcceptEx socket contexts).
+                if (c.output_buffer &&
+                    (!c.input_buffer || c.output_buffer < c.input_buffer ||
+                     c.output_buffer - c.input_buffer > UINT16_MAX || c.output_buffer_length > UINT16_MAX ||
+                     c.output_buffer_length > c.input_buffer_length ||
+                     c.output_buffer - c.input_buffer > c.input_buffer_length - c.output_buffer_length))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                if (c.input_buffer_length && !c.input_buffer)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                std::vector<std::byte> context(c.input_buffer_length);
+                if (!context.empty() && !win_emu.memory.try_read_memory(c.input_buffer, context.data(), context.size()))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                this->socket_context_ = std::move(context);
+                this->update_shared_info(win_emu, c);
+                return STATUS_SUCCESS;
+            }
+
+            NTSTATUS ioctl_get_context(windows_emulator& win_emu, const io_device_context& c) const
+            {
+                // XP AFD returns INVALID_PARAMETER for a direct endpoint without
+                // context. Modern Winsock creates its own context before a caller
+                // sees a socket; that fresh-socket case is not emulated by copying
+                // host context, which may contain host-specific provider state.
+                if (!this->socket_context_)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                const auto& context = *this->socket_context_;
+                const auto copied = std::min<size_t>(context.size(), c.output_buffer_length);
+                if (copied && !win_emu.memory.try_write_memory(c.output_buffer, context.data(), copied))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if (c.io_status_block)
+                {
+                    c.io_status_block.access([&](status_block& block) { block.Information = context.size(); });
+                }
+                return copied == context.size() ? STATUS_SUCCESS : STATUS_BUFFER_OVERFLOW;
             }
 
             NTSTATUS pend_or_would_block(const io_device_context& c, const bool require_poll, const ULONG flags)
@@ -826,6 +883,23 @@ namespace sogen
                 buffer.read_optional(this->creation_data);
                 this->setup(buffer.read<socket_factory_wrapper>());
                 buffer.read(this->non_blocking_);
+                if (buffer.read<bool>())
+                {
+                    const auto context_size = buffer.read<uint64_t>();
+                    if (context_size > max_context_bytes)
+                    {
+                        throw std::runtime_error("Serialized AFD context exceeds limit");
+                    }
+                    this->socket_context_.emplace(static_cast<size_t>(context_size));
+                    for (auto& byte : *this->socket_context_)
+                    {
+                        buffer.read(byte);
+                    }
+                }
+                else
+                {
+                    this->socket_context_.reset();
+                }
                 const auto count = buffer.read<uint64_t>();
                 if (count > max_pending_requests)
                 {
@@ -843,6 +917,15 @@ namespace sogen
             {
                 buffer.write_optional(this->creation_data);
                 buffer.write(this->non_blocking_);
+                buffer.write(this->socket_context_.has_value());
+                if (this->socket_context_)
+                {
+                    buffer.write(static_cast<uint64_t>(this->socket_context_->size()));
+                    for (const auto byte : *this->socket_context_)
+                    {
+                        buffer.write(byte);
+                    }
+                }
                 buffer.write(static_cast<uint64_t>(this->pending_requests_.size()));
                 for (const auto& request : this->pending_requests_)
                 {
@@ -943,9 +1026,10 @@ namespace sogen
                     return this->ioctl_event_select(win_emu, c);
                 case AFD_ENUM_NETWORK_EVENTS:
                     return this->ioctl_enum_network_events(win_emu, c);
+                case AFD_GET_CONTEXT:
+                    return this->ioctl_get_context(win_emu, c);
                 case AFD_SET_CONTEXT:
-                    this->update_shared_info(win_emu, c);
-                    return STATUS_SUCCESS;
+                    return this->ioctl_set_context(win_emu, c);
                 case AFD_GET_INFORMATION:
                     return this->ioctl_information(win_emu, c, false);
                 case AFD_SET_INFORMATION:

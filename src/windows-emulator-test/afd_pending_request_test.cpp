@@ -536,6 +536,96 @@ namespace sogen::test
         }
     }
 
+    TEST_P(AfdPendingRequestTest, ContextStoresGuestBytesAndReturnsNativePrefixContract)
+    {
+        constexpr uint64_t input = memory + 0x800;
+        constexpr uint64_t output = memory + 0xa00;
+        constexpr uint64_t iosb = memory + 0x100;
+        // The endpoint request layout varies with GetParam(); io_device_context
+        // stores IOSB as Emu64 for both endpoint bitnesses.
+        const auto set = [&](const uint32_t size, const uint64_t alias = 0, const uint32_t alias_size = 0) {
+            io_device_context request{emu.memory};
+            request.io_control_code = 0x12047;
+            request.io_status_block = {emu.memory, iosb};
+            request.input_buffer = size ? input : 0;
+            request.input_buffer_length = size;
+            request.output_buffer = alias;
+            request.output_buffer_length = alias_size;
+            return device->execute_ioctl(emu, request);
+        };
+        const auto get = [&](io_device& endpoint, const uint32_t capacity) {
+            io_device_context request{emu.memory};
+            request.io_control_code = 0x12043;
+            request.io_status_block = {emu.memory, iosb};
+            request.output_buffer = capacity ? output : 0;
+            request.output_buffer_length = capacity;
+            return endpoint.execute_ioctl(emu, request);
+        };
+        // A direct endpoint with no context follows the XP AFD null-context
+        // path. Modern Winsock sockets already set context during creation.
+        EXPECT_EQ(get(*device, 256), STATUS_INVALID_PARAMETER);
+
+        const auto native_default_size = GetParam() ? 164u : 168u;
+        for (const uint32_t size : {0u, 1u, 16u, native_default_size})
+        {
+            std::vector<std::byte> payload(size);
+            for (size_t index = 0; index < payload.size(); ++index)
+            {
+                payload[index] = static_cast<std::byte>((index * 17 + 3) & 0xff);
+            }
+            if (size)
+            {
+                emu.memory.write_memory(input, payload.data(), payload.size());
+            }
+            ASSERT_EQ(set(size), STATUS_SUCCESS);
+            EXPECT_EQ(emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb).Information, 0u);
+
+            emu.memory.set_memory(output, 0xa5, 256);
+            const auto short_size = size ? size - 1 : 0;
+            EXPECT_EQ(get(*device, short_size), size ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS);
+            const auto short_iosb = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb);
+            EXPECT_EQ(short_iosb.Information, size);
+            const auto short_bytes = emu.memory.read_memory(output, size + 1);
+            EXPECT_TRUE(std::equal(payload.begin(), payload.begin() + short_size, short_bytes.begin()));
+            EXPECT_EQ(short_bytes[short_size], std::byte{0xa5});
+
+            emu.memory.set_memory(output, 0xa5, 256);
+            EXPECT_EQ(get(*device, size + 8), STATUS_SUCCESS);
+            const auto full_iosb = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb);
+            EXPECT_EQ(full_iosb.Information, size);
+            const auto full_bytes = emu.memory.read_memory(output, size + 8);
+            EXPECT_TRUE(std::equal(payload.begin(), payload.end(), full_bytes.begin()));
+            EXPECT_TRUE(std::all_of(full_bytes.begin() + size, full_bytes.end(),
+                                    [](const std::byte byte) { return byte == std::byte{0xa5}; }));
+        }
+
+        // The native USHORT alias bounds are enforced before replacing context.
+        std::array<std::byte, 32> replacement{};
+        replacement.fill(std::byte{0x77});
+        emu.memory.write_memory(input, replacement.data(), replacement.size());
+        EXPECT_EQ(set(32, input + 30, 4), STATUS_INVALID_PARAMETER);
+        emu.memory.set_memory(output, 0xa5, 256);
+        EXPECT_EQ(get(*device, native_default_size), STATUS_SUCCESS);
+        const auto preserved = emu.memory.read_memory(output, native_default_size);
+        EXPECT_NE(preserved.front(), replacement.front());
+        EXPECT_EQ(set(32, input + 4, 8), STATUS_SUCCESS);
+        EXPECT_EQ(get(*device, 32), STATUS_SUCCESS);
+        EXPECT_EQ(emu.memory.read_memory(output, 32),
+                  (std::vector<std::byte>(replacement.begin(), replacement.end())));
+
+        utils::buffer_serializer saved{};
+        device->serialize(saved);
+        utils::buffer_deserializer saved_input{saved};
+        saved_input.register_factory<memory_manager_wrapper>([this] { return memory_manager_wrapper{emu.memory}; });
+        saved_input.register_factory<x64_emulator_wrapper>([this] { return x64_emulator_wrapper{emu.emu()}; });
+        saved_input.register_factory<socket_factory_wrapper>([this] { return socket_factory_wrapper{emu.socket_factory()}; });
+        auto restored = create_afd_endpoint({.is_32_bit = GetParam()});
+        restored->deserialize(saved_input);
+        EXPECT_EQ(get(*restored, 32), STATUS_SUCCESS);
+        EXPECT_EQ(emu.memory.read_memory(output, 32),
+                  (std::vector<std::byte>(replacement.begin(), replacement.end())));
+    }
+
     TEST_P(AfdPendingRequestTest, TransportAddressSortMatchesNativePendingAndOutputContract)
     {
         struct guest_sockaddr_in6

@@ -202,7 +202,7 @@ namespace sogen::test
     {
         auto emu = sample();
         emu.setup_process_if_necessary();
-        for (const uint8_t version : {uint8_t{1}, uint8_t{2}, uint8_t{3}})
+        for (const uint8_t version : {uint8_t{1}, uint8_t{2}, uint8_t{3}, uint8_t{4}})
         {
             auto old_format = snapshot::create_emulator_snapshot(emu);
             ASSERT_GE(old_format.size(), 8U);
