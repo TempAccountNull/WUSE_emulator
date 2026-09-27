@@ -48,17 +48,29 @@ namespace sogen
         {
             if (handle == DBWIN_DATA_READY)
             {
-                if (c.proc.dbwin_buffer && c.win_emu.callbacks.on_debug_string)
+                if (c.proc.dbwin_buffer && (c.win_emu.callbacks.on_debug_string || c.win_emu.package_reads_trace.enabled()))
                 {
                     constexpr auto pid_length = 4;
                     std::array<char, 4096 - pid_length> buffer{};
                     if (!c.win_emu.memory.try_read_memory(c.proc.dbwin_buffer + pid_length, buffer.data(), buffer.size()))
                     {
-                        c.win_emu.callbacks.on_debug_string_error(c.proc.dbwin_buffer + pid_length, "DBWIN buffer unreadable");
+                        if (c.win_emu.callbacks.on_debug_string_error)
+                        {
+                            c.win_emu.callbacks.on_debug_string_error(c.proc.dbwin_buffer + pid_length, "DBWIN buffer unreadable");
+                        }
                         return STATUS_SUCCESS;
                     }
                     const auto end = std::ranges::find(buffer, '\0');
-                    c.win_emu.callbacks.on_debug_string(std::string_view(buffer.data(), static_cast<size_t>(end - buffer.begin())));
+                    const std::string_view message(buffer.data(), static_cast<size_t>(end - buffer.begin()));
+                    if (c.win_emu.callbacks.on_debug_string)
+                    {
+                        c.win_emu.callbacks.on_debug_string(message);
+                    }
+                    if (c.win_emu.package_reads_trace.trigger_on_oodle(message) && c.win_emu.callbacks.on_debug_string)
+                    {
+                        const auto snapshot = c.win_emu.package_reads_trace.snapshot_json();
+                        c.win_emu.callbacks.on_debug_string("Package read snapshot at first OODLE ERROR: " + snapshot);
+                    }
                 }
 
                 return STATUS_SUCCESS;

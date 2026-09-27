@@ -1549,6 +1549,11 @@ namespace sogen
             json += "}";
         }
 
+        if (this->package_reads_trace.enabled())
+        {
+            json += ",\"package_read_trace\":" + this->package_reads_trace.snapshot_json();
+        }
+
         if (this->cmapi_interface_profile.enabled())
         {
             const auto profile = this->cmapi_interface_profile.read();
@@ -2863,9 +2868,28 @@ namespace sogen
                 this->callbacks.on_suspicious_activity("Illegal instruction");
                 dispatch_illegal_instruction_violation(*this, vcpu);
                 return;
-            case 13:
+            case 13: {
+                // A CPL3 control-register MOV raises #GP. Report the Windows privileged-instruction
+                // exception at the original RIP, rather than treating the missing IDT gate as a read fault.
+                const auto rip = acting.read_instruction_pointer();
+                uint8_t first{};
+                if ((acting.reg<uint16_t>(x86_register::cs) & 3) == 3 &&
+                    acting.try_read_memory(rip, &first, sizeof(first)))
+                {
+                    const auto has_rex = (first & 0xf0) == 0x40;
+                    std::array<uint8_t, 3> opcode{};
+                    if (rip <= UINT64_MAX - static_cast<uint64_t>(has_rex) &&
+                        acting.try_read_memory(rip + static_cast<uint64_t>(has_rex), opcode.data(), opcode.size()) &&
+                        opcode[0] == 0x0f && (opcode[1] == 0x20 || opcode[1] == 0x22) &&
+                        (opcode[2] & 0xc0) == 0xc0)
+                    {
+                        dispatch_exception(*this, vcpu, STATUS_PRIVILEGED_INSTRUCTION, {});
+                        return;
+                    }
+                }
                 dispatch_access_violation(*this, vcpu, std::numeric_limits<uint64_t>::max(), memory_operation::read);
                 return;
+            }
             case 19: {
                 const auto mxcsr = acting.reg<uint32_t>(x86_register::mxcsr);
                 const auto pending = mxcsr & ~(mxcsr >> 7) & 0x3F;

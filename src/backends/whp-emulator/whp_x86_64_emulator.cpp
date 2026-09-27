@@ -2080,7 +2080,8 @@ namespace sogen::whp
                     WHV_PARTITION_PROPERTY exception_exit_bitmap{};
                     exception_exit_bitmap.ExceptionExitBitmap =
                         (1ull << WHvX64ExceptionTypeDebugTrapOrFault) | (1ull << WHvX64ExceptionTypeBreakpointTrap) |
-                        (1ull << WHvX64ExceptionTypeInvalidOpcodeFault) | (1ull << WHvX64ExceptionTypePageFault) |
+                        (1ull << WHvX64ExceptionTypeInvalidOpcodeFault) | (1ull << WHvX64ExceptionTypeGeneralProtectionFault) |
+                        (1ull << WHvX64ExceptionTypePageFault) |
                         (1ull << WHvX64ExceptionTypeFloatingPointErrorFault) | (1ull << WHvX64ExceptionTypeSimdFloatingPointFault);
 
                     WHP_CHECK_HR(WHvSetPartitionProperty(this->partition_, WHvPartitionPropertyCodeExceptionExitBitmap,

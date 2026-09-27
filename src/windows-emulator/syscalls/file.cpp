@@ -1331,6 +1331,7 @@ namespace sogen
                 return STATUS_INVALID_HANDLE;
             }
 
+            const bool trace_package = c.win_emu.package_reads_trace.enabled() && f->name.ends_with(u".pkg");
             const auto nanos_between = [](const auto first, const auto last) {
                 return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(last - first).count());
             };
@@ -1372,6 +1373,7 @@ namespace sogen
                 profile_sample.seek_nanos = nanos_between(seek_started, std::chrono::steady_clock::now());
             }
 
+            const auto read_offset = trace_package ? f->handle.tell() : 0;
             const auto read_started = profile_read ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const auto bytes_read = fread(temp_buffer.data(), 1, temp_buffer.size(), f->handle);
             if (profile_read)
@@ -1379,6 +1381,42 @@ namespace sogen
                 profile_sample.host_read_nanos = nanos_between(read_started, std::chrono::steady_clock::now());
                 profile_sample.read_bytes = bytes_read;
             }
+
+            const auto record_package_read = [&](const size_t actual) {
+                if (!trace_package) return;
+                static thread_local std::array<char, package_read_trace::hash_chunk_bytes> guest_chunk{};
+                uint64_t host_hash = package_read_trace::hash_seed;
+                uint64_t guest_hash = package_read_trace::hash_seed;
+                size_t hashed = 0;
+                bool guest_valid = true;
+                const auto hash_limit = std::min(actual, package_read_trace::max_hashed_bytes);
+                while (hashed < hash_limit)
+                {
+                    const auto count = std::min(hash_limit - hashed, guest_chunk.size());
+                    if (!c.emu.try_read_memory(buffer + hashed, guest_chunk.data(), count))
+                    {
+                        guest_valid = false;
+                        break;
+                    }
+                    host_hash = package_read_trace::hash_append(
+                        host_hash, std::span<const char>(temp_buffer.data() + hashed, count));
+                    guest_hash = package_read_trace::hash_append(
+                        guest_hash, std::span<const char>(guest_chunk.data(), count));
+                    hashed += count;
+                }
+                c.win_emu.package_reads_trace.record({
+                    .path = u16_to_u8(f->name),
+                    .handle = file_handle.bits,
+                    .tid = c.thread().id,
+                    .offset = read_offset,
+                    .requested = length,
+                    .actual = actual,
+                    .hashed_bytes = hashed,
+                    .host_hash = host_hash,
+                    .guest_hash = guest_hash,
+                    .guest_valid = guest_valid,
+                });
+            };
 
             if (bytes_read > 0)
             {
@@ -1388,10 +1426,12 @@ namespace sogen
                 {
                     profile_sample.guest_write_nanos = nanos_between(write_started, std::chrono::steady_clock::now());
                 }
+                record_package_read(bytes_read);
                 deliver_file_io_completion(c, event, apc_routine, apc_context, io_status_block, STATUS_SUCCESS, bytes_read);
                 return STATUS_SUCCESS;
             }
 
+            record_package_read(0);
             const auto status = length > 0 ? STATUS_END_OF_FILE : STATUS_SUCCESS;
 
             if (io_status_block)

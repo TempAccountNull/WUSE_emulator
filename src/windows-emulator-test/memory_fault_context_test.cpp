@@ -58,6 +58,56 @@ namespace sogen::test
         }
     };
 
+    TEST_P(MemoryFaultContext, WhpUserModeMovCr2DeliversPrivilegedInstruction)
+    {
+        if (win_emu.emu().get_name() != "Windows Hypervisor Platform")
+        {
+            GTEST_SKIP() << "Requires WHP #GP exits";
+        }
+        const std::array<uint8_t, 4> bytes{0x0F, 0x20, 0xD0, 0x90};
+        win_emu.emu().write_memory(code, bytes.data(), bytes.size());
+        constexpr uint64_t original_rax = 0x1122334455667788;
+        win_emu.emu().reg(x86_register::rax, original_rax);
+        std::vector<uint64_t> memory_violations;
+        win_emu.callbacks.on_memory_violate = [&](uint64_t address, uint64_t, memory_operation, memory_violation_type) {
+            memory_violations.push_back(address);
+        };
+
+        bool dispatched = false;
+        win_emu.emu().hook_memory_execution(win_emu.process.ki_user_exception_dispatcher,
+            [&](cpu_interface& cpu, uint64_t) {
+                dispatched = true;
+                cpu.stop();
+            });
+        win_emu.emu().start(0);
+        ASSERT_TRUE(dispatched);
+        const auto frame = win_emu.emu().reg<uint64_t>(x86_register::rsp);
+        const auto saved_context = win_emu.emu().read_memory<CONTEXT64>(frame);
+        const auto saved_record = win_emu.emu().read_memory<EMU_EXCEPTION_RECORD<EmulatorTraits<Emu64>>>(frame + 0x4F0);
+        EXPECT_EQ(saved_record.ExceptionCode, static_cast<DWORD>(STATUS_PRIVILEGED_INSTRUCTION));
+        EXPECT_EQ(saved_record.ExceptionAddress, code);
+        EXPECT_EQ(saved_record.NumberParameters, 0U);
+        EXPECT_EQ(saved_context.Rip, code);
+        EXPECT_EQ(saved_context.Rsp, stack);
+        EXPECT_EQ(saved_context.Rax, original_rax);
+        EXPECT_TRUE(memory_violations.empty());
+    }
+
+    TEST_P(MemoryFaultContext, WhpNonControlRegisterGeneralProtectionKeepsGenericException)
+    {
+        if (win_emu.emu().get_name() != "Windows Hypervisor Platform")
+        {
+            GTEST_SKIP() << "Requires WHP #GP exits";
+        }
+        win_emu.emu().write_memory<uint8_t>(code, 0xF4); // HLT at CPL3 is #GP, but not MOV CR.
+        capture();
+        EXPECT_EQ(record.ExceptionAddress, code);
+        EXPECT_EQ(record.ExceptionInformation[0], 0U);
+        EXPECT_EQ(record.ExceptionInformation[1], std::numeric_limits<uint64_t>::max());
+        EXPECT_EQ(context.Rip, code);
+        EXPECT_EQ(context.Rsp, stack);
+    }
+
     TEST_P(MemoryFaultContext, XrstorGeneralProtectionReachesGuestExceptionDispatcher)
     {
         if (win_emu.emu().get_name() != "icicle-emu")
