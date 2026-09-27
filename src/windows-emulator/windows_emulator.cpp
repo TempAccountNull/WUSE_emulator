@@ -1602,6 +1602,39 @@ namespace sogen
             json += "]}";
         }
 
+        if (this->afd_diagnostics.enabled())
+        {
+            const auto profile = this->afd_diagnostics.read();
+            constexpr std::array names{"connect", "send", "receive", "send_datagram", "receive_datagram", "poll"};
+            json += ",\"afd_profile\":{\"operations\":{";
+            for (size_t i = 0; i < profile.size(); ++i)
+            {
+                const auto& bucket = profile[i];
+                json += i == 0 ? "" : ",";
+                json += "\"" + std::string(names[i]) + "\":{\"attempts\":" + std::to_string(bucket.attempts);
+                json += ",\"retries\":" + std::to_string(bucket.retries);
+                json += ",\"success\":" + std::to_string(bucket.success);
+                json += ",\"pending\":" + std::to_string(bucket.pending);
+                json += ",\"not_supported\":" + std::to_string(bucket.not_supported);
+                json += ",\"device_not_ready\":" + std::to_string(bucket.device_not_ready);
+                json += ",\"timeout\":" + std::to_string(bucket.timeout);
+                json += ",\"other_failure\":" + std::to_string(bucket.other_failure);
+                json += ",\"exceptions\":" + std::to_string(bucket.exceptions);
+                json += ",\"multi_buffer_calls\":" + std::to_string(bucket.multi_buffer_calls);
+                json += ",\"max_buffer_count\":" + std::to_string(bucket.max_buffer_count);
+                json += ",\"transferred_bytes\":" + std::to_string(bucket.transferred_bytes);
+                json += ",\"max_transfer_bytes\":" + std::to_string(bucket.max_transfer_bytes);
+                json += ",\"io_nanos\":" + std::to_string(bucket.io_nanos);
+                json += ",\"max_io_nanos\":" + std::to_string(bucket.max_io_nanos);
+                json += ",\"completions\":" + std::to_string(bucket.completions);
+                json += ",\"completion_timeouts\":" + std::to_string(bucket.completion_timeouts);
+                json += ",\"completion_nanos\":" + std::to_string(bucket.completion_nanos);
+                json += ",\"max_completion_nanos\":" + std::to_string(bucket.max_completion_nanos);
+                json += ",\"last_status\":" + std::to_string(bucket.last_status) + "}";
+            }
+            json += "}}";
+        }
+
         if (!smp_profile.empty() && smp_profile.size() == activity.size())
         {
             // The first snapshot establishes a baseline; subsequent entries are 1 Hz deltas.

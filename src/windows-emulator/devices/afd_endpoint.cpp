@@ -18,6 +18,21 @@ namespace sogen
     {
         // NOLINTBEGIN(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
 
+        std::optional<afd_profile::operation> profiled_operation(const ULONG request)
+        {
+            using operation = afd_profile::operation;
+            switch (request)
+            {
+            case AFD_CONNECT: return operation::connect;
+            case AFD_SEND: return operation::send;
+            case AFD_RECEIVE: return operation::receive;
+            case AFD_SEND_DATAGRAM: return operation::send_datagram;
+            case AFD_RECEIVE_DATAGRAM: return operation::receive_datagram;
+            case AFD_POLL: return operation::poll_request;
+            default: return {};
+            }
+        }
+
         struct afd_creation_data
         {
             uint64_t unk1;
@@ -363,6 +378,8 @@ namespace sogen
             std::optional<bool> require_poll_{};
             std::optional<io_device_context> delayed_ioctl_{};
             std::optional<std::chrono::steady_clock::time_point> timeout_{};
+            std::optional<std::chrono::steady_clock::time_point> profile_pending_since_{};
+            std::optional<afd_profile::operation> profile_pending_operation_{};
             std::optional<std::function<void(windows_emulator&, const io_device_context&)>> timeout_callback_{};
 
             std::unordered_map<LONG, pending_connection> pending_connections_{};
@@ -433,6 +450,8 @@ namespace sogen
                 this->timeout_ = {};
                 this->require_poll_ = {};
                 this->delayed_ioctl_ = {};
+                this->profile_pending_since_ = {};
+                this->profile_pending_operation_ = {};
             }
 
             void update_shared_info(windows_emulator& win_emu, const io_device_context& c)
@@ -462,6 +481,7 @@ namespace sogen
             void rebase_steady_deadlines(const std::chrono::steady_clock::duration offset) override
             {
                 utils::rebase_steady_deadline(this->timeout_, offset);
+                utils::rebase_steady_deadline(this->profile_pending_since_, offset);
             }
 
             void work(windows_emulator& win_emu) override
@@ -522,7 +542,7 @@ namespace sogen
                         }
                     }
 
-                    const auto status = this->execute_ioctl(win_emu, *this->delayed_ioctl_);
+                    auto status = this->execute_ioctl(win_emu, *this->delayed_ioctl_);
                     if (status == STATUS_PENDING)
                     {
                         if (!this->timeout_ || this->timeout_ > win_emu.clock().steady_now())
@@ -531,6 +551,7 @@ namespace sogen
                         }
 
                         write_io_status(this->delayed_ioctl_->io_status_block, STATUS_TIMEOUT);
+                        status = STATUS_TIMEOUT;
 
                         if (this->timeout_callback_)
                         {
@@ -544,6 +565,13 @@ namespace sogen
                         e->signaled = true;
                     }
 
+                    if (this->profile_pending_since_ && this->profile_pending_operation_)
+                    {
+                        const auto elapsed = std::chrono::steady_clock::now() - *this->profile_pending_since_;
+                        win_emu.afd_diagnostics.record_completion(*this->profile_pending_operation_,
+                            static_cast<uint32_t>(status),
+                            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()));
+                    }
                     this->clear_pending_state();
                 }
             }
@@ -577,7 +605,39 @@ namespace sogen
                 }
 
                 const auto request = _AFD_REQUEST(c.io_control_code);
+                const auto operation = profiled_operation(request);
+                if (!operation || !win_emu.afd_diagnostics.enabled())
+                {
+                    return this->dispatch_ioctl(win_emu, c, request);
+                }
 
+                const bool retry = this->executing_delayed_ioctl_;
+                const auto start = std::chrono::steady_clock::now();
+                try
+                {
+                    const auto status = this->dispatch_ioctl(win_emu, c, request);
+                    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - start).count();
+                    win_emu.afd_diagnostics.record_attempt(*operation, static_cast<uint32_t>(status),
+                        static_cast<uint64_t>(nanos), retry);
+                    if (!retry && status == STATUS_PENDING && this->delayed_ioctl_ && !this->profile_pending_since_)
+                    {
+                        this->profile_pending_since_ = start;
+                        this->profile_pending_operation_ = *operation;
+                    }
+                    return status;
+                }
+                catch (...)
+                {
+                    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - start).count();
+                    win_emu.afd_diagnostics.record_exception(*operation, static_cast<uint64_t>(nanos), retry);
+                    throw;
+                }
+            }
+
+            NTSTATUS dispatch_ioctl(windows_emulator& win_emu, const io_device_context& c, const ULONG request)
+            {
                 switch (request)
                 {
                 case AFD_BIND:
@@ -970,6 +1030,8 @@ namespace sogen
                 }
 
                 const auto receive_info = emu.read_memory<AFD_RECV_INFO<Traits>>(c.input_buffer);
+                if (!this->executing_delayed_ioctl_)
+                    win_emu.afd_diagnostics.record_buffer_count(afd_profile::operation::receive, receive_info.BufferCount);
 
                 if (!receive_info.BufferArray || receive_info.BufferCount == 0)
                 {
@@ -1014,6 +1076,7 @@ namespace sogen
                 }
 
                 emu.write_memory(wsabuf.buf, host_buffer.data(), static_cast<size_t>(bytes_received));
+                win_emu.afd_diagnostics.record_transfer(afd_profile::operation::receive, static_cast<uint64_t>(bytes_received));
 
                 if (c.io_status_block)
                 {
@@ -1040,6 +1103,8 @@ namespace sogen
                 }
 
                 const auto send_info = emu.read_memory<AFD_SEND_INFO<Traits>>(c.input_buffer);
+                if (!this->executing_delayed_ioctl_)
+                    win_emu.afd_diagnostics.record_buffer_count(afd_profile::operation::send, send_info.BufferCount);
 
                 if (!send_info.BufferArray || send_info.BufferCount == 0)
                 {
@@ -1091,6 +1156,7 @@ namespace sogen
                     c.io_status_block.write(block);
                 }
 
+                win_emu.afd_diagnostics.record_transfer(afd_profile::operation::send, static_cast<uint64_t>(bytes_sent));
                 return STATUS_SUCCESS;
             }
 
@@ -1252,6 +1318,8 @@ namespace sogen
                 }
 
                 const auto receive_info = emu.read_memory<AFD_RECV_DATAGRAM_INFO<Traits>>(c.input_buffer);
+                if (!this->executing_delayed_ioctl_)
+                    win_emu.afd_diagnostics.record_buffer_count(afd_profile::operation::receive_datagram, receive_info.BufferCount);
                 const auto buffer = emu.read_memory<EMU_WSABUF<Traits>>(receive_info.BufferArray);
 
                 if (!buffer.len || !buffer.buf)
@@ -1281,6 +1349,7 @@ namespace sogen
 
                 const auto data_size = std::min(data.size(), static_cast<size_t>(recevied_data));
                 emu.write_memory(buffer.buf, data.data(), data_size);
+                win_emu.afd_diagnostics.record_transfer(afd_profile::operation::receive_datagram, data_size);
 
                 const auto win_from = convert_to_win_address(win_emu, from);
 
@@ -1318,6 +1387,8 @@ namespace sogen
                 }
 
                 const auto send_info = emu.read_memory<AFD_SEND_DATAGRAM_INFO<Traits>>(c.input_buffer);
+                if (!this->executing_delayed_ioctl_)
+                    win_emu.afd_diagnostics.record_buffer_count(afd_profile::operation::send_datagram, send_info.BufferCount);
                 const auto buffer = emu.read_memory<EMU_WSABUF<Traits>>(send_info.BufferArray);
 
                 // RemoteAddressLength is a signed LONG; a negative or oversized value would turn into a
@@ -1353,6 +1424,7 @@ namespace sogen
                     c.io_status_block.write(block);
                 }
 
+                win_emu.afd_diagnostics.record_transfer(afd_profile::operation::send_datagram, static_cast<uint64_t>(sent_data));
                 return STATUS_SUCCESS;
             }
 
