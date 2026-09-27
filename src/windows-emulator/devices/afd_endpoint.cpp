@@ -249,6 +249,65 @@ namespace sogen
             return win_emu.emu().read_memory<afd_creation_data>(data.buffer);
         }
 
+        static_assert(sizeof(EMU_WSABUF<EmulatorTraits<Emu32>>) == 8);
+        static_assert(offsetof(EMU_WSABUF<EmulatorTraits<Emu32>>, buf) == 4);
+        static_assert(sizeof(EMU_WSABUF<EmulatorTraits<Emu64>>) == 16);
+        static_assert(offsetof(EMU_WSABUF<EmulatorTraits<Emu64>>, buf) == 8);
+
+        // Untrusted guest lengths need bounded staging; stream I/O may complete with a prefix.
+        constexpr size_t max_stream_transfer_bytes = 64u << 20;
+        constexpr ULONG max_stream_buffer_count = 1u << 16;
+
+        template <typename Traits>
+        NTSTATUS load_stream_buffers(const memory_interface& memory, const uint64_t array, const ULONG count,
+                                     std::vector<EMU_WSABUF<Traits>>& buffers)
+        {
+            if (!array || !count)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            if (count > max_stream_buffer_count)
+            {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            const size_t bytes = static_cast<size_t>(count) * sizeof(EMU_WSABUF<Traits>);
+            if (array > std::numeric_limits<uint64_t>::max() - bytes)
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            try
+            {
+                buffers.resize(count);
+            }
+            catch (const std::bad_alloc&)
+            {
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            if (!memory.try_read_memory(array, buffers.data(), bytes))
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            for (const auto& buffer : buffers)
+            {
+                if (buffer.len != 0 && !buffer.buf)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+            }
+            return STATUS_SUCCESS;
+        }
+
+        template <typename Traits>
+        size_t stream_transfer_size(const std::span<const EMU_WSABUF<Traits>> buffers)
+        {
+            size_t size = 0;
+            for (const auto& buffer : buffers)
+            {
+                size += std::min<size_t>(buffer.len, max_stream_transfer_bytes - size);
+            }
+            return size;
+        }
+
         template <typename Traits>
         std::pair<AFD_POLL_INFO<Traits>, std::vector<AFD_POLL_HANDLE_INFO<Traits>>> get_poll_info(windows_emulator& win_emu,
                                                                                                   const io_device_context& c)
@@ -372,6 +431,8 @@ namespace sogen
             };
 
             std::unique_ptr<network::i_socket> s_{};
+            std::vector<EMU_WSABUF<Traits>> pending_stream_buffers_{};
+            ULONG pending_stream_afd_flags_{};
 
             bool executing_delayed_ioctl_{};
             std::optional<afd_creation_data> creation_data{};
@@ -452,6 +513,8 @@ namespace sogen
                 this->delayed_ioctl_ = {};
                 this->profile_pending_since_ = {};
                 this->profile_pending_operation_ = {};
+                this->pending_stream_buffers_.clear();
+                this->pending_stream_afd_flags_ = 0;
             }
 
             void update_shared_info(windows_emulator& win_emu, const io_device_context& c)
@@ -585,6 +648,8 @@ namespace sogen
                 buffer.read_optional(this->delayed_ioctl_);
                 buffer.read_optional(this->timeout_);
                 buffer.read(this->non_blocking_);
+                buffer.read_vector(this->pending_stream_buffers_);
+                buffer.read(this->pending_stream_afd_flags_);
             }
 
             void serialize_object(utils::buffer_serializer& buffer) const override
@@ -594,6 +659,8 @@ namespace sogen
                 buffer.write_optional(this->delayed_ioctl_);
                 buffer.write_optional(this->timeout_);
                 buffer.write(this->non_blocking_);
+                buffer.write_vector(this->pending_stream_buffers_);
+                buffer.write(this->pending_stream_afd_flags_);
             }
 
             NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& c) override
@@ -1023,59 +1090,86 @@ namespace sogen
                 }
 
                 auto& emu = win_emu.emu();
-
                 if (c.input_buffer_length < sizeof(AFD_RECV_INFO<Traits>))
                 {
                     return STATUS_BUFFER_TOO_SMALL;
                 }
 
-                const auto receive_info = emu.read_memory<AFD_RECV_INFO<Traits>>(c.input_buffer);
-                if (!this->executing_delayed_ioctl_)
-                    win_emu.afd_diagnostics.record_buffer_count(afd_profile::operation::receive, receive_info.BufferCount);
-
-                if (!receive_info.BufferArray || receive_info.BufferCount == 0)
+                std::vector<EMU_WSABUF<Traits>> loaded_buffers;
+                const bool use_captured = this->executing_delayed_ioctl_ && !this->pending_stream_buffers_.empty();
+                AFD_RECV_INFO<Traits> receive_info{};
+                if (use_captured)
                 {
-                    return STATUS_INVALID_PARAMETER;
+                    receive_info.AfdFlags = this->pending_stream_afd_flags_;
                 }
-
-                if (receive_info.BufferCount > 1)
+                else
                 {
-                    // TODO: Scatter/Gather
-                    return STATUS_NOT_SUPPORTED;
+                    receive_info = emu.read_memory<AFD_RECV_INFO<Traits>>(c.input_buffer);
+                    if (!this->executing_delayed_ioctl_)
+                    {
+                        win_emu.afd_diagnostics.record_buffer_count(afd_profile::operation::receive, receive_info.BufferCount);
+                    }
                 }
-
-                const auto wsabuf = emu.read_memory<EMU_WSABUF<Traits>>(receive_info.BufferArray);
-                if (!wsabuf.buf || wsabuf.len == 0)
+                if (!use_captured)
                 {
-                    return STATUS_INVALID_PARAMETER;
+                    const auto status =
+                        load_stream_buffers<Traits>(win_emu.memory, receive_info.BufferArray, receive_info.BufferCount, loaded_buffers);
+                    if (status != STATUS_SUCCESS)
+                    {
+                        return status;
+                    }
                 }
+                const auto& buffers = use_captured ? this->pending_stream_buffers_ : loaded_buffers;
 
-                // Cap the staging buffer: a guest can declare a ~4 GiB WSABUF without backing it, so allocating
-                // its full length before any data arrives is an asymmetric memory-exhaustion vector. Stream
-                // recv has partial-read semantics, so the guest simply reads the rest on the next call.
-                constexpr size_t max_stream_transfer_bytes = 64u << 20;
                 std::vector<std::byte> host_buffer;
-                host_buffer.resize(std::min<size_t>(wsabuf.len, max_stream_transfer_bytes));
+                try
+                {
+                    host_buffer.resize(stream_transfer_size<Traits>(buffers));
+                }
+                catch (const std::bad_alloc&)
+                {
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
 
                 const auto bytes_received = this->s_->recv(host_buffer);
-
                 if (bytes_received < 0)
                 {
                     const auto error = this->s_->get_last_error();
                     if (error == SERR(EWOULDBLOCK))
                     {
-                        return this->pend_or_would_block(c, true, receive_info.AfdFlags);
+                        const auto status = this->pend_or_would_block(c, true, receive_info.AfdFlags);
+                        if (status == STATUS_PENDING && !this->executing_delayed_ioctl_)
+                        {
+                            this->pending_stream_buffers_ = buffers;
+                            this->pending_stream_afd_flags_ = receive_info.AfdFlags;
+                        }
+                        return status;
                     }
-
                     if (error == SERR(ECONNRESET))
                     {
                         return STATUS_CONNECTION_RESET;
                     }
-
+                    return STATUS_UNSUCCESSFUL;
+                }
+                if (static_cast<size_t>(bytes_received) > host_buffer.size())
+                {
                     return STATUS_UNSUCCESSFUL;
                 }
 
-                emu.write_memory(wsabuf.buf, host_buffer.data(), static_cast<size_t>(bytes_received));
+                size_t copied = 0;
+                for (const auto& buffer : buffers)
+                {
+                    const auto length = std::min<size_t>(buffer.len, static_cast<size_t>(bytes_received) - copied);
+                    if (length && !win_emu.memory.try_write_memory(buffer.buf, host_buffer.data() + copied, length))
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    copied += length;
+                    if (copied == static_cast<size_t>(bytes_received))
+                    {
+                        break;
+                    }
+                }
                 win_emu.afd_diagnostics.record_transfer(afd_profile::operation::receive, static_cast<uint64_t>(bytes_received));
 
                 if (c.io_status_block)
@@ -1084,7 +1178,6 @@ namespace sogen
                     block.Information = static_cast<uint32_t>(bytes_received);
                     c.io_status_block.write(block);
                 }
-
                 return STATUS_SUCCESS;
             }
 
@@ -1096,56 +1189,83 @@ namespace sogen
                 }
 
                 auto& emu = win_emu.emu();
-
                 if (c.input_buffer_length < sizeof(AFD_SEND_INFO<Traits>))
                 {
                     return STATUS_BUFFER_TOO_SMALL;
                 }
 
-                const auto send_info = emu.read_memory<AFD_SEND_INFO<Traits>>(c.input_buffer);
-                if (!this->executing_delayed_ioctl_)
-                    win_emu.afd_diagnostics.record_buffer_count(afd_profile::operation::send, send_info.BufferCount);
-
-                if (!send_info.BufferArray || send_info.BufferCount == 0)
+                std::vector<EMU_WSABUF<Traits>> loaded_buffers;
+                const bool use_captured = this->executing_delayed_ioctl_ && !this->pending_stream_buffers_.empty();
+                AFD_SEND_INFO<Traits> send_info{};
+                if (use_captured)
                 {
-                    return STATUS_INVALID_PARAMETER;
+                    send_info.AfdFlags = this->pending_stream_afd_flags_;
                 }
-
-                if (send_info.BufferCount > 1)
+                else
                 {
-                    // TODO: Scatter/Gather
-                    return STATUS_NOT_SUPPORTED;
+                    send_info = emu.read_memory<AFD_SEND_INFO<Traits>>(c.input_buffer);
+                    if (!this->executing_delayed_ioctl_)
+                    {
+                        win_emu.afd_diagnostics.record_buffer_count(afd_profile::operation::send, send_info.BufferCount);
+                    }
                 }
-
-                const auto wsabuf = emu.read_memory<EMU_WSABUF<Traits>>(send_info.BufferArray);
-                if (!wsabuf.buf || wsabuf.len == 0)
+                if (!use_captured)
                 {
-                    return STATUS_INVALID_PARAMETER;
+                    const auto status =
+                        load_stream_buffers<Traits>(win_emu.memory, send_info.BufferArray, send_info.BufferCount, loaded_buffers);
+                    if (status != STATUS_SUCCESS)
+                    {
+                        return status;
+                    }
                 }
+                const auto& buffers = use_captured ? this->pending_stream_buffers_ : loaded_buffers;
 
-                // Cap as in receive; stream send has partial-write semantics, so a larger request is simply
-                // sent across multiple calls rather than staged in one oversized host allocation.
-                constexpr size_t max_stream_transfer_bytes = 64u << 20;
                 std::vector<std::byte> host_buffer;
-                host_buffer.resize(std::min<size_t>(wsabuf.len, max_stream_transfer_bytes));
-
-                emu.read_memory(wsabuf.buf, host_buffer.data(), host_buffer.size());
+                try
+                {
+                    host_buffer.resize(stream_transfer_size<Traits>(buffers));
+                }
+                catch (const std::bad_alloc&)
+                {
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
+                size_t copied = 0;
+                for (const auto& buffer : buffers)
+                {
+                    const auto length = std::min<size_t>(buffer.len, host_buffer.size() - copied);
+                    if (length && !win_emu.memory.try_read_memory(buffer.buf, host_buffer.data() + copied, length))
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    copied += length;
+                    if (copied == host_buffer.size())
+                    {
+                        break;
+                    }
+                }
 
                 const auto bytes_sent = this->s_->send(host_buffer);
-
                 if (bytes_sent < 0)
                 {
                     const auto error = this->s_->get_last_error();
                     if (error == SERR(EWOULDBLOCK))
                     {
-                        return this->pend_or_would_block(c, false, send_info.AfdFlags);
+                        const auto status = this->pend_or_would_block(c, false, send_info.AfdFlags);
+                        if (status == STATUS_PENDING && !this->executing_delayed_ioctl_)
+                        {
+                            this->pending_stream_buffers_ = buffers;
+                            this->pending_stream_afd_flags_ = send_info.AfdFlags;
+                        }
+                        return status;
                     }
-
                     if (error == SERR(ECONNRESET))
                     {
                         return STATUS_CONNECTION_RESET;
                     }
-
+                    return STATUS_UNSUCCESSFUL;
+                }
+                if (static_cast<size_t>(bytes_sent) > host_buffer.size())
+                {
                     return STATUS_UNSUCCESSFUL;
                 }
 
@@ -1155,7 +1275,6 @@ namespace sogen
                     block.Information = static_cast<uint32_t>(bytes_sent);
                     c.io_status_block.write(block);
                 }
-
                 win_emu.afd_diagnostics.record_transfer(afd_profile::operation::send, static_cast<uint64_t>(bytes_sent));
                 return STATUS_SUCCESS;
             }
