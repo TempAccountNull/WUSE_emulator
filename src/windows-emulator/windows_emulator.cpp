@@ -2266,6 +2266,42 @@ namespace sogen
                                 static_cast<unsigned long long>(return_address),
                                 caller ? caller->name.c_str() : "<unmapped>",
                                 static_cast<unsigned long long>(caller ? return_address - caller->image_base : 0));
+                            if (site == 9)
+                            {
+                                // The deployed Dawn installer receives &failure at RSP+0x30.
+                                // Read exactly its 24-byte output once; never alter guest state.
+                                std::array<uint8_t, 24> failure{};
+                                const bool address_valid = rsp <= UINT64_MAX - 0x30;
+                                const auto address = address_valid ? rsp + 0x30 : 0;
+                                const bool readable = address_valid &&
+                                    acting.try_read_memory(address, failure.data(), failure.size());
+                                std::array<char, 3 * failure.size() + 1> bytes{};
+                                if (readable)
+                                {
+                                    for (size_t i = 0; i < failure.size(); ++i)
+                                    {
+                                        std::snprintf(bytes.data() + i * 3, 4, "%02X%s", failure[i],
+                                                      i + 1 == failure.size() ? "" : " ");
+                                    }
+                                }
+                                uint32_t phase = 0;
+                                uint64_t index = 0;
+                                uint32_t error = 0;
+                                if (readable)
+                                {
+                                    std::memcpy(&phase, failure.data(), sizeof(phase));
+                                    std::memcpy(&index, failure.data() + 8, sizeof(index));
+                                    std::memcpy(&error, failure.data() + 0x10, sizeof(error));
+                                }
+                                this->log.error(
+                                    "[STEAMINITPROBE] detours_status tid=%u vcpu=%zu address=%#llx valid=%u "
+                                    "phase=%u index=%#llx error=%#x attach_failed=%u bytes=%s\n",
+                                    tid, cpu.index(), static_cast<unsigned long long>(address),
+                                    static_cast<unsigned>(readable), phase,
+                                    static_cast<unsigned long long>(index), error,
+                                    readable ? static_cast<unsigned>(failure[0x14]) : 0,
+                                    readable ? bytes.data() : "<unreadable>");
+                            }
                         });
                 }
                 hooks->emplace(base, installed);
