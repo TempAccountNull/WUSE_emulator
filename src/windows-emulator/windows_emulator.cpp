@@ -2150,9 +2150,9 @@ namespace sogen
         // steam_api64.dll SHA-256 39788C155DF397BA8C12415911880089FE5982F0B38F3496E4CE056779066845.
         if (const auto* probe = std::getenv("SOGEN_STEAM_INIT_PROBE"); probe && std::strcmp(probe, "1") == 0)
         {
-            auto seen = std::make_shared<std::array<uint8_t, 12>>();
+            auto seen = std::make_shared<std::array<uint8_t, 22>>();
             auto attempted = std::make_shared<bool>(false);
-            auto hooks = std::make_shared<std::unordered_map<uint64_t, std::array<emulator_hook*, 12>>>();
+            auto hooks = std::make_shared<std::unordered_map<uint64_t, std::array<emulator_hook*, 22>>>();
             this->callbacks.on_module_load.add([this, seen, attempted, hooks](mapped_module& mod) {
                 if (!is_steam_api_module(mod.name) || *attempted)
                 {
@@ -2164,13 +2164,18 @@ namespace sogen
                 constexpr std::array<uint8_t, 18> expected_entry{
                     0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0x48, 0x8B, 0x1D,
                     0x83, 0xC3, 0x49, 0x12, 0xE8, 0x4E, 0xF4, 0x05, 0x00};
-                constexpr std::array<uint64_t, 12> site_rvas{
+                constexpr std::array<uint64_t, 22> site_rvas{
                     entry_rva, 0x2295, 0x22BD, 0x22D3, 0x2303, 0x2348,
-                    0x180850, 0x180959, 0x1809BD, 0x180A09, 0x180A7D, 0x180AC4};
-                constexpr std::array<std::array<uint8_t, 2>, 12> expected_sites{{
+                    0x180850, 0x180959, 0x1809BD, 0x180A09, 0x180A7D, 0x180AC4,
+                    0x199290, 0x199302, 0x19931A, 0x19935F, 0x19939E,
+                    0x19937E, 0x19938A, 0x1993A4, 0x199390, 0x1993BE};
+                constexpr std::array<std::array<uint8_t, 2>, 22> expected_sites{{
                     {{0x40, 0x53}}, {{0x74, 0x6C}}, {{0x74, 0x37}}, {{0x75, 0x36}},
                     {{0x32, 0xC0}}, {{0xB0, 0x01}}, {{0x48, 0x89}}, {{0x0F, 0x84}},
-                    {{0x74, 0x6B}}, {{0x74, 0x1F}}, {{0x48, 0x8D}}, {{0xC3, 0xCC}}}};
+                    {{0x74, 0x6B}}, {{0x74, 0x1F}}, {{0x48, 0x8D}}, {{0xC3, 0xCC}},
+                    {{0x48, 0x89}}, {{0x0F, 0x85}}, {{0x0F, 0x85}}, {{0x74, 0x31}},
+                    {{0x85, 0xC0}}, {{0x85, 0xC0}}, {{0x84, 0xC0}}, {{0xE8, 0x87}},
+                    {{0xEB, 0x2E}}, {{0x32, 0xC0}}}};
                 const bool range_valid = mod.image_base <= UINT64_MAX - site_rvas.back() &&
                                          mod.size_of_image == expected_image_size &&
                                          mod.find_export("SteamAPI_Init") == mod.image_base + entry_rva;
@@ -2232,6 +2237,7 @@ namespace sogen
                             const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
                             const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
                             const auto rax = acting.reg<uint64_t>(x86_register::rax);
+                            const auto rcx = acting.reg<uint64_t>(x86_register::rcx);
                             const auto rdi = acting.reg<uint64_t>(x86_register::rdi);
                             const auto eflags = acting.reg<uint32_t>(x86_register::eflags);
                             uint64_t stack0 = 0;
@@ -2240,24 +2246,29 @@ namespace sogen
                             // push rsi; sub rsp,0x260. At each ret, RSP again holds the caller.
                             const uint64_t return_offset = site == 0 || site == 6 || site == 11 ?
                                 0 : site < 6 ? 0x38 : 0x268;
-                            const bool return_slot_valid = rsp <= UINT64_MAX - return_offset;
+                            const bool return_slot_valid = site < 12 && rsp <= UINT64_MAX - return_offset;
                             const auto return_slot = return_slot_valid ? rsp + return_offset : 0;
                             uint64_t return_address = 0;
                             const bool return_valid = return_slot_valid &&
                                 acting.try_read_memory(return_slot, &return_address, sizeof(return_address));
                             const auto* caller = return_valid ? this->mod_manager.find_by_address(return_address) : nullptr;
-                            constexpr std::array<const char*, 12> names{
+                            constexpr std::array<const char*, 22> names{
                                 "entry", "egress_result", "core_result", "package_trust_result",
                                 "return_false", "return_true", "egress_entry", "loader_result",
-                                "export_resolution_result", "detours_result", "egress_failure_cleanup", "egress_return"};
+                                "export_resolution_result", "detours_result", "egress_failure_cleanup", "egress_return",
+                                "begin_entry", "owner_global_check", "owner_cmpxchg",
+                                "trampoline_protect_result", "trampoline_get_last_error",
+                                "update_current_thread_result", "thread_enlist_result",
+                                "begin_abort", "begin_success_branch", "begin_false"};
                             this->log.error(
                                 "[STEAMINITPROBE] site=%s n=%u tid=%u vcpu=%zu rip=%#llx rva=%#llx "
-                                "rax=%#llx rdi=%#llx eflags=%#x zf=%u rsp=%#llx stack0_valid=%u stack0=%#llx "
+                                "rax=%#llx rcx=%#llx rdi=%#llx eflags=%#x zf=%u rsp=%#llx stack0_valid=%u stack0=%#llx "
                                 "return_valid=%u return=%#llx return_module=%s return_rva=%#llx\n",
                                 names[site], static_cast<unsigned>(hit), tid, cpu.index(),
                                 static_cast<unsigned long long>(rip),
                                 static_cast<unsigned long long>(rip - base),
-                                static_cast<unsigned long long>(rax), static_cast<unsigned long long>(rdi), eflags,
+                                static_cast<unsigned long long>(rax), static_cast<unsigned long long>(rcx),
+                                static_cast<unsigned long long>(rdi), eflags,
                                 static_cast<unsigned>((eflags & 0x40u) != 0),
                                 static_cast<unsigned long long>(rsp),
                                 static_cast<unsigned>(stack0_valid),
