@@ -1138,6 +1138,18 @@ namespace sogen::whp
                 WHP_CHECK_HR(WHvGetVirtualProcessorRegisters(this->partition_, this->vp_index_, names.data(),
                                                              static_cast<UINT32>(names.size()), values.data()));
 
+                // Internal TF belongs to WHP hook stepping, not to the guest thread snapshot.
+                if (this->pending_execution_step_)
+                {
+                    const auto flags = std::find(names.begin(), names.end(), WHvX64RegisterRflags);
+                    if (flags != names.end())
+                    {
+                        auto& value = values[static_cast<size_t>(flags - names.begin())].Reg64;
+                        value = this->pending_execution_step_->had_trap_flag ? (value | trap_flag_bit)
+                                                                            : (value & ~trap_flag_bit);
+                    }
+                }
+
                 const auto register_bytes = sizeof(WHV_REGISTER_VALUE) * values.size();
                 std::vector<std::byte> bytes(register_bytes + sizeof(UINT32));
                 std::memcpy(bytes.data(), values.data(), register_bytes);
@@ -1174,36 +1186,7 @@ namespace sogen::whp
                 return bytes;
             }
 
-            void restore_registers(const std::vector<std::byte>& register_data) override
-            {
-                auto names = snapshot_register_names();
-                const auto register_bytes = sizeof(WHV_REGISTER_VALUE) * names.size();
-                if (register_data.size() < register_bytes + sizeof(UINT32))
-                {
-                    throw std::runtime_error("Unexpected WHP register snapshot size");
-                }
-
-                std::vector<WHV_REGISTER_VALUE> values(names.size());
-                std::memcpy(values.data(), register_data.data(), register_bytes);
-
-                UINT32 xsave_size = 0;
-                std::memcpy(&xsave_size, register_data.data() + register_bytes, sizeof(xsave_size));
-                if (register_data.size() != register_bytes + sizeof(xsave_size) + xsave_size || (xsave_size != 0 && !this->xsave_enabled_))
-                {
-                    throw std::runtime_error("Unexpected WHP register snapshot size");
-                }
-
-                WHP_CHECK_HR(WHvSetVirtualProcessorRegisters(this->partition_, this->vp_index_, names.data(),
-                                                             static_cast<UINT32>(names.size()), values.data()));
-                if (xsave_size != 0)
-                {
-#pragma warning(push)
-#pragma warning(disable : 4995)
-                    WHP_CHECK_HR(WHvSetVirtualProcessorXsaveState(this->partition_, this->vp_index_,
-                                                                  register_data.data() + register_bytes + sizeof(xsave_size), xsave_size));
-#pragma warning(pop)
-                }
-            }
+            void restore_registers(const std::vector<std::byte>& register_data) override;
 
             bool has_violation() const override
             {
@@ -1302,6 +1285,7 @@ namespace sogen::whp
         class whp_x86_64_emulator : public x86_64_emulator
         {
           public:
+            friend class whp_vcpu;
             explicit whp_x86_64_emulator(const size_t vcpu_count)
             {
                 this->ensure_platform_support();
@@ -2156,7 +2140,18 @@ namespace sogen::whp
 
                 const auto post_syscall_rcx = entry_values[1].Reg64;
                 const auto post_syscall_r10 = entry_values[2].Reg64;
-                const auto saved_rflags = entry_values[3].Reg64;
+                auto saved_rflags = entry_values[3].Reg64;
+                {
+                    std::unique_lock lock(this->partition_mutex_);
+                    if (vcpu.pending_execution_step_)
+                    {
+                        // SYSCALL retired before the intercept HLT, but may not have raised #DB.
+                        const auto had_guest_tf = vcpu.pending_execution_step_->had_trap_flag;
+                        (void)this->complete_execution_step(vcpu);
+                        saved_rflags = had_guest_tf ? (saved_rflags | trap_flag_bit)
+                                                    : (saved_rflags & ~trap_flag_bit);
+                    }
+                }
 
                 const auto pre_syscall_rip = post_syscall_rcx - syscall_instruction_size;
 
@@ -2688,6 +2683,12 @@ namespace sogen::whp
             // Assumes partition_mutex_ is held exclusively.
             bool arm_execution_single_step(whp_vcpu& vcpu, const std::optional<uint64_t> page_base, const bool stop_after_step)
             {
+                if (vcpu.pending_execution_step_ && page_base && vcpu.pending_execution_step_->page_base &&
+                    *vcpu.pending_execution_step_->page_base != *page_base)
+                {
+                    // The next hooked page was entered without #DB. The old page step did not complete here.
+                    (void)this->complete_execution_step(vcpu, false);
+                }
                 if (vcpu.pending_execution_step_)
                 {
                     if (!page_base || vcpu.pending_execution_step_->page_base)
@@ -2736,7 +2737,7 @@ namespace sogen::whp
             }
 
             // Assumes partition_mutex_ is held exclusively.
-            bool complete_execution_step(whp_vcpu& vcpu)
+            bool complete_execution_step(whp_vcpu& vcpu, const bool instruction_retired = true)
             {
                 if (!vcpu.pending_execution_step_)
                 {
@@ -2765,7 +2766,7 @@ namespace sogen::whp
                     this->set_patched_execution_breakpoint_state(*state->patched_breakpoint, true);
                 }
 
-                if (state->stop_after_step)
+                if (instruction_retired && state->stop_after_step)
                 {
                     vcpu.stop_requested_ = true;
                 }
@@ -2773,6 +2774,55 @@ namespace sogen::whp
                 return !state->had_trap_flag;
             }
 
+            // An intercepted fault or a guest context switch can redirect RIP before #DB.
+            // The original instruction did not retire, so restore only our TF/page/breakpoint state.
+            void abandon_execution_step(whp_vcpu& vcpu)
+            {
+                std::unique_lock lock(this->partition_mutex_);
+                (void)this->complete_execution_step(vcpu, false);
+            }
+
+            void abandon_execution_step_for_context_restore(whp_vcpu& vcpu)
+            {
+                std::unique_lock lock(this->partition_mutex_);
+                (void)this->complete_execution_step(vcpu, false);
+                if (vcpu.deferred_patched_breakpoint_)
+                {
+                    this->set_patched_execution_breakpoint_state(*vcpu.deferred_patched_breakpoint_, true);
+                    vcpu.deferred_patched_breakpoint_.reset();
+                }
+                vcpu.deferred_execution_page_.reset();
+            }
+
+            [[noreturn]] void throw_nested_execution_step(whp_vcpu& vcpu, const char* phase) const
+            {
+                std::ostringstream message;
+                message << "Nested WHP execution single-step state is not supported"
+                        << " phase=" << phase << " vcpu=" << vcpu.index()
+                        << " rip=0x" << std::hex << vcpu.read_instruction_pointer();
+                if (vcpu.pending_execution_step_)
+                {
+                    message << " pending_page=";
+                    if (vcpu.pending_execution_step_->page_base)
+                    {
+                        message << "0x" << *vcpu.pending_execution_step_->page_base;
+                    }
+                    else
+                    {
+                        message << "none";
+                    }
+                    message << " pending_stop=" << vcpu.pending_execution_step_->stop_after_step;
+                }
+                if (vcpu.deferred_execution_page_)
+                {
+                    message << " deferred_page=0x" << *vcpu.deferred_execution_page_;
+                }
+                if (vcpu.deferred_patched_breakpoint_)
+                {
+                    message << " deferred_breakpoint=0x" << *vcpu.deferred_patched_breakpoint_;
+                }
+                throw std::runtime_error(message.str());
+            }
             // Assumes partition_mutex_ is held.
             mmio_region* find_mmio_region(const uint64_t address)
             {
@@ -3324,7 +3374,7 @@ namespace sogen::whp
                         {
                             if (!this->arm_patched_breakpoint_single_step(vcpu, *vcpu.deferred_patched_breakpoint_, count == 1))
                             {
-                                throw std::runtime_error("Nested WHP execution single-step state is not supported");
+                                this->throw_nested_execution_step(vcpu, "run.deferred_breakpoint");
                             }
 
                             armed_single_step = true;
@@ -3336,11 +3386,21 @@ namespace sogen::whp
                         }
                     }
 
+                    if (vcpu.deferred_execution_page_ &&
+                        align_down_to_page(vcpu.read_instruction_pointer()) != *vcpu.deferred_execution_page_)
+                    {
+                        vcpu.deferred_execution_page_.reset();
+                    }
+                    if (vcpu.pending_execution_step_ && vcpu.deferred_execution_page_)
+                    {
+                        // A prior fault or thread switch left a page step pending across stop/start.
+                        (void)this->complete_execution_step(vcpu, false);
+                    }
                     if (!armed_single_step && vcpu.deferred_execution_page_)
                     {
                         if (!this->arm_execution_single_step(vcpu, *vcpu.deferred_execution_page_, count == 1))
                         {
-                            throw std::runtime_error("Nested WHP execution single-step state is not supported");
+                            this->throw_nested_execution_step(vcpu, "run.deferred_page");
                         }
 
                         vcpu.deferred_execution_page_.reset();
@@ -3349,7 +3409,7 @@ namespace sogen::whp
 
                     if (!armed_single_step && count == 1 && !this->arm_execution_single_step(vcpu, std::nullopt, true))
                     {
-                        throw std::runtime_error("Nested WHP execution single-step state is not supported");
+                        this->throw_nested_execution_step(vcpu, "run.single_instruction");
                     }
                 }
 
@@ -3541,6 +3601,10 @@ namespace sogen::whp
                     opcode_read = this->access_memory(rip, opcode.data(), opcode.size(), false);
                 }
 
+                if (opcode_read && opcode[0] == std::byte{0xCD})
+                {
+                    this->abandon_execution_step(vcpu);
+                }
                 if (opcode_read && this->handle_software_interrupt(vcpu, rip, opcode))
                 {
                     return true;
@@ -3548,6 +3612,7 @@ namespace sogen::whp
 
                 if (opcode_read && opcode[0] == std::byte{0x0F} && opcode[1] == std::byte{0x0B})
                 {
+                    this->abandon_execution_step(vcpu);
                     bool skip = false;
                     bool consumed = false;
 
@@ -3588,6 +3653,7 @@ namespace sogen::whp
                     }
                 }
 
+                this->abandon_execution_step(vcpu);
                 const auto rflags = vcpu.reg<uint64_t>(x86_register::rflags);
                 if ((rflags & 0x100ull) != 0)
                 {
@@ -3616,6 +3682,7 @@ namespace sogen::whp
                         return true;
                     }
 
+                    this->abandon_execution_step(vcpu);
                     for (const auto& hook : this->copy_memory_violation_hooks())
                     {
                         const auto result = hook(vcpu, fault_address, 1, operation, memory_violation_type::unmapped);
@@ -3682,7 +3749,7 @@ namespace sogen::whp
 
                 if (!this->arm_execution_single_step(vcpu, page_base, false))
                 {
-                    throw std::runtime_error("Nested WHP execution single-step state is not supported");
+                    this->throw_nested_execution_step(vcpu, "memory.execution_hook");
                 }
 
                 return true;
@@ -3779,6 +3846,7 @@ namespace sogen::whp
                     return true;
                 }
 
+                this->abandon_execution_step(vcpu);
                 const auto violation_hooks = this->copy_memory_violation_hooks();
                 if (violation_hooks.empty())
                 {
@@ -3837,7 +3905,7 @@ namespace sogen::whp
                     std::unique_lock lock(this->partition_mutex_);
                     if (!this->arm_patched_breakpoint_single_step(vcpu, address, false))
                     {
-                        throw std::runtime_error("Nested WHP execution single-step state is not supported");
+                        this->throw_nested_execution_step(vcpu, "exception.patched_breakpoint");
                     }
                 }
 
@@ -3860,6 +3928,10 @@ namespace sogen::whp
                         opcode_read = this->access_memory(rip, opcode.data(), opcode.size(), false);
                     }
 
+                    if (opcode_read && opcode[0] == std::byte{0xCD})
+                    {
+                        this->abandon_execution_step(vcpu);
+                    }
                     if (opcode_read && this->handle_software_interrupt(vcpu, rip, opcode))
                     {
                         return true;
@@ -3883,6 +3955,7 @@ namespace sogen::whp
                         return true;
                     }
 
+                    this->abandon_execution_step(vcpu);
                     for (const auto& hook : this->copy_memory_violation_hooks())
                     {
                         const auto result = hook(vcpu, fault_address, 1, operation, type);
@@ -3928,18 +4001,21 @@ namespace sogen::whp
                 if (exception.ExceptionType == WHvX64ExceptionTypeBreakpointTrap)
                 {
                     const auto rip = exit_context.VpContext.Rip;
+                    if (this->syscall_hook_ != nullptr &&
+                        (rip == this->syscall_hook_page_ || rip == (this->syscall_hook_page_ + 1)))
+                    {
+                        return this->handle_syscall_halt(vcpu);
+                    }
+                    this->abandon_execution_step(vcpu);
                     if (this->handle_patched_execution_breakpoint(vcpu, rip - 1) || this->handle_patched_execution_breakpoint(vcpu, rip))
                     {
                         return true;
                     }
-
-                    if (this->syscall_hook_ != nullptr)
-                    {
-                        if (rip == this->syscall_hook_page_ || rip == (this->syscall_hook_page_ + 1))
-                        {
-                            return this->handle_syscall_halt(vcpu);
-                        }
-                    }
+                }
+                else if (exception.ExceptionType != WHvX64ExceptionTypeDebugTrapOrFault)
+                {
+                    // A faulted instruction did not retire; guest callbacks may redirect its RIP.
+                    this->abandon_execution_step(vcpu);
                 }
 
                 if (exception.ExceptionType == WHvX64ExceptionTypeInvalidOpcodeFault)
@@ -3992,6 +4068,38 @@ namespace sogen::whp
                 return false;
             }
         };
+
+        void whp_vcpu::restore_registers(const std::vector<std::byte>& register_data)
+        {
+            auto names = snapshot_register_names();
+            const auto register_bytes = sizeof(WHV_REGISTER_VALUE) * names.size();
+            if (register_data.size() < register_bytes + sizeof(UINT32))
+            {
+                throw std::runtime_error("Unexpected WHP register snapshot size");
+            }
+
+            std::vector<WHV_REGISTER_VALUE> values(names.size());
+            std::memcpy(values.data(), register_data.data(), register_bytes);
+
+            UINT32 xsave_size = 0;
+            std::memcpy(&xsave_size, register_data.data() + register_bytes, sizeof(xsave_size));
+            if (register_data.size() != register_bytes + sizeof(xsave_size) + xsave_size || (xsave_size != 0 && !this->xsave_enabled_))
+            {
+                throw std::runtime_error("Unexpected WHP register snapshot size");
+            }
+
+            this->emulator_.abandon_execution_step_for_context_restore(*this);
+            WHP_CHECK_HR(WHvSetVirtualProcessorRegisters(this->partition_, this->vp_index_, names.data(),
+                                                         static_cast<UINT32>(names.size()), values.data()));
+            if (xsave_size != 0)
+            {
+#pragma warning(push)
+#pragma warning(disable : 4995)
+                WHP_CHECK_HR(WHvSetVirtualProcessorXsaveState(this->partition_, this->vp_index_,
+                                                              register_data.data() + register_bytes + sizeof(xsave_size), xsave_size));
+#pragma warning(pop)
+            }
+        }
 
         void whp_vcpu::start(const size_t count)
         {
