@@ -2386,6 +2386,74 @@ namespace sogen
                     }
                 }
             });
+            // The guest kernel32 Toolhelp implementation returns the underlying NTSTATUS
+            // at these three sites. This opt-in trace keeps only eight hits per site.
+            // Image size and bytes identify the authorized guest kernel32 build.
+            auto snapshot_status_seen = std::make_shared<std::array<uint8_t, 3>>();
+            auto snapshot_status_hooks =
+                std::make_shared<std::unordered_map<uint64_t, std::array<emulator_hook*, 3>>>();
+            this->callbacks.on_module_load.add(
+                [this, snapshot_status_seen, snapshot_status_hooks](mapped_module& mod) {
+                    if (mod.name != "kernel32.dll")
+                    {
+                        return;
+                    }
+                    constexpr uint64_t expected_size = 0xC2000;
+                    constexpr std::array<uint64_t, 3> rvas{0x1E118, 0x1D583, 0x1D5D4};
+                    constexpr std::array<uint8_t, 5> expected{0x0F, 0x1F, 0x44, 0x00, 0x00};
+                    bool match = mod.size_of_image == expected_size;
+                    for (const auto rva : rvas)
+                    {
+                        std::array<uint8_t, 5> actual{};
+                        match = match && this->emu().try_read_memory(
+                            mod.image_base + rva, actual.data(), actual.size()) && actual == expected;
+                    }
+                    if (!match)
+                    {
+                        this->log.error("[STEAMINITPROBE] kernel32 snapshot status probe skipped image_size=%#llx\n",
+                                        static_cast<unsigned long long>(mod.size_of_image));
+                        return;
+                    }
+                    constexpr std::array<const char*, 3> names{
+                        "NtQuerySystemInformation", "NtCreateSection", "NtMapViewOfSection"};
+                    std::array<emulator_hook*, 3> installed{};
+                    for (size_t i = 0; i < rvas.size(); ++i)
+                    {
+                        installed[i] = this->emu().hook_memory_execution(
+                            mod.image_base + rvas[i],
+                            [this, snapshot_status_seen, i, names](cpu_interface& cpu, const uint64_t rip) {
+                                const std::scoped_lock lock(this->kernel_lock_);
+                                auto& samples = (*snapshot_status_seen)[i];
+                                if (samples >= 8)
+                                {
+                                    return;
+                                }
+                                ++samples;
+                                auto& vcpu = this->vcpu(cpu.index());
+                                const auto rax = vcpu.cpu.reg<uint64_t>(x86_register::rax);
+                                this->log.error(
+                                    "[STEAMINITPROBE] toolhelp_native site=%s n=%u tid=%u vcpu=%zu "
+                                    "rip=%#llx status=%#x rax=%#llx\n",
+                                    names[i], static_cast<unsigned>(samples),
+                                    vcpu.active_thread ? vcpu.active_thread->id : 0, cpu.index(),
+                                    static_cast<unsigned long long>(rip),
+                                    static_cast<uint32_t>(rax), static_cast<unsigned long long>(rax));
+                            });
+                    }
+                    snapshot_status_hooks->emplace(mod.image_base, installed);
+                });
+            this->callbacks.on_module_unload.add([this, snapshot_status_hooks](mapped_module& mod) {
+                if (auto entry = snapshot_status_hooks->extract(mod.image_base); entry)
+                {
+                    for (auto* hook : entry.mapped())
+                    {
+                        if (hook)
+                        {
+                            this->emu().delete_hook(hook);
+                        }
+                    }
+                }
+            });
         }
         // Exact execution hooks only: no global instruction callback or default hot-path work.
         // The first few guest C++ throws identify the caller preceding a DXVK/d3d11 terminate.
