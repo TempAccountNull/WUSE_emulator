@@ -874,6 +874,19 @@ namespace sogen
                 }
             }
 
+            bool invalid_parameter_completes(const io_device_context& c) const override
+            {
+                switch (_AFD_REQUEST(c.io_control_code))
+                {
+                case AFD_QUERY_HANDLES:
+                case AFD_ENUM_NETWORK_EVENTS:
+                case AFD_PARTIAL_DISCONNECT:
+                    return true;
+                default:
+                    return false;
+                }
+            }
+
             NTSTATUS dispatch_ioctl(windows_emulator& win_emu, const io_device_context& c, const ULONG request)
             {
                 switch (request)
@@ -914,6 +927,7 @@ namespace sogen
                 case AFD_SET_INFORMATION:
                     return this->ioctl_information(win_emu, c, true);
                 case AFD_QUERY_HANDLES:
+                    return this->ioctl_query_handles(win_emu, c);
                 case AFD_TRANSPORT_IOCTL:
                 case AFD_PARTIAL_DISCONNECT:
                     return STATUS_SUCCESS;
@@ -922,6 +936,37 @@ namespace sogen
                                       static_cast<uint32_t>(request));
                     return STATUS_NOT_SUPPORTED;
                 }
+            }
+
+            NTSTATUS ioctl_query_handles(windows_emulator& win_emu, const io_device_context& c) const
+            {
+                using info = AFD_HANDLE_INFO<Traits>;
+                if (c.input_buffer_length < sizeof(ULONG) || c.output_buffer_length < sizeof(info))
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+                ULONG flags{};
+                if (!win_emu.memory.try_read_memory(c.input_buffer, &flags, sizeof(flags)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if (flags == 0 || (flags & ~ULONG{3}) != 0)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                // Modern AFD exposes no TDI address/connection handles for Winsock sockets.
+                // Native Windows 10 returns two INVALID_HANDLE_VALUE entries.
+                const info handles{.TdiAddressHandle = static_cast<typename Traits::HANDLE>(-1),
+                                   .TdiConnectionHandle = static_cast<typename Traits::HANDLE>(-1)};
+                if (!win_emu.memory.try_write_memory(c.output_buffer, &handles, sizeof(handles)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if (c.io_status_block)
+                {
+                    c.io_status_block.access([](status_block& block) { block.Information = sizeof(info); });
+                }
+                return STATUS_SUCCESS;
             }
 
             NTSTATUS ioctl_address_list(windows_emulator& win_emu, const io_device_context& c)
@@ -1971,9 +2016,9 @@ namespace sogen
                     throw std::runtime_error("Invalid AFD endpoint socket!");
                 }
 
-                if (c.output_buffer_length < 56)
+                if (c.output_buffer_length < sizeof(AFD_ENUM_NETWORK_EVENTS_INFO))
                 {
-                    return STATUS_BUFFER_TOO_SMALL;
+                    return STATUS_INVALID_PARAMETER;
                 }
 
                 if (c.input_buffer)
@@ -1994,14 +2039,16 @@ namespace sogen
                     }
                 }
 
-                win_emu.emu().write_memory(c.output_buffer, this->triggered_events_);
+                AFD_ENUM_NETWORK_EVENTS_INFO events{};
+                events.PollEvents = this->triggered_events_;
+                if (!win_emu.memory.try_write_memory(c.output_buffer, &events, sizeof(events)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
                 this->triggered_events_ = 0;
-
                 if (c.io_status_block)
                 {
-                    status_block block{};
-                    block.Information = 56;
-                    c.io_status_block.write(block);
+                    c.io_status_block.access([](status_block& block) { block.Information = sizeof(events); });
                 }
 
                 return STATUS_SUCCESS;

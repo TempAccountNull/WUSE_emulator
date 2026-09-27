@@ -138,6 +138,13 @@ namespace sogen
             return false;
         }
 
+        // Some invalid AFD requests are rejected before an IRP is completed, whereas
+        // others complete with STATUS_INVALID_PARAMETER in the caller's IOSB.
+        virtual bool invalid_parameter_completes(const io_device_context&) const
+        {
+            return false;
+        }
+
         // A zero filter matches every pending request on this open device object.
         virtual uint32_t cancel_pending_io(windows_emulator& win_emu, uint64_t io_status_block, uint32_t issuer_thread_id)
         {
@@ -209,6 +216,7 @@ namespace sogen
         uint32_t cancel_pending_io(windows_emulator& win_emu, uint64_t io_status_block, uint32_t issuer_thread_id) override;
         void rebase_steady_deadlines(std::chrono::steady_clock::duration offset) override;
         bool may_return_pending() const override;
+        bool invalid_parameter_completes(const io_device_context& context) const override;
         NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& context) override;
 
         void serialize_object(utils::buffer_serializer& buffer) const override;

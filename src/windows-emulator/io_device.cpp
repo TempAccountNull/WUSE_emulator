@@ -236,7 +236,8 @@ namespace sogen
             return result;
         }
 
-        if (this->may_return_pending() && !c.completing_pending && result == STATUS_INVALID_PARAMETER)
+        if (this->may_return_pending() && !c.completing_pending && result == STATUS_INVALID_PARAMETER &&
+            !this->invalid_parameter_completes(c))
         {
             // Native AFD rejects invalid requests before completing an IRP: no IOSB update,
             // event signal, APC, or IOCP packet is delivered.
@@ -261,6 +262,12 @@ namespace sogen
     {
         this->assert_validity();
         return this->device_->may_return_pending();
+    }
+
+    bool io_device_container::invalid_parameter_completes(const io_device_context& context) const
+    {
+        this->assert_validity();
+        return this->device_->invalid_parameter_completes(context);
     }
 
     NTSTATUS io_device_container::io_control(windows_emulator& win_emu, const io_device_context& context)

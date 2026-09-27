@@ -167,8 +167,26 @@ namespace sogen
 #define AFD_POLL_GROUP_QOS_BIT         10
 #define AFD_POLL_GROUP_QOS             (1 << AFD_POLL_GROUP_QOS_BIT)
 
-#define AFD_NUM_POLL_EVENTS            11
+#define AFD_POLL_ROUTING_IF_CHANGE_BIT 11
+#define AFD_POLL_ROUTING_IF_CHANGE     (1 << AFD_POLL_ROUTING_IF_CHANGE_BIT)
+#define AFD_POLL_ADDRESS_LIST_CHANGE_BIT 12
+#define AFD_POLL_ADDRESS_LIST_CHANGE     (1 << AFD_POLL_ADDRESS_LIST_CHANGE_BIT)
+#define AFD_NUM_POLL_EVENTS            13
 #define AFD_POLL_ALL                   ((1 << AFD_NUM_POLL_EVENTS) - 1)
+
+    template <typename Traits>
+    struct AFD_HANDLE_INFO
+    {
+        typename Traits::HANDLE TdiAddressHandle;
+        typename Traits::HANDLE TdiConnectionHandle;
+    };
+
+    struct AFD_ENUM_NETWORK_EVENTS_INFO
+    {
+        ULONG PollEvents;
+        NTSTATUS EventStatus[AFD_NUM_POLL_EVENTS];
+    };
+    static_assert(sizeof(AFD_ENUM_NETWORK_EVENTS_INFO) == 56);
 
     struct AFD_EVENT_SELECT_INFO
     {

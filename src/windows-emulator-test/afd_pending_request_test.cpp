@@ -390,6 +390,82 @@ namespace sogen::test
         EXPECT_EQ(port->queue.front().io_status_block.Status, STATUS_SUCCESS);
     }
 
+    TEST_P(AfdPendingRequestTest, QueryHandlesMatchesNativeBufferAndStatusContract)
+    {
+        constexpr uint64_t input = memory + 0x800;
+        constexpr uint64_t output = memory + 0x880;
+        constexpr uint64_t iosb = memory + 0x100;
+        const auto expected_size = GetParam() ? sizeof(AFD_HANDLE_INFO<EmulatorTraits<Emu32>>)
+                                              : sizeof(AFD_HANDLE_INFO<EmulatorTraits<Emu64>>);
+        const auto invoke = [&](const uint32_t flags, const uint32_t input_length, const uint32_t output_length) {
+            emu.memory.write_memory(input, &flags, sizeof(flags));
+            emu.memory.set_memory(output, 0xa5, 24);
+            io_device_context context{emu.memory};
+            context.io_control_code = 0x12037;
+            context.io_status_block = {emu.memory, iosb};
+            context.input_buffer = input;
+            context.input_buffer_length = input_length;
+            context.output_buffer = output;
+            context.output_buffer_length = output_length;
+            return device->execute_ioctl(emu, context);
+        };
+        for (const auto flags : {1u, 2u, 3u})
+        {
+            EXPECT_EQ(invoke(flags, 4, static_cast<uint32_t>(expected_size)), STATUS_SUCCESS);
+            const auto block = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb);
+            EXPECT_EQ(block.Status, STATUS_SUCCESS);
+            EXPECT_EQ(block.Information, expected_size);
+            const auto bytes = emu.memory.read_memory(output, 24);
+            EXPECT_TRUE(std::all_of(bytes.begin(), bytes.begin() + expected_size,
+                                    [](const std::byte value) { return value == std::byte{0xff}; }));
+            EXPECT_TRUE(std::all_of(bytes.begin() + expected_size, bytes.end(),
+                                    [](const std::byte value) { return value == std::byte{0xa5}; }));
+        }
+        for (const auto flags : {0u, 4u})
+        {
+            EXPECT_EQ(invoke(flags, 4, static_cast<uint32_t>(expected_size)), STATUS_INVALID_PARAMETER);
+            const auto block = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb);
+            EXPECT_EQ(block.Status, STATUS_INVALID_PARAMETER);
+            EXPECT_EQ(block.Information, 0u);
+            const auto bytes = emu.memory.read_memory(output, 24);
+            EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(),
+                                    [](const std::byte value) { return value == std::byte{0xa5}; }));
+        }
+        EXPECT_EQ(invoke(3, 3, static_cast<uint32_t>(expected_size)), STATUS_BUFFER_TOO_SMALL);
+        EXPECT_EQ(invoke(3, 4, static_cast<uint32_t>(expected_size - 1)), STATUS_BUFFER_TOO_SMALL);
+    }
+
+    TEST_P(AfdPendingRequestTest, EnumNetworkEventsWritesEveryStatusSlot)
+    {
+        constexpr uint64_t output = memory + 0x880;
+        constexpr uint64_t iosb = memory + 0x100;
+        const auto invoke = [&](const uint32_t length) {
+            emu.memory.set_memory(output, 0xa5, 64);
+            io_device_context context{emu.memory};
+            context.io_control_code = 0x1208b;
+            context.io_status_block = {emu.memory, iosb};
+            context.output_buffer = output;
+            context.output_buffer_length = length;
+            return device->execute_ioctl(emu, context);
+        };
+        EXPECT_EQ(invoke(55), STATUS_INVALID_PARAMETER);
+        auto block = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb);
+        EXPECT_EQ(block.Status, STATUS_INVALID_PARAMETER);
+        EXPECT_EQ(block.Information, 0u);
+        auto bytes = emu.memory.read_memory(output, 64);
+        EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(),
+                                [](const std::byte value) { return value == std::byte{0xa5}; }));
+        EXPECT_EQ(invoke(64), STATUS_SUCCESS);
+        block = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb);
+        EXPECT_EQ(block.Status, STATUS_SUCCESS);
+        EXPECT_EQ(block.Information, sizeof(AFD_ENUM_NETWORK_EVENTS_INFO));
+        bytes = emu.memory.read_memory(output, 64);
+        EXPECT_TRUE(std::all_of(bytes.begin(), bytes.begin() + sizeof(AFD_ENUM_NETWORK_EVENTS_INFO),
+                                [](const std::byte value) { return value == std::byte{0}; }));
+        EXPECT_TRUE(std::all_of(bytes.begin() + sizeof(AFD_ENUM_NETWORK_EVENTS_INFO), bytes.end(),
+                                [](const std::byte value) { return value == std::byte{0xa5}; }));
+    }
+
     TEST_P(AfdPendingRequestTest, PendingIoStatusBlockRetainsCallerFieldsUntilCompletion)
     {
         const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
