@@ -14,6 +14,7 @@
 #include "devices/cng_notifications.hpp"
 #include "devices/cm_api_profile.hpp"
 #include "devices/afd_profile.hpp"
+#include "network_debug.hpp"
 #include "file_read_profile.hpp"
 #include "package_read_trace.hpp"
 #include "logger.hpp"
@@ -201,6 +202,7 @@ namespace sogen
         cng_notifications cng_changes;
         cm_api_interface_profile cmapi_interface_profile{};
         afd_profile afd_diagnostics{};
+        network_debug_logger network_debug{};
         file_read_profile file_reads_profile{};
         package_read_trace package_reads_trace{};
 

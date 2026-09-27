@@ -206,6 +206,7 @@ namespace sogen
             std::filesystem::path checkpoint_request{}; // poll-file: write a snapshot to the path inside it, then keep running
             std::filesystem::path minidump_path{};
             std::filesystem::path report_path{};
+            std::filesystem::path network_debug_path{};
             std::filesystem::path stdout_path{};
             std::string report_format{"jsonl"};
             std::string whp_execution_hook_mode{"auto"};
@@ -969,6 +970,10 @@ namespace sogen
             const auto win_emu = setup_emulator(options, args);
             apply_registry_files(*win_emu, options);
             context.win_emu = win_emu.get();
+            if (!options.network_debug_path.empty())
+            {
+                win_emu->network_debug.open(options.network_debug_path);
+            }
 
             const auto lower_cased = [](const std::vector<std::string>& names) {
                 std::vector<std::string> result{};
@@ -1355,6 +1360,8 @@ namespace sogen
                            "Poll this file while running; when it appears, snapshot to the path it contains and keep executing");
             app.add_option("--minidump", options.minidump_path, "Load minidump from path");
             app.add_option("--report", options.report_path, "Write machine-readable analysis events to a file");
+            app.add_option("--network-debug-file", options.network_debug_path,
+                           "Write bounded AFD/APC/IOCP network diagnostics JSONL independently of the main report");
             app.add_option("--report-format", options.report_format, "Report format (supported: jsonl)")->capture_default_str();
             app.add_option("--report-mode", options.report_mode,
                            "Report detail: full writes every event; audit keeps diagnostics and counts routine events")

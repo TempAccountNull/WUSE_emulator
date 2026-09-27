@@ -875,6 +875,7 @@ namespace sogen
     {
         uint64_t key_context{};
         uint64_t apc_context{};
+        uint64_t network_request_id{};
         IO_STATUS_BLOCK<EmulatorTraits<Emu64>> io_status_block{};
         handle wait_packet_handle{};
 
@@ -885,6 +886,7 @@ namespace sogen
         {
             buffer.write(this->key_context);
             buffer.write(this->apc_context);
+            buffer.write(this->network_request_id);
             buffer.write(this->io_status_block);
             buffer.write(this->wait_packet_handle);
             buffer.write(this->worker_factory_handle);
@@ -895,6 +897,7 @@ namespace sogen
         {
             buffer.read(this->key_context);
             buffer.read(this->apc_context);
+            buffer.read(this->network_request_id);
             buffer.read(this->io_status_block);
             buffer.read(this->wait_packet_handle);
             buffer.read(this->worker_factory_handle);

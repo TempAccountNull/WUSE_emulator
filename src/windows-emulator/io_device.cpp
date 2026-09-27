@@ -151,6 +151,10 @@ namespace sogen
         {
             return;
         }
+        if (c.network_request_id)
+        {
+            win_emu.network_debug.afd_completion(win_emu, c, static_cast<int32_t>(status), !completed_synchronously);
+        }
         if (c.event.bits)
         {
             if (auto* event = win_emu.process.events.get(c.event))
@@ -172,10 +176,13 @@ namespace sogen
                         .apc_argument1 = c.apc_context,
                         .apc_argument2 = c.io_status_block.value(),
                         .apc_argument3 = 0,
+                        .network_request_id = c.network_request_id,
                         .restamp_io_status_block = win_emu.process.is_wow64_process && c.io_status_block,
                         .io_status = static_cast<int32_t>(static_cast<ULONG>(status)),
                         .io_information = static_cast<uint32_t>(block.Information),
                     });
+                    win_emu.network_debug.apc_queue(c.network_request_id, c.issuer_thread_id,
+                                                   static_cast<int32_t>(status), block.Information);
                 }
             }
             return;
@@ -196,8 +203,11 @@ namespace sogen
             io_completion_message message{};
             message.key_context = file_object->completion_key;
             message.apc_context = c.apc_context;
+            message.network_request_id = c.network_request_id;
             message.io_status_block = block;
             port->enqueue(message);
+            win_emu.network_debug.iocp_queue(c.network_request_id, file_object->completion_port.bits,
+                                              file_object->completion_key, static_cast<int32_t>(status), block.Information);
         }
     }
 
@@ -219,6 +229,10 @@ namespace sogen
             {
                 c.io_status_block.write(*original_io_status);
             }
+            if (!c.completing_pending)
+            {
+                win_emu.network_debug.afd_result(win_emu, c, static_cast<int32_t>(result));
+            }
             return result;
         }
 
@@ -230,10 +244,15 @@ namespace sogen
             {
                 c.io_status_block.write(*original_io_status);
             }
+            win_emu.network_debug.afd_result(win_emu, c, static_cast<int32_t>(result));
             return result;
         }
 
         write_io_status(c.io_status_block, result);
+        if (!c.completing_pending)
+        {
+            win_emu.network_debug.afd_result(win_emu, c, static_cast<int32_t>(result));
+        }
         complete_device_ioctl(win_emu, c, result, !c.completing_pending);
         return result;
     }

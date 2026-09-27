@@ -22,7 +22,7 @@ namespace sogen
             {
                 // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
                 char magic[4] = {'S', 'N', 'A', 'P'};
-                uint32_t version{3};
+                uint32_t version{4};
             };
 
             static_assert(sizeof(snapshot_header) == 8);

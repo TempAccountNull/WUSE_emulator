@@ -1,5 +1,6 @@
 #include "std_include.hpp"
 #include "io_completion_wait.hpp"
+#include "network_debug.hpp"
 #include "worker_factory_support.hpp"
 
 namespace sogen
@@ -276,6 +277,10 @@ namespace sogen
                 return false;
             }
 
+            if (process.network_debug)
+            {
+                process.network_debug->iocp_dequeue(out_message, io_completion_handle.bits);
+            }
             worker_factory_support::on_io_completion_message_dequeued(process, out_message);
             clear_wait_packet_completion_state(process, out_message.wait_packet_handle);
             return true;
@@ -307,6 +312,10 @@ namespace sogen
                     break;
                 }
 
+                if (process.network_debug)
+                {
+                    process.network_debug->iocp_dequeue(message, io_completion_handle.bits);
+                }
                 worker_factory_support::on_io_completion_message_dequeued(process, message);
 
                 FILE_IO_COMPLETION_INFORMATION<EmulatorTraits<Emu64>> entry{};

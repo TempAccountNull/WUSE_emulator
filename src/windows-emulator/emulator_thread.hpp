@@ -62,6 +62,7 @@ namespace sogen
         uint64_t apc_argument1{};
         uint64_t apc_argument2{};
         uint64_t apc_argument3{};
+        uint64_t network_request_id{};
 
         // For a WoW64 I/O completion APC: the WoW64 layer's 64-bit I/O status block (apc_argument2) is a
         // reused per-thread scratch buffer. A syscall issued between this APC being queued and dispatched
@@ -78,6 +79,7 @@ namespace sogen
             buffer.write(this->apc_argument1);
             buffer.write(this->apc_argument2);
             buffer.write(this->apc_argument3);
+            buffer.write(this->network_request_id);
             buffer.write(this->restamp_io_status_block);
             buffer.write(this->io_status);
             buffer.write(this->io_information);
@@ -90,6 +92,7 @@ namespace sogen
             buffer.read(this->apc_argument1);
             buffer.read(this->apc_argument2);
             buffer.read(this->apc_argument3);
+            buffer.read(this->network_request_id);
             buffer.read(this->restamp_io_status_block);
             buffer.read(this->io_status);
             buffer.read(this->io_information);

@@ -171,8 +171,12 @@ namespace sogen
         }
     };
 
+    class network_debug_logger;
+
     struct process_context
     {
+        // Non-serialized observer for optional network diagnostics.
+        network_debug_logger* network_debug{};
         struct callbacks
         {
             utils::optional_function<void(handle h, emulator_thread& thr)> on_thread_create{};

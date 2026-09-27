@@ -991,6 +991,10 @@ namespace sogen
             context.output_buffer = output_buffer;
             context.output_buffer_length = output_buffer_length;
             context.vcpu = &c.vcpu;
+            if (c.win_emu.network_debug.enabled() && device->get_device_name().starts_with(u"Afd\\"))
+            {
+                c.win_emu.network_debug.begin_afd_request(c.win_emu, context, c, "NtDeviceIoControlFile");
+            }
 
             try
             {

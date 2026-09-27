@@ -22,6 +22,7 @@ namespace sogen
     {
         handle file_handle{};
         uint32_t issuer_thread_id{};
+        uint64_t network_request_id{};
         bool completing_pending{};
         handle event{};
         emulator_pointer /*PIO_APC_ROUTINE*/ apc_routine{};
@@ -54,6 +55,7 @@ namespace sogen
         {
             buffer.write(file_handle);
             buffer.write(issuer_thread_id);
+            buffer.write(network_request_id);
             buffer.write(completing_pending);
             buffer.write(event);
             buffer.write(apc_routine);
@@ -70,6 +72,7 @@ namespace sogen
         {
             buffer.read(file_handle);
             buffer.read(issuer_thread_id);
+            buffer.read(network_request_id);
             buffer.read(completing_pending);
             buffer.read(event);
             buffer.read(apc_routine);

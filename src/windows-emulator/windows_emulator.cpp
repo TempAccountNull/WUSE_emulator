@@ -642,6 +642,7 @@ namespace sogen
 
             const auto next_apx = apcs.front();
             apcs.erase(apcs.begin());
+            win_emu.network_debug.apc_dispatch(next_apx.network_request_id, thread.id);
 
             if (next_apx.restamp_io_status_block && next_apx.apc_argument2)
             {
@@ -971,6 +972,8 @@ namespace sogen
           vcpu_count_(static_cast<uint32_t>(this->emu_->vcpu_count())),
           use_section_first_execution_hooks_(!this->emu_->supports_global_memory_execution_hooks())
     {
+        this->process.network_debug = &this->network_debug;
+
         if (this->vcpu_count_ == 0)
         {
             throw std::invalid_argument("At least one vCPU is required");
