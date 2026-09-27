@@ -2150,10 +2150,11 @@ namespace sogen
         // steam_api64.dll SHA-256 39788C155DF397BA8C12415911880089FE5982F0B38F3496E4CE056779066845.
         if (const auto* probe = std::getenv("SOGEN_STEAM_INIT_PROBE"); probe && std::strcmp(probe, "1") == 0)
         {
-            auto seen = std::make_shared<std::array<uint8_t, 22>>();
+            auto seen = std::make_shared<std::array<uint8_t, 30>>();
+            auto failed_seen = std::make_shared<std::array<uint8_t, 30>>();
             auto attempted = std::make_shared<bool>(false);
-            auto hooks = std::make_shared<std::unordered_map<uint64_t, std::array<emulator_hook*, 22>>>();
-            this->callbacks.on_module_load.add([this, seen, attempted, hooks](mapped_module& mod) {
+            auto hooks = std::make_shared<std::unordered_map<uint64_t, std::array<emulator_hook*, 30>>>();
+            this->callbacks.on_module_load.add([this, seen, failed_seen, attempted, hooks](mapped_module& mod) {
                 if (!is_steam_api_module(mod.name) || *attempted)
                 {
                     return;
@@ -2164,19 +2165,23 @@ namespace sogen
                 constexpr std::array<uint8_t, 18> expected_entry{
                     0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0x48, 0x8B, 0x1D,
                     0x83, 0xC3, 0x49, 0x12, 0xE8, 0x4E, 0xF4, 0x05, 0x00};
-                constexpr std::array<uint64_t, 22> site_rvas{
+                constexpr std::array<uint64_t, 30> site_rvas{
                     entry_rva, 0x2295, 0x22BD, 0x22D3, 0x2303, 0x2348,
                     0x180850, 0x180959, 0x1809BD, 0x180A09, 0x180A7D, 0x180AC4,
                     0x199290, 0x199302, 0x19931A, 0x19935F, 0x19939E,
-                    0x19937E, 0x19938A, 0x1993A4, 0x199390, 0x1993BE};
-                constexpr std::array<std::array<uint8_t, 2>, 22> expected_sites{{
+                    0x19937E, 0x19938A, 0x1993A4, 0x199390, 0x1993BE,
+                    0x199100, 0x199148, 0x1991C8, 0x1991DA,
+                    0x1991ED, 0x199248, 0x199267, 0x199270};
+                constexpr std::array<std::array<uint8_t, 2>, 30> expected_sites{{
                     {{0x40, 0x53}}, {{0x74, 0x6C}}, {{0x74, 0x37}}, {{0x75, 0x36}},
                     {{0x32, 0xC0}}, {{0xB0, 0x01}}, {{0x48, 0x89}}, {{0x0F, 0x84}},
                     {{0x74, 0x6B}}, {{0x74, 0x1F}}, {{0x48, 0x8D}}, {{0xC3, 0xCC}},
                     {{0x48, 0x89}}, {{0x0F, 0x85}}, {{0x0F, 0x85}}, {{0x74, 0x31}},
                     {{0x85, 0xC0}}, {{0x85, 0xC0}}, {{0x84, 0xC0}}, {{0xE8, 0x87}},
-                    {{0xEB, 0x2E}}, {{0x32, 0xC0}}}};
-                const bool range_valid = mod.image_base <= UINT64_MAX - site_rvas.back() &&
+                    {{0xEB, 0x2E}}, {{0x32, 0xC0}}, {{0x48, 0x83}}, {{0x85, 0xDB}},
+                    {{0x48, 0x85}}, {{0x83, 0xF8}}, {{0x85, 0xC0}}, {{0x83, 0xF8}},
+                    {{0xB0, 0x01}}, {{0x32, 0xC0}}}};
+                const bool range_valid = mod.image_base <= UINT64_MAX - 0x1993BE &&
                                          mod.size_of_image == expected_image_size &&
                                          mod.find_export("SteamAPI_Init") == mod.image_base + entry_rva;
                 std::array<uint8_t, expected_entry.size()> actual_entry{};
@@ -2224,42 +2229,61 @@ namespace sogen
                 for (size_t site = 0; site < site_rvas.size(); ++site)
                 {
                     installed[site] = this->emu().hook_memory_execution(
-                        base + site_rvas[site], [this, seen, site, base](cpu_interface& cpu, const uint64_t rip) {
+                        base + site_rvas[site], [this, seen, failed_seen, site, base](cpu_interface& cpu, const uint64_t rip) {
                             const std::scoped_lock lock(this->kernel_lock_);
-                            const uint8_t limit = site == 7 ? 3 : 1; // Three loader attempts; other sites once.
-                            if ((*seen)[site] >= limit)
+                            auto& vcpu = this->vcpu(cpu.index());
+                            auto& acting = vcpu.cpu;
+                            const auto rax = acting.reg<uint64_t>(x86_register::rax);
+                            const auto rbx = acting.reg<uint64_t>(x86_register::rbx);
+                            bool condition_failed = false;
+                            switch (site)
+                            {
+                            case 22: condition_failed = rax == UINT64_MAX; break; // INVALID_HANDLE_VALUE
+                            case 23: condition_failed = static_cast<uint32_t>(rbx) == 0; break; // Thread32First
+                            case 24: condition_failed = rax == 0; break; // OpenThread
+                            case 25: condition_failed = static_cast<uint32_t>(rax) != 0x57; break; // ERROR_INVALID_PARAMETER
+                            case 26: condition_failed = static_cast<uint32_t>(rax) != 0; break; // DetourUpdateThread
+                            case 27: condition_failed = static_cast<uint32_t>(rax) != 0x12; break; // ERROR_NO_MORE_FILES
+                            }
+                            // Repeated calls retain the first success and first failure only.
+                            auto& observed = site >= 22 && site <= 27 && condition_failed ?
+                                (*failed_seen)[site] : (*seen)[site];
+                            const uint8_t limit = site == 7 ? 3 : 1;
+                            if (observed >= limit)
                             {
                                 return;
                             }
-                            const auto hit = ++(*seen)[site];
-                            auto& vcpu = this->vcpu(cpu.index());
-                            auto& acting = vcpu.cpu;
+                            const auto hit = ++observed;
                             const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
                             const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
-                            const auto rax = acting.reg<uint64_t>(x86_register::rax);
                             const auto rcx = acting.reg<uint64_t>(x86_register::rcx);
                             const auto rdi = acting.reg<uint64_t>(x86_register::rdi);
+                            const auto r12 = acting.reg<uint64_t>(x86_register::r12);
+                            const auto r15 = acting.reg<uint64_t>(x86_register::r15);
                             const auto eflags = acting.reg<uint32_t>(x86_register::eflags);
                             uint64_t stack0 = 0;
                             const bool stack0_valid = acting.try_read_memory(rsp, &stack0, sizeof(stack0));
-                            // SteamAPI_Init: push rbx; sub rsp,0x30. egress::install:
-                            // push rsi; sub rsp,0x260. At each ret, RSP again holds the caller.
-                            const uint64_t return_offset = site == 0 || site == 6 || site == 11 ?
-                                0 : site < 6 ? 0x38 : 0x268;
-                            const bool return_slot_valid = site < 12 && rsp <= UINT64_MAX - return_offset;
+                            // Deployed Dawn frame sizes: begin reserves 0x3030 bytes;
+                            // enlist_snapshot saves eight registers and reserves 0x58 bytes.
+                            const uint64_t return_offset = site == 0 || site == 6 || site == 11 || site == 12 ?
+                                0 : site < 6 ? 0x38 : site < 12 ? 0x268 : site < 22 ? 0x3038 : 0x98;
+                            const bool return_slot_valid = rsp <= UINT64_MAX - return_offset;
                             const auto return_slot = return_slot_valid ? rsp + return_offset : 0;
                             uint64_t return_address = 0;
                             const bool return_valid = return_slot_valid &&
                                 acting.try_read_memory(return_slot, &return_address, sizeof(return_address));
                             const auto* caller = return_valid ? this->mod_manager.find_by_address(return_address) : nullptr;
-                            constexpr std::array<const char*, 22> names{
+                            constexpr std::array<const char*, 30> names{
                                 "entry", "egress_result", "core_result", "package_trust_result",
                                 "return_false", "return_true", "egress_entry", "loader_result",
                                 "export_resolution_result", "detours_result", "egress_failure_cleanup", "egress_return",
                                 "begin_entry", "owner_global_check", "owner_cmpxchg",
                                 "trampoline_protect_result", "trampoline_get_last_error",
                                 "update_current_thread_result", "thread_enlist_result",
-                                "begin_abort", "begin_success_branch", "begin_false"};
+                                "begin_abort", "begin_success_branch", "begin_false",
+                                "snapshot_result", "thread_first_result", "open_thread_result",
+                                "open_thread_last_error", "update_other_thread_result",
+                                "thread_next_last_error", "enlist_success", "enlist_failure"};
                             this->log.error(
                                 "[STEAMINITPROBE] site=%s n=%u tid=%u vcpu=%zu rip=%#llx rva=%#llx "
                                 "rax=%#llx rcx=%#llx rdi=%#llx eflags=%#x zf=%u rsp=%#llx stack0_valid=%u stack0=%#llx "
@@ -2277,6 +2301,24 @@ namespace sogen
                                 static_cast<unsigned long long>(return_address),
                                 caller ? caller->name.c_str() : "<unmapped>",
                                 static_cast<unsigned long long>(caller ? return_address - caller->image_base : 0));
+                            if (site >= 22)
+                            {
+                                // ThreadEntry32 fields in the deployed enlist_snapshot stack frame.
+                                uint32_t target_tid = 0;
+                                uint32_t owner_pid = 0;
+                                const bool target_valid = site >= 24 && site <= 26 &&
+                                    rsp <= UINT64_MAX - 0x30 &&
+                                    acting.try_read_memory(rsp + 0x28, &target_tid, sizeof(target_tid)) &&
+                                    acting.try_read_memory(rsp + 0x2C, &owner_pid, sizeof(owner_pid));
+                                this->log.error(
+                                    "[STEAMINITPROBE] enlist_detail site=%s failure=%u rbx=%#llx "
+                                    "current_tid=%#llx current_pid=%#llx target_valid=%u target_tid=%u owner_pid=%u\n",
+                                    names[site], static_cast<unsigned>(condition_failed),
+                                    static_cast<unsigned long long>(rbx),
+                                    static_cast<unsigned long long>(r12),
+                                    static_cast<unsigned long long>(r15),
+                                    static_cast<unsigned>(target_valid), target_tid, owner_pid);
+                            }
                             if (site == 9)
                             {
                                 // The deployed Dawn installer receives &failure at RSP+0x30.
