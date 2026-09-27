@@ -1537,6 +1537,52 @@ namespace sogen::whp
                 }
             }
 
+            bool map_shared_memory(const uint64_t address, const uint64_t source, const size_t size,
+                                   const memory_permission permissions) override
+            {
+                if (!is_page_aligned(address) || !is_page_aligned(source) || !is_page_aligned(size) || !size ||
+                    address > UINT64_MAX - size || source > UINT64_MAX - size)
+                {
+                    return false;
+                }
+
+                std::unique_lock lock(this->partition_mutex_);
+
+                // A second guest GPA can point at the same host page. Hold its shared owner
+                // on both mappings so either view can be unmapped first without losing data.
+                for (size_t offset = 0; offset < size; offset += page_size)
+                {
+                    const auto from = this->mapped_pages_.find(source + offset);
+                    const auto to = this->mapped_pages_.find(address + offset);
+                    if (from == this->mapped_pages_.end() || !from->second || !from->second->host_page ||
+                        (to != this->mapped_pages_.end() && to->second &&
+                         (to->second->host_page ||
+                          to->second->guest_physical_address != unmapped_guest_page)))
+                    {
+                        return false;
+                    }
+                }
+
+                for (size_t offset = 0; offset < size; offset += page_size)
+                {
+                    const auto& backing = *this->mapped_pages_.at(source + offset);
+                    auto& view = this->mapped_pages_[address + offset];
+                    if (!view)
+                    {
+                        view = std::make_unique<mapped_page>();
+                    }
+                    view->owned_page = backing.owned_page;
+                    view->host_page = backing.host_page;
+                    this->assign_guest_physical_page(address + offset, *view);
+                    view->permissions = permissions;
+                    this->apply_patched_execution_breakpoints(address + offset);
+                    this->ensure_virtual_mapping(address + offset);
+                }
+
+                this->remap_pages(address, size);
+                return true;
+            }
+
             void map_host_memory(const uint64_t address, const size_t size, void* host_pointer,
                                  const memory_permission permissions) override
             {

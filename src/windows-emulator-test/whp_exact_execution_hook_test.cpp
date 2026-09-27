@@ -76,6 +76,26 @@ namespace sogen::test
         }
     }
 
+    TEST(WhpSharedMemory, AliasedPagesStayCoherentAfterOriginalViewIsUnmapped)
+    {
+        auto emu = create_x86_64_emulator(backend_type::whp);
+        memory_manager memory(*emu);
+        const auto source = memory.allocate_memory(0x2000, memory_permission::read_write);
+        constexpr uint64_t alias = 0x70000000;
+        ASSERT_NE(source, 0u);
+        ASSERT_TRUE(memory.allocate_shared_view(alias, source, 0x2000, memory_permission::read_write));
+
+        emu->write_memory<uint32_t>(source + 0x1000, 0x12345678);
+        EXPECT_EQ(emu->read_memory<uint32_t>(alias + 0x1000), 0x12345678u);
+        emu->write_memory<uint32_t>(alias, 0xabcdef01);
+        EXPECT_EQ(emu->read_memory<uint32_t>(source), 0xabcdef01u);
+
+        ASSERT_TRUE(memory.release_memory(source, 0));
+        EXPECT_EQ(emu->read_memory<uint32_t>(alias), 0xabcdef01u);
+        EXPECT_EQ(emu->read_memory<uint32_t>(alias + 0x1000), 0x12345678u);
+        ASSERT_TRUE(memory.release_memory(alias, 0));
+    }
+
     TEST(WhpExactExecutionHook, ClearsPendingStepWhenFaultHandlerSwitchesContext)
     {
         auto emu = create_x86_64_emulator(backend_type::whp);

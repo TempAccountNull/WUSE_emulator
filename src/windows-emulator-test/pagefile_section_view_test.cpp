@@ -72,7 +72,19 @@ namespace sogen::test
         auto& cpu = emu.emu();
         cpu.reg(x86_register::rip, entry);
         cpu.reg(x86_register::rcx, middle + 0xfff8);
-        cpu.start(2);
+        if (cpu.supports_instruction_counting())
+        {
+            cpu.start(2);
+        }
+        else
+        {
+            auto* completion = cpu.hook_memory_execution(entry + 7, [](cpu_interface& acting, uint64_t) {
+                acting.stop();
+            });
+            ASSERT_NE(completion, nullptr);
+            cpu.start(0);
+            cpu.delete_hook(completion);
+        }
         EXPECT_EQ(cpu.reg<uint64_t>(x86_register::rip), entry + 7);
         EXPECT_EQ(cpu.read_memory<uint64_t>(first), UINT64_MAX);
         EXPECT_EQ(cpu.read_memory<uint64_t>(middle + 0xfff8), UINT64_MAX);
