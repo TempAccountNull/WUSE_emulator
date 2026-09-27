@@ -543,6 +543,11 @@ namespace sogen
         std::map<uint64_t, std::vector<emulator_hook*>> section_first_execution_hooks_{};
         basic_memory_region<> last_executed_section_{};
 
+        // Exact-export, opt-in Dawn callback activity for sign-in diagnostics.
+        std::atomic_bool dawn_callback_probe_installed_{false};
+        std::atomic<uint64_t> dawn_callback_probe_calls_{0};
+        std::atomic<uint64_t> dawn_callback_probe_last_tick_ms_{0};
+
         void setup_hooks();
         void setup_process();
         void configure_xstate();

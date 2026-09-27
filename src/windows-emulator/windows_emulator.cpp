@@ -1602,6 +1602,22 @@ namespace sogen
             json += "]}";
         }
 
+        if (const char* probe = std::getenv("SOGEN_DAWN_CALLBACK_PROBE");
+            probe && std::strcmp(probe, "1") == 0)
+        {
+            const auto calls = this->dawn_callback_probe_calls_.load(std::memory_order_relaxed);
+            const auto last_tick = this->dawn_callback_probe_last_tick_ms_.load(std::memory_order_relaxed);
+            const auto probe_now = static_cast<uint64_t>(GetTickCount64());
+            json += ",\"dawn_callback_probe\":{\"installed\":";
+            json += this->dawn_callback_probe_installed_.load(std::memory_order_relaxed) ? "true" : "false";
+            json += ",\"calls\":" + std::to_string(calls);
+            json += ",\"last_tick_ms\":";
+            json += last_tick ? std::to_string(last_tick) : "null";
+            json += ",\"last_age_ms\":";
+            json += last_tick ? std::to_string(probe_now >= last_tick ? probe_now - last_tick : 0) : "null";
+            json += "}";
+        }
+
         if (this->afd_diagnostics.enabled())
         {
             const auto profile = this->afd_diagnostics.read();
@@ -2204,6 +2220,69 @@ namespace sogen
                 this->install_section_first_execution_hook(mod, i);
             }
         });
+
+        // Opt-in exact-export observation of Dawn's callback-driven BAP pump.
+        // WHP traps the containing code page, so leave this disabled by default.
+        if (const char* probe = std::getenv("SOGEN_DAWN_CALLBACK_PROBE");
+            probe && std::strcmp(probe, "1") == 0)
+        {
+            auto hooks = std::make_shared<std::unordered_map<uint64_t, emulator_hook*>>();
+            this->callbacks.on_module_load.add([this, hooks](mapped_module& mod) {
+                if (!is_steam_api_module(mod.name))
+                {
+                    return;
+                }
+                constexpr uint64_t image_size = 0x1ABEB000;
+                constexpr uint64_t callback_rva = 0x2350;
+                constexpr uint64_t dispatcher_rva = 0x33EEF0;
+                constexpr uint64_t service_rva = 0x3AB9A0;
+                constexpr std::array<uint8_t, 5> callback_bytes{0xE9, 0x9B, 0xCB, 0x33, 0x00};
+                constexpr std::array<uint8_t, 16> dispatcher_bytes{
+                    0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41,
+                    0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0xAC};
+                constexpr std::array<uint8_t, 16> service_bytes{
+                    0x40, 0x55, 0x57, 0x48, 0x8D, 0xAC, 0x24, 0x38,
+                    0xF8, 0xFF, 0xFF, 0x48, 0x81, 0xEC, 0xC8, 0x08};
+                std::array<uint8_t, callback_bytes.size()> actual_callback{};
+                std::array<uint8_t, dispatcher_bytes.size()> actual_dispatcher{};
+                std::array<uint8_t, service_bytes.size()> actual_service{};
+                const bool match = mod.size_of_image == image_size &&
+                    mod.find_export("SteamAPI_RunCallbacks") == mod.image_base + callback_rva &&
+                    this->emu().try_read_memory(mod.image_base + callback_rva,
+                                                actual_callback.data(), actual_callback.size()) &&
+                    this->emu().try_read_memory(mod.image_base + dispatcher_rva,
+                                                actual_dispatcher.data(), actual_dispatcher.size()) &&
+                    this->emu().try_read_memory(mod.image_base + service_rva,
+                                                actual_service.data(), actual_service.size()) &&
+                    actual_callback == callback_bytes && actual_dispatcher == dispatcher_bytes &&
+                    actual_service == service_bytes;
+                if (!match)
+                {
+                    this->log.warn("[DAWNCALLBACKPROBE] skipped module=%s image_size=%#llx export=%#llx\n",
+                                   mod.name.c_str(), static_cast<unsigned long long>(mod.size_of_image),
+                                   static_cast<unsigned long long>(mod.find_export("SteamAPI_RunCallbacks")));
+                    return;
+                }
+                auto* hook = this->emu().hook_memory_execution(
+                    mod.image_base + callback_rva,
+                    [this](cpu_interface&, uint64_t) {
+                        this->dawn_callback_probe_calls_.fetch_add(1, std::memory_order_relaxed);
+                        this->dawn_callback_probe_last_tick_ms_.store(
+                            static_cast<uint64_t>(GetTickCount64()), std::memory_order_relaxed);
+                    });
+                hooks->emplace(mod.image_base, hook);
+                this->dawn_callback_probe_installed_.store(true, std::memory_order_relaxed);
+                this->log.info("[DAWNCALLBACKPROBE] installed module=%s rva=%#llx\n",
+                               mod.name.c_str(), static_cast<unsigned long long>(callback_rva));
+            });
+            this->callbacks.on_module_unload.add([this, hooks](mapped_module& mod) {
+                if (auto entry = hooks->extract(mod.image_base); entry)
+                {
+                    this->emu().delete_hook(entry.mapped());
+                    this->dawn_callback_probe_installed_.store(!hooks->empty(), std::memory_order_relaxed);
+                }
+            });
+        }
 
         // Observe the matching Dawn Steam API initializer and its egress install path
         // without changing guest registers or memory. RVAs and signatures belong to
