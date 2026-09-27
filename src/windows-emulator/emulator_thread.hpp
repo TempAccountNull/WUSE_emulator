@@ -264,7 +264,7 @@ namespace sogen
         }
 
         emulator_thread(memory_manager& memory, const process_context& context, uint64_t start_address, uint64_t argument,
-                        uint64_t stack_size, uint32_t create_flags, uint32_t id, bool initial_thread);
+                        uint64_t stack_size, uint64_t stack_commit_size, uint32_t create_flags, uint32_t id, bool initial_thread);
 
         emulator_thread(const emulator_thread&) = delete;
         emulator_thread& operator=(const emulator_thread&) = delete;
@@ -281,10 +281,29 @@ namespace sogen
 
         memory_manager* memory_ptr{};
 
-        uint64_t stack_base{};                    // Native 64-bit stack base
-        uint64_t stack_size{};                    // Native 64-bit stack size
+        uint64_t stack_base{}; // Native 64-bit stack base
+        uint64_t stack_size{}; // Native 64-bit stack size
+        uint64_t stack_guard_page{};
+        uint64_t stack_guarantee_size{};
         std::optional<uint64_t> wow64_stack_base; // WOW64 32-bit stack base
         std::optional<uint64_t> wow64_stack_size; // WOW64 32-bit stack size
+        enum class stack_guard_result
+        {
+            not_stack,
+            grown,
+            overflow,
+        };
+
+        stack_guard_result handle_stack_guard(uint64_t address);
+        enum class exception_stack_result
+        {
+            writable,
+            overflow,
+            unavailable,
+        };
+
+        exception_stack_result ensure_exception_stack(uint64_t low_address);
+
         uint64_t start_address{};
         uint64_t argument{};
         uint64_t executed_instructions{0};
@@ -426,6 +445,8 @@ namespace sogen
 
             buffer.write(this->stack_base);
             buffer.write(this->stack_size);
+            buffer.write(this->stack_guard_page);
+            buffer.write(this->stack_guarantee_size);
             buffer.write(this->start_address);
             buffer.write(this->argument);
             buffer.write(this->executed_instructions);
@@ -495,6 +516,8 @@ namespace sogen
 
             buffer.read(this->stack_base);
             buffer.read(this->stack_size);
+            buffer.read(this->stack_guard_page);
+            buffer.read(this->stack_guarantee_size);
             buffer.read(this->start_address);
             buffer.read(this->argument);
             buffer.read(this->executed_instructions);

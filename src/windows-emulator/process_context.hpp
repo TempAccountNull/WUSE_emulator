@@ -428,7 +428,7 @@ namespace sogen
         static void sync_user_class(memory_manager& memory, const class_entry& entry);
 
         handle create_thread(memory_manager& memory, uint64_t start_address, uint64_t argument, uint64_t stack_size, uint32_t create_flags,
-                             bool initial_thread = false);
+                             bool initial_thread = false, uint64_t stack_commit_size = 0);
         void terminate_thread(emulator_thread& thread, NTSTATUS thread_exit_status);
 
         std::optional<uint16_t> find_atom(std::u16string_view name);

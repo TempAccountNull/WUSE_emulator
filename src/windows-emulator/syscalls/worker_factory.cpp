@@ -143,8 +143,8 @@ namespace sogen
                     const auto stack_size =
                         factory.stack_reserve != 0 ? factory.stack_reserve : c.win_emu.mod_manager.executable->size_of_stack_reserve;
                     const auto create_flags = (factory.flags & WORKER_FACTORY_FLAG_LOADER_POOL) ? THREAD_CREATE_FLAGS_LOADER_WORKER : 0;
-                    const auto thread_handle =
-                        c.proc.create_thread(c.win_emu.memory, factory.start_routine, factory.start_parameter, stack_size, create_flags);
+                    const auto thread_handle = c.proc.create_thread(c.win_emu.memory, factory.start_routine, factory.start_parameter,
+                                                                    stack_size, create_flags, false, factory.stack_commit);
                     factory.worker_threads.push_back(thread_handle);
                 }
             }

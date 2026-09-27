@@ -4,6 +4,7 @@
 #include "host_wait_idle_policy.hpp"
 #include "scheduler_vm_gate.hpp"
 #include "telemetry_shared_memory.hpp"
+#include "exception_shared_memory.hpp"
 
 #include <atomic>
 #include <cctype>
@@ -1114,7 +1115,8 @@ namespace sogen
         this->dispatcher.setup(ntdll->exports, ntdll_data, win32u->exports, win32u_data);
 
         const auto main_thread_id = context.create_thread(this->memory, this->mod_manager.executable->entry_point, 0,
-                                                          this->mod_manager.executable->size_of_stack_reserve, 0, true);
+                                                          this->mod_manager.executable->size_of_stack_reserve, 0, true,
+                                                          this->mod_manager.executable->size_of_stack_commit);
 
         switch_to_thread(*this, this->vcpu(0), main_thread_id);
     }
@@ -2519,6 +2521,19 @@ namespace sogen
                     }
                     else
                     {
+                        // Unicorn reports RIP after INT 2D to its interrupt hook. The shared
+                        // exception builder expects the instruction start and then advances it.
+                        if (!this->uses_instruction_precision() && this->emu().get_name() == "Unicorn Engine")
+                        {
+                            const auto post_ip = acting.read_instruction_pointer();
+                            std::array<uint8_t, 2> opcode{};
+                            if (post_ip >= opcode.size() &&
+                                this->memory.try_read_memory(post_ip - opcode.size(), opcode.data(), opcode.size()) &&
+                                opcode[0] == 0xCD && opcode[1] == 0x2D)
+                            {
+                                acting.reg(x86_register::rip, post_ip - opcode.size());
+                            }
+                        }
                         dispatch_breakpoint(*this, vcpu);
                     }
                 }
@@ -2625,8 +2640,18 @@ namespace sogen
             this->callbacks.on_memory_violate(address, size, operation, type);
             if (region.permissions.is_guarded())
             {
-                // Unset the GUARD_PAGE flag and dispatch a STATUS_GUARD_PAGE_VIOLATION
-                this->memory.protect_memory(region.allocation_base, region.length, region.permissions & ~memory_permission_ext::guard);
+                const auto stack_result = vcpu.thread().handle_stack_guard(address);
+                if (stack_result == emulator_thread::stack_guard_result::grown)
+                {
+                    return memory_violation_continuation::restart;
+                }
+                if (stack_result == emulator_thread::stack_guard_result::overflow)
+                {
+                    dispatch_exception(*this, vcpu, STATUS_STACK_OVERFLOW, {});
+                    return memory_violation_continuation::resume;
+                }
+                this->memory.protect_memory(page_align_down(address), 0x1000,
+                                            region.permissions & ~memory_permission_ext::guard);
                 dispatch_guard_page_violation(*this, vcpu, address, operation);
             }
             else
@@ -3167,6 +3192,34 @@ namespace sogen
 
     void windows_emulator::record_exception_trace(exception_trace_entry entry, x86_64_cpu& cpu)
     {
+        // The process-wide publisher serializes writes from emulator instances.
+        // Telemetry failure must never change guest exception handling.
+        static const bool shared_memory_enabled = [] {
+            const auto* value = std::getenv("SOGEN_TELEMETRY_SHM");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        const auto publish_shared = [&](const detail::exception_shared_packet* packet) {
+            if (!shared_memory_enabled)
+            {
+                return;
+            }
+            try
+            {
+                static detail::exception_shared_memory mapping;
+                if (packet)
+                {
+                    (void)mapping.publish(*packet);
+                }
+                else
+                {
+                    (void)mapping.observe_skipped();
+                }
+            }
+            catch (...)
+            {
+            }
+        };
+
         entry.ordinal = ++this->all_exception_trace_index_;
         const bool debug_exception = entry.status == STATUS_BREAKPOINT || entry.status == STATUS_SINGLE_STEP;
         if (debug_exception)
@@ -3174,6 +3227,7 @@ namespace sogen
             const auto index = this->debug_exception_trace_index_++;
             if (index >= this->first_debug_exception_trace_.size() && (index % 1024) != 0)
             {
+                publish_shared(nullptr);
                 return;
             }
             entry.debug_sample = true;
@@ -3224,6 +3278,27 @@ namespace sogen
                 break;
             }
             ++entry.readable_stack_words;
+        }
+
+        if (shared_memory_enabled)
+        {
+            detail::exception_shared_packet packet{};
+            packet.status = entry.status;
+            packet.tid = entry.tid;
+            packet.vcpu = entry.vcpu;
+            packet.flags = entry.debug_sample ? 1u : 0u;
+            packet.rip = entry.rip;
+            packet.info = entry.info;
+            packet.module_base = entry.module_base;
+            packet.module_rva = entry.module_rva;
+            packet.module_name = entry.module_name;
+            packet.code_bytes = entry.code_bytes;
+            packet.readable_code_bytes = entry.readable_code_bytes;
+            packet.readable_stack_words = entry.readable_stack_words;
+            packet.eflags = entry.eflags;
+            packet.gprs = entry.gprs;
+            packet.stack_words = entry.stack_words;
+            publish_shared(&packet);
         }
 
         if (debug_exception)

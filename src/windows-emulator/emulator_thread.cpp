@@ -370,8 +370,8 @@ namespace sogen
     }
 
     emulator_thread::emulator_thread(memory_manager& memory, const process_context& context, const uint64_t start_address,
-                                     const uint64_t argument, const uint64_t stack_size, const uint32_t create_flags, const uint32_t id,
-                                     const bool initial_thread)
+                                     const uint64_t argument, const uint64_t stack_size, const uint64_t stack_commit_size,
+                                     const uint32_t create_flags, const uint32_t id, const bool initial_thread)
         : memory_ptr(&memory),
           // stack_size(page_align_up(std::max(stack_size, static_cast<uint64_t>(STACK_SIZE)))),
           start_address(start_address),
@@ -385,8 +385,29 @@ namespace sogen
         // native 64-bit
         if (!context.is_wow64_process)
         {
-            this->stack_size = page_align_up(std::max(stack_size, static_cast<uint64_t>(STACK_SIZE)));
-            this->stack_base = memory.allocate_memory(static_cast<size_t>(this->stack_size), memory_permission::read_write);
+            constexpr uint64_t page_size = 0x1000;
+            this->stack_guarantee_size = 4 * page_size;
+            const auto requested_commit = page_align_up(std::max(stack_commit_size, page_size));
+            if (requested_commit > std::numeric_limits<uint64_t>::max() - this->stack_guarantee_size - page_size)
+            {
+                throw std::runtime_error("Native thread stack commit exceeds address range");
+            }
+            this->stack_size = align_up(
+                std::max({stack_size, static_cast<uint64_t>(STACK_SIZE), requested_commit + this->stack_guarantee_size + page_size}),
+                ALLOCATION_GRANULARITY);
+            const auto initial_commit = requested_commit;
+            this->stack_base = memory.allocate_memory(static_cast<size_t>(this->stack_size), memory_permission::read_write, true);
+            if (this->stack_base == 0)
+            {
+                throw std::runtime_error("Failed to reserve native thread stack");
+            }
+            this->stack_guard_page = this->stack_base + this->stack_size - initial_commit - page_size;
+            if (!memory.commit_memory(this->stack_guard_page, static_cast<size_t>(initial_commit + page_size),
+                                      memory_permission::read_write) ||
+                !memory.protect_memory(this->stack_guard_page, page_size, {memory_permission::read_write, memory_permission_ext::guard}))
+            {
+                throw std::runtime_error("Failed to commit native thread stack");
+            }
 
             this->gs_segment = emulator_allocator{
                 memory,
@@ -405,17 +426,15 @@ namespace sogen
                 teb_obj.ClientId.UniqueProcess = process_context::process_id;
                 teb_obj.ClientId.UniqueThread = static_cast<uint64_t>(this->id);
                 teb_obj.DeallocationStack = this->stack_base;
-                // TODO: Proper GuaranteedStack implementation.
-                teb_obj.GuaranteedStackBytes = static_cast<ULONG>(this->stack_size);
-                teb_obj.NtTib.StackLimit = this->stack_base;
+                teb_obj.GuaranteedStackBytes = static_cast<ULONG>(this->stack_guarantee_size);
+                teb_obj.NtTib.StackLimit = this->stack_guard_page;
                 teb_obj.NtTib.StackBase = this->stack_base + this->stack_size;
                 teb_obj.NtTib.Self = this->teb64->value();
                 teb_obj.CurrentLocale = 0x409;
                 teb_obj.ProcessEnvironmentBlock = context.peb64.value();
                 if (const char* diag = std::getenv("SOGEN_SMP_TRACE"); diag && *diag == '1')
                 {
-                    std::fprintf(stderr, "[TEBDIAG w] teb=%#llx PEB=%#llx tid=%u\n",
-                                 (unsigned long long)this->teb64->value(),
+                    std::fprintf(stderr, "[TEBDIAG w] teb=%#llx PEB=%#llx tid=%u\n", (unsigned long long)this->teb64->value(),
                                  (unsigned long long)teb_obj.ProcessEnvironmentBlock, this->id);
                 }
                 teb_obj.SameTebFlags.InitialThread = initial_thread;
@@ -500,8 +519,7 @@ namespace sogen
             teb_obj.ProcessEnvironmentBlock = context.peb64.value();
             if (const char* diag = std::getenv("SOGEN_SMP_TRACE"); diag && *diag == '1')
             {
-                std::fprintf(stderr, "[TEBDIAG w2] teb=%#llx PEB=%#llx tid=%u\n",
-                             (unsigned long long)this->teb64->value(),
+                std::fprintf(stderr, "[TEBDIAG w2] teb=%#llx PEB=%#llx tid=%u\n", (unsigned long long)this->teb64->value(),
                              (unsigned long long)teb_obj.ProcessEnvironmentBlock, this->id);
             }
             teb_obj.SameTebFlags.InitialThread = initial_thread;
@@ -669,6 +687,63 @@ namespace sogen
             static_assert(sizeof(xmm_state) <= sizeof(ctx.Context.ExtendedRegisters));
             memcpy(ctx.Context.ExtendedRegisters, &xmm_state, sizeof(xmm_state));
         });
+    }
+
+    emulator_thread::stack_guard_result emulator_thread::handle_stack_guard(const uint64_t address)
+    {
+        constexpr uint64_t page_size = 0x1000;
+        if (this->stack_guard_page == 0 || page_align_down(address) != this->stack_guard_page)
+        {
+            return stack_guard_result::not_stack;
+        }
+
+        const auto requested_guarantee = page_align_up(static_cast<uint64_t>(this->teb64->read().GuaranteedStackBytes));
+        this->stack_guarantee_size = std::max(this->stack_guarantee_size, std::min(requested_guarantee, this->stack_size - page_size));
+
+        const auto current_guard = this->stack_guard_page;
+        if (!this->memory_ptr->protect_memory(current_guard, page_size, memory_permission::read_write))
+        {
+            throw std::runtime_error("Failed to clear native stack guard");
+        }
+
+        const auto next_guard = current_guard - page_size;
+        if (next_guard >= this->stack_base + this->stack_guarantee_size &&
+            this->memory_ptr->commit_memory(next_guard, page_size, memory_permission::read_write) &&
+            this->memory_ptr->protect_memory(next_guard, page_size, {memory_permission::read_write, memory_permission_ext::guard}))
+        {
+            this->stack_guard_page = next_guard;
+            this->teb64->access([&](TEB64& teb) { teb.NtTib.StackLimit = next_guard; });
+            return stack_guard_result::grown;
+        }
+
+        this->stack_guard_page = 0;
+        const auto remaining = current_guard - this->stack_base;
+        if (remaining != 0 &&
+            !this->memory_ptr->commit_memory(this->stack_base, static_cast<size_t>(remaining), memory_permission::read_write))
+        {
+            throw std::runtime_error("Failed to commit native stack overflow guarantee");
+        }
+        this->teb64->access([&](TEB64& teb) { teb.NtTib.StackLimit = this->stack_base; });
+        return stack_guard_result::overflow;
+    }
+
+    emulator_thread::exception_stack_result emulator_thread::ensure_exception_stack(const uint64_t low_address)
+    {
+        if (low_address < this->stack_base || low_address >= this->stack_base + this->stack_size)
+        {
+            return exception_stack_result::unavailable;
+        }
+        bool exhausted = false;
+        while (this->stack_guard_page != 0 && low_address <= this->stack_guard_page)
+        {
+            exhausted |= this->handle_stack_guard(this->stack_guard_page) == stack_guard_result::overflow;
+        }
+        const auto region = this->memory_ptr->get_region_info(low_address);
+        if (!region.is_committed || region.permissions.is_guarded())
+        {
+            return exception_stack_result::unavailable;
+        }
+        return exhausted ? exception_stack_result::overflow : exception_stack_result::writable;
     }
 
     void emulator_thread::mark_as_ready(const NTSTATUS status)

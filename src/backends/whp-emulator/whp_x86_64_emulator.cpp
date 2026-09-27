@@ -3602,20 +3602,23 @@ namespace sogen::whp
 
                 if (fault_address != 0)
                 {
+                    const auto operation = !opcode_read && fault_address == rip ? memory_operation::exec
+                                                                                    : memory_operation::read;
                     // Guest page faults escalate here (the guest IDT cannot dispatch them). Under
                     // multiple vCPUs the faulting page may in fact be backed with permissions that
                     // allow the access - a peer mapped/committed/reprotected it after this vCPU cached
                     // a stale translation. Repair and retry rather than delivering a spurious access
-                    // violation. The exit carries no access type, so assume a read; a genuine
-                    // write-to-read-only self-corrects via the per-vCPU retry guard.
-                    if (this->try_repair_spurious_fault(vcpu, fault_address, memory_operation::read, false))
+                    // violation. The exit carries no access type; a fault at unreadable RIP is
+                    // an instruction fetch, otherwise assume a read. A genuine write-to-read-only
+                    // self-corrects via the per-vCPU retry guard.
+                    if (this->try_repair_spurious_fault(vcpu, fault_address, operation, false))
                     {
                         return true;
                     }
 
                     for (const auto& hook : this->copy_memory_violation_hooks())
                     {
-                        const auto result = hook(vcpu, fault_address, 1, memory_operation::read, memory_violation_type::unmapped);
+                        const auto result = hook(vcpu, fault_address, 1, operation, memory_violation_type::unmapped);
                         if (result == memory_violation_continuation::resume || result == memory_violation_continuation::restart)
                         {
                             return true;
@@ -3864,8 +3867,10 @@ namespace sogen::whp
 
                     const auto fault_address = exception.ExceptionParameter;
                     const bool is_write = (exception.ErrorCode & 0x2u) != 0;
+                    const bool is_execute = (exception.ErrorCode & 0x10u) != 0 || (!opcode_read && fault_address == rip);
                     const bool is_present = (exception.ErrorCode & 0x1u) != 0;
-                    const auto operation = is_write ? memory_operation::write : memory_operation::read;
+                    const auto operation = is_execute ? memory_operation::exec
+                                                      : is_write ? memory_operation::write : memory_operation::read;
                     const auto type = is_present ? memory_violation_type::protection : memory_violation_type::unmapped;
 
                     // Under multiple vCPUs a peer may have mapped/committed/reprotected this page

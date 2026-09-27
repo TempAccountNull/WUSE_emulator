@@ -1,4 +1,12 @@
 #include "emulation_test_utils.hpp"
+#include "../windows-emulator/syscall_utils.hpp"
+#include "../windows-emulator/cpu_context.hpp"
+
+namespace sogen::syscalls
+{
+    NTSTATUS handle_NtContinueEx(const syscall_context& c, emulator_object<CONTEXT64> thread_context, uint64_t continue_argument);
+    NTSTATUS handle_NtContinue(const syscall_context& c, emulator_object<CONTEXT64> thread_context, BOOLEAN raise_alert);
+}
 
 namespace sogen::test
 {
@@ -33,7 +41,14 @@ namespace sogen::test
                 dispatched = true;
                 cpu.stop();
             });
-            win_emu.emu().start(16);
+            for (unsigned attempt = 0; attempt < 4 && !dispatched; ++attempt)
+            {
+                win_emu.emu().start(win_emu.emu().get_name() == "icicle-emu" ? 16 : 0);
+                if (!win_emu.emu().has_violation())
+                {
+                    break;
+                }
+            }
             ASSERT_TRUE(dispatched);
             const auto frame = win_emu.emu().reg<uint64_t>(x86_register::rsp);
             context = win_emu.emu().read_memory<CONTEXT64>(frame);
@@ -152,6 +167,99 @@ namespace sogen::test
         EXPECT_EQ(record.ExceptionAddress, 0x777700000000U);
         EXPECT_EQ(context.Rip, 0x777700000000U);
         EXPECT_EQ(context.Rsp, stack + 8);
+    }
+
+    TEST_P(MemoryFaultContext, Int2dUnknownServiceBuildsBreakpointContextAtNextByte)
+    {
+        const std::array<uint8_t, 4> bytes{0xCD, 0x2D, 0x90, 0x90};
+        win_emu.emu().write_memory(code, bytes.data(), bytes.size());
+        win_emu.emu().reg(x86_register::rax, 0x1234ULL);
+        win_emu.emu().reg(x86_register::rcx, 0x5678ULL);
+        win_emu.emu().reg(x86_register::rdx, 0x9ABCULL);
+
+        bool dispatched = false;
+        win_emu.emu().hook_memory_execution(win_emu.process.ki_user_exception_dispatcher, [&](cpu_interface& cpu, uint64_t) {
+            dispatched = true;
+            cpu.stop();
+        });
+        win_emu.emu().start(win_emu.emu().get_name() == "icicle-emu" ? 16 : 0);
+        ASSERT_TRUE(dispatched);
+
+        const auto frame = win_emu.emu().reg<uint64_t>(x86_register::rsp);
+        const auto saved_context = win_emu.emu().read_memory<CONTEXT64>(frame);
+        const auto saved_record = win_emu.emu().read_memory<EMU_EXCEPTION_RECORD<EmulatorTraits<Emu64>>>(frame + 0x4F0);
+        EXPECT_EQ(saved_record.ExceptionCode, static_cast<DWORD>(STATUS_BREAKPOINT));
+        EXPECT_EQ(saved_record.ExceptionAddress, code + 2);
+        EXPECT_EQ(saved_context.Rip, code + 2);
+        EXPECT_EQ(saved_record.NumberParameters, 3U);
+        EXPECT_EQ(saved_record.ExceptionInformation[0], 0x1234U);
+        EXPECT_EQ(saved_record.ExceptionInformation[1], 0x5678U);
+        EXPECT_EQ(saved_record.ExceptionInformation[2], 0x9ABCU);
+        const auto traces = win_emu.exception_trace_snapshot();
+        ASSERT_EQ(traces.size(), 1U);
+        EXPECT_EQ(traces[0].rip, code + 2);
+    }
+
+    TEST_P(MemoryFaultContext, Ud2BuildsIllegalInstructionContextAndCanContinue)
+    {
+        const std::array<uint8_t, 4> bytes{0x0F, 0x0B, 0x90, 0x90};
+        win_emu.emu().write_memory(code, bytes.data(), bytes.size());
+
+        bool dispatched = false;
+        win_emu.emu().hook_memory_execution(win_emu.process.ki_user_exception_dispatcher, [&](cpu_interface& cpu, uint64_t) {
+            dispatched = true;
+            cpu.stop();
+        });
+        win_emu.emu().start(win_emu.emu().get_name() == "icicle-emu" ? 16 : 0);
+        ASSERT_TRUE(dispatched);
+
+        const auto frame = win_emu.emu().reg<uint64_t>(x86_register::rsp);
+        auto saved_context = win_emu.emu().read_memory<CONTEXT64>(frame);
+        const auto saved_record = win_emu.emu().read_memory<EMU_EXCEPTION_RECORD<EmulatorTraits<Emu64>>>(frame + 0x4F0);
+        EXPECT_EQ(saved_record.ExceptionCode, static_cast<DWORD>(STATUS_ILLEGAL_INSTRUCTION));
+        EXPECT_EQ(saved_record.ExceptionAddress, code);
+        EXPECT_EQ(saved_context.Rip, code);
+        EXPECT_EQ(saved_record.NumberParameters, 0U);
+        const auto traces = win_emu.exception_trace_snapshot();
+        ASSERT_EQ(traces.size(), 1U);
+        EXPECT_EQ(traces[0].rip, code);
+
+        // Model a guest VEH/SEH handler that skips the two-byte UD2 and resumes.
+        saved_context.Rip = code + 2;
+        saved_context.Rsp = stack;
+        saved_context.Rax = 0x1122334455667788ULL;
+        win_emu.emu().write_memory(frame, saved_context);
+        const syscall_context c{win_emu, win_emu.emu(), win_emu.vcpu(0), win_emu.process};
+        // A real argument block with flags=0 avoids the unrelated test-alert path.
+        ASSERT_EQ(syscalls::handle_NtContinueEx(c, emulator_object<CONTEXT64>{win_emu.emu(), frame}, target), STATUS_SUCCESS);
+        EXPECT_FALSE(c.write_status);
+        EXPECT_EQ(win_emu.emu().reg<uint64_t>(x86_register::rip), code + 2);
+        EXPECT_EQ(win_emu.emu().reg<uint64_t>(x86_register::rsp), stack);
+        EXPECT_EQ(win_emu.emu().reg<uint64_t>(x86_register::rax), 0x1122334455667788ULL);
+        EXPECT_EQ(win_emu.emu().reg<uint64_t>(x86_register::rflags), saved_context.EFlags);
+    }
+
+    TEST_P(MemoryFaultContext, NtContinueFalseRestoresContextWithoutAlertableYield)
+    {
+        CONTEXT64 saved_context{};
+        saved_context.ContextFlags = CONTEXT64_ALL;
+        cpu_context::save(win_emu.emu(), saved_context);
+        saved_context.Rip = code + 2;
+        saved_context.Rsp = stack;
+        win_emu.emu().write_memory(target, saved_context);
+
+        auto& vcpu = win_emu.vcpu(0);
+        vcpu.switch_thread.store(false);
+        ASSERT_NE(vcpu.active_thread, nullptr);
+        vcpu.active_thread->apc_alertable = false;
+        const syscall_context c{win_emu, win_emu.emu(), vcpu, win_emu.process};
+        ASSERT_EQ(syscalls::handle_NtContinue(c, emulator_object<CONTEXT64>{win_emu.emu(), target}, FALSE), STATUS_SUCCESS);
+
+        EXPECT_FALSE(c.write_status);
+        EXPECT_EQ(win_emu.emu().reg<uint64_t>(x86_register::rip), code + 2);
+        EXPECT_EQ(win_emu.emu().reg<uint64_t>(x86_register::rsp), stack);
+        EXPECT_FALSE(vcpu.switch_thread.load());
+        EXPECT_FALSE(vcpu.active_thread->apc_alertable);
     }
 
     INSTANTIATE_TEST_SUITE_P(InstructionPrecision, MemoryFaultContext, testing::Bool());

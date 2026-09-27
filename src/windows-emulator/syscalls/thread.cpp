@@ -4,6 +4,8 @@
 #include "../syscall_utils.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <utils/finally.hpp>
 
 namespace sogen
@@ -872,7 +874,7 @@ namespace sogen
             KCONTINUE_ARGUMENT argument{};
             if (continue_argument <= 0xFF)
             {
-                argument.ContinueFlags = KCONTINUE_FLAG_TEST_ALERT;
+                argument.ContinueFlags = continue_argument != 0 ? KCONTINUE_FLAG_TEST_ALERT : 0;
             }
             else
             {
@@ -880,6 +882,40 @@ namespace sogen
             }
 
             const auto context = thread_context.read();
+            // Opt-in, bounded continuation evidence for first-chance guest exceptions.
+            // Reading the current CPU here must precede restore; this is the syscall-side RIP.
+            static const bool trace_continue = [] {
+                const char* value = std::getenv("SOGEN_TRACE_NTCONTINUE");
+                return value != nullptr && *value == '1';
+            }();
+            if (trace_continue)
+            {
+                static std::atomic<uint32_t> traced_calls{0};
+                const auto ordinal = traced_calls.fetch_add(1, std::memory_order_relaxed);
+                if (ordinal < 128)
+                {
+                    const auto previous_rip = c.emu.reg<uint64_t>(x86_register::rip);
+                    const auto previous_rsp = c.emu.reg<uint64_t>(x86_register::rsp);
+                    const auto* previous_module = c.win_emu.mod_manager.find_by_address(previous_rip);
+                    const auto* target_module = c.win_emu.mod_manager.find_by_address(context.Rip);
+                    c.win_emu.log.info(
+                        "[NTCONTDIAG] ordinal=%u tid=%u vcpu=%zu old_rip=0x%llX old_rsp=0x%llX "
+                        "old_module=%s old_rva=0x%llX target_rip=0x%llX target_rsp=0x%llX eflags=0x%08X "
+                        "target_module=%s target_rva=0x%llX flags=0x%08X\n",
+                        ordinal + 1, c.vcpu.active_thread ? c.vcpu.active_thread->id : 0, c.emu.index(),
+                        static_cast<unsigned long long>(previous_rip), static_cast<unsigned long long>(previous_rsp),
+                        previous_module ? previous_module->name.c_str() : "<unmapped>",
+                        static_cast<unsigned long long>(previous_module ? previous_rip - previous_module->image_base : 0),
+                        static_cast<unsigned long long>(context.Rip), static_cast<unsigned long long>(context.Rsp),
+                        context.EFlags, target_module ? target_module->name.c_str() : "<unmapped>",
+                        static_cast<unsigned long long>(target_module ? context.Rip - target_module->image_base : 0),
+                        argument.ContinueFlags);
+                }
+                else if (ordinal == 128)
+                {
+                    c.win_emu.log.info("[NTCONTDIAG] suppressed further NtContinue/NtContinueEx traces after 128 calls\n");
+                }
+            }
             cpu_context::restore(c.emu, context);
 
             if (argument.ContinueFlags & KCONTINUE_FLAG_TEST_ALERT)
@@ -1058,7 +1094,9 @@ namespace sogen
             actual_stack_size = std::max(stack_size, actual_stack_size);
             actual_stack_size = align_up(actual_stack_size, ALLOCATION_GRANULARITY);
 
-            const auto h = c.proc.create_thread(c.win_emu.memory, start_routine, argument, actual_stack_size, create_flags);
+            const auto initial_commit = stack_size != 0 ? stack_size : c.win_emu.mod_manager.executable->size_of_stack_commit;
+            const auto h = c.proc.create_thread(c.win_emu.memory, start_routine, argument, actual_stack_size, create_flags,
+                                                false, initial_commit);
 
             // FULLTRACE: thread births are the other half of the story - young-thread block
             // logging starts from the first scheduled block, this records the creation itself.

@@ -198,6 +198,28 @@ namespace sogen::test
         }
     };
 
+    TEST_F(SnapshotFile, RejectsVersionOneBeforeReadingChangedThreadLayout)
+    {
+        auto emu = sample();
+        emu.setup_process_if_necessary();
+        auto old_format = snapshot::create_emulator_snapshot(emu);
+        ASSERT_GE(old_format.size(), 8U);
+        old_format[4] = std::byte{1};
+        old_format[5] = std::byte{0};
+        old_format[6] = std::byte{0};
+        old_format[7] = std::byte{0};
+
+        try
+        {
+            snapshot::load_emulator_snapshot(emu, old_format);
+            FAIL() << "Version-one snapshot was accepted";
+        }
+        catch (const std::runtime_error& e)
+        {
+            EXPECT_NE(std::string_view(e.what()).find("Unsupported snapshot version: 1"), std::string_view::npos);
+        }
+    }
+
     TEST_F(SnapshotFile, StreamingSnapshotMatchesLegacyPayloadAndRestores)
     {
         auto emu = sample();
@@ -239,9 +261,8 @@ namespace sogen::test
         thread->await_io_completion->timeout = steady_clock::time_point::min();
         const user_timer_key key{.hwnd = 0x100, .timer_id = 7};
         thread->user_timers[key].due_time = saved_now + std::chrono::milliseconds{250};
-        const auto saved_ticks = std::chrono::duration_cast<std::chrono::duration<uint64_t, std::ratio<1, 10'000'000>>>(
-                                     saved_now.time_since_epoch())
-                                     .count();
+        const auto saved_ticks =
+            std::chrono::duration_cast<std::chrono::duration<uint64_t, std::ratio<1, 10'000'000>>>(saved_now.time_since_epoch()).count();
         source.process.kusd.access([&](KUSER_SHARED_DATA64& kusd) {
             kusd.InterruptTime.High1Time = static_cast<int32_t>(saved_ticks >> 32);
             kusd.InterruptTime.High2Time = kusd.InterruptTime.High1Time;

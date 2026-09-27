@@ -97,10 +97,29 @@ namespace sogen
             uint64_t ss;
         };
 
-        void dispatch_exception_pointers(x86_64_cpu& emu, const uint64_t dispatcher,
-                                         const EMU_EXCEPTION_POINTERS<EmulatorTraits<Emu64>> pointers)
+        bool exception_frame_writable(memory_manager& memory, uint64_t address, const uint64_t end)
         {
-            constexpr auto mach_frame_size = 0x40;
+            while (address < end)
+            {
+                const auto region = memory.get_region_info(address);
+                if (!region.is_committed || (region.permissions.common & memory_permission::write) == memory_permission::none ||
+                    region.permissions.is_guarded())
+                {
+                    return false;
+                }
+                const auto next = region.start + region.length;
+                if (next <= address)
+                {
+                    return false;
+                }
+                address = std::min(next, end);
+            }
+            return true;
+        }
+
+        void dispatch_exception_pointers(x86_64_cpu& emu, const uint64_t dispatcher,
+                                         const EMU_EXCEPTION_POINTERS<EmulatorTraits<Emu64>> pointers, const uint64_t new_sp)
+        {
             constexpr auto context_record_size = 0x4F0;
             const auto exception_record_size =
                 calculate_exception_record_size(*reinterpret_cast<exception_record*>(pointers.ExceptionRecord));
@@ -108,13 +127,8 @@ namespace sogen
 
             assert(combined_size == 0x590);
 
-            const auto allocation_size = combined_size + mach_frame_size;
-
             const auto initial_sp = emu.reg(x86_register::rsp);
-            const auto new_sp = align_down(initial_sp - allocation_size, 0x100);
-
             const auto total_size = initial_sp - new_sp;
-            assert(total_size >= allocation_size);
 
             std::vector<uint8_t> zero_memory{};
             zero_memory.resize(static_cast<size_t>(total_size), 0);
@@ -139,7 +153,6 @@ namespace sogen
                              (unsigned long long)exception_record_obj.value(), (unsigned)wr.ExceptionCode,
                              (unsigned long long)wr.ExceptionAddress, (unsigned long long)new_sp);
             }
-
 
             const emulator_object<machine_frame> machine_frame_obj{emu, new_sp + combined_size};
             machine_frame_obj.access([&](machine_frame& frame) {
@@ -297,23 +310,61 @@ namespace sogen
 
         record.ExceptionAddress = ctx.Rip;
 
+        constexpr uint64_t machine_frame_size = 0x40;
+        constexpr uint64_t context_record_size = 0x4F0;
+        const auto exception_record_size = calculate_exception_record_size(record);
+        const auto allocation_size = align_up(exception_record_size + context_record_size, 0x10) + machine_frame_size;
+        const auto initial_sp = vcpu.cpu.reg(x86_register::rsp);
+        if (initial_sp < allocation_size)
+        {
+            win_emu.process.exit_status = STATUS_STACK_OVERFLOW;
+            win_emu.stop();
+            return;
+        }
+        const auto new_sp = align_down(initial_sp - allocation_size, 0x100);
+        const auto stack_top = thread.stack_base + thread.stack_size;
+        if (initial_sp >= thread.stack_base && initial_sp <= stack_top)
+        {
+            const auto stack_result = thread.ensure_exception_stack(new_sp);
+            if (stack_result == emulator_thread::exception_stack_result::unavailable)
+            {
+                win_emu.process.exit_status = STATUS_STACK_OVERFLOW;
+                win_emu.stop();
+                return;
+            }
+            if (stack_result == emulator_thread::exception_stack_result::overflow)
+            {
+                record.ExceptionCode = STATUS_STACK_OVERFLOW;
+                record.NumberParameters = 0;
+                std::fill(std::begin(record.ExceptionInformation), std::end(record.ExceptionInformation), 0);
+            }
+        }
+        else if (!exception_frame_writable(win_emu.memory, new_sp, initial_sp))
+        {
+            win_emu.process.exit_status = STATUS_STACK_OVERFLOW;
+            win_emu.stop();
+            return;
+        }
+
         // Capture the final fault RIP before the dispatcher replaces the guest context.
         // The backend's current RIP may be one instruction beyond the fault when
         // instruction precision is enabled.
-        win_emu.record_exception_trace({
-            .status = static_cast<uint32_t>(status),
-            .tid = thread.id,
-            .vcpu = static_cast<uint32_t>(vcpu.cpu.index()),
-            .rip = ctx.Rip,
-            .info = parameters.size() > 1 ? static_cast<uint64_t>(parameters[1]) : 0,
-        }, vcpu.cpu);
+        win_emu.record_exception_trace(
+            {
+                .status = static_cast<uint32_t>(record.ExceptionCode),
+                .tid = thread.id,
+                .vcpu = static_cast<uint32_t>(vcpu.cpu.index()),
+                .rip = ctx.Rip,
+                .info = record.NumberParameters > 1 ? static_cast<uint64_t>(record.ExceptionInformation[1]) : 0,
+            },
+            vcpu.cpu);
 
         sync_wow64_cpu_reserved_context(win_emu, vcpu.cpu, thread, ctx);
 
         EMU_EXCEPTION_POINTERS<EmulatorTraits<Emu64>> pointers{};
         pointers.ContextRecord = reinterpret_cast<EmulatorTraits<Emu64>::PVOID>(&ctx);
         pointers.ExceptionRecord = reinterpret_cast<EmulatorTraits<Emu64>::PVOID>(&record);
-        dispatch_exception_pointers(vcpu.cpu, win_emu.process.ki_user_exception_dispatcher, pointers);
+        dispatch_exception_pointers(vcpu.cpu, win_emu.process.ki_user_exception_dispatcher, pointers, new_sp);
     }
 
     void dispatch_access_violation(windows_emulator& win_emu, vcpu_context& vcpu, const uint64_t address, const memory_operation operation)
