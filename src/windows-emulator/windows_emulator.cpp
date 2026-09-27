@@ -2303,6 +2303,18 @@ namespace sogen
                                 static_cast<unsigned long long>(caller ? return_address - caller->image_base : 0));
                             if (site >= 22)
                             {
+                                if (site == 22)
+                                {
+                                    const auto gs_base = acting.get_segment_base(x86_register::gs);
+                                    uint32_t last_error = 0;
+                                    const bool last_error_read = gs_base <= UINT64_MAX - 0x68 &&
+                                        acting.try_read_memory(gs_base + 0x68, &last_error, sizeof(last_error));
+                                    this->log.error(
+                                        "[STEAMINITPROBE] snapshot_last_error tid=%u vcpu=%zu "
+                                        "teb=%#llx valid=%u value=%#x\n",
+                                        tid, cpu.index(), static_cast<unsigned long long>(gs_base),
+                                        static_cast<unsigned>(last_error_read), last_error);
+                                }
                                 // ThreadEntry32 fields in the deployed enlist_snapshot stack frame.
                                 uint32_t target_tid = 0;
                                 uint32_t owner_pid = 0;
