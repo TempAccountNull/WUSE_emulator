@@ -307,12 +307,29 @@ namespace sogen::test
         }
     };
 
+    TEST_P(AfdPendingRequestTest, PendingIoStatusBlockRetainsCallerFieldsUntilCompletion)
+    {
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+        emu.memory.write_memory(memory + 0x100, &initial, sizeof(initial));
+
+        ASSERT_EQ(transfer(false), STATUS_PENDING);
+        EXPECT_EQ(status(false).Status, initial.Status);
+        EXPECT_EQ(status(false).Information, initial.Information);
+
+        socket->incoming.push_back(std::byte{'q'});
+        device->work(emu);
+
+        EXPECT_EQ(status(false).Status, STATUS_SUCCESS);
+        EXPECT_EQ(status(false).Information, 1u);
+        EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+    }
+
     TEST_P(AfdPendingRequestTest, ReceiveAndSendCompleteIndependentlyOnSameEndpoint)
     {
         ASSERT_EQ(transfer(false), STATUS_PENDING);
         ASSERT_EQ(transfer(true), STATUS_PENDING);
-        EXPECT_EQ(status(false).Status, STATUS_PENDING);
-        EXPECT_EQ(status(true).Status, STATUS_PENDING);
+        EXPECT_EQ(status(false).Status, STATUS_SUCCESS);
+        EXPECT_EQ(status(true).Status, STATUS_SUCCESS);
         EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
         EXPECT_FALSE(emu.process.events.get(send_event)->signaled);
 
@@ -328,7 +345,7 @@ namespace sogen::test
         EXPECT_FALSE(emu.process.events.get(send_event)->signaled);
         const auto received = emu.memory.read_memory(memory + 0x400, 3);
         EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(received.data()), received.size()), "abc");
-        EXPECT_EQ(status(true).Status, STATUS_PENDING);
+        EXPECT_EQ(status(true).Status, STATUS_SUCCESS);
 
         socket->send_blocked = false;
         device->work(emu);
@@ -343,8 +360,8 @@ namespace sogen::test
     {
         ASSERT_EQ(transfer(true), STATUS_PENDING);
         ASSERT_EQ(GetParam() ? second_send<Emu32>() : second_send<Emu64>(), STATUS_PENDING);
-        EXPECT_EQ(status(true).Status, STATUS_PENDING);
-        EXPECT_EQ(emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(memory + 0x620).Status, STATUS_PENDING);
+        EXPECT_EQ(status(true).Status, STATUS_SUCCESS);
+        EXPECT_EQ(emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(memory + 0x620).Status, STATUS_SUCCESS);
 
         socket->send_blocked = false;
         device->work(emu);
@@ -372,7 +389,7 @@ namespace sogen::test
                                               : offsetof(AFD_POLL_INFO<EmulatorTraits<Emu64>>, NumberOfHandles);
         EXPECT_EQ(emu.memory.read_memory<ULONG>(memory + 0x800 + number_offset), 0u);
         EXPECT_TRUE(emu.process.events.get(poll_event)->signaled);
-        EXPECT_EQ(status(false).Status, STATUS_PENDING);
+        EXPECT_EQ(status(false).Status, STATUS_SUCCESS);
         EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
     }
 
@@ -488,7 +505,7 @@ namespace sogen::test
         EXPECT_EQ(status(false).Status, STATUS_CANCELLED);
         EXPECT_EQ(status(false).Information, 0u);
         EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
-        EXPECT_EQ(status(true).Status, STATUS_PENDING);
+        EXPECT_EQ(status(true).Status, STATUS_SUCCESS);
         EXPECT_FALSE(emu.process.events.get(send_event)->signaled);
 
         const auto* target = emu.process.threads.get(thread_handle);
@@ -513,7 +530,7 @@ namespace sogen::test
         ASSERT_EQ(transfer(true, 0, nullptr, {}, 0x5678), STATUS_PENDING);
         EXPECT_EQ(device->cancel_pending_io(emu, 0, 0x1234), 1u);
         EXPECT_EQ(status(false).Status, STATUS_CANCELLED);
-        EXPECT_EQ(status(true).Status, STATUS_PENDING);
+        EXPECT_EQ(status(true).Status, STATUS_SUCCESS);
         EXPECT_EQ(device->cancel_pending_io(emu, 0, 0x5678), 1u);
         EXPECT_EQ(status(true).Status, STATUS_CANCELLED);
         EXPECT_EQ(status(true).Information, 0u);

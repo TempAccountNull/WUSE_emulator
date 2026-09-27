@@ -130,6 +130,11 @@ namespace sogen
             (void)win_emu;
         }
 
+        virtual bool may_return_pending() const
+        {
+            return false;
+        }
+
         // A zero filter matches every pending request on this open device object.
         virtual uint32_t cancel_pending_io(windows_emulator& win_emu, uint64_t io_status_block, uint32_t issuer_thread_id)
         {

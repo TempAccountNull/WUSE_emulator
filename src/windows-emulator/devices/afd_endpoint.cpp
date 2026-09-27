@@ -462,6 +462,11 @@ namespace sogen
         {
             using status_block = IO_STATUS_BLOCK<EmulatorTraits<Emu64>>;
 
+            bool may_return_pending() const override
+            {
+                return true;
+            }
+
             struct pending_connection
             {
                 network::address remote_address;

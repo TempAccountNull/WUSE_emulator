@@ -203,19 +203,27 @@ namespace sogen
 
     NTSTATUS io_device::execute_ioctl(windows_emulator& win_emu, const io_device_context& c)
     {
+        const auto original_io_status = this->may_return_pending() && c.io_status_block
+                                            ? std::optional{c.io_status_block.read()}
+                                            : std::optional<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>{};
         if (c.io_status_block)
         {
             c.io_status_block.write({});
         }
 
         const auto result = this->io_control(win_emu, c);
-        write_io_status(c.io_status_block, result);
-
-        if (result != STATUS_PENDING)
+        if (result == STATUS_PENDING)
         {
-            complete_device_ioctl(win_emu, c, result, !c.completing_pending);
+            // Native AFD leaves the caller's status block untouched until completion.
+            if (original_io_status)
+            {
+                c.io_status_block.write(*original_io_status);
+            }
+            return result;
         }
 
+        write_io_status(c.io_status_block, result);
+        complete_device_ioctl(win_emu, c, result, !c.completing_pending);
         return result;
     }
 
