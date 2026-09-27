@@ -25,6 +25,13 @@ namespace sogen
         win_sockaddr RemoteAddress;
     };
 
+    struct AFD_PARTIAL_DISCONNECT_INFO
+    {
+        ULONG DisconnectMode;
+        LARGE_INTEGER Timeout;
+    };
+    static_assert(sizeof(AFD_PARTIAL_DISCONNECT_INFO) == 16);
+
     struct AFD_INFO
     {
         ULONG InformationClass;

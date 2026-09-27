@@ -31,6 +31,10 @@ namespace sogen
                 return 0xc00000bb;
             }
 
+            // Windows backends forward this AFD request to the host socket; offline
+            // sockets apply equivalent send/receive state transitions.
+            virtual uint32_t partial_disconnect(uint32_t mode, int64_t timeout) = 0;
+
             virtual bool is_ready(bool in_poll) = 0;
             virtual bool is_listening() = 0;
 

@@ -22,6 +22,7 @@ namespace sogen
 
             uint32_t query_address_list(uint16_t family, std::vector<std::byte>& data) override;
 
+            uint32_t partial_disconnect(uint32_t mode, int64_t timeout) override;
             bool is_ready(bool in_poll) override;
             bool is_listening() override;
 
@@ -38,6 +39,11 @@ namespace sogen
             sent_size recv(std::span<std::byte> data) override;
             sent_size recvfrom(address& source, std::span<std::byte> data) override;
 
+            bool is_aborted() const
+            {
+                return this->socket_type_ != SOCK_DGRAM && (this->disconnect_mode_ & 4) != 0;
+            }
+
             const socket& get() const
             {
                 return this->socket_;
@@ -45,6 +51,9 @@ namespace sogen
 
           private:
             socket socket_{};
+            uint32_t disconnect_mode_{};
+            int socket_type_{SOCK_STREAM};
+            int synthetic_error_{};
         };
     }
 

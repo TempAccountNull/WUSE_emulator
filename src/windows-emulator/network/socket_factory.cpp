@@ -56,6 +56,11 @@ namespace sogen
 
                 entry.events = fd.events;
                 entry.revents = fd.revents;
+                const auto* wrapper = static_cast<const socket_wrapper*>(entry.s);
+                if (wrapper->is_aborted())
+                {
+                    entry.revents = static_cast<int16_t>(entry.revents | POLLERR);
+                }
             }
 
             return res;

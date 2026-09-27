@@ -10,10 +10,12 @@ namespace sogen
         socket_wrapper::socket_wrapper(SOCKET s)
             : socket_(s)
         {
+            socklen_t length = sizeof(this->socket_type_);
+            getsockopt(s, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&this->socket_type_), &length);
         }
 
         socket_wrapper::socket_wrapper(const int af, const int type, const int protocol)
-            : socket_(af, type, protocol)
+            : socket_(af, type, protocol), socket_type_(type)
         {
         }
 
@@ -24,6 +26,12 @@ namespace sogen
 
         int socket_wrapper::get_last_error()
         {
+#ifndef _WIN32
+            if (this->synthetic_error_)
+            {
+                return this->synthetic_error_;
+            }
+#endif
             return GET_SOCKET_ERROR();
         }
 
@@ -100,6 +108,50 @@ namespace sogen
             }
         }
 
+        uint32_t socket_wrapper::partial_disconnect(const uint32_t mode, const int64_t timeout)
+        {
+#ifdef _WIN32
+            struct alignas(8) request
+            {
+                uint32_t disconnect_mode;
+                int64_t timeout;
+            };
+            static_assert(sizeof(request) == 16);
+            const request input{mode, timeout};
+            uint64_t information{};
+            return socket_control(this->socket_.get_socket(), 0x1202B, std::as_bytes(std::span(&input, 1)), {}, information);
+#else
+            (void)timeout;
+            const auto native = this->socket_.get_socket();
+            if (mode & 4)
+            {
+                if (this->socket_type_ != SOCK_DGRAM)
+                {
+                    linger abortive{1, 0};
+                    setsockopt(native, SOL_SOCKET, SO_LINGER, &abortive, sizeof(abortive));
+                    this->socket_.close();
+                }
+                this->disconnect_mode_ |= 4;
+                return 0;
+            }
+            if ((mode & 1) && !(this->disconnect_mode_ & 1))
+            {
+                if (this->socket_type_ != SOCK_DGRAM && ::shutdown(native, SHUT_WR) != 0)
+                {
+                    return 0xC0000001;
+                }
+                this->disconnect_mode_ |= 1;
+            }
+            if (this->socket_type_ == SOCK_DGRAM)
+            {
+                this->disconnect_mode_ |= mode & (2 | 8);
+            }
+            // TCP modes 2/8 leave receive state intact; UDP sendto/recvfrom
+            // remain usable after modes 1/4/8 in the native localhost probe.
+            return 0;
+#endif
+        }
+
         uint32_t socket_wrapper::query_information(const uint32_t information_class, uint64_t& value,
                                                    const std::span<const std::byte> parameters)
         {
@@ -143,7 +195,7 @@ namespace sogen
 
         bool socket_wrapper::is_ready(const bool in_poll)
         {
-            return this->socket_.is_ready(in_poll);
+            return this->is_aborted() || this->socket_.is_ready(in_poll);
         }
 
         bool socket_wrapper::is_listening()
@@ -209,22 +261,74 @@ namespace sogen
 
         sent_size socket_wrapper::send(const std::span<const std::byte> data)
         {
+#ifndef _WIN32
+            if (this->disconnect_mode_ & 4)
+            {
+                this->synthetic_error_ = SERR(ECONNABORTED);
+                return -1;
+            }
+            if (this->disconnect_mode_ & 1)
+            {
+                this->synthetic_error_ = SERR(ESHUTDOWN);
+                return -1;
+            }
+            if (this->socket_type_ == SOCK_DGRAM && (this->disconnect_mode_ & 8))
+            {
+                this->synthetic_error_ = SERR(ENOTCONN);
+                return -1;
+            }
+            this->synthetic_error_ = 0;
+#endif
             return ::send(this->socket_.get_socket(), reinterpret_cast<const char*>(data.data()), static_cast<send_size>(data.size()), 0);
         }
 
         sent_size socket_wrapper::sendto(const address& destination, const std::span<const std::byte> data)
         {
+#ifndef _WIN32
+            if (this->socket_type_ != SOCK_DGRAM && (this->disconnect_mode_ & 4))
+            {
+                this->synthetic_error_ = SERR(ECONNABORTED);
+                return -1;
+            }
+            if (this->socket_type_ != SOCK_DGRAM && (this->disconnect_mode_ & 1))
+            {
+                this->synthetic_error_ = SERR(ESHUTDOWN);
+                return -1;
+            }
+            this->synthetic_error_ = 0;
+#endif
             return ::sendto(this->socket_.get_socket(), reinterpret_cast<const char*>(data.data()), static_cast<send_size>(data.size()), 0,
                             &destination.get_addr(), destination.get_size());
         }
 
         sent_size socket_wrapper::recv(std::span<std::byte> data)
         {
+#ifndef _WIN32
+            if (this->disconnect_mode_ & 4)
+            {
+                this->synthetic_error_ = SERR(ECONNABORTED);
+                return -1;
+            }
+            if (this->socket_type_ == SOCK_DGRAM && (this->disconnect_mode_ & 2))
+            {
+                this->synthetic_error_ = SERR(ESHUTDOWN);
+                return -1;
+            }
+            this->synthetic_error_ = 0;
+#endif
             return ::recv(this->socket_.get_socket(), reinterpret_cast<char*>(data.data()), static_cast<send_size>(data.size()), 0);
         }
 
         sent_size socket_wrapper::recvfrom(address& source, std::span<std::byte> data)
         {
+#ifndef _WIN32
+            if (this->socket_type_ != SOCK_DGRAM && (this->disconnect_mode_ & 4))
+            {
+                this->synthetic_error_ = SERR(ECONNABORTED);
+                return -1;
+            }
+            this->synthetic_error_ = 0;
+#endif
             auto source_length = source.get_max_size();
             const auto res = ::recvfrom(this->socket_.get_socket(), reinterpret_cast<char*>(data.data()),
                                         static_cast<send_size>(data.size()), 0, &source.get_addr(), &source_length);

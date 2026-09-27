@@ -35,6 +35,8 @@ namespace sogen
                 std::deque<std::byte> server_to_client;
                 bool client_closed{false};
                 bool server_closed{false};
+                bool client_reset{false};
+                bool server_reset{false};
             };
 
             struct pending_connection
@@ -146,14 +148,16 @@ namespace sogen
                     std::shared_ptr<pipe_state> pipe{};
                     bool listening{false};
                     bool is_server_side{false};
+                    uint32_t disconnect_mode{};
+                    int socket_type{SOCK_STREAM};
 
                     explicit static_socket(static_socket_factory_impl& f)
                         : factory(&f)
                     {
                     }
 
-                    static_socket(static_socket_factory_impl& f, const int af)
-                        : factory(&f)
+                    static_socket(static_socket_factory_impl& f, const int af, const int type)
+                        : factory(&f), socket_type(type)
                     {
                         if (af == AF_INET)
                         {
@@ -233,6 +237,31 @@ namespace sogen
                         return this->error;
                     }
 
+                    uint32_t partial_disconnect(const uint32_t mode, int64_t) override
+                    {
+                        this->disconnect_mode |= mode & 0xf;
+                        if (this->pipe)
+                        {
+                            auto& closed = this->is_server_side ? this->pipe->server_closed : this->pipe->client_closed;
+                            auto& reset = this->is_server_side ? this->pipe->server_reset : this->pipe->client_reset;
+                            if (mode & 4)
+                            {
+                                reset = true;
+                                closed = true;
+                            }
+                            else if (mode & 1)
+                            {
+                                closed = true;
+                            }
+                        }
+                        if ((mode & 8) && this->socket_type == SOCK_DGRAM)
+                        {
+                            this->peer_addr = {};
+                        }
+                        this->error = 0;
+                        return 0;
+                    }
+
                     bool is_ready(const bool in_poll) override
                     {
                         if (this->listening)
@@ -244,7 +273,7 @@ namespace sogen
                         {
                             auto& q = this->is_server_side ? this->pipe->client_to_server : this->pipe->server_to_client;
                             bool peer_closed = this->is_server_side ? this->pipe->client_closed : this->pipe->server_closed;
-                            return !q.empty() || peer_closed;
+                            return !q.empty() || peer_closed || (this->socket_type != SOCK_DGRAM && (this->disconnect_mode & 4));
                         }
                         return true;
                     }
@@ -268,6 +297,11 @@ namespace sogen
                     bool connect(const address& addr) override
                     {
                         this->peer_addr = addr;
+                        if (this->socket_type == SOCK_DGRAM)
+                        {
+                            this->error = 0;
+                            return true;
+                        }
 
                         auto& queues = this->factory->state->listen_queues;
                         auto it = queues.find(addr);
@@ -318,6 +352,30 @@ namespace sogen
 
                     sent_size send(std::span<const std::byte> data) override
                     {
+                        if (this->disconnect_mode & 4)
+                        {
+                            this->error = SERR(ECONNABORTED);
+                            return -1;
+                        }
+                        if (this->disconnect_mode & 1)
+                        {
+                            this->error = SERR(ESHUTDOWN);
+                            return -1;
+                        }
+                        if (this->socket_type == SOCK_DGRAM && (this->disconnect_mode & 8))
+                        {
+                            this->error = SERR(ENOTCONN);
+                            return -1;
+                        }
+                        if (this->socket_type == SOCK_DGRAM)
+                        {
+                            if (!this->peer_addr.is_supported())
+                            {
+                                this->error = SERR(ENOTCONN);
+                                return -1;
+                            }
+                            return this->sendto(this->peer_addr, data);
+                        }
                         if (!this->pipe)
                         {
                             this->error = SERR(ENOTCONN);
@@ -331,6 +389,16 @@ namespace sogen
 
                     sent_size sendto(const address& destination, std::span<const std::byte> data) override
                     {
+                        if (this->socket_type != SOCK_DGRAM && (this->disconnect_mode & 4))
+                        {
+                            this->error = SERR(ECONNABORTED);
+                            return -1;
+                        }
+                        if (this->socket_type != SOCK_DGRAM && (this->disconnect_mode & 1))
+                        {
+                            this->error = SERR(ESHUTDOWN);
+                            return -1;
+                        }
                         this->error = 0;
                         this->factory->state->packets[destination].emplace(this->a, shared_state::packet_data{data.begin(), data.end()});
                         return static_cast<sent_size>(data.size());
@@ -338,6 +406,26 @@ namespace sogen
 
                     sent_size recv(std::span<std::byte> data) override
                     {
+                        if (this->disconnect_mode & 4)
+                        {
+                            this->error = SERR(ECONNABORTED);
+                            return -1;
+                        }
+                        if (this->socket_type == SOCK_DGRAM && (this->disconnect_mode & 2))
+                        {
+                            this->error = SERR(ESHUTDOWN);
+                            return -1;
+                        }
+                        if (this->socket_type == SOCK_DGRAM)
+                        {
+                            address source{};
+                            return this->recvfrom(source, data);
+                        }
+                        if (this->pipe && (this->is_server_side ? this->pipe->client_reset : this->pipe->server_reset))
+                        {
+                            this->error = SERR(ECONNRESET);
+                            return -1;
+                        }
                         if (!this->pipe)
                         {
                             this->error = SERR(ENOTCONN);
@@ -369,6 +457,11 @@ namespace sogen
 
                     sent_size recvfrom(address& source, std::span<std::byte> data) override
                     {
+                        if (this->socket_type != SOCK_DGRAM && (this->disconnect_mode & 4))
+                        {
+                            this->error = SERR(ECONNABORTED);
+                            return -1;
+                        }
                         this->error = 0;
 
                         auto& q = this->factory->state->packets[this->a];
@@ -389,9 +482,9 @@ namespace sogen
                     }
                 };
 
-                std::unique_ptr<i_socket> create_socket(const int af, const int /*type*/, const int /*protocol*/) override
+                std::unique_ptr<i_socket> create_socket(const int af, const int type, const int /*protocol*/) override
                 {
-                    return std::make_unique<static_socket>(*this, af);
+                    return std::make_unique<static_socket>(*this, af, type);
                 }
 
                 int poll_sockets(std::span<poll_entry> entries) override
@@ -443,6 +536,10 @@ namespace sogen
                         if (peer_closed)
                         {
                             revents = static_cast<int16_t>(revents | POLLHUP);
+                        }
+                        if (s->socket_type != SOCK_DGRAM && (s->disconnect_mode & 4))
+                        {
+                            revents = static_cast<int16_t>(revents | POLLERR);
                         }
 
                         if (entry.events & write_mask)

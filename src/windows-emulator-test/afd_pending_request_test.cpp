@@ -1,6 +1,10 @@
 #include "emulation_test_utils.hpp"
 #include <devices/afd_endpoint.hpp>
 #include <devices/afd_types.hpp>
+#include <network/socket_factory.hpp>
+#include <network/static_socket_factory.hpp>
+#include <network/socket_wrapper.hpp>
+#include <utils/finally.hpp>
 #include <syscall_utils.hpp>
 
 #include <array>
@@ -35,6 +39,7 @@ namespace sogen::test
             std::vector<std::byte> outgoing;
             bool send_blocked{true};
             bool connect_blocked{};
+            uint32_t disconnect_mode{};
             int last_error{};
         };
 
@@ -52,6 +57,12 @@ namespace sogen::test
             int get_last_error() override
             {
                 return state->last_error;
+            }
+
+            uint32_t partial_disconnect(const uint32_t mode, int64_t) override
+            {
+                state->disconnect_mode |= mode;
+                return 0;
             }
 
             bool is_ready(bool) override
@@ -97,6 +108,16 @@ namespace sogen::test
 
             sent_size send(std::span<const std::byte> bytes) override
             {
+                if (state->disconnect_mode & 4)
+                {
+                    state->last_error = SERR(ECONNABORTED);
+                    return -1;
+                }
+                if (state->disconnect_mode & 1)
+                {
+                    state->last_error = SERR(ESHUTDOWN);
+                    return -1;
+                }
                 if (state->send_blocked)
                 {
                     state->last_error = SERR(EWOULDBLOCK);
@@ -433,6 +454,60 @@ namespace sogen::test
         }
         EXPECT_EQ(invoke(3, 3, static_cast<uint32_t>(expected_size)), STATUS_BUFFER_TOO_SMALL);
         EXPECT_EQ(invoke(3, 4, static_cast<uint32_t>(expected_size - 1)), STATUS_BUFFER_TOO_SMALL);
+    }
+
+    TEST_P(AfdPendingRequestTest, PartialDisconnectMatchesMeasuredNativeStatusAndSendState)
+    {
+        constexpr uint64_t input = memory + 0x800;
+        constexpr uint64_t iosb = memory + 0x100;
+        socket->send_blocked = false;
+        const auto invoke = [&](const uint32_t mode, const uint32_t input_length, const int64_t timeout = 0) {
+            AFD_PARTIAL_DISCONNECT_INFO request{};
+            request.DisconnectMode = mode;
+            request.Timeout.QuadPart = timeout;
+            emu.memory.write_memory(input, &request, sizeof(request));
+            io_device_context context{emu.memory};
+            context.io_control_code = 0x1202b;
+            context.io_status_block = {emu.memory, iosb};
+            context.input_buffer = input;
+            context.input_buffer_length = input_length;
+            return device->execute_ioctl(emu, context);
+        };
+        // Native Windows: short input completes with INVALID_PARAMETER, Info=0.
+        for (const auto length : {0u, 15u})
+        {
+            EXPECT_EQ(invoke(0, length), STATUS_INVALID_PARAMETER);
+            const auto block = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb);
+            EXPECT_EQ(block.Status, STATUS_INVALID_PARAMETER);
+            EXPECT_EQ(block.Information, 0u);
+        }
+        // Native Windows: these modes and timeout values complete synchronously.
+        for (const auto [mode, timeout] : {std::pair<uint32_t, int64_t>{0, 0}, {2, -10000}, {8, 1}})
+        {
+            EXPECT_EQ(invoke(mode, sizeof(AFD_PARTIAL_DISCONNECT_INFO), timeout), STATUS_SUCCESS);
+            const auto block = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb);
+            EXPECT_EQ(block.Status, STATUS_SUCCESS);
+            EXPECT_EQ(block.Information, 0u);
+        }
+        EXPECT_EQ(transfer(true), STATUS_SUCCESS);
+        EXPECT_EQ(status(true).Information, 3u);
+        emu.process.events.get(send_event)->signaled = false;
+
+        EXPECT_EQ(invoke(1, sizeof(AFD_PARTIAL_DISCONNECT_INFO), -10000000), STATUS_SUCCESS);
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{
+            .Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+        emu.memory.write_memory(memory + 0x120, &initial, sizeof(initial));
+        EXPECT_EQ(transfer(true), STATUS_PIPE_DISCONNECTED);
+        EXPECT_EQ(status(true).Status, initial.Status);
+        EXPECT_EQ(status(true).Information, initial.Information);
+        EXPECT_FALSE(emu.process.events.get(send_event)->signaled);
+
+        EXPECT_EQ(invoke(4, sizeof(AFD_PARTIAL_DISCONNECT_INFO)), STATUS_SUCCESS);
+        emu.memory.write_memory(memory + 0x120, &initial, sizeof(initial));
+        EXPECT_EQ(transfer(true), STATUS_LOCAL_DISCONNECT);
+        EXPECT_EQ(status(true).Status, initial.Status);
+        EXPECT_EQ(status(true).Information, initial.Information);
+        EXPECT_FALSE(emu.process.events.get(send_event)->signaled);
     }
 
     TEST_P(AfdPendingRequestTest, EnumNetworkEventsWritesEveryStatusSlot)
@@ -774,6 +849,146 @@ namespace sogen::test
         EXPECT_EQ(port->queue.front().key_context, 0x9876u);
         EXPECT_EQ(port->queue.front().io_status_block.Status, STATUS_CANCELLED);
         EXPECT_EQ(port->queue.front().io_status_block.Information, 0u);
+    }
+
+#ifdef _WIN32
+    TEST(AfdPartialDisconnectHostTest, WrapperForwardsModesAndTimeoutToNativeAfd)
+    {
+        network::socket_factory initialize_winsock;
+        for (const auto [mode, timeout] : {std::pair<uint32_t, int64_t>{0, 0}, {2, -10000},
+                                           {8, 1}, {1, -10000000}, {4, 0}})
+        {
+            SOCKET listener = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            ASSERT_NE(listener, INVALID_SOCKET);
+            SOCKET client = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            ASSERT_NE(client, INVALID_SOCKET);
+            const auto close_handles = utils::finally([&] {
+                ::closesocket(listener);
+                ::closesocket(client);
+            });
+            sockaddr_in local{};
+            local.sin_family = AF_INET;
+            local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            ASSERT_EQ(::bind(listener, reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0);
+            ASSERT_EQ(::listen(listener, 1), 0);
+            int length = sizeof(local);
+            ASSERT_EQ(::getsockname(listener, reinterpret_cast<sockaddr*>(&local), &length), 0);
+            ASSERT_EQ(::connect(client, reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0);
+            SOCKET accepted = ::accept(listener, nullptr, nullptr);
+            ASSERT_NE(accepted, INVALID_SOCKET);
+            network::socket_wrapper wrapper{accepted};
+            ASSERT_EQ(wrapper.partial_disconnect(mode, timeout), STATUS_SUCCESS) << "mode=" << mode;
+            const std::array payload{std::byte{'x'}};
+            const auto sent = wrapper.send(payload);
+            if (mode == 1 || mode == 4)
+            {
+                EXPECT_EQ(sent, -1) << "mode=" << mode;
+                EXPECT_EQ(wrapper.get_last_error(), mode == 1 ? WSAESHUTDOWN : WSAECONNABORTED);
+            }
+            else
+            {
+                EXPECT_EQ(sent, 1) << "mode=" << mode;
+            }
+        }
+    }
+#endif
+
+    TEST(AfdPartialDisconnectStaticTest, AbortWakesLocalAndPeerReceives)
+    {
+        auto factory = network::create_static_socket_factory();
+        auto listener = factory->create_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        const network::address local{"127.0.0.1", uint16_t{20001}};
+        ASSERT_TRUE(listener->bind(local));
+        ASSERT_TRUE(listener->listen(1));
+        auto client = factory->create_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        ASSERT_TRUE(client->connect(local));
+        network::address peer{};
+        auto accepted = listener->accept(peer);
+        ASSERT_NE(accepted, nullptr);
+        ASSERT_EQ(accepted->partial_disconnect(4, 0), STATUS_SUCCESS);
+        const std::array payload{std::byte{'x'}};
+        std::array<std::byte, 1> received{};
+        EXPECT_EQ(accepted->send(payload), -1);
+        EXPECT_EQ(accepted->get_last_error(), SERR(ECONNABORTED));
+        EXPECT_EQ(accepted->recv(received), -1);
+        EXPECT_EQ(accepted->get_last_error(), SERR(ECONNABORTED));
+        EXPECT_EQ(client->recv(received), -1);
+        EXPECT_EQ(client->get_last_error(), SERR(ECONNRESET));
+        network::poll_entry local_poll{accepted.get(), POLLIN, 0};
+        network::poll_entry peer_poll{client.get(), POLLIN, 0};
+        EXPECT_EQ(factory->poll_sockets(std::span(&local_poll, 1)), 1);
+        EXPECT_NE(local_poll.revents & POLLERR, 0);
+        EXPECT_EQ(factory->poll_sockets(std::span(&peer_poll, 1)), 1);
+        EXPECT_NE(peer_poll.revents & POLLHUP, 0);
+    }
+
+#ifdef _WIN32
+    TEST(AfdPartialDisconnectHostTest, UdpExplicitSendAndReceiveRemainAvailable)
+    {
+        network::socket_factory initialize_winsock;
+        for (const auto [mode, expected_error] : {std::pair<uint32_t, int>{1, WSAESHUTDOWN},
+                                                  {4, WSAECONNABORTED}, {8, WSAENOTCONN}})
+        {
+            SOCKET local = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            SOCKET peer = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            ASSERT_NE(local, INVALID_SOCKET);
+            ASSERT_NE(peer, INVALID_SOCKET);
+            const auto close_peer = utils::finally([&] { ::closesocket(peer); });
+            network::socket_wrapper wrapper{local};
+            sockaddr_in peer_address{};
+            peer_address.sin_family = AF_INET;
+            peer_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            ASSERT_EQ(::bind(peer, reinterpret_cast<sockaddr*>(&peer_address), sizeof(peer_address)), 0);
+            int length = sizeof(peer_address);
+            ASSERT_EQ(::getsockname(peer, reinterpret_cast<sockaddr*>(&peer_address), &length), 0);
+            ASSERT_EQ(::connect(local, reinterpret_cast<sockaddr*>(&peer_address), sizeof(peer_address)), 0);
+            ASSERT_EQ(wrapper.partial_disconnect(mode, 0), STATUS_SUCCESS);
+            const std::array payload{std::byte{'x'}};
+            EXPECT_EQ(wrapper.send(payload), -1);
+            EXPECT_EQ(wrapper.get_last_error(), expected_error);
+            EXPECT_EQ(wrapper.sendto(network::address{peer_address}, payload), 1);
+        }
+    }
+#endif
+
+    TEST(AfdPartialDisconnectStaticTest, UdpExplicitSendAndReceiveRemainAvailable)
+    {
+        const network::address peer_address{"127.0.0.1", uint16_t{20002}};
+        for (const auto [mode, expected_error] : {std::pair<uint32_t, int>{1, SERR(ESHUTDOWN)},
+                                                  {4, SERR(ECONNABORTED)}, {8, SERR(ENOTCONN)}})
+        {
+            auto factory = network::create_static_socket_factory();
+            auto local = factory->create_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            auto peer = factory->create_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            ASSERT_TRUE(peer->bind(peer_address));
+            ASSERT_TRUE(local->connect(peer_address));
+            ASSERT_EQ(local->partial_disconnect(mode, 0), STATUS_SUCCESS);
+            const std::array payload{std::byte{'x'}};
+            EXPECT_EQ(local->send(payload), -1);
+            EXPECT_EQ(local->get_last_error(), expected_error);
+            EXPECT_EQ(local->sendto(peer_address, payload), 1);
+            std::array<std::byte, 1> received{};
+            network::address source{};
+            EXPECT_EQ(peer->recvfrom(source, received), 1);
+            EXPECT_EQ(received[0], payload[0]);
+        }
+    }
+
+    TEST(AfdPartialDisconnectStaticTest, UdpModeTwoBlocksConnectedReceiveButAllowsRecvfrom)
+    {
+        auto factory = network::create_static_socket_factory();
+        auto local = factory->create_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        auto peer = factory->create_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        const auto local_address = *local->get_local_address();
+        ASSERT_EQ(local->partial_disconnect(2, 0), STATUS_SUCCESS);
+        const std::array payload{std::byte{'z'}};
+        ASSERT_EQ(peer->sendto(local_address, payload), 1);
+        std::array<std::byte, 1> received{};
+        EXPECT_EQ(local->recv(received), -1);
+        EXPECT_EQ(local->get_last_error(), SERR(ESHUTDOWN));
+        network::address source{};
+        EXPECT_EQ(local->recvfrom(source, received), 1);
+        EXPECT_EQ(received[0], payload[0]);
     }
 
     INSTANTIATE_TEST_SUITE_P(GuestBitness, AfdPendingRequestTest, testing::Bool());

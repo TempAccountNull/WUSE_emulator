@@ -887,6 +887,12 @@ namespace sogen
                 }
             }
 
+            bool skips_immediate_completion(const io_device_context& c, const NTSTATUS status) const override
+            {
+                return _AFD_REQUEST(c.io_control_code) == AFD_SEND &&
+                       (status == STATUS_PIPE_DISCONNECTED || status == STATUS_LOCAL_DISCONNECT);
+            }
+
             NTSTATUS dispatch_ioctl(windows_emulator& win_emu, const io_device_context& c, const ULONG request)
             {
                 switch (request)
@@ -928,14 +934,33 @@ namespace sogen
                     return this->ioctl_information(win_emu, c, true);
                 case AFD_QUERY_HANDLES:
                     return this->ioctl_query_handles(win_emu, c);
-                case AFD_TRANSPORT_IOCTL:
                 case AFD_PARTIAL_DISCONNECT:
+                    return this->ioctl_partial_disconnect(win_emu, c);
+                case AFD_TRANSPORT_IOCTL:
                     return STATUS_SUCCESS;
                 default:
                     win_emu.log.error("Unsupported AFD IOCTL: 0x%X (%u)\n", static_cast<uint32_t>(c.io_control_code),
                                       static_cast<uint32_t>(request));
                     return STATUS_NOT_SUPPORTED;
                 }
+            }
+
+            NTSTATUS ioctl_partial_disconnect(windows_emulator& win_emu, const io_device_context& c) const
+            {
+                if (!this->s_)
+                {
+                    return STATUS_INVALID_HANDLE;
+                }
+                if (c.input_buffer_length < sizeof(AFD_PARTIAL_DISCONNECT_INFO))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                AFD_PARTIAL_DISCONNECT_INFO request{};
+                if (!win_emu.memory.try_read_memory(c.input_buffer, &request, sizeof(request)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                return static_cast<NTSTATUS>(this->s_->partial_disconnect(request.DisconnectMode, request.Timeout.QuadPart));
             }
 
             NTSTATUS ioctl_query_handles(windows_emulator& win_emu, const io_device_context& c) const
@@ -1374,6 +1399,14 @@ namespace sogen
                         }
                         return status;
                     }
+                    if (error == SERR(ESHUTDOWN))
+                    {
+                        return STATUS_PIPE_DISCONNECTED;
+                    }
+                    if (error == SERR(ECONNABORTED))
+                    {
+                        return STATUS_LOCAL_DISCONNECT;
+                    }
                     if (error == SERR(ECONNRESET))
                     {
                         return STATUS_CONNECTION_RESET;
@@ -1487,6 +1520,14 @@ namespace sogen
                             pending.stream_afd_flags = send_info.AfdFlags;
                         }
                         return status;
+                    }
+                    if (error == SERR(ESHUTDOWN))
+                    {
+                        return STATUS_PIPE_DISCONNECTED;
+                    }
+                    if (error == SERR(ECONNABORTED))
+                    {
+                        return STATUS_LOCAL_DISCONNECT;
                     }
                     if (error == SERR(ECONNRESET))
                     {
@@ -1773,6 +1814,14 @@ namespace sogen
                     {
                         return STATUS_BUFFER_OVERFLOW;
                     }
+                    if (error == SERR(ESHUTDOWN))
+                    {
+                        return STATUS_PIPE_DISCONNECTED;
+                    }
+                    if (error == SERR(ECONNABORTED))
+                    {
+                        return STATUS_LOCAL_DISCONNECT;
+                    }
                     if (error == SERR(ECONNRESET))
                     {
                         return STATUS_CONNECTION_RESET;
@@ -1930,6 +1979,14 @@ namespace sogen
                     if (error == SERR(EMSGSIZE))
                     {
                         return STATUS_INVALID_BUFFER_SIZE;
+                    }
+                    if (error == SERR(ESHUTDOWN))
+                    {
+                        return STATUS_PIPE_DISCONNECTED;
+                    }
+                    if (error == SERR(ECONNABORTED))
+                    {
+                        return STATUS_LOCAL_DISCONNECT;
                     }
                     if (error == SERR(ECONNRESET))
                     {

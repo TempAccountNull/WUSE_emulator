@@ -35,6 +35,11 @@ namespace sogen::test
                 return state->last_error;
             }
 
+            uint32_t partial_disconnect(uint32_t, int64_t) override
+            {
+                return 0;
+            }
+
             bool is_ready(bool) override
             {
                 return true;
