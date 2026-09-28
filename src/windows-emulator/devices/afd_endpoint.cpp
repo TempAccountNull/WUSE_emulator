@@ -580,6 +580,13 @@ namespace sogen
             // explicitly set empty context from an endpoint with no context.
             std::optional<std::vector<std::byte>> socket_context_{};
 
+            enum class remote_connection_role : uint8_t { open, outgoing, accepted };
+            remote_connection_role remote_role_{remote_connection_role::open};
+            // The modern mswsock remote sockaddr slot survives later context
+            // replacements, including short or empty replacement blobs.
+            uint16_t remote_offset_{};
+            uint16_t remote_length_{};
+
             afd_endpoint()
             {
                 network::initialize_wsa();
@@ -675,6 +682,36 @@ namespace sogen
                     return STATUS_ACCESS_VIOLATION;
                 }
                 this->socket_context_ = std::move(context);
+                if (this->remote_role_ == remote_connection_role::open)
+                {
+                    if (!this->remote_length_ && this->creation_data && this->creation_data->type == 1)
+                    {
+                        // Measured modern mswsock context layouts. Unknown provider
+                        // blobs are not interpreted as this layout. Native modern
+                        // Winsock keeps this offset even when SET_CONTEXT supplies
+                        // a different output alias.
+                        const auto ipv6 = this->creation_data->address_family == 23;
+                        const auto address_size = ipv6 ? sizeof(win_sockaddr_in6) : sizeof(win_sockaddr_in);
+                        const auto expected_size = (ipv6 ? 196u : 164u) + (sizeof(typename Traits::PVOID) == 4 ? 0u : 4u);
+                        if ((this->creation_data->address_family == 2 || ipv6) &&
+                            this->socket_context_->size() == expected_size &&
+                            this->socket_context_->size() >= 24)
+                        {
+                            const auto read_u32 = [this](size_t offset) {
+                                uint32_t value{};
+                                memcpy(&value, this->socket_context_->data() + offset, sizeof(value));
+                                return value;
+                            };
+                            if (read_u32(4) == static_cast<uint32_t>(this->creation_data->address_family) &&
+                                read_u32(8) == 1 && read_u32(12) == 6 && read_u32(16) == address_size &&
+                                read_u32(20) == address_size)
+                            {
+                                this->remote_offset_ = ipv6 ? 160 : 144;
+                                this->remote_length_ = static_cast<uint16_t>(address_size);
+                            }
+                        }
+                    }
+                }
                 this->update_shared_info(win_emu, c);
                 return STATUS_SUCCESS;
             }
@@ -700,6 +737,54 @@ namespace sogen
                     c.io_status_block.access([&](status_block& block) { block.Information = context.size(); });
                 }
                 return copied == context.size() ? STATUS_SUCCESS : STATUS_BUFFER_OVERFLOW;
+            }
+
+            void record_outgoing_connection(const std::span<const std::byte> remote_address)
+            {
+                this->remote_role_ = remote_connection_role::outgoing;
+                if (!this->socket_context_ || !this->remote_length_ ||
+                    static_cast<size_t>(this->remote_offset_) + this->remote_length_ > this->socket_context_->size() ||
+                    remote_address.size() < this->remote_length_)
+                {
+                    return;
+                }
+                memcpy(this->socket_context_->data() + this->remote_offset_, remote_address.data(), this->remote_length_);
+            }
+
+            NTSTATUS ioctl_get_remote_address(windows_emulator& win_emu, const io_device_context& c) const
+            {
+                if (!this->socket_context_ || this->remote_role_ == remote_connection_role::open ||
+                    !this->s_)
+                {
+                    return STATUS_INVALID_CONNECTION;
+                }
+                const auto& context = *this->socket_context_;
+                if (this->remote_role_ == remote_connection_role::outgoing)
+                {
+                    if (!this->remote_length_ ||
+                        static_cast<size_t>(this->remote_offset_) + this->remote_length_ > context.size())
+                    {
+                        return STATUS_INVALID_CONNECTION;
+                    }
+                    // Modern AFD does not partially copy the sockaddr on a
+                    // short output buffer. Information remains zero.
+                    if (c.output_buffer_length < this->remote_length_)
+                    {
+                        return STATUS_BUFFER_TOO_SMALL;
+                    }
+                    if (!win_emu.memory.try_write_memory(c.output_buffer,
+                                                         context.data() + this->remote_offset_, this->remote_length_))
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                }
+                // An accepted endpoint has no registered remote-address slot.
+                // Native AFD succeeds without touching output, even at size 0.
+                if (c.io_status_block)
+                {
+                    c.io_status_block.access([&](status_block& block) { block.Information = context.size(); });
+                }
+                return STATUS_SUCCESS;
             }
 
             NTSTATUS pend_or_would_block(const io_device_context& c, const bool require_poll, const ULONG flags)
@@ -900,6 +985,14 @@ namespace sogen
                 {
                     this->socket_context_.reset();
                 }
+                const auto role = buffer.read<uint8_t>();
+                if (role > static_cast<uint8_t>(remote_connection_role::accepted))
+                {
+                    throw std::runtime_error("Invalid serialized AFD remote connection role");
+                }
+                this->remote_role_ = static_cast<remote_connection_role>(role);
+                buffer.read(this->remote_offset_);
+                buffer.read(this->remote_length_);
                 const auto count = buffer.read<uint64_t>();
                 if (count > max_pending_requests)
                 {
@@ -926,6 +1019,9 @@ namespace sogen
                         buffer.write(byte);
                     }
                 }
+                buffer.write(static_cast<uint8_t>(this->remote_role_));
+                buffer.write(this->remote_offset_);
+                buffer.write(this->remote_length_);
                 buffer.write(static_cast<uint64_t>(this->pending_requests_.size()));
                 for (const auto& request : this->pending_requests_)
                 {
@@ -1026,6 +1122,8 @@ namespace sogen
                     return this->ioctl_event_select(win_emu, c);
                 case AFD_ENUM_NETWORK_EVENTS:
                     return this->ioctl_enum_network_events(win_emu, c);
+                case AFD_GET_REMOTE_ADDRESS:
+                    return this->ioctl_get_remote_address(win_emu, c);
                 case AFD_GET_CONTEXT:
                     return this->ioctl_get_context(win_emu, c);
                 case AFD_SET_CONTEXT:
@@ -1433,6 +1531,7 @@ namespace sogen
 
                     if (this->executing_delayed_ioctl_ && error == SERR(EISCONN))
                     {
+                        this->record_outgoing_connection(std::span(data).subspan(address_offset));
                         return STATUS_SUCCESS;
                     }
                     if (error == SERR(ECONNREFUSED))
@@ -1443,6 +1542,7 @@ namespace sogen
                     return STATUS_UNSUCCESSFUL;
                 }
 
+                this->record_outgoing_connection(std::span(data).subspan(address_offset));
                 return STATUS_SUCCESS;
             }
 
@@ -1599,6 +1699,7 @@ namespace sogen
                 auto& accepted_socket = it->second.accepted_socket;
 
                 target_endpoint->s_ = std::move(accepted_socket);
+                target_endpoint->remote_role_ = remote_connection_role::accepted;
 
                 pending_connections_.erase(it);
 

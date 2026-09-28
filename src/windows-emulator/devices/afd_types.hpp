@@ -257,7 +257,7 @@ namespace sogen
 #define AFD_QUERY_RECEIVE_INFO          12
 #define AFD_QUERY_HANDLES               13
 #define AFD_SET_INFORMATION             14
-#define AFD_GET_CONTEXT_LENGTH          15
+#define AFD_GET_REMOTE_ADDRESS          15
 #define AFD_GET_CONTEXT                 16
 #define AFD_SET_CONTEXT                 17
 

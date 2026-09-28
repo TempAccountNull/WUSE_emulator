@@ -186,8 +186,8 @@ namespace sogen
                 return "query_handles";
             case AFD_SET_INFORMATION:
                 return "set_information";
-            case AFD_GET_CONTEXT_LENGTH:
-                return "get_context_length";
+            case AFD_GET_REMOTE_ADDRESS:
+                return "get_remote_address";
             case AFD_GET_CONTEXT:
                 return "get_context";
             case AFD_SET_CONTEXT:
