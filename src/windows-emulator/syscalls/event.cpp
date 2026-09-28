@@ -1,6 +1,12 @@
 #include "../std_include.hpp"
 #include "../emulator_utils.hpp"
+#include "../kusd_mmio.hpp"
 #include "../syscall_utils.hpp"
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
 #include <utils/string.hpp>
 
 namespace sogen
@@ -13,6 +19,102 @@ namespace sogen
         {
             constexpr ULONG object_case_insensitive = 0x40;
             constexpr std::u16string_view maximum_commit_event = u"\\KernelObjects\\MaximumCommitCondition";
+
+            std::string_view guest_clock_probe_marker(const std::string_view message)
+            {
+                if (message.find("Entering state 'bootflow:package_registration'") != std::string_view::npos)
+                {
+                    return "package_enter";
+                }
+                if (message.find("Total time spent:") != std::string_view::npos &&
+                    message.find("name: [bootflow:package_registration]") != std::string_view::npos)
+                {
+                    return "package_exit";
+                }
+                if (message.find("Entering state 'bootflow:bap_signin'") != std::string_view::npos)
+                {
+                    return "bap_enter";
+                }
+                if (message.find("_channel_starting") != std::string_view::npos && message.find("Message '0'") != std::string_view::npos &&
+                    message.find("has timed out") != std::string_view::npos)
+                {
+                    return "bap_first_message_timeout";
+                }
+                if (message.find("networking:server:bap:") != std::string_view::npos &&
+                    message.find("has timed out") != std::string_view::npos)
+                {
+                    return "bap_message_timeout";
+                }
+                if (message.find("_channel_starting") != std::string_view::npos &&
+                    message.find("Fatal error '_connection_failure_timed_out'") != std::string_view::npos)
+                {
+                    return "bap_channel_fatal";
+                }
+                if (message.find("BAP connection failed due to hitting timeout") != std::string_view::npos)
+                {
+                    return "bap_signin_timeout";
+                }
+                return {};
+            }
+
+            void emit_guest_clock_probe(const syscall_context& c, const std::string_view message)
+            {
+                static const bool enabled = [] {
+                    const char* const value = std::getenv("SOGEN_GUEST_CLOCK_PROBE");
+                    return value != nullptr && std::string_view{value} == "1";
+                }();
+                if (!enabled || !c.win_emu.callbacks.on_debug_string)
+                {
+                    return;
+                }
+
+                const auto marker = guest_clock_probe_marker(message);
+                if (marker.empty())
+                {
+                    return;
+                }
+
+                static std::atomic<uint32_t> records{};
+                if (records.fetch_add(1, std::memory_order_relaxed) >= 32)
+                {
+                    return;
+                }
+
+                const auto host_monotonic = std::chrono::steady_clock::now().time_since_epoch();
+                const auto host_wall = std::chrono::system_clock::now().time_since_epoch();
+                const auto guest_qpc = c.win_emu.clock().steady_now().time_since_epoch().count();
+                const auto guest_tsc = c.win_emu.clock().timestamp_counter();
+                KUSER_SHARED_DATA64 shared{};
+                if (!c.win_emu.memory.try_read_memory(kusd_mmio::address(), &shared, sizeof(shared)))
+                {
+                    return;
+                }
+                const auto interrupt_100ns =
+                    (static_cast<uint64_t>(static_cast<uint32_t>(shared.InterruptTime.High1Time)) << 32) | shared.InterruptTime.LowPart;
+                const auto tick_ms = (shared.TickCount.TickCountQuad * shared.TickCountMultiplier) >> 24;
+                const auto interrupt_ms = interrupt_100ns / 10000;
+                const auto host_monotonic_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(host_monotonic).count();
+                const auto host_tick_ms = GetTickCount64();
+                const auto host_unix_us = std::chrono::duration_cast<std::chrono::microseconds>(host_wall).count();
+                std::array<char, 512> line{};
+                const int length =
+                    std::snprintf(line.data(), line.size(),
+                                  "guest_clock_probe marker=%.*s guest_qpc=%lld qpc_frequency=%lld kusd_tick_raw=%llu kusd_tick_ms=%llu "
+                                  "kusd_tick_ms_low32=%u kusd_interrupt_100ns=%llu kusd_interrupt_ms=%llu kusd_interrupt_ms_low32=%u "
+                                  "guest_tsc=%llu host_monotonic_ns=%lld host_unix_us=%lld "
+                                  "host_tick_ms=%llu",
+                                  static_cast<int>(marker.size()), marker.data(), static_cast<long long>(guest_qpc),
+                                  static_cast<long long>(shared.QpcFrequency),
+                                  static_cast<unsigned long long>(shared.TickCount.TickCountQuad), static_cast<unsigned long long>(tick_ms),
+                                  static_cast<uint32_t>(tick_ms), static_cast<unsigned long long>(interrupt_100ns),
+                                  static_cast<unsigned long long>(interrupt_ms), static_cast<uint32_t>(interrupt_ms),
+                                  static_cast<unsigned long long>(guest_tsc), static_cast<long long>(host_monotonic_ns),
+                                  static_cast<long long>(host_unix_us), static_cast<unsigned long long>(host_tick_ms));
+                if (length > 0 && static_cast<size_t>(length) < line.size())
+                {
+                    c.win_emu.callbacks.on_debug_string({line.data(), static_cast<size_t>(length)});
+                }
+            }
 
             std::optional<handle> open_named_event(process_context& process, const std::u16string_view name, const bool case_insensitive)
             {
@@ -65,6 +167,7 @@ namespace sogen
                     if (c.win_emu.callbacks.on_debug_string)
                     {
                         c.win_emu.callbacks.on_debug_string(message);
+                        emit_guest_clock_probe(c, message);
                     }
                     if (c.win_emu.package_reads_trace.trigger_on_oodle(message) && c.win_emu.callbacks.on_debug_string)
                     {

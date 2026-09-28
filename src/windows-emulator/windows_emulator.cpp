@@ -1119,9 +1119,101 @@ namespace sogen
                 }
             }
         }
+        if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_TIMEOUT_PROBE");
+            probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
+        {
+            constexpr uint64_t site_rva = 0x1742D2F;
+            constexpr uint64_t clock_base_rva = 0x20D0474;
+            constexpr uint64_t override_rva = 0x26B3920;
+            constexpr uint64_t tls_index_rva = 0x330F0E0;
+            if (executable->size_of_image >= tls_index_rva + sizeof(uint32_t) &&
+                executable->image_base <= UINT64_MAX - tls_index_rva - sizeof(uint32_t))
+            {
+                const auto base = executable->image_base;
+                auto hook = std::make_shared<emulator_hook*>(nullptr);
+                auto samples = std::make_shared<uint32_t>(0);
+                *hook =
+                    this->emu().hook_memory_execution(base + site_rva, [this, base, hook, samples](cpu_interface& cpu, const uint64_t rip) {
+                        const std::scoped_lock lock(this->kernel_lock_);
+                        if (!*hook)
+                        {
+                            return;
+                        }
+
+                        auto& vcpu = this->vcpu(cpu.index());
+                        auto& acting = vcpu.cpu;
+                        constexpr std::array<uint8_t, 5> expected{0x49, 0x3B, 0xC7, 0x7D, 0x74};
+                        std::array<uint8_t, expected.size()> actual{};
+                        const bool signature_read = acting.try_read_memory(rip, actual.data(), actual.size());
+                        if (!signature_read || actual != expected)
+                        {
+                            this->log.warn("BAPTIMEOUTPROBE signature_mismatch rip=%#llx read=%u bytes=%02x%02x%02x%02x%02x\n",
+                                           static_cast<unsigned long long>(rip), static_cast<unsigned>(signature_read), actual[0],
+                                           actual[1], actual[2], actual[3], actual[4]);
+                            auto* const completed = *hook;
+                            *hook = nullptr;
+                            this->emu().delete_hook(completed);
+                            return;
+                        }
+
+                        const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                        const auto rax = acting.reg<uint64_t>(x86_register::rax);
+                        const auto r14 = acting.reg<uint64_t>(x86_register::r14);
+                        const auto r15 = acting.reg<uint64_t>(x86_register::r15);
+                        const auto rdi = acting.reg<uint64_t>(x86_register::rdi);
+                        const auto rsi = acting.reg<uint64_t>(x86_register::rsi);
+                        const bool timed_out = static_cast<int64_t>(rax) >= static_cast<int64_t>(r15);
+                        const auto sample = ++*samples;
+                        if (sample > 2 && !timed_out && sample < 32)
+                        {
+                            return;
+                        }
+                        const auto gs_base = acting.get_segment_base(x86_register::gs);
+                        uint8_t clock_override{};
+                        uint32_t clock_base{};
+                        uint32_t tls_index{};
+                        uint64_t tls_array{};
+                        uint64_t tls_block{};
+                        uint64_t tls_clock{};
+                        const bool override_read = acting.try_read_memory(base + override_rva, &clock_override, sizeof(clock_override));
+                        const bool base_read = acting.try_read_memory(base + clock_base_rva, &clock_base, sizeof(clock_base));
+                        const bool index_read = acting.try_read_memory(base + tls_index_rva, &tls_index, sizeof(tls_index));
+                        const bool array_read = gs_base <= UINT64_MAX - 0x58 - sizeof(tls_array) &&
+                                                acting.try_read_memory(gs_base + 0x58, &tls_array, sizeof(tls_array));
+                        const bool block_read =
+                            array_read && index_read && tls_index < 0x1000 &&
+                            tls_array <= UINT64_MAX - static_cast<uint64_t>(tls_index) * sizeof(tls_block) - sizeof(tls_block) &&
+                            acting.try_read_memory(tls_array + static_cast<uint64_t>(tls_index) * sizeof(tls_block), &tls_block,
+                                                   sizeof(tls_block));
+                        const bool clock_read = block_read && tls_block <= UINT64_MAX - 0x10 - sizeof(tls_clock) &&
+                                                acting.try_read_memory(tls_block + 0x10, &tls_clock, sizeof(tls_clock));
+                        const bool raw_valid = clock_read && base_read;
+                        const uint32_t raw_time_low = raw_valid ? static_cast<uint32_t>(tls_clock) + clock_base : 0;
+                        this->log.warn(
+                            "BAPTIMEOUTPROBE n=%u tid=%u vcpu=%zu rip=%#llx rax_age=%#llx r14_stamp=%#llx r15_limit=%#llx "
+                            "rdi_message=%#llx rsi_queue=%#llx timeout=%u gs=%#llx tls_index=%u tls_clock=%#llx clock_base=%#x "
+                            "raw_time_low=%#x raw_valid=%u override=%u reads=%u%u%u%u%u%u\n",
+                            sample, tid, cpu.index(), static_cast<unsigned long long>(rip), static_cast<unsigned long long>(rax),
+                            static_cast<unsigned long long>(r14), static_cast<unsigned long long>(r15),
+                            static_cast<unsigned long long>(rdi), static_cast<unsigned long long>(rsi), static_cast<unsigned>(timed_out),
+                            static_cast<unsigned long long>(gs_base), tls_index, static_cast<unsigned long long>(tls_clock), clock_base,
+                            raw_time_low, static_cast<unsigned>(raw_valid), static_cast<unsigned>(clock_override),
+                            static_cast<unsigned>(override_read), static_cast<unsigned>(base_read), static_cast<unsigned>(index_read),
+                            static_cast<unsigned>(array_read), static_cast<unsigned>(block_read), static_cast<unsigned>(clock_read));
+                        if (timed_out || sample >= 32)
+                        {
+                            auto* const completed = *hook;
+                            *hook = nullptr;
+                            this->emu().delete_hook(completed);
+                        }
+                    });
+                this->log.info("BAPTIMEOUTPROBE installed base=%#llx rip=%#llx\n", static_cast<unsigned long long>(base),
+                               static_cast<unsigned long long>(base + site_rva));
+            }
+        }
         // The 21122 Shadowkeep vhalt entry is sampled only when explicitly requested.
-        if (const char* probe = std::getenv("SOGEN_DESTINY_VHALT_PROBE"); probe && *probe == '1' &&
-            executable && executable->name == "destiny2.exe" && executable->size_of_image > 0x1310D60)
+        if (const char* probe = std::getenv("SOGEN_DESTINY_VHALT_PROBE");
+            probe && *probe == '1' && executable && executable->name == "destiny2.exe" && executable->size_of_image > 0x1310D60)
         {
             constexpr uint64_t vhalt_rva = 0x1310D60;
             auto samples = std::make_shared<uint32_t>(0);
