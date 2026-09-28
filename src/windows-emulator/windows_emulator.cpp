@@ -10,7 +10,9 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 #include <cstring>
+#include <unordered_map>
 
 #include "cpu_context.hpp"
 
@@ -1132,83 +1134,263 @@ namespace sogen
                 const auto base = executable->image_base;
                 auto hook = std::make_shared<emulator_hook*>(nullptr);
                 auto samples = std::make_shared<uint32_t>(0);
-                *hook =
-                    this->emu().hook_memory_execution(base + site_rva, [this, base, hook, samples](cpu_interface& cpu, const uint64_t rip) {
+                auto timeout_records = std::make_shared<uint32_t>(0);
+                auto previous_clocks = std::make_shared<std::unordered_map<uint32_t, uint64_t>>();
+                *hook = this->emu().hook_memory_execution(base + site_rva, [this, base, hook, samples, timeout_records,
+                                                                            previous_clocks](cpu_interface& cpu, const uint64_t rip) {
+                    const std::scoped_lock lock(this->kernel_lock_);
+                    if (!*hook)
+                    {
+                        return;
+                    }
+
+                    auto& vcpu = this->vcpu(cpu.index());
+                    auto& acting = vcpu.cpu;
+                    constexpr std::array<uint8_t, 5> expected{0x49, 0x3B, 0xC7, 0x7D, 0x74};
+                    std::array<uint8_t, expected.size()> actual{};
+                    const bool signature_read = acting.try_read_memory(rip, actual.data(), actual.size());
+                    if (!signature_read || actual != expected)
+                    {
+                        this->log.warn("BAPTIMEOUTPROBE signature_mismatch rip=%#llx read=%u bytes=%02x%02x%02x%02x%02x\n",
+                                       static_cast<unsigned long long>(rip), static_cast<unsigned>(signature_read), actual[0], actual[1],
+                                       actual[2], actual[3], actual[4]);
+                        auto* const completed = *hook;
+                        *hook = nullptr;
+                        this->emu().delete_hook(completed);
+                        return;
+                    }
+
+                    const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                    const auto rax = acting.reg<uint64_t>(x86_register::rax);
+                    const auto r14 = acting.reg<uint64_t>(x86_register::r14);
+                    const auto r15 = acting.reg<uint64_t>(x86_register::r15);
+                    const auto rdi = acting.reg<uint64_t>(x86_register::rdi);
+                    const auto rsi = acting.reg<uint64_t>(x86_register::rsi);
+                    const bool timed_out = static_cast<int64_t>(rax) >= static_cast<int64_t>(r15);
+                    const auto sample = ++*samples;
+                    const auto current_clock = r14 + rax;
+                    const auto previous = previous_clocks->find(tid);
+                    const bool previous_valid = previous != previous_clocks->end();
+                    const uint64_t previous_clock = previous_valid ? previous->second : 0;
+                    if (previous_valid)
+                    {
+                        previous->second = current_clock;
+                    }
+                    else if (previous_clocks->size() < 64)
+                    {
+                        previous_clocks->emplace(tid, current_clock);
+                    }
+                    const bool highword_advanced =
+                        previous_valid && current_clock > previous_clock && (current_clock >> 32) > (previous_clock >> 32);
+                    const bool age_highword = static_cast<int64_t>(rax) >= 0 && (rax >> 32) != 0;
+                    const bool record_timeout = timed_out && *timeout_records < 4;
+                    if (record_timeout)
+                    {
+                        ++*timeout_records;
+                    }
+                    if (sample > 2 && sample != 32 && !record_timeout && !highword_advanced && !age_highword && sample < 4096)
+                    {
+                        return;
+                    }
+                    const auto gs_base = acting.get_segment_base(x86_register::gs);
+                    uint8_t clock_override{};
+                    uint32_t clock_base{};
+                    uint32_t tls_index{};
+                    uint64_t tls_array{};
+                    uint64_t tls_block{};
+                    uint64_t tls_clock{};
+                    const bool override_read = acting.try_read_memory(base + override_rva, &clock_override, sizeof(clock_override));
+                    const bool base_read = acting.try_read_memory(base + clock_base_rva, &clock_base, sizeof(clock_base));
+                    const bool index_read = acting.try_read_memory(base + tls_index_rva, &tls_index, sizeof(tls_index));
+                    const bool array_read = gs_base <= UINT64_MAX - 0x58 - sizeof(tls_array) &&
+                                            acting.try_read_memory(gs_base + 0x58, &tls_array, sizeof(tls_array));
+                    const bool block_read =
+                        array_read && index_read && tls_index < 0x1000 &&
+                        tls_array <= UINT64_MAX - static_cast<uint64_t>(tls_index) * sizeof(tls_block) - sizeof(tls_block) &&
+                        acting.try_read_memory(tls_array + static_cast<uint64_t>(tls_index) * sizeof(tls_block), &tls_block,
+                                               sizeof(tls_block));
+                    const bool clock_read = block_read && tls_block <= UINT64_MAX - 0x10 - sizeof(tls_clock) &&
+                                            acting.try_read_memory(tls_block + 0x10, &tls_clock, sizeof(tls_clock));
+                    const bool raw_valid = clock_read && base_read;
+                    const uint32_t raw_time_low = raw_valid ? static_cast<uint32_t>(tls_clock) + clock_base : 0;
+                    const uint64_t kusd_interrupt_100ns = this->process.kusd.access([](const KUSER_SHARED_DATA64& kusd) {
+                        return (static_cast<uint64_t>(static_cast<uint32_t>(kusd.InterruptTime.High1Time)) << 32) |
+                               kusd.InterruptTime.LowPart;
+                    });
+                    const auto guest_steady_ns =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(this->clock().steady_now().time_since_epoch()).count();
+                    const auto host_tick_ms = static_cast<uint64_t>(GetTickCount64());
+                    this->log.warn("BAPTIMEOUTPROBE n=%u tid=%u vcpu=%zu rip=%#llx rax_age=%#llx r14_stamp=%#llx r15_limit=%#llx "
+                                   "rdi_message=%#llx rsi_queue=%#llx timeout=%u gs=%#llx tls_index=%u tls_block=%#llx "
+                                   "tls_clock=%#llx prev_clock=%#llx prev_valid=%u current_clock=%#llx highword_advance=%u "
+                                   "clock_base=%#x raw_time_low=%#x raw_valid=%u override=%u kusd_interrupt_100ns=%llu "
+                                   "guest_steady_ns=%lld host_tick_ms=%llu reads=%u%u%u%u%u%u\n",
+                                   sample, tid, cpu.index(), static_cast<unsigned long long>(rip), static_cast<unsigned long long>(rax),
+                                   static_cast<unsigned long long>(r14), static_cast<unsigned long long>(r15),
+                                   static_cast<unsigned long long>(rdi), static_cast<unsigned long long>(rsi),
+                                   static_cast<unsigned>(timed_out), static_cast<unsigned long long>(gs_base), tls_index,
+                                   static_cast<unsigned long long>(tls_block), static_cast<unsigned long long>(tls_clock),
+                                   static_cast<unsigned long long>(previous_clock), static_cast<unsigned>(previous_valid),
+                                   static_cast<unsigned long long>(current_clock), static_cast<unsigned>(highword_advanced), clock_base,
+                                   raw_time_low, static_cast<unsigned>(raw_valid), static_cast<unsigned>(clock_override),
+                                   static_cast<unsigned long long>(kusd_interrupt_100ns), static_cast<long long>(guest_steady_ns),
+                                   static_cast<unsigned long long>(host_tick_ms), static_cast<unsigned>(override_read),
+                                   static_cast<unsigned>(base_read), static_cast<unsigned>(index_read), static_cast<unsigned>(array_read),
+                                   static_cast<unsigned>(block_read), static_cast<unsigned>(clock_read));
+                    if (highword_advanced || age_highword || sample >= 4096)
+                    {
+                        auto* const completed = *hook;
+                        *hook = nullptr;
+                        this->emu().delete_hook(completed);
+                    }
+                });
+                this->log.info("BAPTIMEOUTPROBE installed base=%#llx rip=%#llx\n", static_cast<unsigned long long>(base),
+                               static_cast<unsigned long long>(base + site_rva));
+            }
+        }
+        if (const char* probe = std::getenv("SOGEN_DESTINY_TASK0_TIMEOUT_PROBE");
+            probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
+        {
+            constexpr uint64_t state_rva = 0xD40A3D;
+            constexpr uint64_t failure_rva = 0xD40C4A;
+            constexpr uint64_t clock_base_rva = 0x20D0474;
+            constexpr uint64_t override_rva = 0x26B3920;
+            constexpr uint64_t tls_index_rva = 0x330F0E0;
+            if (executable->size_of_image >= tls_index_rva + sizeof(uint32_t) &&
+                executable->image_base <= UINT64_MAX - tls_index_rva - sizeof(uint32_t))
+            {
+                const auto base = executable->image_base;
+                auto hooks = std::make_shared<std::array<emulator_hook*, 2>>();
+                auto states = std::make_shared<std::unordered_map<uint32_t, uint32_t>>();
+                auto failures = std::make_shared<uint32_t>(0);
+                (*hooks)[0] =
+                    this->emu().hook_memory_execution(base + state_rva, [this, hooks, states](cpu_interface& cpu, const uint64_t rip) {
                         const std::scoped_lock lock(this->kernel_lock_);
-                        if (!*hook)
+                        if (!(*hooks)[0])
+                        {
+                            return;
+                        }
+                        auto& vcpu = this->vcpu(cpu.index());
+                        auto& acting = vcpu.cpu;
+                        constexpr std::array<uint8_t, 3> expected{0x48, 0x63, 0xD8};
+                        std::array<uint8_t, expected.size()> actual{};
+                        if (!acting.try_read_memory(rip, actual.data(), actual.size()) || actual != expected)
+                        {
+                            this->log.warn("TASK0TIMEOUTPROBE state_signature_mismatch rip=%#llx\n", static_cast<unsigned long long>(rip));
+                            for (auto*& installed : *hooks)
+                            {
+                                auto* const completed = installed;
+                                installed = nullptr;
+                                if (completed)
+                                {
+                                    this->emu().delete_hook(completed);
+                                }
+                            }
+                            return;
+                        }
+                        if (vcpu.active_thread)
+                        {
+                            const auto tid = vcpu.active_thread->id;
+                            if (states->contains(tid) || states->size() < 256)
+                            {
+                                (*states)[tid] = acting.reg<uint32_t>(x86_register::rax);
+                            }
+                        }
+                    });
+                (*hooks)[1] = this->emu().hook_memory_execution(
+                    base + failure_rva, [this, base, hooks, states, failures](cpu_interface& cpu, const uint64_t rip) {
+                        const std::scoped_lock lock(this->kernel_lock_);
+                        if (!(*hooks)[1])
                         {
                             return;
                         }
 
                         auto& vcpu = this->vcpu(cpu.index());
                         auto& acting = vcpu.cpu;
-                        constexpr std::array<uint8_t, 5> expected{0x49, 0x3B, 0xC7, 0x7D, 0x74};
+                        constexpr std::array<uint8_t, 6> expected{0x41, 0xBE, 0x02, 0x00, 0x00, 0x00};
                         std::array<uint8_t, expected.size()> actual{};
                         const bool signature_read = acting.try_read_memory(rip, actual.data(), actual.size());
+                        uint32_t state_id{};
+                        bool state_valid{};
                         if (!signature_read || actual != expected)
                         {
-                            this->log.warn("BAPTIMEOUTPROBE signature_mismatch rip=%#llx read=%u bytes=%02x%02x%02x%02x%02x\n",
+                            this->log.warn("TASK0TIMEOUTPROBE signature_mismatch rip=%#llx read=%u bytes=%02x%02x%02x%02x%02x%02x\n",
                                            static_cast<unsigned long long>(rip), static_cast<unsigned>(signature_read), actual[0],
-                                           actual[1], actual[2], actual[3], actual[4]);
-                            auto* const completed = *hook;
-                            *hook = nullptr;
-                            this->emu().delete_hook(completed);
+                                           actual[1], actual[2], actual[3], actual[4], actual[5]);
+                            for (auto*& installed : *hooks)
+                            {
+                                auto* const completed = installed;
+                                installed = nullptr;
+                                if (completed)
+                                {
+                                    this->emu().delete_hook(completed);
+                                }
+                            }
                             return;
                         }
-
-                        const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
-                        const auto rax = acting.reg<uint64_t>(x86_register::rax);
-                        const auto r14 = acting.reg<uint64_t>(x86_register::r14);
-                        const auto r15 = acting.reg<uint64_t>(x86_register::r15);
-                        const auto rdi = acting.reg<uint64_t>(x86_register::rdi);
-                        const auto rsi = acting.reg<uint64_t>(x86_register::rsi);
-                        const bool timed_out = static_cast<int64_t>(rax) >= static_cast<int64_t>(r15);
-                        const auto sample = ++*samples;
-                        if (sample > 2 && !timed_out && sample < 32)
+                        else
                         {
-                            return;
+                            const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                            const auto state_it = states->find(tid);
+                            state_valid = state_it != states->end();
+                            state_id = state_valid ? state_it->second : 0;
+                            const auto elapsed = acting.reg<uint64_t>(x86_register::rbp);
+                            const auto limit = acting.reg<uint64_t>(x86_register::rdi);
+                            const auto base_limit = acting.reg<uint64_t>(x86_register::rbx);
+                            const auto reason_ptr = acting.reg<uint64_t>(x86_register::rsi);
+                            uint32_t reason{};
+                            const bool reason_read = acting.try_read_memory(reason_ptr, &reason, sizeof(reason));
+                            const auto gs_base = acting.get_segment_base(x86_register::gs);
+                            uint8_t clock_override{};
+                            uint32_t clock_base{};
+                            uint32_t tls_index{};
+                            uint64_t tls_array{};
+                            uint64_t tls_block{};
+                            uint64_t tls_clock{};
+                            const bool override_read = acting.try_read_memory(base + override_rva, &clock_override, sizeof(clock_override));
+                            const bool base_read = acting.try_read_memory(base + clock_base_rva, &clock_base, sizeof(clock_base));
+                            const bool index_read = acting.try_read_memory(base + tls_index_rva, &tls_index, sizeof(tls_index));
+                            const bool array_read = gs_base <= UINT64_MAX - 0x58 - sizeof(tls_array) &&
+                                                    acting.try_read_memory(gs_base + 0x58, &tls_array, sizeof(tls_array));
+                            const bool block_read =
+                                array_read && index_read && tls_index < 0x1000 &&
+                                tls_array <= UINT64_MAX - static_cast<uint64_t>(tls_index) * sizeof(tls_block) - sizeof(tls_block) &&
+                                acting.try_read_memory(tls_array + static_cast<uint64_t>(tls_index) * sizeof(tls_block), &tls_block,
+                                                       sizeof(tls_block));
+                            const bool clock_read = block_read && tls_block <= UINT64_MAX - 0x10 - sizeof(tls_clock) &&
+                                                    acting.try_read_memory(tls_block + 0x10, &tls_clock, sizeof(tls_clock));
+                            const bool raw_valid = clock_read && base_read;
+                            const uint32_t raw_time_low = raw_valid ? static_cast<uint32_t>(tls_clock) + clock_base : 0;
+                            this->log.warn("TASK0TIMEOUTPROBE failure=%u tid=%u vcpu=%zu state=%u state_valid=%u rip=%#llx elapsed=%#llx "
+                                           "limit=%#llx base_limit=%#llx "
+                                           "reason=%#x reason_read=%u gs=%#llx tls_index=%u tls_clock=%#llx clock_base=%#x "
+                                           "raw_time_low=%#x raw_valid=%u override=%u reads=%u%u%u%u%u%u\n",
+                                           *failures + 1, tid, cpu.index(), state_id, static_cast<unsigned>(state_valid),
+                                           static_cast<unsigned long long>(rip), static_cast<unsigned long long>(elapsed),
+                                           static_cast<unsigned long long>(limit), static_cast<unsigned long long>(base_limit), reason,
+                                           static_cast<unsigned>(reason_read), static_cast<unsigned long long>(gs_base), tls_index,
+                                           static_cast<unsigned long long>(tls_clock), clock_base, raw_time_low,
+                                           static_cast<unsigned>(raw_valid), static_cast<unsigned>(clock_override),
+                                           static_cast<unsigned>(override_read), static_cast<unsigned>(base_read),
+                                           static_cast<unsigned>(index_read), static_cast<unsigned>(array_read),
+                                           static_cast<unsigned>(block_read), static_cast<unsigned>(clock_read));
                         }
-                        const auto gs_base = acting.get_segment_base(x86_register::gs);
-                        uint8_t clock_override{};
-                        uint32_t clock_base{};
-                        uint32_t tls_index{};
-                        uint64_t tls_array{};
-                        uint64_t tls_block{};
-                        uint64_t tls_clock{};
-                        const bool override_read = acting.try_read_memory(base + override_rva, &clock_override, sizeof(clock_override));
-                        const bool base_read = acting.try_read_memory(base + clock_base_rva, &clock_base, sizeof(clock_base));
-                        const bool index_read = acting.try_read_memory(base + tls_index_rva, &tls_index, sizeof(tls_index));
-                        const bool array_read = gs_base <= UINT64_MAX - 0x58 - sizeof(tls_array) &&
-                                                acting.try_read_memory(gs_base + 0x58, &tls_array, sizeof(tls_array));
-                        const bool block_read =
-                            array_read && index_read && tls_index < 0x1000 &&
-                            tls_array <= UINT64_MAX - static_cast<uint64_t>(tls_index) * sizeof(tls_block) - sizeof(tls_block) &&
-                            acting.try_read_memory(tls_array + static_cast<uint64_t>(tls_index) * sizeof(tls_block), &tls_block,
-                                                   sizeof(tls_block));
-                        const bool clock_read = block_read && tls_block <= UINT64_MAX - 0x10 - sizeof(tls_clock) &&
-                                                acting.try_read_memory(tls_block + 0x10, &tls_clock, sizeof(tls_clock));
-                        const bool raw_valid = clock_read && base_read;
-                        const uint32_t raw_time_low = raw_valid ? static_cast<uint32_t>(tls_clock) + clock_base : 0;
-                        this->log.warn(
-                            "BAPTIMEOUTPROBE n=%u tid=%u vcpu=%zu rip=%#llx rax_age=%#llx r14_stamp=%#llx r15_limit=%#llx "
-                            "rdi_message=%#llx rsi_queue=%#llx timeout=%u gs=%#llx tls_index=%u tls_clock=%#llx clock_base=%#x "
-                            "raw_time_low=%#x raw_valid=%u override=%u reads=%u%u%u%u%u%u\n",
-                            sample, tid, cpu.index(), static_cast<unsigned long long>(rip), static_cast<unsigned long long>(rax),
-                            static_cast<unsigned long long>(r14), static_cast<unsigned long long>(r15),
-                            static_cast<unsigned long long>(rdi), static_cast<unsigned long long>(rsi), static_cast<unsigned>(timed_out),
-                            static_cast<unsigned long long>(gs_base), tls_index, static_cast<unsigned long long>(tls_clock), clock_base,
-                            raw_time_low, static_cast<unsigned>(raw_valid), static_cast<unsigned>(clock_override),
-                            static_cast<unsigned>(override_read), static_cast<unsigned>(base_read), static_cast<unsigned>(index_read),
-                            static_cast<unsigned>(array_read), static_cast<unsigned>(block_read), static_cast<unsigned>(clock_read));
-                        if (timed_out || sample >= 32)
+                        if (++*failures >= 8 || (state_valid && state_id == 23))
                         {
-                            auto* const completed = *hook;
-                            *hook = nullptr;
-                            this->emu().delete_hook(completed);
+                            for (auto*& installed : *hooks)
+                            {
+                                auto* const completed = installed;
+                                installed = nullptr;
+                                if (completed)
+                                {
+                                    this->emu().delete_hook(completed);
+                                }
+                            }
                         }
                     });
-                this->log.info("BAPTIMEOUTPROBE installed base=%#llx rip=%#llx\n", static_cast<unsigned long long>(base),
-                               static_cast<unsigned long long>(base + site_rva));
+                this->log.info("TASK0TIMEOUTPROBE installed base=%#llx state_rip=%#llx failure_rip=%#llx\n",
+                               static_cast<unsigned long long>(base), static_cast<unsigned long long>(base + state_rva),
+                               static_cast<unsigned long long>(base + failure_rva));
             }
         }
         // The 21122 Shadowkeep vhalt entry is sampled only when explicitly requested.
@@ -1217,8 +1399,8 @@ namespace sogen
         {
             constexpr uint64_t vhalt_rva = 0x1310D60;
             auto samples = std::make_shared<uint32_t>(0);
-            this->emu().hook_memory_execution(executable->image_base + vhalt_rva,
-                [this, samples](cpu_interface& cpu, const uint64_t rip) {
+            this->emu().hook_memory_execution(
+                executable->image_base + vhalt_rva, [this, samples](cpu_interface& cpu, const uint64_t rip) {
                     const std::scoped_lock lock(this->kernel_lock_);
                     if (*samples >= 8)
                     {
@@ -2318,6 +2500,168 @@ namespace sogen
                 this->install_section_first_execution_hook(mod, i);
             }
         });
+
+#ifdef _WIN32
+        if (const auto* probe = std::getenv("SOGEN_DAWN_QUEUEZ_SCAN_PROBE"); probe && std::strcmp(probe, "1") == 0)
+        {
+            struct scan_probe_state
+            {
+                bool attempted{};
+                uint64_t base{};
+                uint64_t installed_tick{};
+                uint32_t hits{};
+                std::array<emulator_hook*, 2> hooks{};
+                std::array<std::array<bool, 2>, 3> seen{};
+                std::array<bool, 3> inspect_ok{};
+            };
+
+            auto state = std::make_shared<scan_probe_state>();
+            this->callbacks.on_module_load.add([this, state](mapped_module& mod) {
+                if (!is_steam_api_module(mod.name) || state->attempted)
+                {
+                    return;
+                }
+                state->attempted = true;
+                constexpr uint64_t inspect_rva = 0x32381D;
+                constexpr uint64_t resolve_rva = 0x3238F4;
+                constexpr std::array<uint8_t, 8> inspect_bytes{0x84, 0xC0, 0x0F, 0x84, 0xED, 0x00, 0x00, 0x00};
+                constexpr std::array<uint8_t, 12> resolve_bytes{0x48, 0x8B, 0x9C, 0x24, 0xB0, 0x0C, 0x00, 0x00, 0x84, 0xC0, 0x74, 0x12};
+                std::array<uint8_t, inspect_bytes.size()> actual_inspect{};
+                std::array<uint8_t, resolve_bytes.size()> actual_resolve{};
+                const char* const attestation = std::getenv("SOGEN_DAWN_QUEUEZ_SCAN_PROBE_SHA256_VERIFIED");
+                const bool verified_env =
+                    attestation && std::strcmp(attestation, "00c611416350a3a10eb468d9fdaff20c25317b2d6a26b75bd349886c1a105320") == 0;
+                const bool verified =
+                    mod.size_of_image >= resolve_rva + resolve_bytes.size() &&
+                    mod.image_base <= UINT64_MAX - resolve_rva - resolve_bytes.size() && verified_env &&
+                    this->emu().try_read_memory(mod.image_base + inspect_rva, actual_inspect.data(), actual_inspect.size()) &&
+                    this->emu().try_read_memory(mod.image_base + resolve_rva, actual_resolve.data(), actual_resolve.size()) &&
+                    actual_inspect == inspect_bytes && actual_resolve == resolve_bytes;
+                if (!verified)
+                {
+                    this->log.warn("DAWNQUEUEZSCAN unavailable reason=identity_or_bytes module=%s\n", mod.name.c_str());
+                    return;
+                }
+
+                state->base = mod.image_base;
+                state->installed_tick = GetTickCount64();
+                constexpr std::array<uint64_t, 2> sites{inspect_rva, resolve_rva};
+                for (size_t site = 0; site < sites.size(); ++site)
+                {
+                    state->hooks[site] =
+                        this->emu().hook_memory_execution(mod.image_base + sites[site], [this, state, site](cpu_interface& cpu, uint64_t) {
+                            const std::scoped_lock lock(this->kernel_lock_);
+                            const uint64_t now = GetTickCount64();
+                            if (++state->hits >= 512 || now - state->installed_tick >= 60000)
+                            {
+                                this->log.info("DAWNQUEUEZSCAN retired reason=budget hits=%u elapsed_ms=%llu\n", state->hits,
+                                               static_cast<unsigned long long>(now - state->installed_tick));
+                                for (auto*& hook : state->hooks)
+                                {
+                                    if (hook)
+                                    {
+                                        this->emu().delete_hook(std::exchange(hook, nullptr));
+                                    }
+                                }
+                                return;
+                            }
+                            auto& vcpu = this->vcpu(cpu.index());
+                            auto& acting = vcpu.cpu;
+                            const uint64_t name_address = acting.reg<uint64_t>(x86_register::rdi);
+                            if (name_address == 0 || name_address > UINT64_MAX - 32)
+                            {
+                                return;
+                            }
+                            std::array<char, 32> name{};
+                            bool terminated = false;
+                            for (size_t i = 0; i < name.size(); ++i)
+                            {
+                                if (!acting.try_read_memory(name_address + i, &name[i], 1))
+                                {
+                                    return;
+                                }
+                                if (name[i] == 0)
+                                {
+                                    terminated = true;
+                                    break;
+                                }
+                            }
+                            if (!terminated)
+                            {
+                                return;
+                            }
+                            const int target = std::strcmp(name.data(), "queuez_family_sweep") == 0      ? 0
+                                               : std::strcmp(name.data(), "queuez_family0_sweep") == 0   ? 1
+                                               : std::strcmp(name.data(), "character_signin_enter") == 0 ? 2
+                                                                                                         : -1;
+                            if (target < 0 || state->seen[target][site])
+                            {
+                                return;
+                            }
+                            state->seen[target][site] = true;
+                            const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                            const bool ok = (acting.reg<uint64_t>(x86_register::rax) & 0xFF) != 0;
+                            if (site == 0)
+                            {
+                                state->inspect_ok[target] = ok;
+                                this->log.info("DAWNQUEUEZSCAN name=%s stage=inspect ok=%u tid=%u host_tick_ms=%llu\n", name.data(),
+                                               static_cast<unsigned>(ok), tid, static_cast<unsigned long long>(GetTickCount64()));
+                            }
+                            else
+                            {
+                                const uint64_t rbp = acting.reg<uint64_t>(x86_register::rbp);
+                                uint8_t status = 0xFF;
+                                uint64_t address{};
+                                const bool status_read =
+                                    rbp <= UINT64_MAX - 0x560 - 1 && acting.try_read_memory(rbp + 0x560, &status, sizeof(status));
+                                const bool address_read = status_read && status == 2 && rbp <= UINT64_MAX - 0x568 - sizeof(address) &&
+                                                          acting.try_read_memory(rbp + 0x568, &address, sizeof(address));
+                                const auto* const address_module = address_read ? this->mod_manager.find_by_address(address) : nullptr;
+                                const uint64_t rva =
+                                    address_module && address >= address_module->image_base ? address - address_module->image_base : 0;
+                                this->log.info(
+                                    "DAWNQUEUEZSCAN name=%s stage=resolve ok=%u status=%u status_read=%u address_read=%u "
+                                    "address=%#llx address_module=%s address_rva=%#llx tid=%u host_tick_ms=%llu\n",
+                                    name.data(), static_cast<unsigned>(ok), static_cast<unsigned>(status),
+                                    static_cast<unsigned>(status_read), static_cast<unsigned>(address_read),
+                                    static_cast<unsigned long long>(address), address_module ? address_module->name.c_str() : "unknown",
+                                    static_cast<unsigned long long>(rva), tid, static_cast<unsigned long long>(GetTickCount64()));
+                            }
+
+                            if (state->seen[0][0] && state->seen[1][0] && state->seen[2][0] && state->hooks[0])
+                            {
+                                auto* const hook = std::exchange(state->hooks[0], nullptr);
+                                this->emu().delete_hook(hook);
+                            }
+                            const bool first_done = state->seen[0][1] || (state->seen[0][0] && !state->inspect_ok[0]);
+                            const bool second_done = state->seen[1][1] || (state->seen[1][0] && !state->inspect_ok[1]);
+                            const bool third_done = state->seen[2][1] || (state->seen[2][0] && !state->inspect_ok[2]);
+                            if (first_done && second_done && third_done && state->hooks[1])
+                            {
+                                auto* const hook = std::exchange(state->hooks[1], nullptr);
+                                this->emu().delete_hook(hook);
+                            }
+                        });
+                }
+                this->log.info("DAWNQUEUEZSCAN installed module=%s base=%#llx sha256=00c611416350a3a1...\n", mod.name.c_str(),
+                               static_cast<unsigned long long>(mod.image_base));
+            });
+            this->callbacks.on_module_unload.add([this, state](mapped_module& mod) {
+                if (mod.image_base != state->base)
+                {
+                    return;
+                }
+                for (auto*& hook : state->hooks)
+                {
+                    if (hook)
+                    {
+                        this->emu().delete_hook(std::exchange(hook, nullptr));
+                    }
+                }
+                state->base = 0;
+            });
+        }
+#endif
 
         // Opt-in exact-export observation of Dawn's callback-driven BAP pump.
         // WHP traps the containing code page, so leave this disabled by default.
