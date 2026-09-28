@@ -577,6 +577,12 @@ namespace sogen
             buffer.read(this->message_queue_status_bit_counts);
             buffer.read(this->message_queue_status_bits);
             buffer.read(this->queue_status_changed_bits);
+
+            // Windows places TEB.StackLimit above the guard; older v5 snapshots placed it on the guard.
+            if (this->stack_guard_page != 0 && this->teb64 && this->teb64->read().NtTib.StackLimit == this->stack_guard_page)
+            {
+                this->teb64->access([&](TEB64& teb) { teb.NtTib.StackLimit = this->stack_guard_page + 0x1000; });
+            }
         }
 
         void leak_memory()

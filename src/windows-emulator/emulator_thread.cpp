@@ -427,7 +427,8 @@ namespace sogen
                 teb_obj.ClientId.UniqueThread = static_cast<uint64_t>(this->id);
                 teb_obj.DeallocationStack = this->stack_base;
                 teb_obj.GuaranteedStackBytes = static_cast<ULONG>(this->stack_guarantee_size);
-                teb_obj.NtTib.StackLimit = this->stack_guard_page;
+                // MSVC __chkstk probes one page below StackLimit, which must be the guard page.
+                teb_obj.NtTib.StackLimit = this->stack_guard_page + page_size;
                 teb_obj.NtTib.StackBase = this->stack_base + this->stack_size;
                 teb_obj.NtTib.Self = this->teb64->value();
                 teb_obj.CurrentLocale = 0x409;
@@ -712,7 +713,7 @@ namespace sogen
             this->memory_ptr->protect_memory(next_guard, page_size, {memory_permission::read_write, memory_permission_ext::guard}))
         {
             this->stack_guard_page = next_guard;
-            this->teb64->access([&](TEB64& teb) { teb.NtTib.StackLimit = next_guard; });
+            this->teb64->access([&](TEB64& teb) { teb.NtTib.StackLimit = next_guard + page_size; });
             return stack_guard_result::grown;
         }
 

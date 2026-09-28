@@ -36,14 +36,14 @@ namespace sogen::test
         bool execute_probe(const uint64_t address, const uint64_t rsp)
         {
             const auto code = code_page();
-            const std::array<uint8_t, 4> bytes{0x45, 0x84, 0x1B, 0x90};
+            const std::array<uint8_t, 5> bytes{0x41, 0xC6, 0x03, 0x00, 0x90};
             win.emu().write_memory(code, bytes.data(), bytes.size());
             win.emu().reg(x86_register::r11, address);
             win.emu().reg(x86_register::rsp, rsp);
             win.emu().reg(x86_register::rip, code);
 
             bool reached_next_instruction = false;
-            win.emu().hook_memory_execution(code + 3, [&](cpu_interface& cpu, uint64_t) {
+            win.emu().hook_memory_execution(code + 4, [&](cpu_interface& cpu, uint64_t) {
                 reached_next_instruction = true;
                 cpu.stop();
             });
@@ -54,7 +54,7 @@ namespace sogen::test
                 for (unsigned attempt = 0; attempt < 4; ++attempt)
                 {
                     win.emu().start(1);
-                    if (reached_next_instruction || win.emu().reg<uint64_t>(x86_register::rip) == code + 3)
+                    if (reached_next_instruction || win.emu().reg<uint64_t>(x86_register::rip) == code + 4)
                     {
                         return true;
                     }
@@ -88,7 +88,7 @@ namespace sogen::test
         EXPECT_TRUE(high.is_committed);
         EXPECT_FALSE(high.permissions.is_guarded());
         EXPECT_EQ(teb.DeallocationStack, thread.stack_base);
-        EXPECT_EQ(teb.NtTib.StackLimit, thread.stack_guard_page);
+        EXPECT_EQ(teb.NtTib.StackLimit, thread.stack_guard_page + 0x1000);
         EXPECT_EQ(teb.NtTib.StackBase, thread.stack_base + thread.stack_size);
         EXPECT_EQ(teb.GuaranteedStackBytes, thread.stack_guarantee_size);
         EXPECT_LT(thread.stack_guarantee_size, thread.stack_size);
@@ -107,18 +107,43 @@ namespace sogen::test
         EXPECT_TRUE(win.memory.get_region_info(thread->stack_base + thread->stack_size - requested_commit).is_committed);
     }
 
-    TEST_F(NativeStackGuard, GuestProbeGrowsStackAndRetriesInstruction)
+    TEST_F(NativeStackGuard, GuestChkstkFirstProbeGrowsStackAndRetriesInstruction)
     {
         auto& thread = win.vcpu(0).thread();
         const auto old_guard = thread.stack_guard_page;
         const auto rsp = thread.stack_base + thread.stack_size - 0x1000;
 
-        ASSERT_TRUE(execute_probe(old_guard, rsp));
+        const auto first_probe = thread.teb64->read().NtTib.StackLimit - 0x1000;
+        ASSERT_EQ(first_probe, old_guard);
+        ASSERT_TRUE(execute_probe(first_probe, rsp));
         EXPECT_EQ(thread.stack_guard_page, old_guard - 0x1000);
         EXPECT_FALSE(win.memory.get_region_info(old_guard).permissions.is_guarded());
         EXPECT_TRUE(win.memory.get_region_info(old_guard - 0x1000).permissions.is_guarded());
-        EXPECT_EQ(thread.teb64->read().NtTib.StackLimit, old_guard - 0x1000);
+        EXPECT_EQ(thread.teb64->read().NtTib.StackLimit, old_guard);
         EXPECT_EQ(win.exception_trace_non_debug_count(), 0U);
+    }
+
+    TEST_F(NativeStackGuard, OlderV5SnapshotRestoresStackLimitAboveGuard)
+    {
+        const auto guard = win.vcpu(0).thread().stack_guard_page;
+        win.vcpu(0).thread().teb64->access([&](TEB64& teb) { teb.NtTib.StackLimit = guard; });
+        win.save_snapshot();
+        win.restore_snapshot();
+
+        const auto& restored = win.vcpu(0).thread();
+        EXPECT_EQ(restored.stack_guard_page, guard);
+        EXPECT_EQ(restored.teb64->read().NtTib.StackLimit, guard + 0x1000);
+    }
+
+    TEST_F(NativeStackGuard, SnapshotPreservesGuestAdjustedStackLimit)
+    {
+        const auto guard = win.vcpu(0).thread().stack_guard_page;
+        const auto adjusted_limit = guard + 0x2000;
+        win.vcpu(0).thread().teb64->access([&](TEB64& teb) { teb.NtTib.StackLimit = adjusted_limit; });
+        win.save_snapshot();
+        win.restore_snapshot();
+
+        EXPECT_EQ(win.vcpu(0).thread().teb64->read().NtTib.StackLimit, adjusted_limit);
     }
 
     TEST_F(NativeStackGuard, GuestTebCanIncreaseStackGuarantee)
