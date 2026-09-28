@@ -704,6 +704,21 @@ namespace sogen::test
             EXPECT_EQ(socket->transport_value, (std::vector<std::byte>(one.begin(), one.end())));
 
             auto ipv4_tcp = make_endpoint(2, 1, 6);
+            EXPECT_EQ(invoke(*ipv4_tcp, IPPROTO_TCP, TCP_NODELAY, one), STATUS_SUCCESS);
+            check_success();
+            EXPECT_EQ(socket->transport_level, static_cast<uint32_t>(IPPROTO_TCP));
+            EXPECT_EQ(socket->transport_option, static_cast<uint32_t>(TCP_NODELAY));
+            EXPECT_EQ(socket->transport_value, (std::vector<std::byte>(one.begin(), one.end())));
+            EXPECT_EQ(invoke(*ipv4_tcp, IPPROTO_TCP, TCP_NODELAY, byte_one), STATUS_SUCCESS);
+            check_success();
+            const auto nodelay_calls = socket->transport_calls;
+            EXPECT_EQ(invoke(*ipv4_tcp, IPPROTO_TCP, TCP_NODELAY, {}), STATUS_BUFFER_TOO_SMALL);
+            const auto short_value = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb_ptr);
+            EXPECT_EQ(short_value.Status, initial.Status);
+            EXPECT_EQ(short_value.Information, initial.Information);
+            EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+            EXPECT_EQ(socket->transport_calls, nodelay_calls);
+
             EXPECT_EQ(invoke(*ipv4_tcp, 0xffff, 0x3007, byte_one), STATUS_SUCCESS);
             check_success();
             EXPECT_EQ(socket->transport_option, 0x3007u);
@@ -715,6 +730,14 @@ namespace sogen::test
             EXPECT_EQ(rejected.Status, initial.Status);
             EXPECT_EQ(rejected.Information, initial.Information);
             EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+            EXPECT_EQ(socket->transport_calls, calls);
+
+            EXPECT_EQ(invoke(*ipv4_udp, IPPROTO_TCP, TCP_NODELAY, one), STATUS_PENDING);
+            ipv4_udp->work(emu);
+            const auto udp_nodelay = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb_ptr);
+            EXPECT_EQ(udp_nodelay.Status, STATUS_INVALID_PARAMETER);
+            EXPECT_EQ(udp_nodelay.Information, 0u);
+            EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
             EXPECT_EQ(socket->transport_calls, calls);
 
             EXPECT_EQ(invoke(*ipv4_udp, 0xffff, 0x3007, byte_one), STATUS_PENDING);
@@ -751,6 +774,12 @@ namespace sogen::test
         const std::array<std::byte, 1> byte_one{std::byte{1}};
         ASSERT_EQ(ipv6_tcp.set_transport_option(IPPROTO_IPV6, IPV6_V6ONLY, zero), STATUS_SUCCESS);
         ASSERT_EQ(tcp.set_transport_option(SOL_SOCKET, 0x3007, byte_one), STATUS_SUCCESS);
+        ASSERT_EQ(tcp.set_transport_option(IPPROTO_TCP, TCP_NODELAY, one), STATUS_SUCCESS);
+        int nodelay{};
+        int nodelay_length = sizeof(nodelay);
+        ASSERT_EQ(getsockopt(tcp.get().get_socket(), IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char*>(&nodelay),
+                             &nodelay_length), 0);
+        EXPECT_EQ(nodelay, 1);
         ASSERT_EQ(udp.set_transport_option(SOL_SOCKET, SO_BROADCAST, one), STATUS_SUCCESS);
         int broadcast{};
         int length = sizeof(broadcast);

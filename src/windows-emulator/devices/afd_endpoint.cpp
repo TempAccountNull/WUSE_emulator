@@ -1088,7 +1088,8 @@ namespace sogen
                 return (request == AFD_SEND && (status == STATUS_PIPE_DISCONNECTED || status == STATUS_LOCAL_DISCONNECT)) ||
                        (request == AFD_WAIT_FOR_LISTEN && status == STATUS_BUFFER_TOO_SMALL) ||
                        (request == AFD_ACCEPT && status == STATUS_INVALID_HANDLE) ||
-                       (request == AFD_TRANSPORT_IOCTL && status == STATUS_NOT_SUPPORTED);
+                       (request == AFD_TRANSPORT_IOCTL &&
+                        (status == STATUS_NOT_SUPPORTED || status == STATUS_BUFFER_TOO_SMALL));
             }
 
             NTSTATUS dispatch_ioctl(windows_emulator& win_emu, const io_device_context& c, const ULONG request)
@@ -1219,7 +1220,13 @@ namespace sogen
                                        wrapper.InputBufferLength == 4;
                 const bool reuse_port = wrapper.Reserved == 0xffff && wrapper.ControlCode == 0x3007 && endpoint.address_family == 2 &&
                                         (wrapper.InputBufferLength == 1 || wrapper.InputBufferLength == 4);
-                if (!ipv6_only && !broadcast && !reuse_port)
+                const bool tcp_nodelay = wrapper.Reserved == IPPROTO_TCP && wrapper.ControlCode == TCP_NODELAY &&
+                                         wrapper.InputBufferLength <= 4;
+                if (tcp_nodelay && wrapper.InputBufferLength == 0)
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+                if (!ipv6_only && !broadcast && !reuse_port && !tcp_nodelay)
                 {
                     return STATUS_NOT_SUPPORTED;
                 }
@@ -1240,7 +1247,15 @@ namespace sogen
                 {
                     return this->delay_ioctrl(c);
                 }
+                if (tcp_nodelay && endpoint.type == 2)
+                {
+                    return this->delay_ioctrl(c);
+                }
                 if ((ipv6_only && endpoint.type != 1 && endpoint.type != 2) || (reuse_port && endpoint.type != 1))
+                {
+                    return STATUS_NOT_SUPPORTED;
+                }
+                if (tcp_nodelay && (endpoint.type != 1 || endpoint.protocol != IPPROTO_TCP))
                 {
                     return STATUS_NOT_SUPPORTED;
                 }
