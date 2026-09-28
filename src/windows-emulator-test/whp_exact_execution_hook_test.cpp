@@ -4,6 +4,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <exception>
+#include <thread>
 #include <vector>
 
 namespace sogen::test
@@ -20,9 +23,7 @@ namespace sogen::test
         // mov eax,0; test eax,eax; nop; mov eax,1; ret; ...; nop (return target).
         std::array<uint8_t, 0x21> guest{};
         guest.fill(0x90);
-        constexpr std::array<uint8_t, 14> function{
-            0xB8, 0, 0, 0, 0, 0x85, 0xC0, 0x90,
-            0xB8, 1, 0, 0, 0, 0xC3};
+        constexpr std::array<uint8_t, 14> function{0xB8, 0, 0, 0, 0, 0x85, 0xC0, 0x90, 0xB8, 1, 0, 0, 0, 0xC3};
         std::copy(function.begin(), function.end(), guest.begin());
         emu->write_memory(code, guest.data(), guest.size());
 
@@ -62,8 +63,7 @@ namespace sogen::test
 
         emu->start(0);
         EXPECT_TRUE(reached_return_target);
-        EXPECT_EQ(seen, (std::vector<uint64_t>{
-            code, code + 7, code + 8, code + 13, code + 0x20}));
+        EXPECT_EQ(seen, (std::vector<uint64_t>{code, code + 7, code + 8, code + 13, code + 0x20}));
         EXPECT_EQ(predicate_rax, 0u);
         EXPECT_NE(predicate_flags & 0x40u, 0u);
         EXPECT_EQ(return_rax, 1u);
@@ -209,5 +209,67 @@ namespace sogen::test
         emu->delete_hook(source_hook);
         emu->delete_hook(destination_hook);
         emu->delete_hook(interrupt_hook);
+    }
+
+    TEST(WhpExactExecutionHook, EightVcpusRetireInstructionsOnSharedHookPage)
+    {
+        constexpr size_t vcpu_count = 8;
+        constexpr uint32_t iterations = 512;
+        auto emu = create_x86_64_emulator(backend_type::whp, vcpu_count);
+        memory_manager memory(*emu);
+        const auto code = memory.allocate_memory(0x1000, memory_permission::all);
+        const auto stacks = memory.allocate_memory(vcpu_count * 0x1000, memory_permission::read_write);
+        ASSERT_NE(code, 0u);
+        ASSERT_NE(stacks, 0u);
+
+        constexpr std::array<uint8_t, 11> guest{0xB9, 0x00, 0x02, 0x00, 0x00, 0x90, 0xFF, 0xC9, 0x75, 0xFB, 0xF4};
+        std::array<std::atomic<uint32_t>, vcpu_count> hits{};
+        std::array<emulator_hook*, vcpu_count> hooks{};
+        for (size_t index = 0; index < vcpu_count; ++index)
+        {
+            const auto entry = code + index * 0x100;
+            emu->write_memory(entry, guest.data(), guest.size());
+            auto& cpu = emu->get_cpu(index);
+            cpu.reg(x86_register::rip, entry);
+            cpu.reg(x86_register::rsp, stacks + index * 0x1000 + 0x800);
+            hooks[index] = emu->hook_memory_execution(
+                entry + 5, [&, index](cpu_interface&, uint64_t) { hits[index].fetch_add(1, std::memory_order_relaxed); });
+            ASSERT_NE(hooks[index], nullptr);
+        }
+
+        std::array<std::exception_ptr, vcpu_count> failures{};
+        std::array<std::thread, vcpu_count> workers{};
+        for (size_t index = 0; index < vcpu_count; ++index)
+        {
+            workers[index] = std::thread([&, index] {
+                try
+                {
+                    emu->get_cpu(index).start(0);
+                }
+                catch (...)
+                {
+                    failures[index] = std::current_exception();
+                }
+            });
+        }
+        for (auto& worker : workers)
+        {
+            worker.join();
+        }
+
+        uint32_t total_hits = 0;
+        for (size_t index = 0; index < vcpu_count; ++index)
+        {
+            if (failures[index])
+            {
+                EXPECT_NO_THROW(std::rethrow_exception(failures[index]));
+            }
+            EXPECT_EQ(emu->get_cpu(index).reg(x86_register::rcx), 0u);
+            const auto count = hits[index].load(std::memory_order_relaxed);
+            EXPECT_LE(count, iterations);
+            total_hits += count;
+            emu->delete_hook(hooks[index]);
+        }
+        EXPECT_GT(total_hits, 0u);
     }
 }

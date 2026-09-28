@@ -864,6 +864,8 @@ namespace sogen::whp
         {
             std::optional<uint64_t> page_base{};
             std::optional<uint64_t> patched_breakpoint{};
+            uint64_t instruction_pointer{};
+            uint32_t execute_fault_retries{};
             bool had_trap_flag{};
             bool stop_after_step{};
         };
@@ -1145,8 +1147,7 @@ namespace sogen::whp
                     if (flags != names.end())
                     {
                         auto& value = values[static_cast<size_t>(flags - names.begin())].Reg64;
-                        value = this->pending_execution_step_->had_trap_flag ? (value | trap_flag_bit)
-                                                                            : (value & ~trap_flag_bit);
+                        value = this->pending_execution_step_->had_trap_flag ? (value | trap_flag_bit) : (value & ~trap_flag_bit);
                     }
                 }
 
@@ -1286,6 +1287,7 @@ namespace sogen::whp
         {
           public:
             friend class whp_vcpu;
+
             explicit whp_x86_64_emulator(const size_t vcpu_count)
             {
                 this->ensure_platform_support();
@@ -1556,8 +1558,7 @@ namespace sogen::whp
                     const auto to = this->mapped_pages_.find(address + offset);
                     if (from == this->mapped_pages_.end() || !from->second || !from->second->host_page ||
                         (to != this->mapped_pages_.end() && to->second &&
-                         (to->second->host_page ||
-                          to->second->guest_physical_address != unmapped_guest_page)))
+                         (to->second->host_page || to->second->guest_physical_address != unmapped_guest_page)))
                     {
                         return false;
                     }
@@ -2081,8 +2082,8 @@ namespace sogen::whp
                     exception_exit_bitmap.ExceptionExitBitmap =
                         (1ull << WHvX64ExceptionTypeDebugTrapOrFault) | (1ull << WHvX64ExceptionTypeBreakpointTrap) |
                         (1ull << WHvX64ExceptionTypeInvalidOpcodeFault) | (1ull << WHvX64ExceptionTypeGeneralProtectionFault) |
-                        (1ull << WHvX64ExceptionTypePageFault) |
-                        (1ull << WHvX64ExceptionTypeFloatingPointErrorFault) | (1ull << WHvX64ExceptionTypeSimdFloatingPointFault);
+                        (1ull << WHvX64ExceptionTypePageFault) | (1ull << WHvX64ExceptionTypeFloatingPointErrorFault) |
+                        (1ull << WHvX64ExceptionTypeSimdFloatingPointFault);
 
                     WHP_CHECK_HR(WHvSetPartitionProperty(this->partition_, WHvPartitionPropertyCodeExceptionExitBitmap,
                                                          &exception_exit_bitmap, sizeof(exception_exit_bitmap)));
@@ -2195,8 +2196,7 @@ namespace sogen::whp
                         // SYSCALL retired before the intercept HLT, but may not have raised #DB.
                         const auto had_guest_tf = vcpu.pending_execution_step_->had_trap_flag;
                         (void)this->complete_execution_step(vcpu);
-                        saved_rflags = had_guest_tf ? (saved_rflags | trap_flag_bit)
-                                                    : (saved_rflags & ~trap_flag_bit);
+                        saved_rflags = had_guest_tf ? (saved_rflags | trap_flag_bit) : (saved_rflags & ~trap_flag_bit);
                     }
                 }
 
@@ -2744,12 +2744,14 @@ namespace sogen::whp
                     }
 
                     vcpu.pending_execution_step_->page_base = page_base;
+                    vcpu.pending_execution_step_->instruction_pointer = vcpu.read_instruction_pointer();
                 }
                 else
                 {
                     auto rflags = vcpu.get_register(WHvX64RegisterRflags);
                     pending_execution_step state{};
                     state.page_base = page_base;
+                    state.instruction_pointer = vcpu.read_instruction_pointer();
                     state.had_trap_flag = (rflags.Reg64 & trap_flag_bit) != 0;
                     state.stop_after_step = stop_after_step;
 
@@ -2845,8 +2847,7 @@ namespace sogen::whp
             {
                 std::ostringstream message;
                 message << "Nested WHP execution single-step state is not supported"
-                        << " phase=" << phase << " vcpu=" << vcpu.index()
-                        << " rip=0x" << std::hex << vcpu.read_instruction_pointer();
+                        << " phase=" << phase << " vcpu=" << vcpu.index() << " rip=0x" << std::hex << vcpu.read_instruction_pointer();
                 if (vcpu.pending_execution_step_)
                 {
                     message << " pending_page=";
@@ -2859,6 +2860,8 @@ namespace sogen::whp
                         message << "none";
                     }
                     message << " pending_stop=" << vcpu.pending_execution_step_->stop_after_step;
+                    message << " pending_rip=0x" << vcpu.pending_execution_step_->instruction_pointer;
+                    message << " execute_fault_retries=" << std::dec << vcpu.pending_execution_step_->execute_fault_retries;
                 }
                 if (vcpu.deferred_execution_page_)
                 {
@@ -2870,6 +2873,7 @@ namespace sogen::whp
                 }
                 throw std::runtime_error(message.str());
             }
+
             // Assumes partition_mutex_ is held.
             mmio_region* find_mmio_region(const uint64_t address)
             {
@@ -3715,8 +3719,7 @@ namespace sogen::whp
 
                 if (fault_address != 0)
                 {
-                    const auto operation = !opcode_read && fault_address == rip ? memory_operation::exec
-                                                                                    : memory_operation::read;
+                    const auto operation = !opcode_read && fault_address == rip ? memory_operation::exec : memory_operation::read;
                     // Guest page faults escalate here (the guest IDT cannot dispatch them). Under
                     // multiple vCPUs the faulting page may in fact be backed with permissions that
                     // allow the access - a peer mapped/committed/reprotected it after this vCPU cached
@@ -3753,6 +3756,39 @@ namespace sogen::whp
             {
                 const auto page_base = align_down_to_page(address);
                 std::vector<memory_execution_hook_callback> callbacks{};
+
+                {
+                    std::unique_lock lock(this->partition_mutex_);
+                    auto& pending = vcpu.pending_execution_step_;
+                    if (pending && pending->page_base == page_base)
+                    {
+                        const auto rip = vcpu.read_instruction_pointer();
+                        if (rip == pending->instruction_pointer && address == rip)
+                        {
+                            constexpr uint32_t max_execute_fault_retries = 256;
+                            if (++pending->execute_fault_retries > max_execute_fault_retries)
+                            {
+                                this->throw_nested_execution_step(vcpu, "memory.execution_hook.retry_limit");
+                            }
+
+                            const auto entry = this->mapped_pages_.find(page_base);
+                            if (entry != this->mapped_pages_.end() && entry->second && is_executable(entry->second->permissions) &&
+                                entry->second->page_execution_hook_count != 0)
+                            {
+                                this->ensure_virtual_mapping(page_base);
+                                this->remap_page(*entry->second);
+                                vcpu.set_register(WHvX64RegisterCr3, vcpu.get_register(WHvX64RegisterCr3));
+                                return true;
+                            }
+                        }
+
+                        (void)this->complete_execution_step(vcpu, rip != pending->instruction_pointer);
+                        if (vcpu.stop_requested_)
+                        {
+                            return true;
+                        }
+                    }
+                }
 
                 {
                     std::shared_lock lock(this->partition_mutex_);
@@ -3989,7 +4025,8 @@ namespace sogen::whp
                     const bool is_execute = (exception.ErrorCode & 0x10u) != 0 || (!opcode_read && fault_address == rip);
                     const bool is_present = (exception.ErrorCode & 0x1u) != 0;
                     const auto operation = is_execute ? memory_operation::exec
-                                                      : is_write ? memory_operation::write : memory_operation::read;
+                                           : is_write ? memory_operation::write
+                                                      : memory_operation::read;
                     const auto type = is_present ? memory_violation_type::protection : memory_violation_type::unmapped;
 
                     // Under multiple vCPUs a peer may have mapped/committed/reprotected this page
@@ -4048,8 +4085,7 @@ namespace sogen::whp
                 if (exception.ExceptionType == WHvX64ExceptionTypeBreakpointTrap)
                 {
                     const auto rip = exit_context.VpContext.Rip;
-                    if (this->syscall_hook_ != nullptr &&
-                        (rip == this->syscall_hook_page_ || rip == (this->syscall_hook_page_ + 1)))
+                    if (this->syscall_hook_ != nullptr && (rip == this->syscall_hook_page_ || rip == (this->syscall_hook_page_ + 1)))
                     {
                         return this->handle_syscall_halt(vcpu);
                     }
@@ -4136,8 +4172,8 @@ namespace sogen::whp
             }
 
             this->emulator_.abandon_execution_step_for_context_restore(*this);
-            WHP_CHECK_HR(WHvSetVirtualProcessorRegisters(this->partition_, this->vp_index_, names.data(),
-                                                         static_cast<UINT32>(names.size()), values.data()));
+            WHP_CHECK_HR(WHvSetVirtualProcessorRegisters(this->partition_, this->vp_index_, names.data(), static_cast<UINT32>(names.size()),
+                                                         values.data()));
             if (xsave_size != 0)
             {
 #pragma warning(push)
