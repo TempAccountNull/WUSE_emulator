@@ -5,8 +5,10 @@
 #include <devices/afd_types.hpp>
 
 #include <chrono>
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 
@@ -174,6 +176,7 @@ namespace sogen::test
         EXPECT_NE(journal.find("\"channel\":\"apc\",\"phase\":\"queue\""), std::string::npos);
         EXPECT_NE(journal.find("\"channel\":\"iocp\",\"phase\":\"dequeue\""), std::string::npos);
         EXPECT_NE(journal.find("\"preview_hex\":\"616263\""), std::string::npos);
+        EXPECT_NE(journal.find("\"payload_fnv1a64\":\"0xe71fa2190541574b\",\"payload_hashed_bytes\":3"), std::string::npos);
         EXPECT_NE(journal.find("\"operation\":\"query_handles\""), std::string::npos);
         EXPECT_NE(journal.find("\"operation\":\"get_information\""), std::string::npos);
         EXPECT_NE(journal.find("\"operation\":\"transport_ioctl\""), std::string::npos);
@@ -193,6 +196,268 @@ namespace sogen::test
         io_device_context restored{deserializer};
         restored.deserialize(deserializer);
         EXPECT_EQ(restored.network_request_id, request.network_request_id);
+        input.close();
+        std::filesystem::remove(path);
+    }
+
+    TEST(NetworkDebug, CorrelatesEndpointAndCompletedRequestAndResponseBytes)
+    {
+        emulator_settings settings{};
+        settings.load_registry = false;
+        auto emu = create_emulator(std::move(settings));
+        constexpr uint64_t memory = 0x250000;
+        ASSERT_TRUE(emu.memory.allocate_memory(memory, 0x2000, memory_permission::read_write));
+        auto& vcpu = emu.vcpu(0);
+        vcpu.cpu.reg(x86_register::rip, 0x18009d812);
+        vcpu.cpu.reg(x86_register::rsp, memory + 0x100);
+        const syscall_context issuer{.win_emu = emu, .emu = vcpu.cpu, .vcpu = vcpu, .proc = emu.process};
+        const auto path =
+            std::filesystem::temp_directory_path() /
+            ("sogen-network-endpoint-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".jsonl");
+
+        using Traits = EmulatorTraits<Emu64>;
+        const std::array<std::byte, 16> remote{std::byte{2},   std::byte{0}, std::byte{0x22}, std::byte{0xb8},
+                                               std::byte{127}, std::byte{0}, std::byte{0},    std::byte{1}};
+        AFD_CONNECT_JOIN_INFO_TL<Traits> connect{};
+        std::memcpy(&connect.RemoteAddress, remote.data(), remote.size());
+        emu.memory.write_memory(memory + 0x200, &connect, sizeof(connect));
+
+        io_device_context request{emu.memory};
+        request.file_handle.bits = 0x44;
+        request.issuer_thread_id = 41;
+        request.io_status_block = {emu.memory, memory + 0x700};
+        request.io_control_code = 0x12007;
+        request.input_buffer = memory + 0x200;
+        request.input_buffer_length = sizeof(connect);
+
+        {
+            network_debug_logger logger;
+            logger.open(path);
+            logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+            request.io_status_block.write({.Status = STATUS_SUCCESS, .Information = 0});
+            logger.afd_completion(emu, request, STATUS_SUCCESS, false);
+
+            const EMU_WSABUF<Traits> descriptor{.len = 3, .buf = memory + 0x500};
+            const AFD_SEND_INFO<Traits> send{.BufferArray = memory + 0x300, .BufferCount = 1};
+            emu.memory.write_memory(memory + 0x300, &descriptor, sizeof(descriptor));
+            emu.memory.write_memory(memory + 0x200, &send, sizeof(send));
+            emu.memory.write_memory(memory + 0x500, "abc", 3);
+            request.io_control_code = 0x1201f;
+            request.input_buffer_length = sizeof(send);
+            logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+            request.io_status_block.write({.Status = STATUS_SUCCESS, .Information = 3});
+            logger.afd_completion(emu, request, STATUS_SUCCESS, false);
+
+            std::array<std::byte, 80> output{};
+            output.fill(std::byte{0x55});
+            emu.memory.write_memory(memory + 0x900, output.data(), output.size());
+            request.io_control_code = 0x1207b;
+            request.input_buffer_length = 0;
+            request.output_buffer = memory + 0x900;
+            request.output_buffer_length = static_cast<ULONG>(output.size());
+            logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+            request.io_status_block.write({.Status = STATUS_SUCCESS, .Information = output.size()});
+            logger.afd_completion(emu, request, STATUS_SUCCESS, false);
+
+            const AFD_RECV_DATAGRAM_INFO<Traits> receive{
+                .BufferArray = memory + 0x300, .BufferCount = 1, .Address = memory + 0xa00, .AddressLength = memory + 0xb00};
+            emu.memory.write_memory(memory + 0x200, &receive, sizeof(receive));
+            request.io_control_code = 0x1201b;
+            request.input_buffer_length = sizeof(receive);
+            request.output_buffer_length = 0;
+            logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+            emu.memory.write_memory(memory + 0xa00, remote.data(), remote.size());
+            const ULONG address_length = static_cast<ULONG>(remote.size());
+            emu.memory.write_memory(memory + 0xb00, &address_length, sizeof(address_length));
+            emu.memory.write_memory(memory + 0x500, "xyz", 3);
+            request.io_status_block.write({.Status = STATUS_SUCCESS, .Information = 3});
+            logger.afd_completion(emu, request, STATUS_SUCCESS, true);
+        }
+
+        std::ifstream input(path, std::ios::binary);
+        ASSERT_TRUE(input.good());
+        const std::string journal{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+        EXPECT_NE(journal.find("\"role\":\"remote\",\"source\":\"guest_ioctl_input_at_request\",\"family\":\"ipv4\",\"address\":\"127.0.0."
+                               "1\",\"port\":8888"),
+                  std::string::npos);
+        EXPECT_NE(journal.find("\"preview_hex\":\"616263\""), std::string::npos);
+        EXPECT_NE(journal.find("\"completed_bytes\":3,\"syscall\":\"NtDeviceIoControlFile\""), std::string::npos);
+        EXPECT_NE(journal.find("\"completed_exceeds_requested\":false"), std::string::npos);
+        EXPECT_NE(journal.find("\"control_output_preview_hex\":\"" + std::string(128, '5') + "\""), std::string::npos);
+        EXPECT_NE(journal.find("\"control_output_preview_truncated\":true"), std::string::npos);
+        EXPECT_NE(journal.find("\"source\":\"guest_datagram_source_at_completion\""), std::string::npos);
+        EXPECT_NE(journal.find("\"preview_hex\":\"78797a\""), std::string::npos);
+        EXPECT_NE(journal.find("\"payload_fnv1a64\":\"0xbff4aa198026f420\",\"payload_hashed_bytes\":3"), std::string::npos);
+        EXPECT_NE(journal.find("\"elapsed_us\":"), std::string::npos);
+        input.close();
+        std::filesystem::remove(path);
+    }
+
+    TEST(NetworkDebug, CarriesListenerAndPeerEndpointsToAcceptedStream)
+    {
+        emulator_settings settings{};
+        settings.load_registry = false;
+        auto emu = create_emulator(std::move(settings));
+        constexpr uint64_t memory = 0x270000;
+        ASSERT_TRUE(emu.memory.allocate_memory(memory, 0x1000, memory_permission::read_write));
+        auto& vcpu = emu.vcpu(0);
+        vcpu.cpu.reg(x86_register::rip, 0x18009d812);
+        vcpu.cpu.reg(x86_register::rsp, memory + 0x100);
+        const syscall_context issuer{.win_emu = emu, .emu = vcpu.cpu, .vcpu = vcpu, .proc = emu.process};
+        const auto path =
+            std::filesystem::temp_directory_path() /
+            ("sogen-network-accept-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".jsonl");
+
+        const std::array<std::byte, 16> local{std::byte{2},   std::byte{0}, std::byte{0x78}, std::byte{0xfe},
+                                              std::byte{127}, std::byte{0}, std::byte{0},    std::byte{1}};
+        const std::array<std::byte, 16> peer{std::byte{2},   std::byte{0}, std::byte{0x23}, std::byte{0x28},
+                                             std::byte{127}, std::byte{0}, std::byte{0},    std::byte{2}};
+        io_device_context request{emu.memory};
+        request.file_handle.bits = 0x55;
+        request.io_status_block = {emu.memory, memory + 0x700};
+        request.input_buffer = memory + 0x200;
+        request.output_buffer = memory + 0x400;
+        std::array<std::byte, 20> bind{};
+        std::copy(local.begin(), local.end(), bind.begin() + 4);
+
+        {
+            network_debug_logger logger;
+            logger.open(path);
+            emu.memory.write_memory(memory + 0x200, bind.data(), bind.size());
+            request.io_control_code = 0x12003;
+            request.input_buffer_length = static_cast<ULONG>(bind.size());
+            logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+            request.io_status_block.write({.Status = STATUS_SUCCESS, .Information = 0});
+            logger.afd_completion(emu, request, STATUS_SUCCESS, false);
+
+            std::array<std::byte, 20> listen_response{};
+            const int32_t sequence = 7;
+            std::memcpy(listen_response.data(), &sequence, sizeof(sequence));
+            std::copy(peer.begin(), peer.end(), listen_response.begin() + 4);
+            emu.memory.write_memory(memory + 0x400, listen_response.data(), listen_response.size());
+            request.io_control_code = 0x1200f;
+            request.input_buffer_length = 0;
+            request.output_buffer_length = static_cast<ULONG>(listen_response.size());
+            logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+            request.io_status_block.write({.Status = STATUS_SUCCESS, .Information = listen_response.size()});
+            logger.afd_completion(emu, request, STATUS_SUCCESS, false);
+
+            AFD_ACCEPT_INFO accept{};
+            accept.Sequence = sequence;
+            accept.AcceptHandle.bits = 0x66;
+            emu.memory.write_memory(memory + 0x200, &accept, sizeof(accept));
+            request.io_control_code = 0x12013;
+            request.input_buffer_length = sizeof(accept);
+            request.output_buffer_length = 0;
+            logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+            request.io_status_block.write({.Status = STATUS_SUCCESS, .Information = 0});
+            logger.afd_completion(emu, request, STATUS_SUCCESS, false);
+
+            using Traits = EmulatorTraits<Emu64>;
+            const EMU_WSABUF<Traits> descriptor{.len = 3, .buf = memory + 0x500};
+            const AFD_SEND_INFO<Traits> send{.BufferArray = memory + 0x300, .BufferCount = 1};
+            emu.memory.write_memory(memory + 0x300, &descriptor, sizeof(descriptor));
+            emu.memory.write_memory(memory + 0x200, &send, sizeof(send));
+            emu.memory.write_memory(memory + 0x500, "abc", 3);
+            request.file_handle.bits = 0x66;
+            request.io_control_code = 0x1201f;
+            request.input_buffer_length = sizeof(send);
+            logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+            request.io_status_block.write({.Status = STATUS_SUCCESS, .Information = 3});
+            logger.afd_completion(emu, request, STATUS_SUCCESS, false);
+        }
+
+        std::ifstream input(path, std::ios::binary);
+        ASSERT_TRUE(input.good());
+        const std::string journal{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+        const auto accepted_send = journal.find("\"file_handle\":\"0x66\"");
+        ASSERT_NE(accepted_send, std::string::npos);
+        const auto line = journal.substr(accepted_send, journal.find('\n', accepted_send) - accepted_send);
+        EXPECT_NE(line.find("\"local_endpoint\":{\"role\":\"local\""), std::string::npos);
+        EXPECT_NE(line.find("\"address\":\"127.0.0.1\",\"port\":30974"), std::string::npos);
+        EXPECT_NE(line.find("\"remote_endpoint\":{\"role\":\"remote\""), std::string::npos);
+        EXPECT_NE(line.find("\"address\":\"127.0.0.2\",\"port\":9000"), std::string::npos);
+        input.close();
+        std::filesystem::remove(path);
+    }
+
+    TEST(NetworkDebug, AggregatesOnlyIdenticalIdleOutcomes)
+    {
+        emulator_settings settings{};
+        settings.load_registry = false;
+        auto emu = create_emulator(std::move(settings));
+        constexpr uint64_t memory = 0x260000;
+        ASSERT_TRUE(emu.memory.allocate_memory(memory, 0x1000, memory_permission::read_write));
+        auto& vcpu = emu.vcpu(0);
+        vcpu.cpu.reg(x86_register::rip, 0x18009d812);
+        vcpu.cpu.reg(x86_register::rsp, memory + 0x100);
+        const syscall_context issuer{.win_emu = emu, .emu = vcpu.cpu, .vcpu = vcpu, .proc = emu.process};
+        const auto path = std::filesystem::temp_directory_path() /
+                          ("sogen-network-idle-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".jsonl");
+        io_device_context request{emu.memory};
+        request.file_handle.bits = 0x77;
+        request.issuer_thread_id = 41;
+        request.io_status_block = {emu.memory, memory + 0x700};
+        request.input_buffer = memory + 0x200;
+        request.output_buffer = memory + 0x400;
+        request.output_buffer_length = 32;
+        request.io_control_code = 0x12024;
+        std::array<std::byte, 32> poll{};
+        poll[8] = std::byte{1};
+        emu.memory.write_memory(memory + 0x200, poll.data(), poll.size());
+        request.input_buffer_length = static_cast<ULONG>(poll.size());
+
+        {
+            network_debug_logger logger;
+            logger.open(path);
+            for (size_t index = 0; index < 3; ++index)
+            {
+                logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+                logger.afd_result(emu, request, STATUS_TIMEOUT);
+                request.io_status_block.write({.Status = STATUS_TIMEOUT, .Information = 0});
+                logger.afd_completion(emu, request, STATUS_TIMEOUT, false);
+            }
+            poll[9] = std::byte{1};
+            emu.memory.write_memory(memory + 0x200, poll.data(), poll.size());
+            logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+            logger.afd_result(emu, request, STATUS_TIMEOUT);
+            logger.afd_completion(emu, request, STATUS_TIMEOUT, false);
+
+            using Traits = EmulatorTraits<Emu64>;
+            const EMU_WSABUF<Traits> descriptor{.len = 3, .buf = memory + 0x500};
+            const AFD_RECV_DATAGRAM_INFO<Traits> receive{.BufferArray = memory + 0x300, .BufferCount = 1};
+            emu.memory.write_memory(memory + 0x300, &descriptor, sizeof(descriptor));
+            emu.memory.write_memory(memory + 0x200, &receive, sizeof(receive));
+            request.io_control_code = 0x1201b;
+            request.input_buffer_length = sizeof(receive);
+            request.output_buffer_length = 0;
+            for (size_t index = 0; index < 3; ++index)
+            {
+                logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+                logger.afd_result(emu, request, STATUS_DEVICE_NOT_READY);
+                request.io_status_block.write({.Status = STATUS_DEVICE_NOT_READY, .Information = 0});
+                logger.afd_completion(emu, request, STATUS_DEVICE_NOT_READY, false);
+            }
+            logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+            logger.afd_result(emu, request, STATUS_SUCCESS);
+            emu.memory.write_memory(memory + 0x500, "xyz", 3);
+            request.io_status_block.write({.Status = STATUS_SUCCESS, .Information = 3});
+            logger.afd_completion(emu, request, STATUS_SUCCESS, false);
+        }
+
+        std::ifstream input(path, std::ios::binary);
+        ASSERT_TRUE(input.good());
+        const std::string journal{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+        EXPECT_EQ(std::count(journal.begin(), journal.end(), '\n'), 14);
+        EXPECT_NE(journal.find("\"kind\":\"afd_idle_repeat\",\"operation\":\"poll\",\"status\":\"0x102\""), std::string::npos);
+        EXPECT_NE(journal.find("\"kind\":\"afd_idle_repeat\",\"operation\":\"receive_datagram\",\"status\":\"0xc00000a3\""),
+                  std::string::npos);
+        const auto first_count = journal.find("\"count\":2");
+        ASSERT_NE(first_count, std::string::npos);
+        EXPECT_NE(journal.find("\"count\":2", first_count + 1), std::string::npos);
+        EXPECT_NE(journal.find("\"first_request_id\":"), std::string::npos);
+        EXPECT_NE(journal.find("\"last_time_us\":"), std::string::npos);
+        EXPECT_NE(journal.find("\"preview_hex\":\"78797a\""), std::string::npos);
         input.close();
         std::filesystem::remove(path);
     }
