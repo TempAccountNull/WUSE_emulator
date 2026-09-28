@@ -2,6 +2,7 @@
 
 #include <platform/native_presentation_window.hpp>
 #include <platform/ui_backend.hpp>
+#include "gpu_window_title.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -97,6 +98,11 @@ namespace sogen
             }
         }
 
+        void record_presented_frame() noexcept override
+        {
+            this->presentation_rate.record_presented_frame();
+        }
+
         [[nodiscard]] bool allows_legacy_presentation() const noexcept
         {
             return !this->native_active_ && !this->retired_ && this->renderer;
@@ -109,6 +115,7 @@ namespace sogen
         int texture_height{};
         ui_surface_format texture_format{ui_surface_format::bgra8};
         bool has_surface{};
+        ui::presentation_frame_rate presentation_rate{};
 
       private:
         void require_owner() const noexcept
@@ -168,6 +175,11 @@ namespace sogen
         void retire() noexcept override
         {
             owner_->retire();
+        }
+
+        void record_presented_frame() noexcept override
+        {
+            owner_->record_presented_frame();
         }
 
       private:

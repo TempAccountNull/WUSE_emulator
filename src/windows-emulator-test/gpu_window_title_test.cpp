@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -218,21 +219,50 @@ namespace sogen::test
         EXPECT_EQ(ui::compose_gpu_window_title("", *record, 1234, 4660, 10000), std::string{identity} + " | " + std::string{metrics});
     }
 
-    TEST(GpuWindowTitleTest, ParsesPresentationRateAndExpiresStaleSamples)
+    TEST(GpuWindowTitleTest, CountsPresentedFramesOverElapsedTimeAndClearsAfterIdle)
     {
-        constexpr auto sample =
-            "10000 Presentation metrics: images=60 | calls=60 | failed_images=0 | interval_ns=2000000000 | unix_ms=10000\n";
-        const auto record = ui::decode_presentation_fps_record(sample);
-        ASSERT_TRUE(record.has_value());
-        EXPECT_EQ(ui::append_presentation_fps("Game", record, 10000), "Game | FPS: 30.0");
-        EXPECT_EQ(ui::append_presentation_fps("Game", record, 13001), "Game | FPS: unavailable");
-        EXPECT_EQ(ui::append_presentation_fps("Game", record, 9999), "Game | FPS: unavailable");
-        EXPECT_EQ(ui::append_presentation_fps("Game", std::nullopt, 10000), "Game | FPS: unavailable");
-        EXPECT_FALSE(ui::decode_presentation_fps_record(
-                         "10000 Presentation metrics: images=60 | calls=60 | failed_images=0 | interval_ns=0 | unix_ms=10000\n")
-                         .has_value());
-        EXPECT_FALSE(
-            ui::decode_presentation_fps_record(std::string_view{sample}.substr(0, std::string_view{sample}.size() - 1)).has_value());
+        using clock = ui::presentation_frame_rate::clock;
+        const auto start = clock::time_point{};
+        ui::presentation_frame_rate first{start};
+        ui::presentation_frame_rate second{start};
+        ui::presentation_frame_rate never_presented{start};
+        for (int i = 0; i < 30; ++i)
+        {
+            first.record_presented_frame();
+        }
+        second.record_presented_frame();
+        EXPECT_FALSE(first.sample(start + std::chrono::milliseconds(999)).has_value());
+        EXPECT_DOUBLE_EQ(first.sample(start + std::chrono::seconds(1))->fps(), 30.0);
+        EXPECT_EQ(first.current()->frames, 30u);
+        EXPECT_EQ(first.current()->interval_ns, 1'000'000'000u);
+        EXPECT_DOUBLE_EQ(second.sample(start + std::chrono::seconds(1))->fps(), 1.0);
+        EXPECT_FALSE(never_presented.sample(start + std::chrono::seconds(1)).has_value());
+        EXPECT_EQ(ui::append_presentation_fps("Game", first.current()), "Game | FPS: 30.0");
+        EXPECT_DOUBLE_EQ(first.sample(start + std::chrono::seconds(2))->fps(), 0.0);
+        EXPECT_EQ(ui::append_presentation_fps("Game", first.current()), "Game | FPS: 0.0");
+        EXPECT_EQ(ui::append_presentation_fps("", std::nullopt), "FPS: unavailable");
+    }
+
+    TEST(GpuWindowTitleTest, EncodesRendererSidecarWithWindowAndMeasuredInterval)
+    {
+        const ui::presentation_frame_rate_sample sample{.frames = 30, .interval_ns = 1'500'000'000};
+        EXPECT_EQ(ui::encode_renderer_fps_record(10000, 1234, 4660, sample),
+                  "10000 Renderer metrics: host_pid=1234 | guest_window=4660 | frames=30 | interval_ns=1500000000 | "
+                  "unix_ms=10000\n");
+    }
+
+    TEST(GpuWindowTitleTest, UsesMeasuredIntervalRatherThanAssumingOneSecond)
+    {
+        using clock = ui::presentation_frame_rate::clock;
+        const auto start = clock::time_point{};
+        ui::presentation_frame_rate rate{start};
+        for (int i = 0; i < 90; ++i)
+        {
+            rate.record_presented_frame();
+        }
+        EXPECT_DOUBLE_EQ(rate.sample(start + std::chrono::milliseconds(1500))->fps(), 60.0);
+        EXPECT_DOUBLE_EQ(rate.sample(start + std::chrono::milliseconds(1700))->fps(), 60.0);
+        EXPECT_DOUBLE_EQ(rate.sample(start + std::chrono::milliseconds(2500))->fps(), 0.0);
     }
 
     TEST(GpuWindowTitleTest, RevalidatesManuallyConstructedOrModifiedRecords)

@@ -1260,8 +1260,12 @@ namespace sogen
                     }
                     if (state && state->renderer)
                     {
-                        update_surface_texture(*state, copy);
-                        render_window(*state);
+                        const bool updated = update_surface_texture(*state, copy);
+                        const bool presented = render_window(*state);
+                        if (updated && presented)
+                        {
+                            state->resources->record_presented_frame();
+                        }
                     }
                 });
             }
@@ -1522,33 +1526,28 @@ namespace sogen
                 }
             }
 
-            static void update_surface_texture(window_state& state, const ui_surface_desc& surface)
+            static bool update_surface_texture(window_state& state, const ui_surface_desc& surface)
             {
                 if (!state.resources->allows_legacy_presentation())
                 {
-                    return;
+                    return false;
                 }
 
                 state.has_surface = true;
                 if (!surface.pixels || surface.width <= 0 || surface.height <= 0 || surface.stride <= 0)
                 {
-                    return;
+                    return false;
                 }
 
                 ensure_texture(state, surface);
-                if (!state.texture)
-                {
-                    return;
-                }
-
-                SDL_UpdateTexture(state.texture, nullptr, surface.pixels, surface.stride);
+                return state.texture && SDL_UpdateTexture(state.texture, nullptr, surface.pixels, surface.stride);
             }
 
-            static void render_window(window_state& state)
+            static bool render_window(window_state& state)
             {
                 if (!state.resources->allows_legacy_presentation())
                 {
-                    return;
+                    return false;
                 }
 
                 if (state.has_surface && state.texture)
@@ -1556,19 +1555,17 @@ namespace sogen
                     // The guest renders at a fixed resolution; fit it into the (independently sized) host window
                     // preserving aspect ratio, with black bars on the mismatched axis. Letterbox presentation also
                     // makes SDL_RenderCoordinatesFromWindow map host mouse positions back to guest pixels.
-                    SDL_SetRenderLogicalPresentation(state.renderer, state.texture_width, state.texture_height,
-                                                     SDL_LOGICAL_PRESENTATION_LETTERBOX);
-                    SDL_SetRenderDrawColor(state.renderer, 0, 0, 0, 255);
-                    SDL_RenderClear(state.renderer);
-                    SDL_RenderTexture(state.renderer, state.texture, nullptr, nullptr);
-                    SDL_RenderPresent(state.renderer);
-                    return;
+                    const bool drawn = SDL_SetRenderLogicalPresentation(state.renderer, state.texture_width, state.texture_height,
+                                                                        SDL_LOGICAL_PRESENTATION_LETTERBOX) &&
+                                       SDL_SetRenderDrawColor(state.renderer, 0, 0, 0, 255) && SDL_RenderClear(state.renderer) &&
+                                       SDL_RenderTexture(state.renderer, state.texture, nullptr, nullptr);
+                    return drawn && SDL_RenderPresent(state.renderer);
                 }
 
                 SDL_SetRenderLogicalPresentation(state.renderer, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
                 SDL_SetRenderDrawColor(state.renderer, 224, 224, 224, 255);
                 SDL_RenderClear(state.renderer);
-                SDL_RenderPresent(state.renderer);
+                return SDL_RenderPresent(state.renderer);
             }
 
             static void present_test_pattern(window_state& state, const int width, const int height)
@@ -1671,11 +1668,11 @@ namespace sogen
                                                                        state.desc.handle, current_unix_milliseconds());
                     if (composed)
                     {
-                        return ui::append_presentation_fps(*composed, this->fps_record_, current_unix_milliseconds());
+                        return ui::append_presentation_fps(*composed, state.resources->presentation_rate.current());
                     }
                 }
 #endif
-                return ui::append_presentation_fps(std::move(base), this->fps_record_, current_unix_milliseconds());
+                return ui::append_presentation_fps(std::move(base), state.resources->presentation_rate.current());
             }
 
             void refresh_gpu_window_title()
@@ -1685,10 +1682,6 @@ namespace sogen
                     const char* configured = std::getenv("SOGEN_GPU_STATUS_DIR");
                     return configured && *configured ? std::filesystem::path(configured) : std::filesystem::path{};
                 }();
-                if (directory.empty())
-                {
-                    return;
-                }
                 const auto now = std::chrono::steady_clock::now();
                 if (now < this->next_gpu_title_refresh_)
                 {
@@ -1697,50 +1690,42 @@ namespace sogen
                 this->next_gpu_title_refresh_ = now + std::chrono::seconds(1);
                 try
                 {
-                    std::ifstream input(directory / "gpu-window-title.txt", std::ios::binary);
-                    if (input)
+                    if (!directory.empty())
                     {
-                        std::array<char, 4097> bytes{};
-                        input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-                        const auto length = static_cast<size_t>(input.gcount());
-                        // Atomic empty publication invalidates a dead/replaced process immediately.
-                        if (length == 0)
+                        std::ifstream input(directory / "gpu-window-title.txt", std::ios::binary);
+                        if (input)
                         {
-                            this->gpu_title_record_.reset();
-                        }
-                        else if (length <= 4096)
-                        {
-                            auto record = ui::decode_gpu_window_title_record(std::string_view(bytes.data(), length));
-                            if (record && record->host_pid == GetCurrentProcessId())
+                            std::array<char, 4097> bytes{};
+                            input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                            const auto length = static_cast<size_t>(input.gcount());
+                            // Atomic empty publication invalidates a dead/replaced process immediately.
+                            if (length == 0)
                             {
-                                this->gpu_title_record_ = std::move(record);
+                                this->gpu_title_record_.reset();
+                            }
+                            else if (length <= 4096)
+                            {
+                                auto record = ui::decode_gpu_window_title_record(std::string_view(bytes.data(), length));
+                                if (record && record->host_pid == GetCurrentProcessId())
+                                {
+                                    this->gpu_title_record_ = std::move(record);
+                                }
                             }
                         }
                     }
-                    std::ifstream presentation(directory / "presentation-live.txt", std::ios::binary);
-                    if (presentation)
-                    {
-                        std::array<char, 513> bytes{};
-                        presentation.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-                        const auto length = static_cast<size_t>(presentation.gcount());
-                        if (length == 0)
-                        {
-                            this->fps_record_.reset();
-                        }
-                        else if (length <= 512)
-                        {
-                            auto record = ui::decode_presentation_fps_record(std::string_view(bytes.data(), length));
-                            if (record)
-                            {
-                                this->fps_record_ = *record;
-                            }
-                        }
-                    }
+                    std::string renderer_metrics;
+                    const auto stamp = current_unix_milliseconds();
                     for (const auto& [guest, state] : this->windows_)
                     {
                         (void)guest;
                         if (state.desc.top_level && state.window)
                         {
+                            const auto sample = state.resources->presentation_rate.sample(now);
+                            if (sample)
+                            {
+                                renderer_metrics +=
+                                    ui::encode_renderer_fps_record(stamp, GetCurrentProcessId(), state.desc.handle, *sample);
+                            }
                             const auto title = this->host_window_title(state);
                             const char* current = SDL_GetWindowTitle(state.window);
                             if (!current || title != current)
@@ -1748,6 +1733,11 @@ namespace sogen
                                 SDL_SetWindowTitle(state.window, title.c_str());
                             }
                         }
+                    }
+                    if (!directory.empty())
+                    {
+                        std::ofstream output(directory / "renderer-live.txt", std::ios::binary | std::ios::trunc);
+                        output << renderer_metrics;
                     }
                 }
                 catch (...)
@@ -1758,7 +1748,6 @@ namespace sogen
             }
 
             std::optional<ui::gpu_window_title_record> gpu_title_record_;
-            std::optional<ui::presentation_fps_record> fps_record_;
             std::chrono::steady_clock::time_point next_gpu_title_refresh_{};
 
             std::shared_ptr<ui_completion_queue> completion_queue_{std::make_shared<ui_completion_queue>()};

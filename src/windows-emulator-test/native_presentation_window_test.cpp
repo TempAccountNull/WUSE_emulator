@@ -20,6 +20,7 @@ namespace sogen::test
             size_t suspended{};
             size_t resumed{};
             size_t retired{};
+            std::atomic<uint64_t> presented_frames{};
             bool wrong_thread{};
             bool suspend_succeeds{true};
             bool resume_succeeds{true};
@@ -68,6 +69,11 @@ namespace sogen::test
             {
                 this->observe_thread();
                 ++this->observations_.retired;
+            }
+
+            void record_presented_frame() noexcept override
+            {
+                this->observations_.presented_frames.fetch_add(1, std::memory_order_relaxed);
             }
 
           private:
@@ -287,6 +293,18 @@ namespace sogen::test
         old = {};
         EXPECT_EQ(registry.collect().destroyed, 1u);
         EXPECT_EQ(second.destroyed, 0u);
+    }
+
+    TEST_F(NativePresentationWindowTest, NativeFrameReportsAcrossThreadsOnlyWhileWindowIsLive)
+    {
+        publish();
+        auto lease = registry.acquire(8).lease;
+        std::thread worker([lease] { lease.record_presented_frame(); });
+        worker.join();
+        EXPECT_EQ(first.presented_frames.load(std::memory_order_relaxed), 1u);
+        registry.retire(8);
+        lease.record_presented_frame();
+        EXPECT_EQ(first.presented_frames.load(std::memory_order_relaxed), 1u);
     }
 
     TEST_F(NativePresentationWindowTest, LegacyPresentationResumesOnlyAfterLastLease)

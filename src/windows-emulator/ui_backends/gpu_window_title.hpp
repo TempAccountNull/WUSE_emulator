@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -24,11 +26,57 @@ namespace sogen::ui
         std::string metrics;
     };
 
-    struct presentation_fps_record
+    struct presentation_frame_rate_sample
     {
-        uint64_t unix_ms{};
-        uint64_t images{};
+        uint64_t frames{};
         uint64_t interval_ns{};
+
+        double fps() const noexcept
+        {
+            return static_cast<double>(this->frames) * 1'000'000'000.0 / static_cast<double>(this->interval_ns);
+        }
+    };
+
+    class presentation_frame_rate
+    {
+      public:
+        using clock = std::chrono::steady_clock;
+
+        explicit presentation_frame_rate(const clock::time_point since = clock::now()) noexcept
+            : since_(since)
+        {
+        }
+
+        void record_presented_frame() noexcept
+        {
+            this->frames_.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        std::optional<presentation_frame_rate_sample> sample(const clock::time_point now) noexcept
+        {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - this->since_).count();
+            if (elapsed < 1'000'000'000)
+            {
+                return this->current_;
+            }
+            const auto frames = this->frames_.exchange(0, std::memory_order_relaxed);
+            if (frames != 0 || this->current_)
+            {
+                this->current_ = {.frames = frames, .interval_ns = static_cast<uint64_t>(elapsed)};
+            }
+            this->since_ = now;
+            return this->current_;
+        }
+
+        std::optional<presentation_frame_rate_sample> current() const noexcept
+        {
+            return this->current_;
+        }
+
+      private:
+        std::atomic<uint64_t> frames_{};
+        clock::time_point since_{};
+        std::optional<presentation_frame_rate_sample> current_{};
     };
 
     namespace gpu_window_title_detail
@@ -166,55 +214,17 @@ namespace sogen::ui
         }
     }
 
-    inline std::optional<presentation_fps_record> decode_presentation_fps_record(const std::string_view bytes)
+    inline std::string encode_renderer_fps_record(const uint64_t unix_ms, const uint32_t host_pid, const uint64_t guest_window,
+                                                  const presentation_frame_rate_sample& sample)
     {
-        constexpr std::string_view prefix = " Presentation metrics: images=";
-        constexpr std::string_view calls = " | calls=";
-        constexpr std::string_view interval = " | interval_ns=";
-        constexpr std::string_view stamp = " | unix_ms=";
-        if (bytes.size() > 512 || !bytes.ends_with('\n'))
-        {
-            return std::nullopt;
-        }
-        const auto prefix_pos = bytes.find(prefix);
-        const auto calls_pos = bytes.find(calls, prefix_pos == std::string_view::npos ? 0 : prefix_pos + prefix.size());
-        const auto interval_pos = bytes.find(interval, calls_pos == std::string_view::npos ? 0 : calls_pos + calls.size());
-        const auto stamp_pos = bytes.find(stamp, interval_pos == std::string_view::npos ? 0 : interval_pos + interval.size());
-        if (prefix_pos == std::string_view::npos || calls_pos == std::string_view::npos || interval_pos == std::string_view::npos ||
-            stamp_pos == std::string_view::npos)
-        {
-            return std::nullopt;
-        }
-        presentation_fps_record result;
-        uint64_t payload_stamp{};
-        if (!gpu_window_title_detail::parse_decimal(bytes.substr(0, prefix_pos), result.unix_ms) ||
-            !gpu_window_title_detail::parse_decimal(bytes.substr(prefix_pos + prefix.size(), calls_pos - prefix_pos - prefix.size()),
-                                                    result.images) ||
-            !gpu_window_title_detail::parse_decimal(
-                bytes.substr(interval_pos + interval.size(), stamp_pos - interval_pos - interval.size()), result.interval_ns) ||
-            !gpu_window_title_detail::parse_decimal(bytes.substr(stamp_pos + stamp.size(), bytes.size() - stamp_pos - stamp.size() - 1),
-                                                    payload_stamp) ||
-            result.interval_ns == 0 || (payload_stamp > result.unix_ms && payload_stamp - result.unix_ms > 1000) ||
-            (result.unix_ms > payload_stamp && result.unix_ms - payload_stamp > 1000))
-        {
-            return std::nullopt;
-        }
-        return result;
+        return std::format("{} Renderer metrics: host_pid={} | guest_window={} | frames={} | interval_ns={} | unix_ms={}\n", unix_ms,
+                           host_pid, guest_window, sample.frames, sample.interval_ns, unix_ms);
     }
 
-    inline std::string append_presentation_fps(std::string title, const std::optional<presentation_fps_record>& record,
-                                               const uint64_t now_ms)
+    inline std::string append_presentation_fps(std::string title, const std::optional<presentation_frame_rate_sample> fps)
     {
         title += title.empty() ? "FPS: " : " | FPS: ";
-        if (!record || now_ms < record->unix_ms || now_ms - record->unix_ms > gpu_window_title_freshness_ms)
-        {
-            title += "unavailable";
-        }
-        else
-        {
-            title +=
-                std::format("{:.1f}", static_cast<double>(record->images) * 1'000'000'000.0 / static_cast<double>(record->interval_ns));
-        }
+        title += fps ? std::format("{:.1f}", fps->fps()) : "unavailable";
         return title;
     }
 

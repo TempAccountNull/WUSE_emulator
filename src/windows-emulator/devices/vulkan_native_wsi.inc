@@ -644,6 +644,16 @@ try
         }
         const auto native_result = dev.native_present(queue->second.handle, &info);
         const auto completion = copy->presented(native_result);
+        if ((native_result == VK_SUCCESS || native_result == VK_SUBOPTIMAL_KHR) && !completion.logical_device_lost)
+        {
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                if (results[i] == VK_SUCCESS || results[i] == VK_SUBOPTIMAL_KHR)
+                {
+                    states[i]->lease.record_presented_frame();
+                }
+            }
+        }
         if (completion.logical_device_lost)
         {
             dev.native_presentation_failed = true;

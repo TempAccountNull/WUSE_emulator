@@ -27,6 +27,7 @@ namespace sogen
         virtual bool suspend_legacy_presentation() noexcept = 0;
         virtual bool resume_legacy_presentation() noexcept = 0;
         virtual void retire() noexcept = 0;
+        virtual void record_presented_frame() noexcept = 0;
     };
 
     namespace detail
@@ -105,6 +106,14 @@ namespace sogen
         [[nodiscard]] win32_presentation_target target() const noexcept
         {
             return this->record_ ? this->record_->target : win32_presentation_target{};
+        }
+
+        void record_presented_frame() const noexcept
+        {
+            if (this->live() && this->record_->resource)
+            {
+                this->record_->resource->record_presented_frame();
+            }
         }
 
         void swap(native_presentation_window_lease& other) noexcept
