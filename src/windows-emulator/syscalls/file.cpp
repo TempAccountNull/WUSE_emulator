@@ -1341,11 +1341,11 @@ namespace sogen
             }
         }
 
-        NTSTATUS handle_NtReadFile(const syscall_context& c, const handle file_handle, const uint64_t event, const uint64_t apc_routine,
-                                   const uint64_t apc_context,
-                                   const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const uint64_t buffer,
-                                   const ULONG length, const emulator_object<LARGE_INTEGER> byte_offset,
-                                   const emulator_object<ULONG> /*key*/)
+        NTSTATUS handle_NtReadFile_impl(const syscall_context& c, const handle file_handle, const uint64_t event,
+                                        const uint64_t apc_routine, const uint64_t apc_context,
+                                        const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
+                                        const uint64_t buffer, const ULONG length, const emulator_object<LARGE_INTEGER> byte_offset,
+                                        const emulator_object<ULONG> /*key*/)
         {
             const bool profile_read = c.win_emu.file_reads_profile.enabled();
             const auto started = profile_read ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1468,7 +1468,10 @@ namespace sogen
             }
 
             const auto record_package_read = [&](const size_t actual) {
-                if (!trace_package) return;
+                if (!trace_package)
+                {
+                    return;
+                }
                 static thread_local std::array<char, package_read_trace::hash_chunk_bytes> guest_chunk{};
                 uint64_t host_hash = package_read_trace::hash_seed;
                 uint64_t guest_hash = package_read_trace::hash_seed;
@@ -1483,10 +1486,8 @@ namespace sogen
                         guest_valid = false;
                         break;
                     }
-                    host_hash = package_read_trace::hash_append(
-                        host_hash, std::span<const char>(temp_buffer.data() + hashed, count));
-                    guest_hash = package_read_trace::hash_append(
-                        guest_hash, std::span<const char>(guest_chunk.data(), count));
+                    host_hash = package_read_trace::hash_append(host_hash, std::span<const char>(temp_buffer.data() + hashed, count));
+                    guest_hash = package_read_trace::hash_append(guest_hash, std::span<const char>(guest_chunk.data(), count));
                     hashed += count;
                 }
                 c.win_emu.package_reads_trace.record({
@@ -1528,6 +1529,35 @@ namespace sogen
             }
 
             deliver_file_io_completion(c, event, apc_routine, apc_context, io_status_block, status, 0);
+            return status;
+        }
+
+        NTSTATUS handle_NtReadFile(const syscall_context& c, const handle file_handle, const uint64_t event, const uint64_t apc_routine,
+                                   const uint64_t apc_context,
+                                   const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const uint64_t buffer,
+                                   const ULONG length, const emulator_object<LARGE_INTEGER> byte_offset, const emulator_object<ULONG> key)
+        {
+            const auto status =
+                handle_NtReadFile_impl(c, file_handle, event, apc_routine, apc_context, io_status_block, buffer, length, byte_offset, key);
+            if (c.win_emu.package_reads_trace.enabled() && length >= 300000 && c.win_emu.callbacks.on_generic_activity)
+            {
+                try
+                {
+                    const auto* f = c.proc.files.get(file_handle);
+                    if (f && f->name.ends_with(u".pkg"))
+                    {
+                        const auto iosb = io_status_block.try_read();
+                        const auto offset = byte_offset.try_read();
+                        c.win_emu.callbacks.on_generic_activity(std::format(
+                            "Package read: path={} handle={} offset={} requested={} status=0x{:08X} iosb_status=0x{:08X} actual={}",
+                            u16_to_u8(f->name), file_handle.bits, offset ? offset->QuadPart : -1, length, static_cast<uint32_t>(status),
+                            iosb ? static_cast<uint32_t>(iosb->Status) : 0, iosb ? iosb->Information : 0));
+                    }
+                }
+                catch (...)
+                {
+                }
+            }
             return status;
         }
 
@@ -1909,12 +1939,12 @@ namespace sogen
             return STATUS_SUCCESS;
         }
 
-        NTSTATUS handle_NtCreateFile(const syscall_context& c, const emulator_object<handle> file_handle, ACCESS_MASK desired_access,
-                                     const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
-                                     const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> /*io_status_block*/,
-                                     const emulator_object<LARGE_INTEGER> /*allocation_size*/, ULONG /*file_attributes*/,
-                                     ULONG /*share_access*/, ULONG create_disposition, ULONG create_options, uint64_t ea_buffer,
-                                     ULONG ea_length)
+        NTSTATUS handle_NtCreateFile_impl(const syscall_context& c, const emulator_object<handle> file_handle, ACCESS_MASK desired_access,
+                                          const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
+                                          const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> /*io_status_block*/,
+                                          const emulator_object<LARGE_INTEGER> /*allocation_size*/, ULONG /*file_attributes*/,
+                                          ULONG /*share_access*/, ULONG create_disposition, ULONG create_options, uint64_t ea_buffer,
+                                          ULONG ea_length)
         {
             if (create_options & FILE_DELETE_ON_CLOSE && !(desired_access & DELETE))
             {
@@ -2152,6 +2182,42 @@ namespace sogen
             file_handle.write(handle);
 
             return STATUS_SUCCESS;
+        }
+
+        NTSTATUS handle_NtCreateFile(const syscall_context& c, const emulator_object<handle> file_handle, const ACCESS_MASK desired_access,
+                                     const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
+                                     const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
+                                     const emulator_object<LARGE_INTEGER> allocation_size, const ULONG file_attributes,
+                                     const ULONG share_access, const ULONG create_disposition, const ULONG create_options,
+                                     const uint64_t ea_buffer, const ULONG ea_length)
+        {
+            const auto status =
+                handle_NtCreateFile_impl(c, file_handle, desired_access, object_attributes, io_status_block, allocation_size,
+                                         file_attributes, share_access, create_disposition, create_options, ea_buffer, ea_length);
+            if (c.win_emu.package_reads_trace.enabled() && c.win_emu.callbacks.on_generic_activity)
+            {
+                try
+                {
+                    const auto attributes = object_attributes.try_read();
+                    if (attributes)
+                    {
+                        const auto name = read_unicode_string(c.emu, attributes->ObjectName);
+                        if (name.ends_with(u".pkg"))
+                        {
+                            const auto iosb = io_status_block.try_read();
+                            c.win_emu.callbacks.on_generic_activity(std::format(
+                                "Package open: path={} access=0x{:08X} disposition={} options=0x{:08X} status=0x{:08X} "
+                                "iosb_status=0x{:08X} iosb_information={}",
+                                u16_to_u8(name), desired_access, create_disposition, create_options, static_cast<uint32_t>(status),
+                                iosb ? static_cast<uint32_t>(iosb->Status) : 0, iosb ? iosb->Information : 0));
+                        }
+                    }
+                }
+                catch (...)
+                {
+                }
+            }
+            return status;
         }
 
         NTSTATUS handle_NtQueryFullAttributesFile(const syscall_context& c,
