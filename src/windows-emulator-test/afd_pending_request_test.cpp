@@ -45,6 +45,11 @@ namespace sogen::test
             bool connected{};
             std::optional<network::address> next_accepted_remote{};
             uint32_t disconnect_mode{};
+            uint32_t transport_level{};
+            uint32_t transport_option{};
+            std::vector<std::byte> transport_value{};
+            uint32_t transport_status{};
+            size_t transport_calls{};
             int last_error{};
         };
 
@@ -79,6 +84,15 @@ namespace sogen::test
                     std::swap(addresses[0], addresses[1]);
                 }
                 return STATUS_SUCCESS;
+            }
+
+            uint32_t set_transport_option(const uint32_t level, const uint32_t option, const std::span<const std::byte> value) override
+            {
+                state->transport_level = level;
+                state->transport_option = option;
+                state->transport_value.assign(value.begin(), value.end());
+                ++state->transport_calls;
+                return state->transport_status;
             }
 
             bool is_ready(bool) override
@@ -625,6 +639,126 @@ namespace sogen::test
         EXPECT_EQ(emu.memory.read_memory(output, 32),
                   (std::vector<std::byte>(replacement.begin(), replacement.end())));
     }
+
+    TEST_P(AfdPendingRequestTest, TransportType1OptionsMatchNativeStatusAndCompletion)
+    {
+        constexpr uint64_t creation_ptr = memory + 0x600;
+        constexpr uint64_t wrapper_ptr = memory + 0x800;
+        constexpr uint64_t nested_ptr = memory + 0x900;
+        constexpr uint64_t iosb_ptr = memory + 0x100;
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+
+        const auto make_endpoint = [&](const uint32_t family, const uint32_t type, const uint32_t protocol) {
+            std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, family, type, protocol, 0};
+            emu.memory.write_memory(creation_ptr, creation.data(), sizeof(creation));
+            auto endpoint = create_afd_endpoint({.is_32_bit = GetParam()});
+            endpoint->create(emu, {.buffer = creation_ptr, .length = sizeof(creation)});
+            return endpoint;
+        };
+
+        const auto run = [this, &initial, &make_endpoint]<typename Guest>() {
+            using traits = EmulatorTraits<Guest>;
+            using wrapper = AFD_WINSOCK_TRANSPORT_IOCTL<traits>;
+            const auto invoke = [&](io_device& endpoint, const uint32_t level, const uint32_t option,
+                                    const std::span<const std::byte> value) {
+                emu.memory.write_memory(nested_ptr, value.data(), value.size());
+                const wrapper outer{.Type = 1,
+                                    .Reserved = level,
+                                    .ControlCode = option,
+                                    .Overlapped = 1,
+                                    .Padding = {},
+                                    .InputBuffer = static_cast<typename traits::PVOID>(nested_ptr),
+                                    .InputBufferLength = static_cast<typename traits::SIZE_T>(value.size())};
+                emu.memory.write_memory(wrapper_ptr, &outer, sizeof(outer));
+                emu.memory.write_memory(iosb_ptr, &initial, sizeof(initial));
+                emu.process.events.get(receive_event)->signaled = false;
+                io_device_context request{emu.memory};
+                request.io_control_code = 0x120bf;
+                request.io_status_block = {emu.memory, iosb_ptr};
+                request.event = receive_event;
+                request.input_buffer = wrapper_ptr;
+                request.input_buffer_length = sizeof(outer);
+                return endpoint.execute_ioctl(emu, request);
+            };
+            const std::array<std::byte, 4> zero{};
+            const std::array<std::byte, 4> one{std::byte{1}};
+            const std::array<std::byte, 1> byte_one{std::byte{1}};
+            const auto check_success = [&] {
+                const auto result = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb_ptr);
+                EXPECT_EQ(result.Status, STATUS_SUCCESS);
+                EXPECT_EQ(result.Information, 0u);
+                EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+            };
+
+            auto ipv6_tcp = make_endpoint(23, 1, 6);
+            EXPECT_EQ(invoke(*ipv6_tcp, 0x29, 0x1b, zero), STATUS_SUCCESS);
+            check_success();
+            EXPECT_EQ(socket->transport_level, 0x29u);
+            EXPECT_EQ(socket->transport_option, 0x1bu);
+            EXPECT_EQ(socket->transport_value, (std::vector<std::byte>(zero.begin(), zero.end())));
+
+            auto ipv4_udp = make_endpoint(2, 2, 17);
+            EXPECT_EQ(invoke(*ipv4_udp, 0xffff, 0x20, one), STATUS_SUCCESS);
+            check_success();
+            EXPECT_EQ(socket->transport_option, 0x20u);
+            EXPECT_EQ(socket->transport_value, (std::vector<std::byte>(one.begin(), one.end())));
+
+            auto ipv4_tcp = make_endpoint(2, 1, 6);
+            EXPECT_EQ(invoke(*ipv4_tcp, 0xffff, 0x3007, byte_one), STATUS_SUCCESS);
+            check_success();
+            EXPECT_EQ(socket->transport_option, 0x3007u);
+            EXPECT_EQ(socket->transport_value, (std::vector<std::byte>(byte_one.begin(), byte_one.end())));
+            const auto calls = socket->transport_calls;
+
+            EXPECT_EQ(invoke(*ipv4_tcp, 0xffff, 0x20, one), STATUS_NOT_SUPPORTED);
+            const auto rejected = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb_ptr);
+            EXPECT_EQ(rejected.Status, initial.Status);
+            EXPECT_EQ(rejected.Information, initial.Information);
+            EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+            EXPECT_EQ(socket->transport_calls, calls);
+
+            EXPECT_EQ(invoke(*ipv4_udp, 0xffff, 0x3007, byte_one), STATUS_PENDING);
+            const auto pending = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb_ptr);
+            EXPECT_EQ(pending.Status, initial.Status);
+            EXPECT_EQ(pending.Information, initial.Information);
+            EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+            ipv4_udp->work(emu);
+            const auto completed = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(iosb_ptr);
+            EXPECT_EQ(completed.Status, STATUS_INVALID_PARAMETER);
+            EXPECT_EQ(completed.Information, 0u);
+            EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+            EXPECT_EQ(socket->transport_calls, calls);
+        };
+        if (GetParam())
+        {
+            run.template operator()<Emu32>();
+        }
+        else
+        {
+            run.template operator()<Emu64>();
+        }
+    }
+
+#ifdef _WIN32
+    TEST(AfdType1HostTest, NativeBackendAppliesBroadcastAndPreservesUnsupportedStatus)
+    {
+        network::initialize_wsa();
+        network::socket_wrapper udp{AF_INET, SOCK_DGRAM, IPPROTO_UDP};
+        network::socket_wrapper tcp{AF_INET, SOCK_STREAM, IPPROTO_TCP};
+        network::socket_wrapper ipv6_tcp{AF_INET6, SOCK_STREAM, IPPROTO_TCP};
+        const std::array<std::byte, 4> zero{};
+        const std::array<std::byte, 4> one{std::byte{1}};
+        const std::array<std::byte, 1> byte_one{std::byte{1}};
+        ASSERT_EQ(ipv6_tcp.set_transport_option(IPPROTO_IPV6, IPV6_V6ONLY, zero), STATUS_SUCCESS);
+        ASSERT_EQ(tcp.set_transport_option(SOL_SOCKET, 0x3007, byte_one), STATUS_SUCCESS);
+        ASSERT_EQ(udp.set_transport_option(SOL_SOCKET, SO_BROADCAST, one), STATUS_SUCCESS);
+        int broadcast{};
+        int length = sizeof(broadcast);
+        ASSERT_EQ(getsockopt(udp.get().get_socket(), SOL_SOCKET, SO_BROADCAST, reinterpret_cast<char*>(&broadcast), &length), 0);
+        EXPECT_EQ(broadcast, 1);
+        EXPECT_EQ(tcp.set_transport_option(SOL_SOCKET, SO_BROADCAST, one), STATUS_NOT_SUPPORTED);
+    }
+#endif
 
     TEST_P(AfdPendingRequestTest, TransportAddressSortMatchesNativePendingAndOutputContract)
     {

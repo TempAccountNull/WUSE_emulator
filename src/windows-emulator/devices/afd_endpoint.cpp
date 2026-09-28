@@ -1087,7 +1087,8 @@ namespace sogen
                 const auto request = _AFD_REQUEST(c.io_control_code);
                 return (request == AFD_SEND && (status == STATUS_PIPE_DISCONNECTED || status == STATUS_LOCAL_DISCONNECT)) ||
                        (request == AFD_WAIT_FOR_LISTEN && status == STATUS_BUFFER_TOO_SMALL) ||
-                       (request == AFD_ACCEPT && status == STATUS_INVALID_HANDLE);
+                       (request == AFD_ACCEPT && status == STATUS_INVALID_HANDLE) ||
+                       (request == AFD_TRANSPORT_IOCTL && status == STATUS_NOT_SUPPORTED);
             }
 
             NTSTATUS dispatch_ioctl(windows_emulator& win_emu, const io_device_context& c, const ULONG request)
@@ -1204,6 +1205,49 @@ namespace sogen
                 return STATUS_SUCCESS;
             }
 
+            NTSTATUS ioctl_transport_option(windows_emulator& win_emu, const io_device_context& c,
+                                            const AFD_WINSOCK_TRANSPORT_IOCTL<Traits>& wrapper)
+            {
+                if (!this->creation_data || wrapper.Overlapped != 1)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                const auto& endpoint = *this->creation_data;
+                const bool ipv6_only = wrapper.Reserved == 0x29 && wrapper.ControlCode == 0x1b && endpoint.address_family == 23 &&
+                                       wrapper.InputBufferLength == 4;
+                const bool broadcast = wrapper.Reserved == 0xffff && wrapper.ControlCode == 0x20 && endpoint.address_family == 2 &&
+                                       wrapper.InputBufferLength == 4;
+                const bool reuse_port = wrapper.Reserved == 0xffff && wrapper.ControlCode == 0x3007 && endpoint.address_family == 2 &&
+                                        (wrapper.InputBufferLength == 1 || wrapper.InputBufferLength == 4);
+                if (!ipv6_only && !broadcast && !reuse_port)
+                {
+                    return STATUS_NOT_SUPPORTED;
+                }
+                if (!wrapper.InputBuffer)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                std::array<std::byte, 4> value{};
+                if (!win_emu.memory.try_read_memory(wrapper.InputBuffer, value.data(), static_cast<size_t>(wrapper.InputBufferLength)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if (broadcast && endpoint.type != 2)
+                {
+                    return STATUS_NOT_SUPPORTED;
+                }
+                if (reuse_port && endpoint.type == 2)
+                {
+                    return this->delay_ioctrl(c);
+                }
+                if ((ipv6_only && endpoint.type != 1 && endpoint.type != 2) || (reuse_port && endpoint.type != 1))
+                {
+                    return STATUS_NOT_SUPPORTED;
+                }
+                return static_cast<NTSTATUS>(this->s_->set_transport_option(
+                    wrapper.Reserved, wrapper.ControlCode, std::span(value.data(), static_cast<size_t>(wrapper.InputBufferLength))));
+            }
+
             NTSTATUS ioctl_transport_sort(windows_emulator& win_emu, const io_device_context& c)
             {
                 if (!this->s_)
@@ -1221,6 +1265,10 @@ namespace sogen
                     if (!win_emu.memory.try_read_memory(c.input_buffer, &wrapper, sizeof(wrapper)))
                     {
                         return STATUS_ACCESS_VIOLATION;
+                    }
+                    if (wrapper.Type == 1)
+                    {
+                        return this->ioctl_transport_option(win_emu, c, wrapper);
                     }
                     constexpr uint32_t address_sort_code = 0xc8000019; // SIO_ADDRESS_LIST_SORT (ws2def.h)
                     if (wrapper.Type != 3 || wrapper.ControlCode != address_sort_code)

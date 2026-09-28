@@ -45,6 +45,11 @@ namespace sogen
                 return 0xc00000bb;
             }
 
+            virtual uint32_t set_transport_option(uint32_t, uint32_t, std::span<const std::byte>)
+            {
+                return 0xc00000bb;
+            }
+
             // Windows backends forward this AFD request to the host socket; offline
             // sockets apply equivalent send/receive state transitions.
             virtual uint32_t partial_disconnect(uint32_t mode, int64_t timeout) = 0;

@@ -1,4 +1,5 @@
 #include "socket_wrapper.hpp"
+#include <array>
 #include <cassert>
 #include <utils/nt_handle.hpp>
 
@@ -274,6 +275,51 @@ namespace sogen
             return 0;
 #else
             (void)addresses;
+            return 0xc00000bb;
+#endif
+        }
+
+        uint32_t socket_wrapper::set_transport_option(const uint32_t level, const uint32_t option, const std::span<const std::byte> value)
+        {
+#ifdef _WIN32
+            struct transport_request
+            {
+                uint32_t type{1};
+                uint32_t level{};
+                uint32_t option{};
+                uint8_t is_set{1};
+                std::array<uint8_t, 3> padding{};
+                const void* nested_input{};
+                uintptr_t nested_length{};
+            };
+
+            static_assert(sizeof(transport_request) == 32);
+            const transport_request request{.level = level, .option = option, .nested_input = value.data(), .nested_length = value.size()};
+            uint64_t information{};
+            const auto status = socket_control(this->socket_.get_socket(), 0x120bf, std::as_bytes(std::span(&request, 1)), {}, information);
+            if (status != 0)
+            {
+                return status;
+            }
+            if (setsockopt(this->socket_.get_socket(), static_cast<int>(level), static_cast<int>(option),
+                           reinterpret_cast<const char*>(value.data()), static_cast<int>(value.size())) != 0)
+            {
+                const auto error = WSAGetLastError();
+                if (error == WSAEINVAL)
+                {
+                    return 0xc000000d;
+                }
+                if (error == WSAENOPROTOOPT || error == WSAEOPNOTSUPP)
+                {
+                    return 0xc00000bb;
+                }
+                return 0xc0000001;
+            }
+            return 0;
+#else
+            (void)level;
+            (void)option;
+            (void)value;
             return 0xc00000bb;
 #endif
         }
