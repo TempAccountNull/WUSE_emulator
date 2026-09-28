@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <format>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -21,6 +22,13 @@ namespace sogen::ui
         uint64_t guest_hwnd{};
         std::string identity;
         std::string metrics;
+    };
+
+    struct presentation_fps_record
+    {
+        uint64_t unix_ms{};
+        uint64_t images{};
+        uint64_t interval_ns{};
     };
 
     namespace gpu_window_title_detail
@@ -158,6 +166,58 @@ namespace sogen::ui
         }
     }
 
+    inline std::optional<presentation_fps_record> decode_presentation_fps_record(const std::string_view bytes)
+    {
+        constexpr std::string_view prefix = " Presentation metrics: images=";
+        constexpr std::string_view calls = " | calls=";
+        constexpr std::string_view interval = " | interval_ns=";
+        constexpr std::string_view stamp = " | unix_ms=";
+        if (bytes.size() > 512 || !bytes.ends_with('\n'))
+        {
+            return std::nullopt;
+        }
+        const auto prefix_pos = bytes.find(prefix);
+        const auto calls_pos = bytes.find(calls, prefix_pos == std::string_view::npos ? 0 : prefix_pos + prefix.size());
+        const auto interval_pos = bytes.find(interval, calls_pos == std::string_view::npos ? 0 : calls_pos + calls.size());
+        const auto stamp_pos = bytes.find(stamp, interval_pos == std::string_view::npos ? 0 : interval_pos + interval.size());
+        if (prefix_pos == std::string_view::npos || calls_pos == std::string_view::npos || interval_pos == std::string_view::npos ||
+            stamp_pos == std::string_view::npos)
+        {
+            return std::nullopt;
+        }
+        presentation_fps_record result;
+        uint64_t payload_stamp{};
+        if (!gpu_window_title_detail::parse_decimal(bytes.substr(0, prefix_pos), result.unix_ms) ||
+            !gpu_window_title_detail::parse_decimal(bytes.substr(prefix_pos + prefix.size(), calls_pos - prefix_pos - prefix.size()),
+                                                    result.images) ||
+            !gpu_window_title_detail::parse_decimal(
+                bytes.substr(interval_pos + interval.size(), stamp_pos - interval_pos - interval.size()), result.interval_ns) ||
+            !gpu_window_title_detail::parse_decimal(bytes.substr(stamp_pos + stamp.size(), bytes.size() - stamp_pos - stamp.size() - 1),
+                                                    payload_stamp) ||
+            result.interval_ns == 0 || (payload_stamp > result.unix_ms && payload_stamp - result.unix_ms > 1000) ||
+            (result.unix_ms > payload_stamp && result.unix_ms - payload_stamp > 1000))
+        {
+            return std::nullopt;
+        }
+        return result;
+    }
+
+    inline std::string append_presentation_fps(std::string title, const std::optional<presentation_fps_record>& record,
+                                               const uint64_t now_ms)
+    {
+        title += title.empty() ? "FPS: " : " | FPS: ";
+        if (!record || now_ms < record->unix_ms || now_ms - record->unix_ms > gpu_window_title_freshness_ms)
+        {
+            title += "unavailable";
+        }
+        else
+        {
+            title +=
+                std::format("{:.1f}", static_cast<double>(record->images) * 1'000'000'000.0 / static_cast<double>(record->interval_ns));
+        }
+        return title;
+    }
+
     inline std::optional<gpu_window_title_record> decode_gpu_window_title_record(const std::string_view bytes)
     {
         if (bytes.size() > gpu_window_title_max_record_bytes || !bytes.starts_with(gpu_window_title_detail::header_prefix))
@@ -225,8 +285,11 @@ namespace sogen::ui
             title += " | ";
         }
         title += record.identity;
-        title += " | ";
-        title += fresh ? record.metrics : "Telemetry: stale";
+        if (fresh)
+        {
+            title += " | ";
+            title += record.metrics;
+        }
         return title;
     }
 }

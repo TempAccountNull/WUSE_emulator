@@ -198,7 +198,7 @@ namespace sogen::test
     {
         const auto record = ui::decode_gpu_window_title_record(encode_record());
         ASSERT_TRUE(record.has_value());
-        const auto expected = "Game | " + std::string{identity} + " | Telemetry: stale";
+        const auto expected = "Game | " + std::string{identity};
         EXPECT_EQ(ui::compose_gpu_window_title("Game", *record, 1234, 4660, 13001), expected);
         EXPECT_EQ(ui::compose_gpu_window_title("Game", *record, 1234, 4660, 9999), expected);
         EXPECT_EQ(ui::compose_gpu_window_title("Game", *record, 1234, 4660, 0), expected);
@@ -216,6 +216,23 @@ namespace sogen::test
         const auto expected = base_title + " | " + std::string{identity} + " | " + std::string{metrics};
         EXPECT_EQ(ui::compose_gpu_window_title(base_title, *record, 1234, 4660, 10000), expected);
         EXPECT_EQ(ui::compose_gpu_window_title("", *record, 1234, 4660, 10000), std::string{identity} + " | " + std::string{metrics});
+    }
+
+    TEST(GpuWindowTitleTest, ParsesPresentationRateAndExpiresStaleSamples)
+    {
+        constexpr auto sample =
+            "10000 Presentation metrics: images=60 | calls=60 | failed_images=0 | interval_ns=2000000000 | unix_ms=10000\n";
+        const auto record = ui::decode_presentation_fps_record(sample);
+        ASSERT_TRUE(record.has_value());
+        EXPECT_EQ(ui::append_presentation_fps("Game", record, 10000), "Game | FPS: 30.0");
+        EXPECT_EQ(ui::append_presentation_fps("Game", record, 13001), "Game | FPS: unavailable");
+        EXPECT_EQ(ui::append_presentation_fps("Game", record, 9999), "Game | FPS: unavailable");
+        EXPECT_EQ(ui::append_presentation_fps("Game", std::nullopt, 10000), "Game | FPS: unavailable");
+        EXPECT_FALSE(ui::decode_presentation_fps_record(
+                         "10000 Presentation metrics: images=60 | calls=60 | failed_images=0 | interval_ns=0 | unix_ms=10000\n")
+                         .has_value());
+        EXPECT_FALSE(
+            ui::decode_presentation_fps_record(std::string_view{sample}.substr(0, std::string_view{sample}.size() - 1)).has_value());
     }
 
     TEST(GpuWindowTitleTest, RevalidatesManuallyConstructedOrModifiedRecords)

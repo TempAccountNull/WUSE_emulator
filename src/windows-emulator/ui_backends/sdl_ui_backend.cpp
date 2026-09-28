@@ -1671,11 +1671,11 @@ namespace sogen
                                                                        state.desc.handle, current_unix_milliseconds());
                     if (composed)
                     {
-                        return *composed;
+                        return ui::append_presentation_fps(*composed, this->fps_record_, current_unix_milliseconds());
                     }
                 }
 #endif
-                return base;
+                return ui::append_presentation_fps(std::move(base), this->fps_record_, current_unix_milliseconds());
             }
 
             void refresh_gpu_window_title()
@@ -1717,6 +1717,25 @@ namespace sogen
                             }
                         }
                     }
+                    std::ifstream presentation(directory / "presentation-live.txt", std::ios::binary);
+                    if (presentation)
+                    {
+                        std::array<char, 513> bytes{};
+                        presentation.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                        const auto length = static_cast<size_t>(presentation.gcount());
+                        if (length == 0)
+                        {
+                            this->fps_record_.reset();
+                        }
+                        else if (length <= 512)
+                        {
+                            auto record = ui::decode_presentation_fps_record(std::string_view(bytes.data(), length));
+                            if (record)
+                            {
+                                this->fps_record_ = *record;
+                            }
+                        }
+                    }
                     for (const auto& [guest, state] : this->windows_)
                     {
                         (void)guest;
@@ -1739,6 +1758,7 @@ namespace sogen
             }
 
             std::optional<ui::gpu_window_title_record> gpu_title_record_;
+            std::optional<ui::presentation_fps_record> fps_record_;
             std::chrono::steady_clock::time_point next_gpu_title_refresh_{};
 
             std::shared_ptr<ui_completion_queue> completion_queue_{std::make_shared<ui_completion_queue>()};
