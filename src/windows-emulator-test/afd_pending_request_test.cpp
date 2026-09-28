@@ -1245,6 +1245,53 @@ namespace sogen::test
         EXPECT_EQ(port->queue.front().io_status_block.Information, 3u);
     }
 
+    TEST_P(AfdPendingRequestTest, SynchronousSendSkipsApcButPendingSendQueuesIt)
+    {
+        emu.process.is_wow64_process = GetParam();
+        const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
+        emu.memory.write_memory(memory, creation.data(), sizeof(creation));
+        const auto endpoint_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        auto* endpoint = emu.process.devices.get(endpoint_handle);
+        ASSERT_NE(endpoint, nullptr);
+
+        emulator_thread issuer{emu.memory};
+        issuer.id = 0x1234;
+        const auto thread_handle = emu.process.threads.store(std::move(issuer));
+        emu.process.thread_handles_by_id.emplace(0x1234, thread_handle);
+        auto* thread = emu.process.threads.get(thread_handle);
+        ASSERT_NE(thread, nullptr);
+
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
+        emu.memory.write_memory(memory + 0x120, &initial, sizeof(initial));
+        socket->send_blocked = false;
+        ASSERT_EQ(transfer(true, 0, endpoint, endpoint_handle, 0x1234, 0x567800, 0xfeed), STATUS_SUCCESS);
+        EXPECT_EQ(status(true).Status, STATUS_SUCCESS);
+        EXPECT_EQ(status(true).Information, 3u);
+        EXPECT_TRUE(emu.process.events.get(send_event)->signaled);
+        EXPECT_TRUE(thread->pending_apcs.empty());
+        EXPECT_EQ(socket->outgoing, (std::vector<std::byte>{std::byte{'X'}, std::byte{'Y'}, std::byte{'Z'}}));
+
+        emu.process.events.get(send_event)->signaled = false;
+        emu.memory.write_memory(memory + 0x120, &initial, sizeof(initial));
+        socket->send_blocked = true;
+        ASSERT_EQ(transfer(true, 0, endpoint, endpoint_handle, 0x1234, 0x567800, 0xfeed), STATUS_PENDING);
+        EXPECT_EQ(status(true).Status, initial.Status);
+        EXPECT_EQ(status(true).Information, initial.Information);
+        EXPECT_FALSE(emu.process.events.get(send_event)->signaled);
+        EXPECT_TRUE(thread->pending_apcs.empty());
+
+        socket->send_blocked = false;
+        endpoint->work(emu);
+        EXPECT_EQ(status(true).Status, STATUS_SUCCESS);
+        EXPECT_EQ(status(true).Information, 3u);
+        EXPECT_TRUE(emu.process.events.get(send_event)->signaled);
+        ASSERT_EQ(thread->pending_apcs.size(), 1u);
+        EXPECT_EQ(thread->pending_apcs.front().apc_routine, 0x567800u);
+        EXPECT_EQ(thread->pending_apcs.front().apc_argument1, 0xfeedu);
+        EXPECT_EQ(thread->pending_apcs.front().apc_argument2, memory + 0x120);
+    }
+
     TEST_P(AfdPendingRequestTest, CancelByIosbCompletesOnlyMatchingRequestAndQueuesApc)
     {
         emulator_thread issuer{emu.memory};
