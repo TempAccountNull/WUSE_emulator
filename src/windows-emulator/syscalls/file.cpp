@@ -134,7 +134,7 @@ namespace sogen
                     if (diagnostics_count.fetch_add(1, std::memory_order_relaxed) < 8)
                     {
 #ifdef OS_WINDOWS
-                        unsigned long dos_error{};
+                        ULONG dos_error{};
                         _get_doserrno(&dos_error);
                         std::fprintf(stderr, "Host file open failed: errno=%d dos_error=%lu maxstdio=%d path=%s\n", error, dos_error,
                                      _getmaxstdio(), u16_to_u8(host_path.u16string()).c_str());
