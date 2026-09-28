@@ -5,9 +5,12 @@
 #include "utils/io.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <iostream>
+#include <mutex>
+#include <optional>
 #include <utils/finally.hpp>
 #include <utils/wildcard.hpp>
 #include "utils/stat.hpp"
@@ -23,6 +26,11 @@ namespace sogen
     {
         namespace
         {
+            constexpr ULONG file_superseded = 0;
+            constexpr ULONG file_opened = 1;
+            constexpr ULONG file_created = 2;
+            constexpr ULONG file_overwritten = 3;
+
             bool has_valid_filename_characters(const std::u16string_view path)
             {
                 constexpr std::u16string_view invalid_characters = u"\"<>|*?";
@@ -100,6 +108,16 @@ namespace sogen
 
             std::pair<utils::file_handle, NTSTATUS> open_file(const std::filesystem::path& host_path, const std::u16string& mode)
             {
+#ifdef OS_WINDOWS
+                static std::once_flag stream_limit_once;
+                std::call_once(stream_limit_once, [] {
+                    if (_setmaxstdio(8192) != 8192)
+                    {
+                        std::fprintf(stderr, "Failed to raise host stdio stream limit: errno=%d maxstdio=%d\n", errno, _getmaxstdio());
+                    }
+                });
+#endif
+
                 FILE* file{};
                 const auto error = open_unicode(&file, host_path, mode);
 
@@ -110,6 +128,22 @@ namespace sogen
 
                 using fh = utils::file_handle;
 
+                if (error != ENOENT && error != EACCES && error != EISDIR)
+                {
+                    static std::atomic_uint32_t diagnostics_count{};
+                    if (diagnostics_count.fetch_add(1, std::memory_order_relaxed) < 8)
+                    {
+#ifdef OS_WINDOWS
+                        unsigned long dos_error{};
+                        _get_doserrno(&dos_error);
+                        std::fprintf(stderr, "Host file open failed: errno=%d dos_error=%lu maxstdio=%d path=%s\n", error, dos_error,
+                                     _getmaxstdio(), u16_to_u8(host_path.u16string()).c_str());
+#else
+                        std::fprintf(stderr, "Host file open failed: errno=%d path=%s\n", error, u16_to_u8(host_path.u16string()).c_str());
+#endif
+                    }
+                }
+
                 switch (error)
                 {
                 case ENOENT:
@@ -118,6 +152,8 @@ namespace sogen
                     return {fh{}, STATUS_ACCESS_DENIED};
                 case EISDIR:
                     return {fh{}, STATUS_FILE_IS_A_DIRECTORY};
+                case EMFILE:
+                    return {fh{}, STATUS_TOO_MANY_OPENED_FILES};
                 default:
                     return {fh{}, STATUS_NOT_SUPPORTED};
                 }
@@ -1941,10 +1977,9 @@ namespace sogen
 
         NTSTATUS handle_NtCreateFile_impl(const syscall_context& c, const emulator_object<handle> file_handle, ACCESS_MASK desired_access,
                                           const emulator_object<OBJECT_ATTRIBUTES<EmulatorTraits<Emu64>>> object_attributes,
-                                          const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> /*io_status_block*/,
                                           const emulator_object<LARGE_INTEGER> /*allocation_size*/, ULONG /*file_attributes*/,
                                           ULONG /*share_access*/, ULONG create_disposition, ULONG create_options, uint64_t ea_buffer,
-                                          ULONG ea_length)
+                                          ULONG ea_length, std::optional<ULONG>& create_information)
         {
             if (create_options & FILE_DELETE_ON_CLOSE && !(desired_access & DELETE))
             {
@@ -2057,6 +2092,15 @@ namespace sogen
 
             const auto host_path = c.win_emu.file_sys.translate(path);
             const bool file_exists = std::filesystem::exists(host_path, ec);
+            create_information = file_exists ? file_opened : file_created;
+            if (file_exists && create_disposition == FILE_SUPERSEDE)
+            {
+                create_information = file_superseded;
+            }
+            else if (file_exists && (create_disposition == FILE_OVERWRITE || create_disposition == FILE_OVERWRITE_IF))
+            {
+                create_information = file_overwritten;
+            }
 
             if (file_exists && std::filesystem::is_directory(host_path, ec))
             {
@@ -2191,9 +2235,17 @@ namespace sogen
                                      const ULONG share_access, const ULONG create_disposition, const ULONG create_options,
                                      const uint64_t ea_buffer, const ULONG ea_length)
         {
+            std::optional<ULONG> create_information{};
             const auto status =
-                handle_NtCreateFile_impl(c, file_handle, desired_access, object_attributes, io_status_block, allocation_size,
-                                         file_attributes, share_access, create_disposition, create_options, ea_buffer, ea_length);
+                handle_NtCreateFile_impl(c, file_handle, desired_access, object_attributes, allocation_size, file_attributes, share_access,
+                                         create_disposition, create_options, ea_buffer, ea_length, create_information);
+            if (status == STATUS_SUCCESS && create_information && io_status_block)
+            {
+                IO_STATUS_BLOCK<EmulatorTraits<Emu64>> block{};
+                block.Status = status;
+                block.Information = *create_information;
+                io_status_block.write(block);
+            }
             if (c.win_emu.package_reads_trace.enabled() && c.win_emu.callbacks.on_generic_activity)
             {
                 try
