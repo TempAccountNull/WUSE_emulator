@@ -12,6 +12,85 @@
 
 namespace sogen::test
 {
+    TEST(NetworkDebug, TransportIoctlCapturesBoundedNestedInputForBothPointerWidths)
+    {
+        for (const bool wow64 : {false, true})
+        {
+            emulator_settings settings{};
+            settings.load_registry = false;
+            auto emu = create_emulator(std::move(settings));
+            emu.process.is_wow64_process = wow64;
+            constexpr uint64_t memory = 0x240000;
+            ASSERT_TRUE(emu.memory.allocate_memory(memory, 0x1000, memory_permission::read_write));
+            std::array<std::byte, 80> nested{};
+            nested.fill(std::byte{0x77});
+            emu.memory.write_memory(memory + 0x300, nested.data(), nested.size());
+
+            const auto path = std::filesystem::temp_directory_path() /
+                              ("sogen-network-transport-" + std::to_string(wow64) + "-" +
+                               std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".jsonl");
+            auto& vcpu = emu.vcpu(0);
+            vcpu.cpu.reg(x86_register::rip, 0x18009d812);
+            vcpu.cpu.reg(x86_register::rsp, memory + 0x100);
+            io_device_context request{emu.memory};
+            request.io_control_code = 0x120bf;
+            request.issuer_thread_id = 41;
+            request.input_buffer = memory + 0x200;
+            const syscall_context issuer{.win_emu = emu, .emu = vcpu.cpu, .vcpu = vcpu, .proc = emu.process};
+
+            {
+                network_debug_logger logger;
+                logger.open(path);
+                ASSERT_TRUE(logger.enabled());
+                auto exercise = [&](auto wrapper) {
+                    wrapper.Type = 3;
+                    wrapper.ControlCode = 0xc8000019;
+                    wrapper.InputBuffer = static_cast<decltype(wrapper.InputBuffer)>(memory + 0x300);
+                    wrapper.InputBufferLength = 80;
+                    emu.memory.write_memory(memory + 0x200, &wrapper, sizeof(wrapper));
+                    request.input_buffer_length = sizeof(wrapper);
+                    logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+
+                    wrapper.InputBuffer = static_cast<decltype(wrapper.InputBuffer)>(0xdead0000);
+                    emu.memory.write_memory(memory + 0x200, &wrapper, sizeof(wrapper));
+                    logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+
+                    request.input_buffer_length = sizeof(wrapper) - 1;
+                    logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+
+                    request.input_buffer_length = sizeof(wrapper);
+                    wrapper.InputBuffer = 0;
+                    emu.memory.write_memory(memory + 0x200, &wrapper, sizeof(wrapper));
+                    logger.begin_afd_request(emu, request, issuer, "NtDeviceIoControlFile");
+                };
+                if (wow64)
+                {
+                    exercise(AFD_WINSOCK_TRANSPORT_IOCTL<EmulatorTraits<Emu32>>{});
+                }
+                else
+                {
+                    exercise(AFD_WINSOCK_TRANSPORT_IOCTL<EmulatorTraits<Emu64>>{});
+                }
+            }
+
+            std::ifstream input(path, std::ios::binary);
+            ASSERT_TRUE(input.good());
+            const std::string journal{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+            EXPECT_NE(journal.find("\"transport_type\":3"), std::string::npos);
+            EXPECT_NE(journal.find("\"transport_control_code\":\"0xc8000019\""), std::string::npos);
+            EXPECT_NE(journal.find("\"transport_input_length\":80"), std::string::npos);
+            EXPECT_NE(journal.find("\"transport_input_preview_hex\":\"" + std::string(128, '7') + "\""), std::string::npos);
+            EXPECT_EQ(journal.find("\"transport_input_preview_hex\":\"" + std::string(160, '7') + "\""), std::string::npos);
+            EXPECT_NE(journal.find("\"transport_input_preview_truncated\":true"), std::string::npos);
+            EXPECT_NE(journal.find("\"transport_input_preview_unavailable\":\"nested_input_unreadable\""), std::string::npos);
+            EXPECT_NE(journal.find("\"transport_wrapper_unavailable\":\"input_too_short\""), std::string::npos);
+            EXPECT_NE(journal.find("\"transport_input_preview_unavailable\":\"null_input_buffer\""), std::string::npos);
+            EXPECT_EQ(std::count(journal.begin(), journal.end(), '\n'), 4);
+            input.close();
+            std::filesystem::remove(path);
+        }
+    }
+
     TEST(NetworkDebug, DisabledByDefaultAndEmitsBoundedCorrelatedRecordsWhenEnabled)
     {
         emulator_settings settings{};

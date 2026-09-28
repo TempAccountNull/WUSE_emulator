@@ -136,6 +136,49 @@ namespace sogen
             }
         };
 
+        template <typename Traits>
+        void capture_transport_ioctl_input(json_fields& event, windows_emulator& win_emu, const io_device_context& request)
+        {
+            using wrapper_type = AFD_WINSOCK_TRANSPORT_IOCTL<Traits>;
+            if (request.input_buffer_length < sizeof(wrapper_type))
+            {
+                event.string("transport_wrapper_unavailable", "input_too_short");
+                event.string("transport_input_preview_unavailable", "wrapper_unavailable");
+                return;
+            }
+            wrapper_type wrapper{};
+            if (!request.input_buffer || !win_emu.memory.try_read_memory(request.input_buffer, &wrapper, sizeof(wrapper)))
+            {
+                event.string("transport_wrapper_unavailable", "input_buffer_unreadable");
+                event.string("transport_input_preview_unavailable", "wrapper_unavailable");
+                return;
+            }
+
+            event.number("transport_type", wrapper.Type);
+            event.string("transport_control_code", hex(wrapper.ControlCode));
+            event.number("transport_input_length", static_cast<uint64_t>(wrapper.InputBufferLength));
+            const size_t count = std::min<size_t>(wrapper.InputBufferLength, preview_limit);
+            event.boolean("transport_input_preview_truncated", wrapper.InputBufferLength > count);
+            if (!wrapper.InputBufferLength)
+            {
+                event.string("transport_input_preview_unavailable", "empty_input");
+                return;
+            }
+            if (!wrapper.InputBuffer)
+            {
+                event.string("transport_input_preview_unavailable", "null_input_buffer");
+                return;
+            }
+            std::array<std::byte, preview_limit> bytes{};
+            if (!win_emu.memory.try_read_memory(wrapper.InputBuffer, bytes.data(), count))
+            {
+                event.string("transport_input_preview_unavailable", "nested_input_unreadable");
+                return;
+            }
+            event.string("transport_input_preview_hex", hex_bytes(std::span{bytes.data(), count}));
+            event.string("transport_input_preview_source", "guest_transport_input_at_request");
+        }
+
         struct guest_buffer
         {
             uint64_t address{};
@@ -601,6 +644,17 @@ namespace sogen
                     {
                         event.string("control_input_preview_unavailable", "input_buffer_unreadable");
                     }
+                }
+            }
+            if (operation == AFD_TRANSPORT_IOCTL)
+            {
+                if (win_emu.process.is_wow64_process)
+                {
+                    capture_transport_ioctl_input<EmulatorTraits<Emu32>>(event, win_emu, request);
+                }
+                else
+                {
+                    capture_transport_ioctl_input<EmulatorTraits<Emu64>>(event, win_emu, request);
                 }
             }
             event.raw("origin", metadata.origin);
