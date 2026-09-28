@@ -1303,6 +1303,76 @@ namespace sogen
         }
     }
 
+    void network_debug_logger::host_stream_transfer(const io_device_context& request, const std::string_view direction,
+                                                    const std::span<const std::byte> buffer, const size_t transferred) noexcept
+    {
+        const auto captured_at = std::chrono::system_clock::now();
+        if (!impl_ || !request.network_request_id || (direction != "send" && direction != "receive") || transferred > buffer.size())
+        {
+            return;
+        }
+        try
+        {
+            std::scoped_lock lock(impl_->mutex);
+            json_fields event;
+            add_common(event, "host_socket", "completion", request.network_request_id, captured_at);
+            event.string("kind", "host_stream_transfer");
+            event.string("operation", direction);
+            event.string("direction", direction == "send" ? "outbound" : "inbound");
+            event.string("file_handle", hex(request.file_handle.bits));
+            event.number("thread_id", request.issuer_thread_id);
+            event.number("submitted_bytes", buffer.size());
+            event.number("completed_bytes", transferred);
+            event.boolean("pending_retry", request.completing_pending);
+            if (direction == "send")
+            {
+                event.boolean("partial", transferred < buffer.size());
+            }
+            else
+            {
+                event.boolean("eof", transferred == 0 && !buffer.empty());
+                event.boolean("zero_capacity", buffer.empty());
+            }
+            const auto bytes = buffer.first(transferred);
+            const auto preview = bytes.first(std::min(bytes.size(), preview_limit));
+            event.string("preview_hex", hex_bytes(preview));
+            event.boolean("preview_truncated", bytes.size() > preview.size());
+            event.string("preview_source", "host_socket_buffer_at_transfer");
+            if (bytes.size() <= payload_hash_limit)
+            {
+                uint64_t hash = 14695981039346656037ull;
+                for (const auto byte : bytes)
+                {
+                    hash ^= static_cast<uint8_t>(byte);
+                    hash *= 1099511628211ull;
+                }
+                event.string("payload_fnv1a64", hex(hash));
+                event.number("payload_hashed_bytes", bytes.size());
+                event.string("payload_hash_source", "host_socket_buffer_at_transfer");
+            }
+            else
+            {
+                event.string("payload_hash_unavailable", "exceeds_16_mib_limit");
+            }
+            impl_->origin_for(event, request.network_request_id);
+            if (const auto it = impl_->active.find(request.network_request_id); it != impl_->active.end())
+            {
+                if (it->second.local_endpoint)
+                {
+                    event.raw("local_endpoint", *it->second.local_endpoint);
+                }
+                if (it->second.remote_endpoint)
+                {
+                    event.raw("remote_endpoint", *it->second.remote_endpoint);
+                }
+            }
+            impl_->write(event.finish());
+        }
+        catch (...)
+        {
+        }
+    }
+
     void network_debug_logger::apc_queue(const uint64_t request_id, const uint32_t thread_id, const int32_t status,
                                          const uint64_t information) noexcept
     {

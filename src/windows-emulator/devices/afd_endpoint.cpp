@@ -1841,6 +1841,8 @@ namespace sogen
                 {
                     return STATUS_UNSUCCESSFUL;
                 }
+                win_emu.network_debug.host_stream_transfer(c, "receive", std::span<const std::byte>{host_buffer},
+                                                           static_cast<size_t>(bytes_received));
 
                 size_t copied = 0;
                 for (const auto& buffer : buffers)
@@ -1963,6 +1965,8 @@ namespace sogen
                 {
                     return STATUS_UNSUCCESSFUL;
                 }
+                win_emu.network_debug.host_stream_transfer(c, "send", std::span<const std::byte>{host_buffer},
+                                                           static_cast<size_t>(bytes_sent));
 
                 if (c.io_status_block)
                 {
