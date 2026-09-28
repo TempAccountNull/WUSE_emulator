@@ -54,6 +54,10 @@ namespace sogen::test
             windows_emulator win{icicle::create_x86_64_emulator(vcpu_count), settings, {}, std::move(interfaces)};
             win.process.kusd.setup(win.version, win.fake_env);
 
+            constexpr auto shared_data_base = 0x7ffe0000ULL;
+            const auto qpc_bypass = win.memory.read_memory<uint8_t>(shared_data_base + offsetof(KUSER_SHARED_DATA64, QpcData));
+            EXPECT_EQ(qpc_bypass, 0U);
+
             const auto page = win.memory.allocate_memory(0x1000, memory_permission::all);
             ASSERT_NE(page, 0U);
             std::array<uint8_t, 512> code{};
@@ -92,6 +96,11 @@ namespace sogen::test
             const auto before_tsc = read_tsc(0);
             const auto before_rdtscp = read_tsc(0x10);
             const auto before_qpc = read_qpc();
+            const auto qpc_frequency = win.memory.read_memory<LARGE_INTEGER>(output + sizeof(LARGE_INTEGER)).QuadPart;
+            const auto shared_qpc_frequency =
+                win.memory.read_memory<int64_t>(shared_data_base + offsetof(KUSER_SHARED_DATA64, QpcFrequency));
+            EXPECT_EQ(qpc_frequency, shared_qpc_frequency);
+            EXPECT_GT(qpc_frequency, 0);
             const auto before_tick_ms = read_tick_ms();
 
             if (vcpu_count > 1)

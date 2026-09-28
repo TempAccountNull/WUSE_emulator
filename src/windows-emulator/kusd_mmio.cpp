@@ -76,9 +76,9 @@ namespace sogen
             kusd.XState.EnabledFeatures = 0x000000000000001f;
             kusd.XState.EnabledVolatileFeatures = 0x000000000000000f;
             kusd.XState.Size = 0x000003c0;
-            kusd.QpcData.QpcData = 0x0083;
-            kusd.QpcData.QpcBypassEnabled = 0x83;
-            kusd.QpcBias = 0x000000159530c4af;
+            // The hypervisor QPC bypass requires a shared conversion page that SystemHypervisorSharedPageInformation must provide.
+            kusd.QpcData.QpcData = 0;
+            kusd.QpcBias = 0;
             kusd.QpcFrequency = utils::clock::steady_duration::period::den;
             kusd.Reserved1 = 0x7ffeffff;
             kusd.Reserved3 = 0x80000000;
@@ -150,6 +150,8 @@ namespace sogen
     void kusd_mmio::deserialize(utils::buffer_deserializer& buffer)
     {
         buffer.read(this->kusd_);
+        this->kusd_.QpcData.QpcData = 0;
+        this->kusd_.QpcBias = 0;
 
         this->deregister_mmio();
         this->register_mmio();
