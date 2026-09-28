@@ -1808,6 +1808,9 @@ namespace sogen
                 json += ",\"idle_host_sleeps_total\":" + std::to_string(stats.idle_host_sleeps);
                 json += ",\"idle_relative_ticks_total\":" + std::to_string(stats.idle_relative_ticks);
                 json += ",\"timer_preempt_requests_total\":" + std::to_string(stats.timer_preempt_requests);
+                json += ",\"timer_wait_target_ms\":" + std::to_string(stats.timer_wait_target_ms);
+                json += ",\"timer_wait_calls_total\":" + std::to_string(stats.timer_wait_calls);
+                json += ",\"timer_wait_nanos_total\":" + std::to_string(stats.timer_wait_nanos);
                 json += "}";
             }
             json += "]";
@@ -3267,8 +3270,7 @@ namespace sogen
         const auto start_instructions = this->get_executed_instructions();
         const auto target_instructions = start_instructions + count;
 
-        std::mutex interrupt_mutex{};
-        std::condition_variable interrupt_cond{};
+        HANDLE interrupt_event = nullptr;
         std::thread interrupt_thread{};
         std::thread lock_owner_monitor{};
         std::vector<std::thread> workers{};
@@ -3280,12 +3282,11 @@ namespace sogen
         }
 
         const auto _ = utils::finally([&] {
+            this->should_stop = true;
+            if (interrupt_event)
             {
-                std::unique_lock lock{interrupt_mutex};
-                this->should_stop = true;
+                SetEvent(interrupt_event);
             }
-
-            interrupt_cond.notify_all();
 
             for (uint32_t i = 0; i < this->vcpu_count_; ++i)
             {
@@ -3303,6 +3304,10 @@ namespace sogen
             if (interrupt_thread.joinable())
             {
                 interrupt_thread.join();
+            }
+            if (interrupt_event)
+            {
+                CloseHandle(interrupt_event);
             }
 
             if (lock_owner_monitor.joinable())
@@ -3368,16 +3373,34 @@ namespace sogen
                 const char* configured = std::getenv("SOGEN_PREEMPT_MS");
                 return configured ? std::max(1, atoi(configured)) : 20;
             }();
+            if (scheduler_profiling_enabled())
+            {
+                this->vcpu(0).scheduler_profile.timer_wait_target_ms = preempt_ms;
+            }
+            interrupt_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!interrupt_event)
+            {
+                throw std::runtime_error("Failed to create preemption timer event: " + std::to_string(GetLastError()));
+            }
             interrupt_thread = std::thread([&] {
                 const kernel_lock::attribution_scope lock_site("preemption_timer");
                 constexpr auto heartbeat_interval = std::chrono::milliseconds(1000);
                 auto last_preemption = std::chrono::steady_clock::now();
                 while (!this->should_stop)
                 {
-                    std::unique_lock lock{interrupt_mutex};
-                    interrupt_cond.wait_for(lock, std::min(std::chrono::milliseconds(preempt_ms), heartbeat_interval), [&] {
-                        return this->should_stop.load(); //
-                    });
+                    const auto wait_started = std::chrono::steady_clock::now();
+                    const auto wait_result = WaitForSingleObject(interrupt_event, std::min(preempt_ms, 1000));
+                    const auto wait_elapsed = std::chrono::steady_clock::now() - wait_started;
+                    if (wait_result == WAIT_OBJECT_0)
+                    {
+                        break;
+                    }
+                    if (wait_result != WAIT_TIMEOUT)
+                    {
+                        std::fprintf(stderr, "Preemption timer wait failed: %lu\n", GetLastError());
+                        this->should_stop = true;
+                        break;
+                    }
 
                     if (!this->should_stop)
                     {
@@ -3390,6 +3413,13 @@ namespace sogen
                         // lands either fully before the consume (plain early switch) or fully inside the
                         // running quantum (ordinary preemption), never split across it.
                         const std::scoped_lock kernel_lock(this->kernel_lock_);
+                        if (scheduler_profiling_enabled())
+                        {
+                            auto& stats = this->vcpu(0).scheduler_profile;
+                            ++stats.timer_wait_calls;
+                            stats.timer_wait_nanos +=
+                                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(wait_elapsed).count());
+                        }
                         uint32_t running_vcpus = 0;
                         bool running_thread_needs_switch = false;
                         for (const auto& v : this->vcpus_)
@@ -3998,13 +4028,17 @@ namespace sogen
                 this->log.print(
                     color::cyan,
                     "SCHEDPROFILE vcpu=%zu switches=%llu switch_ms=%.3f device_calls=%llu device_ms=%.3f "
-                    "idle_retries=%llu idle_yields=%llu idle_host_wait_sleeps=%llu idle_sleeps=%llu relative_ticks=%llu timer_preempts=%llu\n",
+                    "idle_retries=%llu idle_yields=%llu idle_host_wait_sleeps=%llu idle_sleeps=%llu relative_ticks=%llu "
+                    "timer_preempts=%llu "
+                    "timer_target_ms=%llu timer_waits=%llu timer_wait_ms=%.3f\n",
                     i, static_cast<unsigned long long>(stats.context_switch_calls), static_cast<double>(stats.context_switch_nanos) / 1e6,
                     static_cast<unsigned long long>(stats.device_work_calls), static_cast<double>(stats.device_work_nanos) / 1e6,
                     static_cast<unsigned long long>(stats.idle_retries), static_cast<unsigned long long>(stats.idle_host_yields),
-                    static_cast<unsigned long long>(stats.idle_host_wait_sleeps),
-                    static_cast<unsigned long long>(stats.idle_host_sleeps), static_cast<unsigned long long>(stats.idle_relative_ticks),
-                    static_cast<unsigned long long>(stats.timer_preempt_requests));
+                    static_cast<unsigned long long>(stats.idle_host_wait_sleeps), static_cast<unsigned long long>(stats.idle_host_sleeps),
+                    static_cast<unsigned long long>(stats.idle_relative_ticks),
+                    static_cast<unsigned long long>(stats.timer_preempt_requests),
+                    static_cast<unsigned long long>(stats.timer_wait_target_ms), static_cast<unsigned long long>(stats.timer_wait_calls),
+                    static_cast<double>(stats.timer_wait_nanos) / 1e6);
             }
         };
         if (this->kernel_lock_.is_held_by_current_thread())

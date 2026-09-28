@@ -145,6 +145,9 @@ namespace sogen
             uint64_t idle_host_sleeps{};
             uint64_t idle_relative_ticks{};
             uint64_t timer_preempt_requests{};
+            uint64_t timer_wait_target_ms{};
+            uint64_t timer_wait_calls{};
+            uint64_t timer_wait_nanos{};
         };
 
         x86_64_cpu& cpu;
