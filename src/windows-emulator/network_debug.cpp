@@ -31,6 +31,36 @@ namespace sogen
         constexpr uint64_t idle_summary_batch = 256;
         constexpr uint64_t payload_hash_limit = 16ull * 1024 * 1024;
         constexpr uint64_t output_limit = 64ull * 1024 * 1024;
+        constexpr size_t bap_frame_limit = 256 * 1024;
+        constexpr size_t bap_stream_limit = 128;
+        constexpr uint64_t fnv_offset = 14695981039346656037ull;
+        constexpr uint64_t fnv_prime = 1099511628211ull;
+
+        struct bap_stream_state
+        {
+            std::array<uint8_t, 6> header{};
+            size_t header_bytes{};
+            size_t body_remaining{};
+            size_t frame_bytes{};
+            uint64_t frame_hash{fnv_offset};
+            uint64_t first_request_id{};
+            uint64_t last_request_id{};
+            uint64_t frame_number{};
+            uint32_t fragment_count{};
+            bool ignored{};
+            bool recognized{};
+
+            void reset_frame() noexcept
+            {
+                header_bytes = 0;
+                body_remaining = 0;
+                frame_bytes = 0;
+                frame_hash = fnv_offset;
+                first_request_id = 0;
+                last_request_id = 0;
+                fragment_count = 0;
+            }
+        };
 
         std::string hex(const uint64_t value)
         {
@@ -711,6 +741,145 @@ namespace sogen
         std::unordered_map<uint64_t, std::string> local_endpoints;
         std::unordered_map<std::string, std::string> pending_accept_endpoints;
         std::unordered_map<std::string, idle_summary> idle_summaries;
+        std::unordered_map<uint64_t, bap_stream_state> bap_outbound;
+        std::unordered_map<uint64_t, bap_stream_state> bap_inbound;
+
+        void record_bap_transfer(const io_device_context& request, const std::string_view direction,
+                                 const std::span<const std::byte> bytes,
+                                 const std::chrono::system_clock::time_point captured_at)
+        {
+            if (bytes.empty())
+            {
+                return;
+            }
+            auto& streams = direction == "send" ? bap_outbound : bap_inbound;
+            const auto handle = request.file_handle.bits;
+            if (!streams.contains(handle) && streams.size() >= bap_stream_limit)
+            {
+                json_fields event;
+                add_common(event, "bap_wire", "diagnostic", request.network_request_id, captured_at);
+                event.string("kind", "bap_stream_state_limit");
+                event.string("direction", direction == "send" ? "outbound" : "inbound");
+                event.number("limit", bap_stream_limit);
+                write(event.finish());
+                streams.clear();
+            }
+            auto& state = streams[handle];
+            bool counted_fragment = false;
+            for (const auto byte : bytes)
+            {
+                if (state.ignored)
+                {
+                    return;
+                }
+                const auto value = static_cast<uint8_t>(byte);
+                if (state.header_bytes == 0 && state.body_remaining == 0)
+                {
+                    counted_fragment = false;
+                    if (value != 1)
+                    {
+                        state.ignored = true;
+                        return;
+                    }
+                    state.first_request_id = request.network_request_id;
+                }
+                if (!counted_fragment)
+                {
+                    ++state.fragment_count;
+                    counted_fragment = true;
+                }
+                state.last_request_id = request.network_request_id;
+                state.frame_hash ^= value;
+                state.frame_hash *= fnv_prime;
+                ++state.frame_bytes;
+                if (state.header_bytes < state.header.size())
+                {
+                    state.header[state.header_bytes++] = value;
+                    if (state.header_bytes == 2 && value > 2)
+                    {
+                        state.ignored = true;
+                        return;
+                    }
+                    if (state.header_bytes == state.header.size())
+                    {
+                        const auto body_size = (static_cast<size_t>(state.header[2]) << 24) |
+                                               (static_cast<size_t>(state.header[3]) << 16) |
+                                               (static_cast<size_t>(state.header[4]) << 8) |
+                                               static_cast<size_t>(state.header[5]);
+                        if (body_size > bap_frame_limit - state.header.size())
+                        {
+                            if (state.recognized)
+                            {
+                                json_fields event;
+                                add_common(event, "bap_wire", "diagnostic", request.network_request_id, captured_at);
+                                event.string("kind", "bap_stream_invalid_length");
+                                event.string("direction", direction == "send" ? "outbound" : "inbound");
+                                event.string("file_handle", hex(handle));
+                                event.number("declared_body_bytes", body_size);
+                                event.number("frame_limit", bap_frame_limit);
+                                write(event.finish());
+                            }
+                            state.ignored = true;
+                            return;
+                        }
+                        state.recognized = true;
+                        state.body_remaining = body_size;
+                    }
+                }
+                else
+                {
+                    --state.body_remaining;
+                }
+                if (state.header_bytes == state.header.size() && state.body_remaining == 0)
+                {
+                    json_fields event;
+                    add_common(event, "bap_wire", "completion", request.network_request_id, captured_at);
+                    event.string("kind", "bap_frame_complete");
+                    event.string("direction", direction == "send" ? "outbound" : "inbound");
+                    event.string("file_handle", hex(handle));
+                    event.number("outer_type", state.header[1]);
+                    event.number("frame_bytes", state.frame_bytes);
+                    event.string("frame_fnv1a64", hex(state.frame_hash));
+                    event.number("frame_number", ++state.frame_number);
+                    event.number("first_request_id", state.first_request_id);
+                    event.number("last_request_id", state.last_request_id);
+                    event.number("source_request_id", request.network_request_id);
+                    event.number("fragment_count", state.fragment_count);
+                    event.string("source_boundary", "host_socket_buffer_at_transfer");
+                    write(event.finish());
+                    state.reset_frame();
+                    counted_fragment = false;
+                }
+            }
+        }
+
+        void record_bap_eof(const io_device_context& request, const std::chrono::system_clock::time_point captured_at)
+        {
+            const auto handle = request.file_handle.bits;
+            for (auto* streams : {&bap_inbound, &bap_outbound})
+            {
+                const auto it = streams->find(handle);
+                if (it == streams->end())
+                {
+                    continue;
+                }
+                const auto& state = it->second;
+                if (state.recognized && state.frame_bytes)
+                {
+                    json_fields event;
+                    add_common(event, "bap_wire", "diagnostic", request.network_request_id, captured_at);
+                    event.string("kind", "bap_frame_truncated_on_eof");
+                    event.string("direction", streams == &bap_inbound ? "inbound" : "outbound");
+                    event.string("file_handle", hex(handle));
+                    event.number("observed_bytes", state.frame_bytes);
+                    event.number("remaining_bytes", state.body_remaining);
+                    event.number("header_bytes", state.header_bytes);
+                    event.string("source_boundary", "host_socket_eof");
+                    write(event.finish());
+                }
+                streams->erase(it);
+            }
+        }
 
         ~implementation()
         {
@@ -1367,6 +1536,11 @@ namespace sogen
                 }
             }
             impl_->write(event.finish());
+            impl_->record_bap_transfer(request, direction, bytes, captured_at);
+            if (direction == "receive" && transferred == 0 && !buffer.empty())
+            {
+                impl_->record_bap_eof(request, captured_at);
+            }
         }
         catch (...)
         {

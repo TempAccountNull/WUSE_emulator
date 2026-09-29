@@ -456,6 +456,52 @@ namespace sogen::test
         std::filesystem::remove(path);
     }
 
+    TEST(NetworkDebug, BapWireFramesHashAcrossHostSocketFragments)
+    {
+        emulator_settings settings{};
+        settings.load_registry = false;
+        auto emu = create_emulator(std::move(settings));
+        io_device_context request{emu.memory};
+        request.file_handle.bits = 0x55;
+        request.issuer_thread_id = 41;
+        const auto path = std::filesystem::temp_directory_path() /
+                          ("sogen-bap-wire-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".jsonl");
+        const std::array<std::byte, 30> reply{
+            std::byte{0x01}, std::byte{0x01}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x18},
+            std::byte{0xef}, std::byte{0xad}, std::byte{0x02}, std::byte{0xae}, std::byte{0x1b}, std::byte{0x67},
+            std::byte{0x09}, std::byte{0xab}, std::byte{0xa8}, std::byte{0xc0}, std::byte{0xeb}, std::byte{0xc9},
+            std::byte{0xa6}, std::byte{0xc5}, std::byte{0x97}, std::byte{0x20}, std::byte{0xba}, std::byte{0xaa},
+            std::byte{0x74}, std::byte{0xca}, std::byte{0x6f}, std::byte{0x45}, std::byte{0x5c}, std::byte{0xb4}};
+        const std::array<std::byte, 12> two_frames{
+            std::byte{0x01}, std::byte{0x02}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+            std::byte{0x01}, std::byte{0x02}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}};
+        const std::array<std::byte, 6> oversized_header{
+            std::byte{0x01}, std::byte{0x01}, std::byte{0x00}, std::byte{0x04}, std::byte{0x00}, std::byte{0x00}};
+        {
+            network_debug_logger logger;
+            logger.open(path);
+            request.network_request_id = 100;
+            logger.host_stream_transfer(request, "receive", std::span{reply}.first(6), 6);
+            request.network_request_id = 101;
+            logger.host_stream_transfer(request, "receive", std::span{reply}.subspan(6, 16), 16);
+            request.network_request_id = 102;
+            logger.host_stream_transfer(request, "receive", std::span{reply}.subspan(22), 8);
+            request.network_request_id = 103;
+            logger.host_stream_transfer(request, "receive", two_frames, two_frames.size());
+            request.network_request_id = 104;
+            logger.host_stream_transfer(request, "receive", oversized_header, oversized_header.size());
+        }
+        std::ifstream input(path, std::ios::binary);
+        ASSERT_TRUE(input.good());
+        const std::string journal{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+        EXPECT_NE(journal.find("\"kind\":\"bap_frame_complete\",\"direction\":\"inbound\",\"file_handle\":\"0x55\",\"outer_type\":1,\"frame_bytes\":30,\"frame_fnv1a64\":\"0x4f033e9b4e11100d\""), std::string::npos);
+        EXPECT_NE(journal.find("\"first_request_id\":100,\"last_request_id\":102,\"source_request_id\":102,\"fragment_count\":3"), std::string::npos);
+        EXPECT_NE(journal.find("\"frame_number\":3,\"first_request_id\":103"), std::string::npos);
+        EXPECT_NE(journal.find("\"kind\":\"bap_stream_invalid_length\""), std::string::npos);
+        input.close();
+        std::filesystem::remove(path);
+    }
+
     TEST(NetworkDebug, HostLoopbackAfdStreamMatchesSocketBytes)
     {
         network::socket_factory initialize_winsock;

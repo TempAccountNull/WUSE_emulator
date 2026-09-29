@@ -1585,6 +1585,180 @@ namespace sogen
                 });
             }
         }
+        if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_RESPONSE_PROBE");
+            probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
+        {
+            struct response_site
+            {
+                uint64_t rva;
+                std::string_view expected;
+                const char* stage;
+            };
+
+            const std::array<response_site, 5> sites{{
+                {0xE0235B, {"\xBA\x04\x00\x00\x00", 5}, "decode_rejected"},
+                {0xE02473, {"\x8B\x85\xD0\x02\x00\x00", 6}, "decode_succeeded"},
+                {0xE024AE, {"\x83\x38\xFF", 3}, "handler_lookup"},
+                {0xE0250D, {"\xFF\x10", 2}, "handler_invoked"},
+                {0xE0250F, {"\x41\xB6\x01", 3}, "internal_success_path"},
+            }};
+            const uint64_t base = executable->image_base;
+            if (executable->size_of_image >= sites.back().rva + sites.back().expected.size() &&
+                base <= UINT64_MAX - sites.back().rva - sites.back().expected.size())
+            {
+                struct response_probe_state
+                {
+                    std::mutex mutex{};
+                    std::array<emulator_hook*, 5> hooks{};
+                    std::array<std::array<bool, 5>, 2> logged{};
+                    std::array<bool, 2> terminal{};
+                    std::unordered_map<uint32_t, bool> handler_called{};
+                    uint64_t installed_tick{};
+                    bool attempted{};
+                };
+
+                auto state = std::make_shared<response_probe_state>();
+                this->callbacks.on_debug_string.add([this, state, base, sites](const std::string_view message) {
+                    if (message.find("Entering state 'bootflow:bap_signin'") == std::string_view::npos)
+                    {
+                        return;
+                    }
+                    const std::scoped_lock state_guard(state->mutex);
+                    if (state->attempted)
+                    {
+                        return;
+                    }
+                    state->attempted = true;
+                    for (const auto& site : sites)
+                    {
+                        std::array<uint8_t, 6> actual{};
+                        const bool read = this->emu().try_read_memory(base + site.rva, actual.data(), site.expected.size());
+                        if (!read || std::memcmp(actual.data(), site.expected.data(), site.expected.size()) != 0)
+                        {
+                            this->log.warn("BAPRESPONSEPROBE unavailable stage=%s reason=runtime_bytes address=%#llx read=%u "
+                                           "bytes=%02x%02x%02x%02x%02x%02x\n",
+                                           site.stage, static_cast<unsigned long long>(base + site.rva), static_cast<unsigned>(read),
+                                           actual[0], actual[1], actual[2], actual[3], actual[4], actual[5]);
+                            return;
+                        }
+                    }
+                    const auto retire = [this, state]() {
+                        for (auto*& hook : state->hooks)
+                        {
+                            if (hook)
+                            {
+                                this->emu().delete_hook(std::exchange(hook, nullptr));
+                            }
+                        }
+                    };
+                    state->installed_tick = GetTickCount64();
+                    try
+                    {
+                        for (size_t site_index = 0; site_index < sites.size(); ++site_index)
+                        {
+                            const auto site = sites[site_index];
+                            state->hooks[site_index] = this->emu().hook_memory_execution_with_mode(
+                                base + site.rva, hook_interface::memory_execution_hook_mode::int3,
+                                [this, state, site_index, stage = site.stage](cpu_interface& cpu, const uint64_t rip) {
+                                    const std::scoped_lock kernel_guard(this->kernel_lock_);
+                                    const std::scoped_lock state_guard(state->mutex);
+                                    const auto retire_hooks = [this, state]() {
+                                        for (auto*& hook : state->hooks)
+                                        {
+                                            if (hook)
+                                            {
+                                                this->emu().delete_hook(std::exchange(hook, nullptr));
+                                            }
+                                        }
+                                    };
+                                    if (!state->hooks[site_index])
+                                    {
+                                        return;
+                                    }
+                                    const uint64_t elapsed = GetTickCount64() - state->installed_tick;
+                                    if (elapsed >= 45000)
+                                    {
+                                        this->log.info("BAPRESPONSEPROBE retired reason=budget elapsed_ms=%llu\n",
+                                                       static_cast<unsigned long long>(elapsed));
+                                        retire_hooks();
+                                        return;
+                                    }
+                                    auto& vcpu = this->vcpu(cpu.index());
+                                    auto& acting = vcpu.cpu;
+                                    const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
+                                    uint32_t service{};
+                                    const bool service_read = rsp <= UINT64_MAX - 0x38 - sizeof(service) &&
+                                                              acting.try_read_memory(rsp + 0x38, &service, sizeof(service));
+                                    if (!service_read || (service != 251 && service != 305))
+                                    {
+                                        return;
+                                    }
+                                    const size_t service_index = service == 251 ? 0 : 1;
+                                    if (state->logged[service_index][site_index])
+                                    {
+                                        return;
+                                    }
+                                    state->logged[service_index][site_index] = true;
+                                    const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                                    int32_t route_index{};
+                                    bool route_read{};
+                                    uint64_t handler{};
+                                    bool handler_read{};
+                                    if (site_index == 0)
+                                    {
+                                        state->handler_called.erase(tid);
+                                    }
+                                    if (site_index == 1 && state->handler_called.size() < 64)
+                                    {
+                                        state->handler_called[tid] = false;
+                                    }
+                                    if (site_index == 2)
+                                    {
+                                        const auto route = acting.reg<uint64_t>(x86_register::rax);
+                                        route_read = acting.try_read_memory(route, &route_index, sizeof(route_index));
+                                    }
+                                    if (site_index == 3)
+                                    {
+                                        const auto route = acting.reg<uint64_t>(x86_register::rax);
+                                        handler_read = acting.try_read_memory(route, &handler, sizeof(handler));
+                                        if (state->handler_called.contains(tid) || state->handler_called.size() < 64)
+                                        {
+                                            state->handler_called[tid] = true;
+                                        }
+                                    }
+                                    const auto called = state->handler_called.find(tid);
+                                    const bool called_on_path = called != state->handler_called.end() && called->second;
+                                    this->log.warn("BAPRESPONSEPROBE stage=%s service=%u tid=%u vcpu=%zu rip=%#llx "
+                                                   "route_index=%d route_read=%u handler=%#llx handler_read=%u "
+                                                   "handler_called=%u elapsed_ms=%llu\n",
+                                                   stage, service, tid, cpu.index(), static_cast<unsigned long long>(rip), route_index,
+                                                   static_cast<unsigned>(route_read), static_cast<unsigned long long>(handler),
+                                                   static_cast<unsigned>(handler_read), static_cast<unsigned>(called_on_path),
+                                                   static_cast<unsigned long long>(elapsed));
+                                    if (site_index == 0 || site_index == 4)
+                                    {
+                                        state->terminal[service_index] = true;
+                                        state->handler_called.erase(tid);
+                                    }
+                                    if (state->terminal[0] && state->terminal[1])
+                                    {
+                                        this->log.info("BAPRESPONSEPROBE retired reason=both_services elapsed_ms=%llu\n",
+                                                       static_cast<unsigned long long>(elapsed));
+                                        retire_hooks();
+                                    }
+                                });
+                        }
+                    }
+                    catch (const std::exception& error)
+                    {
+                        retire();
+                        this->log.warn("BAPRESPONSEPROBE unavailable reason=hook error=%s\n", error.what());
+                        return;
+                    }
+                    this->log.info("BAPRESPONSEPROBE installed base=%#llx mode=int3\n", static_cast<unsigned long long>(base));
+                });
+            }
+        }
         // The 21122 Shadowkeep vhalt entry is sampled only when explicitly requested.
         if (const char* probe = std::getenv("SOGEN_DESTINY_VHALT_PROBE");
             probe && *probe == '1' && executable && executable->name == "destiny2.exe" && executable->size_of_image > 0x1310D60)
