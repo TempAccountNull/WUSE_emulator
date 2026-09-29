@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <tuple>
+#include <type_traits>
 #include <utility>
 #include <cstring>
 #include <unordered_map>
@@ -1073,8 +1075,8 @@ namespace sogen
         this->install_section_first_execution_hooks();
 
         const auto* executable = this->mod_manager.executable;
-        // Opt-in, exact-address diagnostic. Arm before guest execution so the first
-        // clock epoch change cannot precede a BAP-signin-triggered installation.
+        // Opt-in, exact-address diagnostic. Defer arming until a bootflow marker
+        // verifies the decrypted hook targets. Earlier clock changes may be missed.
         if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_EARLY_CLOCK_PROBE");
             probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
         {
@@ -1102,8 +1104,8 @@ namespace sogen
                 {0xE8, 0xAF, 0xC8, 0x10, 0x00},
             }};
             const auto base = executable->image_base;
-            // The main image may still be encrypted at mapping time. Validate the
-            // instruction bytes on their first execution, before reading registers.
+            // The main image may still be encrypted at mapping time. Validate
+            // all target bytes on bootflow markers before installing any INT3.
             if (executable->size_of_image <= static_clock_rva + sizeof(uint64_t))
             {
                 this->log.warn("BAPEARLYCLOCK unavailable reason=image_bounds base=%#llx\n", static_cast<unsigned long long>(base));
@@ -1155,7 +1157,9 @@ namespace sogen
                     std::array<bool, 4> writer_first_logged{};
                     std::chrono::steady_clock::time_point started{std::chrono::steady_clock::now()};
                     uint64_t hits{};
+                    uint32_t readiness_attempts{};
                     uint32_t changes{};
+                    bool armed{};
                     bool retired{};
                 };
 
@@ -1183,282 +1187,370 @@ namespace sogen
                     remove(state->writer_hooks);
                     remove(state->writer_done_hooks);
                 };
-                try
-                {
-                    for (size_t site = 0; site < input_rvas.size(); ++site)
+                const auto expire = [state, retire] {
+                    if (std::chrono::steady_clock::now() - state->started < std::chrono::minutes(15))
                     {
-                        state->input_hooks[site] = this->emu().hook_memory_execution_with_mode(
-                            base + input_rvas[site], hook_interface::memory_execution_hook_mode::int3,
-                            [this, state, retire, base, site, input_rvas, input_bytes, committed_rvas, committed_bytes](cpu_interface& cpu,
-                                                                                                                        uint64_t) {
-                                const std::scoped_lock kernel_guard(this->kernel_lock_);
-                                const std::scoped_lock state_guard(state->mutex);
-                                if (state->retired)
-                                {
-                                    return;
-                                }
-                                const auto hit = ++state->hits;
-                                if (hit >= 1000000 ||
-                                    ((hit & 1023) == 0 && std::chrono::steady_clock::now() - state->started >= std::chrono::minutes(15)))
-                                {
-                                    retire(hit >= 1000000 ? "hit_cap" : "host_deadline");
-                                    return;
-                                }
-                                auto& vcpu = this->vcpu(cpu.index());
-                                auto& acting = vcpu.cpu;
-                                if (!state->input_validated[site])
-                                {
-                                    std::array<uint8_t, 6> actual{};
-                                    if (!acting.try_read_memory(base + input_rvas[site], actual.data(), actual.size()) ||
-                                        actual != input_bytes[site])
+                        return false;
+                    }
+                    retire("host_deadline");
+                    return true;
+                };
+                const auto arm = [this, state, retire, expire, base, input_rvas, input_bytes, committed_rvas, committed_bytes, writer_rvas,
+                                  writer_bytes, writer_done_rvas, writer_done_bytes]() {
+                    state->started = std::chrono::steady_clock::now();
+                    try
+                    {
+                        for (size_t site = 0; site < input_rvas.size(); ++site)
+                        {
+                            state->input_hooks[site] = this->emu().hook_memory_execution_with_mode(
+                                base + input_rvas[site], hook_interface::memory_execution_hook_mode::int3,
+                                [this, state, retire, expire, base, site, input_rvas, input_bytes, committed_rvas,
+                                 committed_bytes](cpu_interface& cpu, uint64_t) {
+                                    const std::scoped_lock kernel_guard(this->kernel_lock_);
+                                    const std::scoped_lock state_guard(state->mutex);
+                                    if (state->retired || expire())
                                     {
-                                        this->log.warn("BAPEARLYCLOCK signature_mismatch kind=input site=%zu rva=%#llx\n", site,
-                                                       static_cast<unsigned long long>(input_rvas[site]));
-                                        retire("signature_mismatch");
                                         return;
                                     }
-                                    state->input_validated[site] = true;
-                                }
-                                const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
-                                if (!tid)
-                                {
-                                    return;
-                                }
-                                const auto address = acting.reg<uint64_t>(x86_register::rbx);
-                                const auto raw = acting.reg<uint32_t>(x86_register::rax);
-                                uint64_t old_value{};
-                                uint32_t clock_base{};
-                                const bool old_read = address <= UINT64_MAX - sizeof(old_value) &&
-                                                      acting.try_read_memory(address, &old_value, sizeof(old_value));
-                                const bool base_read = acting.try_read_memory(base + clock_base_rva, &clock_base, sizeof(clock_base));
-                                if (!old_read || !base_read)
-                                {
-                                    return;
-                                }
-                                const uint32_t low = raw - clock_base;
-                                const auto host_tick = static_cast<uint64_t>(GetTickCount64());
-                                if (!state->threads.contains(tid) && state->threads.size() >= 128)
-                                {
-                                    retire("thread_cap");
-                                    return;
-                                }
-                                auto& thread = state->threads[tid];
-                                if (!thread.seen || thread.address != address)
-                                {
-                                    this->log.warn("BAPEARLYCLOCK first_seen site=%zu tid=%u vcpu=%zu address=%#llx old=%#llx "
-                                                   "raw=%#x base=%#x low=%#x already_high=%u host_tick_ms=%llu\n",
-                                                   site, tid, cpu.index(), static_cast<unsigned long long>(address),
-                                                   static_cast<unsigned long long>(old_value), raw, clock_base, low,
-                                                   static_cast<unsigned>((old_value >> 32) != 0),
-                                                   static_cast<unsigned long long>(host_tick));
-                                    thread = {address, old_value, host_tick, raw, true, false};
-                                }
-                                else if (!thread.first_change_logged && (old_value >> 32) > (thread.value >> 32))
-                                {
-                                    this->log.warn("BAPEARLYCLOCK between_calls site=%zu tid=%u vcpu=%zu address=%#llx "
-                                                   "previous=%#llx current=%#llx previous_raw=%#x raw=%#x\n",
-                                                   site, tid, cpu.index(), static_cast<unsigned long long>(address),
-                                                   static_cast<unsigned long long>(thread.value),
-                                                   static_cast<unsigned long long>(old_value), thread.raw_time, raw);
-                                    thread.first_change_logged = true;
-                                    ++state->changes;
-                                }
-                                if (!thread.first_change_logged && low < static_cast<uint32_t>(old_value))
-                                {
-                                    if (!state->committed_hooks[site])
+                                    const auto hit = ++state->hits;
+                                    if (hit >= 1000000)
                                     {
-                                        state->committed_hooks[site] = this->emu().hook_memory_execution_with_mode(
-                                            base + committed_rvas[site], hook_interface::memory_execution_hook_mode::int3,
-                                            [this, state, retire, base, site, committed_rvas, committed_bytes](cpu_interface& post_cpu,
-                                                                                                               uint64_t) {
-                                                const std::scoped_lock post_kernel_guard(this->kernel_lock_);
-                                                const std::scoped_lock post_state_guard(state->mutex);
-                                                if (state->retired)
-                                                {
-                                                    return;
-                                                }
-                                                auto& post_vcpu = this->vcpu(post_cpu.index());
-                                                auto& post = post_vcpu.cpu;
-                                                if (!state->committed_validated[site])
-                                                {
-                                                    std::array<uint8_t, 8> actual{};
-                                                    if (!post.try_read_memory(base + committed_rvas[site], actual.data(), actual.size()) ||
-                                                        actual != committed_bytes)
-                                                    {
-                                                        this->log.warn(
-                                                            "BAPEARLYCLOCK signature_mismatch kind=committed site=%zu rva=%#llx\n", site,
-                                                            static_cast<unsigned long long>(committed_rvas[site]));
-                                                        retire("signature_mismatch");
-                                                        return;
-                                                    }
-                                                    state->committed_validated[site] = true;
-                                                }
-                                                const auto post_tid = post_vcpu.active_thread ? post_vcpu.active_thread->id : 0;
-                                                const auto found = state->pending.find(post_tid);
-                                                if (found == state->pending.end() || found->second.site != site ||
-                                                    found->second.address != post.reg<uint64_t>(x86_register::rbx))
-                                                {
-                                                    return;
-                                                }
-                                                const auto sample = found->second;
-                                                state->pending.erase(found);
-                                                uint64_t committed{};
-                                                const bool committed_read =
-                                                    post.try_read_memory(sample.address, &committed, sizeof(committed));
-                                                const auto kusd = this->process.kusd.access([](const KUSER_SHARED_DATA64& data) {
-                                                    return std::array<uint32_t, 3>{data.InterruptTime.LowPart,
-                                                                                   static_cast<uint32_t>(data.InterruptTime.High1Time),
-                                                                                   static_cast<uint32_t>(data.InterruptTime.High2Time)};
-                                                });
-                                                const auto now = static_cast<uint64_t>(GetTickCount64());
-                                                const bool confirmed = committed_read && (committed >> 32) > (sample.old_value >> 32) &&
-                                                                       static_cast<uint32_t>(committed) == sample.low_time;
-                                                this->log.warn("BAPEARLYCLOCK %s site=%zu tid=%u vcpu=%zu address=%#llx "
-                                                               "old=%#llx committed=%#llx committed_read=%u raw=%#x base=%#x low=%#x "
-                                                               "previous_host_tick_ms=%llu host_tick_ms=%llu "
-                                                               "kusd_low=%#x kusd_high1=%#x kusd_high2=%#x\n",
-                                                               confirmed ? "first_transition" : "candidate_unconfirmed", site, post_tid,
-                                                               post_cpu.index(), static_cast<unsigned long long>(sample.address),
-                                                               static_cast<unsigned long long>(sample.old_value),
-                                                               static_cast<unsigned long long>(committed),
-                                                               static_cast<unsigned>(committed_read), sample.raw_time, sample.clock_base,
-                                                               sample.low_time, static_cast<unsigned long long>(sample.previous_host_tick),
-                                                               static_cast<unsigned long long>(now), kusd[0], kusd[1], kusd[2]);
-                                                auto& thread = state->threads[post_tid];
-                                                thread.first_change_logged = confirmed;
-                                                if (committed_read)
-                                                {
-                                                    thread.value = committed;
-                                                }
-                                                thread.host_tick = now;
-                                                if (confirmed)
-                                                {
-                                                    ++state->changes;
-                                                }
-                                                if (state->changes >= 16)
-                                                {
-                                                    retire("change_cap");
-                                                }
-                                            });
+                                        retire("hit_cap");
+                                        return;
+                                    }
+                                    auto& vcpu = this->vcpu(cpu.index());
+                                    auto& acting = vcpu.cpu;
+                                    if (!state->input_validated[site])
+                                    {
+                                        std::array<uint8_t, 6> actual{};
+                                        if (!acting.try_read_memory(base + input_rvas[site], actual.data(), actual.size()) ||
+                                            actual != input_bytes[site])
+                                        {
+                                            this->log.warn("BAPEARLYCLOCK signature_mismatch kind=input site=%zu rva=%#llx\n", site,
+                                                           static_cast<unsigned long long>(input_rvas[site]));
+                                            retire("signature_mismatch");
+                                            return;
+                                        }
+                                        state->input_validated[site] = true;
+                                    }
+                                    const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                                    if (!tid)
+                                    {
+                                        return;
+                                    }
+                                    const auto address = acting.reg<uint64_t>(x86_register::rbx);
+                                    const auto raw = acting.reg<uint32_t>(x86_register::rax);
+                                    uint64_t old_value{};
+                                    uint32_t clock_base{};
+                                    const bool old_read = address <= UINT64_MAX - sizeof(old_value) &&
+                                                          acting.try_read_memory(address, &old_value, sizeof(old_value));
+                                    const bool base_read = acting.try_read_memory(base + clock_base_rva, &clock_base, sizeof(clock_base));
+                                    if (!old_read || !base_read)
+                                    {
+                                        return;
+                                    }
+                                    const uint32_t low = raw - clock_base;
+                                    const auto host_tick = static_cast<uint64_t>(GetTickCount64());
+                                    if (!state->threads.contains(tid) && state->threads.size() >= 128)
+                                    {
+                                        retire("thread_cap");
+                                        return;
+                                    }
+                                    auto& thread = state->threads[tid];
+                                    if (!thread.seen || thread.address != address)
+                                    {
+                                        this->log.warn("BAPEARLYCLOCK first_seen site=%zu tid=%u vcpu=%zu address=%#llx old=%#llx "
+                                                       "raw=%#x base=%#x low=%#x already_high=%u host_tick_ms=%llu\n",
+                                                       site, tid, cpu.index(), static_cast<unsigned long long>(address),
+                                                       static_cast<unsigned long long>(old_value), raw, clock_base, low,
+                                                       static_cast<unsigned>((old_value >> 32) != 0),
+                                                       static_cast<unsigned long long>(host_tick));
+                                        thread = {address, old_value, host_tick, raw, true, false};
+                                    }
+                                    else if (!thread.first_change_logged && (old_value >> 32) > (thread.value >> 32))
+                                    {
+                                        this->log.warn("BAPEARLYCLOCK between_calls site=%zu tid=%u vcpu=%zu address=%#llx "
+                                                       "previous=%#llx current=%#llx previous_raw=%#x raw=%#x\n",
+                                                       site, tid, cpu.index(), static_cast<unsigned long long>(address),
+                                                       static_cast<unsigned long long>(thread.value),
+                                                       static_cast<unsigned long long>(old_value), thread.raw_time, raw);
+                                        thread.first_change_logged = true;
+                                        ++state->changes;
+                                    }
+                                    if (!thread.first_change_logged && low < static_cast<uint32_t>(old_value))
+                                    {
                                         if (!state->committed_hooks[site])
                                         {
-                                            retire("post_hook_unavailable");
-                                            return;
+                                            state->committed_hooks[site] = this->emu().hook_memory_execution_with_mode(
+                                                base + committed_rvas[site], hook_interface::memory_execution_hook_mode::int3,
+                                                [this, state, retire, expire, base, site, committed_rvas,
+                                                 committed_bytes](cpu_interface& post_cpu, uint64_t) {
+                                                    const std::scoped_lock post_kernel_guard(this->kernel_lock_);
+                                                    const std::scoped_lock post_state_guard(state->mutex);
+                                                    if (state->retired || expire())
+                                                    {
+                                                        return;
+                                                    }
+                                                    auto& post_vcpu = this->vcpu(post_cpu.index());
+                                                    auto& post = post_vcpu.cpu;
+                                                    if (!state->committed_validated[site])
+                                                    {
+                                                        std::array<uint8_t, 8> actual{};
+                                                        if (!post.try_read_memory(base + committed_rvas[site], actual.data(),
+                                                                                  actual.size()) ||
+                                                            actual != committed_bytes)
+                                                        {
+                                                            this->log.warn(
+                                                                "BAPEARLYCLOCK signature_mismatch kind=committed site=%zu rva=%#llx\n",
+                                                                site, static_cast<unsigned long long>(committed_rvas[site]));
+                                                            retire("signature_mismatch");
+                                                            return;
+                                                        }
+                                                        state->committed_validated[site] = true;
+                                                    }
+                                                    const auto post_tid = post_vcpu.active_thread ? post_vcpu.active_thread->id : 0;
+                                                    const auto found = state->pending.find(post_tid);
+                                                    if (found == state->pending.end() || found->second.site != site ||
+                                                        found->second.address != post.reg<uint64_t>(x86_register::rbx))
+                                                    {
+                                                        return;
+                                                    }
+                                                    const auto sample = found->second;
+                                                    state->pending.erase(found);
+                                                    uint64_t committed{};
+                                                    const bool committed_read =
+                                                        post.try_read_memory(sample.address, &committed, sizeof(committed));
+                                                    const auto kusd = this->process.kusd.access([](const KUSER_SHARED_DATA64& data) {
+                                                        return std::array<uint32_t, 3>{data.InterruptTime.LowPart,
+                                                                                       static_cast<uint32_t>(data.InterruptTime.High1Time),
+                                                                                       static_cast<uint32_t>(data.InterruptTime.High2Time)};
+                                                    });
+                                                    const auto now = static_cast<uint64_t>(GetTickCount64());
+                                                    const bool confirmed = committed_read && (committed >> 32) > (sample.old_value >> 32) &&
+                                                                           static_cast<uint32_t>(committed) == sample.low_time;
+                                                    this->log.warn("BAPEARLYCLOCK %s site=%zu tid=%u vcpu=%zu address=%#llx "
+                                                                   "old=%#llx committed=%#llx committed_read=%u raw=%#x base=%#x low=%#x "
+                                                                   "previous_host_tick_ms=%llu host_tick_ms=%llu "
+                                                                   "kusd_low=%#x kusd_high1=%#x kusd_high2=%#x\n",
+                                                                   confirmed ? "first_transition" : "candidate_unconfirmed", site, post_tid,
+                                                                   post_cpu.index(), static_cast<unsigned long long>(sample.address),
+                                                                   static_cast<unsigned long long>(sample.old_value),
+                                                                   static_cast<unsigned long long>(committed),
+                                                                   static_cast<unsigned>(committed_read), sample.raw_time,
+                                                                   sample.clock_base, sample.low_time,
+                                                                   static_cast<unsigned long long>(sample.previous_host_tick),
+                                                                   static_cast<unsigned long long>(now), kusd[0], kusd[1], kusd[2]);
+                                                    auto& thread = state->threads[post_tid];
+                                                    thread.first_change_logged = confirmed;
+                                                    if (committed_read)
+                                                    {
+                                                        thread.value = committed;
+                                                    }
+                                                    thread.host_tick = now;
+                                                    if (confirmed)
+                                                    {
+                                                        ++state->changes;
+                                                    }
+                                                    if (state->changes >= 16)
+                                                    {
+                                                        retire("change_cap");
+                                                    }
+                                                });
+                                            if (!state->committed_hooks[site])
+                                            {
+                                                retire("post_hook_unavailable");
+                                                return;
+                                            }
                                         }
+                                        state->pending[tid] = {address, old_value, thread.host_tick, raw, low, clock_base, site};
                                     }
-                                    state->pending[tid] = {address, old_value, thread.host_tick, raw, low, clock_base, site};
-                                }
-                                thread.value = old_value;
-                                thread.host_tick = host_tick;
-                                thread.raw_time = raw;
-                            });
-                        if (!state->input_hooks[site])
-                        {
-                            retire("input_hook_unavailable");
-                            break;
-                        }
-                    }
-                    if (!state->retired)
-                    {
-                        for (size_t site = 0; site < writer_rvas.size(); ++site)
-                        {
-                            state->writer_hooks[site] = this->emu().hook_memory_execution_with_mode(
-                                base + writer_rvas[site], hook_interface::memory_execution_hook_mode::int3,
-                                [this, state, retire, base, site, writer_rvas, writer_bytes](cpu_interface& cpu, uint64_t) {
-                                    const std::scoped_lock kernel_guard(this->kernel_lock_);
-                                    const std::scoped_lock state_guard(state->mutex);
-                                    if (state->retired)
-                                    {
-                                        return;
-                                    }
-                                    auto& vcpu = this->vcpu(cpu.index());
-                                    if (!state->writer_validated[site])
-                                    {
-                                        std::array<uint8_t, 7> actual{};
-                                        if (!vcpu.cpu.try_read_memory(base + writer_rvas[site], actual.data(), actual.size()) ||
-                                            actual != writer_bytes[site])
-                                        {
-                                            this->log.warn("BAPEARLYCLOCK signature_mismatch kind=writer site=%zu rva=%#llx\n", site,
-                                                           static_cast<unsigned long long>(writer_rvas[site]));
-                                            retire("signature_mismatch");
-                                            return;
-                                        }
-                                        state->writer_validated[site] = true;
-                                    }
-                                    const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
-                                    uint64_t old_value{};
-                                    if (!tid || !vcpu.cpu.try_read_memory(base + static_clock_rva, &old_value, sizeof(old_value)))
-                                    {
-                                        return;
-                                    }
-                                    state->writer_pending[tid] = {old_value, vcpu.cpu.reg<uint64_t>(x86_register::rax), site};
+                                    thread.value = old_value;
+                                    thread.host_tick = host_tick;
+                                    thread.raw_time = raw;
                                 });
-                            state->writer_done_hooks[site] = this->emu().hook_memory_execution_with_mode(
-                                base + writer_done_rvas[site], hook_interface::memory_execution_hook_mode::int3,
-                                [this, state, retire, base, site, writer_done_rvas, writer_done_bytes](cpu_interface& cpu, uint64_t) {
-                                    const std::scoped_lock kernel_guard(this->kernel_lock_);
-                                    const std::scoped_lock state_guard(state->mutex);
-                                    if (state->retired)
-                                    {
-                                        return;
-                                    }
-                                    auto& vcpu = this->vcpu(cpu.index());
-                                    if (!state->writer_done_validated[site])
-                                    {
-                                        std::array<uint8_t, 5> actual{};
-                                        if (!vcpu.cpu.try_read_memory(base + writer_done_rvas[site], actual.data(), actual.size()) ||
-                                            actual != writer_done_bytes[site])
-                                        {
-                                            this->log.warn("BAPEARLYCLOCK signature_mismatch kind=writer_done site=%zu rva=%#llx\n", site,
-                                                           static_cast<unsigned long long>(writer_done_rvas[site]));
-                                            retire("signature_mismatch");
-                                            return;
-                                        }
-                                        state->writer_done_validated[site] = true;
-                                    }
-                                    const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
-                                    const auto found = state->writer_pending.find(tid);
-                                    if (found == state->writer_pending.end() || found->second.site != site)
-                                    {
-                                        return;
-                                    }
-                                    const auto sample = found->second;
-                                    state->writer_pending.erase(found);
-                                    uint64_t value{};
-                                    const bool read = vcpu.cpu.try_read_memory(base + static_clock_rva, &value, sizeof(value));
-                                    const bool first = !state->writer_first_logged[site];
-                                    const bool high_changed = read && (value >> 32) != (sample.old_value >> 32);
-                                    if (first || high_changed || (read && value != sample.return_value))
-                                    {
-                                        this->log.warn("BAPEARLYCLOCK static_write site=%zu tid=%u vcpu=%zu old=%#llx "
-                                                       "source_rax=%#llx committed=%#llx read=%u high_changed=%u match=%u\n",
-                                                       site, tid, cpu.index(), static_cast<unsigned long long>(sample.old_value),
-                                                       static_cast<unsigned long long>(sample.return_value),
-                                                       static_cast<unsigned long long>(value), static_cast<unsigned>(read),
-                                                       static_cast<unsigned>(high_changed),
-                                                       static_cast<unsigned>(read && value == sample.return_value));
-                                        state->writer_first_logged[site] = true;
-                                    }
-                                });
-                            if (!state->writer_hooks[site] || !state->writer_done_hooks[site])
+                            if (!state->input_hooks[site])
                             {
-                                retire("writer_hook_unavailable");
+                                retire("input_hook_unavailable");
                                 break;
                             }
                         }
+                        if (!state->retired)
+                        {
+                            for (size_t site = 0; site < writer_rvas.size(); ++site)
+                            {
+                                state->writer_hooks[site] = this->emu().hook_memory_execution_with_mode(
+                                    base + writer_rvas[site], hook_interface::memory_execution_hook_mode::int3,
+                                    [this, state, retire, expire, base, site, writer_rvas, writer_bytes](cpu_interface& cpu, uint64_t) {
+                                        const std::scoped_lock kernel_guard(this->kernel_lock_);
+                                        const std::scoped_lock state_guard(state->mutex);
+                                        if (state->retired || expire())
+                                        {
+                                            return;
+                                        }
+                                        auto& vcpu = this->vcpu(cpu.index());
+                                        if (!state->writer_validated[site])
+                                        {
+                                            std::array<uint8_t, 7> actual{};
+                                            if (!vcpu.cpu.try_read_memory(base + writer_rvas[site], actual.data(), actual.size()) ||
+                                                actual != writer_bytes[site])
+                                            {
+                                                this->log.warn("BAPEARLYCLOCK signature_mismatch kind=writer site=%zu rva=%#llx\n", site,
+                                                               static_cast<unsigned long long>(writer_rvas[site]));
+                                                retire("signature_mismatch");
+                                                return;
+                                            }
+                                            state->writer_validated[site] = true;
+                                        }
+                                        const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                                        uint64_t old_value{};
+                                        if (!tid || !vcpu.cpu.try_read_memory(base + static_clock_rva, &old_value, sizeof(old_value)))
+                                        {
+                                            return;
+                                        }
+                                        state->writer_pending[tid] = {old_value, vcpu.cpu.reg<uint64_t>(x86_register::rax), site};
+                                    });
+                                state->writer_done_hooks[site] = this->emu().hook_memory_execution_with_mode(
+                                    base + writer_done_rvas[site], hook_interface::memory_execution_hook_mode::int3,
+                                    [this, state, retire, expire, base, site, writer_done_rvas, writer_done_bytes](cpu_interface& cpu,
+                                                                                                                   uint64_t) {
+                                        const std::scoped_lock kernel_guard(this->kernel_lock_);
+                                        const std::scoped_lock state_guard(state->mutex);
+                                        if (state->retired || expire())
+                                        {
+                                            return;
+                                        }
+                                        auto& vcpu = this->vcpu(cpu.index());
+                                        if (!state->writer_done_validated[site])
+                                        {
+                                            std::array<uint8_t, 5> actual{};
+                                            if (!vcpu.cpu.try_read_memory(base + writer_done_rvas[site], actual.data(), actual.size()) ||
+                                                actual != writer_done_bytes[site])
+                                            {
+                                                this->log.warn("BAPEARLYCLOCK signature_mismatch kind=writer_done site=%zu rva=%#llx\n",
+                                                               site, static_cast<unsigned long long>(writer_done_rvas[site]));
+                                                retire("signature_mismatch");
+                                                return;
+                                            }
+                                            state->writer_done_validated[site] = true;
+                                        }
+                                        const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                                        const auto found = state->writer_pending.find(tid);
+                                        if (found == state->writer_pending.end() || found->second.site != site)
+                                        {
+                                            return;
+                                        }
+                                        const auto sample = found->second;
+                                        state->writer_pending.erase(found);
+                                        uint64_t value{};
+                                        const bool read = vcpu.cpu.try_read_memory(base + static_clock_rva, &value, sizeof(value));
+                                        const bool first = !state->writer_first_logged[site];
+                                        const bool high_changed = read && (value >> 32) != (sample.old_value >> 32);
+                                        if (first || high_changed || (read && value != sample.return_value))
+                                        {
+                                            this->log.warn("BAPEARLYCLOCK static_write site=%zu tid=%u vcpu=%zu old=%#llx "
+                                                           "source_rax=%#llx committed=%#llx read=%u high_changed=%u match=%u\n",
+                                                           site, tid, cpu.index(), static_cast<unsigned long long>(sample.old_value),
+                                                           static_cast<unsigned long long>(sample.return_value),
+                                                           static_cast<unsigned long long>(value), static_cast<unsigned>(read),
+                                                           static_cast<unsigned>(high_changed),
+                                                           static_cast<unsigned>(read && value == sample.return_value));
+                                            state->writer_first_logged[site] = true;
+                                        }
+                                    });
+                                if (!state->writer_hooks[site] || !state->writer_done_hooks[site])
+                                {
+                                    retire("writer_hook_unavailable");
+                                    break;
+                                }
+                            }
+                        }
+                        if (!state->retired)
+                        {
+                            this->log.info("BAPEARLYCLOCK installed base=%#llx helpers=2 writers=4 hit_cap=1000000 "
+                                           "change_cap=16 hit_checked_deadline_ms=900000\n",
+                                           static_cast<unsigned long long>(base));
+                        }
                     }
-                    if (!state->retired)
+                    catch (const std::exception& error)
                     {
-                        this->log.info("BAPEARLYCLOCK installed base=%#llx helpers=2 writers=4 hit_cap=1000000 "
-                                       "change_cap=16 host_deadline_ms=900000\n",
-                                       static_cast<unsigned long long>(base));
+                        this->log.warn("BAPEARLYCLOCK unavailable reason=hook error=%s\n", error.what());
+                        retire("hook_error");
                     }
-                }
-                catch (const std::exception& error)
-                {
-                    this->log.warn("BAPEARLYCLOCK unavailable reason=hook error=%s\n", error.what());
-                    retire("hook_error");
-                }
+                };
+
+                // Do not alter the mapped image until decryption has exposed every hook target.
+                // Retry on later bootflow messages; retire rather than patch an unknown build.
+                this->callbacks.on_debug_string.add([this, state, retire, arm, base, clock_base_rva, static_clock_rva, input_rvas,
+                                                     input_bytes, committed_rvas, committed_bytes, writer_rvas, writer_bytes,
+                                                     writer_done_rvas, writer_done_bytes](const std::string_view message) {
+                    if (message.find("Entering state 'bootflow:") == std::string_view::npos)
+                    {
+                        return;
+                    }
+                    const std::scoped_lock state_guard(state->mutex);
+                    if (state->retired || state->armed)
+                    {
+                        return;
+                    }
+                    const bool bap_signin = message.find("Entering state 'bootflow:bap_signin'") != std::string_view::npos;
+                    const auto attempt = ++state->readiness_attempts;
+                    uint32_t mismatches = 0;
+                    const char* first_kind = "none";
+                    size_t first_site = 0;
+                    uint64_t first_rva = 0;
+                    const auto check = [this, base, &mismatches, &first_kind, &first_site,
+                                        &first_rva](const char* kind, const size_t site, const uint64_t rva, const auto& expected) {
+                        std::array<uint8_t, std::tuple_size_v<std::remove_cvref_t<decltype(expected)>>> actual{};
+                        if (!this->emu().try_read_memory(base + rva, actual.data(), actual.size()) || actual != expected)
+                        {
+                            if (!mismatches)
+                            {
+                                first_kind = kind;
+                                first_site = site;
+                                first_rva = rva;
+                            }
+                            ++mismatches;
+                        }
+                    };
+                    for (size_t site = 0; site < input_rvas.size(); ++site)
+                    {
+                        check("input", site, input_rvas[site], input_bytes[site]);
+                        check("committed", site, committed_rvas[site], committed_bytes);
+                    }
+                    for (size_t site = 0; site < writer_rvas.size(); ++site)
+                    {
+                        check("writer", site, writer_rvas[site], writer_bytes[site]);
+                        check("writer_done", site, writer_done_rvas[site], writer_done_bytes[site]);
+                    }
+                    if (mismatches)
+                    {
+                        this->log.warn("BAPEARLYCLOCK readiness_retry attempt=%u mismatches=%u "
+                                       "first_kind=%s first_site=%zu first_rva=%#llx bap_signin=%u\n",
+                                       attempt, mismatches, first_kind, first_site, static_cast<unsigned long long>(first_rva),
+                                       static_cast<unsigned>(bap_signin));
+                        if (bap_signin || attempt >= 64)
+                        {
+                            retire(bap_signin ? "unready_at_bap_signin" : "readiness_attempt_cap");
+                        }
+                        return;
+                    }
+                    uint64_t static_clock{};
+                    uint32_t clock_base{};
+                    const bool static_read = this->emu().try_read_memory(base + static_clock_rva, &static_clock, sizeof(static_clock));
+                    const bool base_read = this->emu().try_read_memory(base + clock_base_rva, &clock_base, sizeof(clock_base));
+                    const auto host_tick = static_cast<uint64_t>(GetTickCount64());
+                    state->armed = true;
+                    this->log.info("BAPEARLYCLOCK readiness_verified attempt=%u signatures=12 bap_signin=%u late_arm=%u "
+                                   "static_read=%u static=%#llx static_high=%#x base_read=%u clock_base=%#x "
+                                   "host_tick_ms=%llu\n",
+                                   attempt, static_cast<unsigned>(bap_signin), static_cast<unsigned>(bap_signin),
+                                   static_cast<unsigned>(static_read), static_cast<unsigned long long>(static_clock),
+                                   static_cast<uint32_t>(static_clock >> 32), static_cast<unsigned>(base_read), clock_base,
+                                   static_cast<unsigned long long>(host_tick));
+                    arm();
+                });
+                this->log.info("BAPEARLYCLOCK readiness_wait base=%#llx trigger=bootflow_debug_string\n",
+                               static_cast<unsigned long long>(base));
                 this->callbacks.on_module_unload.add([state, retire, base](mapped_module& module) {
                     if (module.image_base == base)
                     {
