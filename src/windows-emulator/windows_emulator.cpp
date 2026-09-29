@@ -1123,6 +1123,301 @@ namespace sogen
                 }
             }
         }
+        if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_CLOCK_TRANSITION_PROBE");
+            probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
+        {
+            constexpr uint64_t static_clock_rva = 0x26B3928;
+            constexpr uint64_t clock_base_rva = 0x20D0474;
+            constexpr uint64_t tls_index_rva = 0x330F0E0;
+            if (executable->size_of_image >= tls_index_rva + sizeof(uint32_t) &&
+                executable->image_base <= UINT64_MAX - tls_index_rva - sizeof(uint32_t))
+            {
+                struct clock_values
+                {
+                    uint64_t tls_address{};
+                    uint64_t tls{};
+                    uint64_t global{};
+                    uint64_t host_tick_ms{};
+                    bool tls_read{};
+                    bool global_read{};
+                };
+
+                struct clock_thread
+                {
+                    clock_values before{};
+                    clock_values last{};
+                    size_t site{};
+                    bool pending{};
+                    bool baseline_logged{};
+                    bool last_valid{};
+                };
+
+                struct clock_probe_state
+                {
+                    std::mutex mutex{};
+                    std::array<emulator_hook*, 8> hooks{};
+                    std::unordered_map<uint32_t, clock_thread> threads{};
+                    std::chrono::steady_clock::time_point started{};
+                    uint32_t hits{};
+                    uint32_t pairs{};
+                    bool attempted{};
+                    bool retired{};
+                };
+
+                const auto base = executable->image_base;
+                auto state = std::make_shared<clock_probe_state>();
+                const auto retire = [this, state](const char* reason) {
+                    if (state->retired)
+                    {
+                        return;
+                    }
+                    state->retired = true;
+                    this->log.warn("BAPCLOCK stage=retired reason=%s hits=%u pairs=%u threads=%zu\n", reason, state->hits, state->pairs,
+                                   state->threads.size());
+                    for (auto*& hook : state->hooks)
+                    {
+                        if (auto* const installed = std::exchange(hook, nullptr))
+                        {
+                            this->emu().delete_hook(installed);
+                        }
+                    }
+                };
+                const auto read_clock = [base](auto& acting) {
+                    clock_values values{};
+                    values.global_read = acting.try_read_memory(base + static_clock_rva, &values.global, sizeof(values.global));
+                    uint32_t tls_index{};
+                    uint64_t tls_array{};
+                    uint64_t tls_block{};
+                    const auto gs_base = acting.get_segment_base(x86_register::gs);
+                    const bool index_read = acting.try_read_memory(base + tls_index_rva, &tls_index, sizeof(tls_index));
+                    const bool array_read = gs_base <= UINT64_MAX - 0x58 - sizeof(tls_array) &&
+                                            acting.try_read_memory(gs_base + 0x58, &tls_array, sizeof(tls_array));
+                    const bool block_read =
+                        array_read && index_read && tls_index < 0x1000 &&
+                        tls_array <= UINT64_MAX - static_cast<uint64_t>(tls_index) * sizeof(tls_block) - sizeof(tls_block) &&
+                        acting.try_read_memory(tls_array + static_cast<uint64_t>(tls_index) * sizeof(tls_block), &tls_block,
+                                               sizeof(tls_block));
+                    if (block_read && tls_block <= UINT64_MAX - 0x10 - sizeof(values.tls))
+                    {
+                        values.tls_address = tls_block + 0x10;
+                        values.tls_read = acting.try_read_memory(values.tls_address, &values.tls, sizeof(values.tls));
+                    }
+                    values.host_tick_ms = static_cast<uint64_t>(GetTickCount64());
+                    return values;
+                };
+                const auto log_pair = [this, state, base](const char* stage, auto& acting, const uint32_t tid, const size_t site,
+                                                          const clock_values& before, const clock_values& after, const clock_values& last,
+                                                          const bool last_valid, const uint64_t result) {
+                    uint32_t clock_base{};
+                    const bool base_read = acting.try_read_memory(base + clock_base_rva, &clock_base, sizeof(clock_base));
+                    const auto kusd_sample = this->process.kusd.access([](const KUSER_SHARED_DATA64& kusd) {
+                        return std::array<uint32_t, 3>{
+                            kusd.InterruptTime.LowPart,
+                            static_cast<uint32_t>(kusd.InterruptTime.High1Time),
+                            static_cast<uint32_t>(kusd.InterruptTime.High2Time),
+                        };
+                    });
+                    const auto elapsed =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - state->started).count();
+                    this->log.warn(
+                        "BAPCLOCK stage=%s site=%zu tid=%u vcpu=%zu hits=%u pairs=%u host_elapsed_ms=%lld "
+                        "pre_tls=%#llx pre_static=%#llx post_tls=%#llx post_static=%#llx rax=%#llx "
+                        "last_tls=%#llx last_static=%#llx last_valid=%u "
+                        "pre_tls_address=%#llx post_tls_address=%#llx last_tls_address=%#llx "
+                        "pre_host_tick_ms=%llu post_host_tick_ms=%llu last_host_tick_ms=%llu clock_base=%#x "
+                        "derived_timegettime_low=%#x kusd_source=host_locked kusd_low=%#x kusd_high1=%#x kusd_high2=%#x host_tick_ms=%llu "
+                        "reads=%u%u%u%u%u%u\n",
+                        stage, site, tid, acting.index(), state->hits, state->pairs, static_cast<long long>(elapsed),
+                        static_cast<unsigned long long>(before.tls), static_cast<unsigned long long>(before.global),
+                        static_cast<unsigned long long>(after.tls), static_cast<unsigned long long>(after.global),
+                        static_cast<unsigned long long>(result), static_cast<unsigned long long>(last.tls),
+                        static_cast<unsigned long long>(last.global), static_cast<unsigned>(last_valid),
+                        static_cast<unsigned long long>(before.tls_address), static_cast<unsigned long long>(after.tls_address),
+                        static_cast<unsigned long long>(last.tls_address), static_cast<unsigned long long>(before.host_tick_ms),
+                        static_cast<unsigned long long>(after.host_tick_ms), static_cast<unsigned long long>(last.host_tick_ms), clock_base,
+                        base_read && after.tls_read ? static_cast<uint32_t>(after.tls) + clock_base : 0, kusd_sample[0], kusd_sample[1],
+                        kusd_sample[2], static_cast<unsigned long long>(GetTickCount64()), static_cast<unsigned>(before.tls_read),
+                        static_cast<unsigned>(before.global_read), static_cast<unsigned>(after.tls_read),
+                        static_cast<unsigned>(after.global_read), static_cast<unsigned>(base_read),
+                        static_cast<unsigned>(last_valid));
+                };
+                this->clock_probe_expire_ = [state, retire] {
+                    const std::scoped_lock state_guard(state->mutex);
+                    if (state->attempted && !state->retired && state->started.time_since_epoch().count() != 0 &&
+                        std::chrono::steady_clock::now() - state->started >= std::chrono::minutes(3))
+                    {
+                        retire("host_deadline");
+                    }
+                };
+                this->callbacks.on_debug_string.add([this, state, base, retire, read_clock, log_pair](const std::string_view message) {
+                    if (message.find("Entering state 'bootflow:bap_signin'") == std::string_view::npos)
+                    {
+                        return;
+                    }
+                    const std::scoped_lock state_guard(state->mutex);
+                    if (state->attempted)
+                    {
+                        return;
+                    }
+                    state->attempted = true;
+                    constexpr std::array<uint64_t, 4> call_rvas{0x16CCA99, 0x16CCDDF, 0x16D1F94, 0x16D2370};
+                    constexpr std::array<uint64_t, 4> store_rvas{0x16CCAA1, 0x16CCDE4, 0x16D1F99, 0x16D2375};
+                    constexpr std::array<uint64_t, 4> post_rvas{0x16CCAA8, 0x16CCDEB, 0x16D1FA0, 0x16D237C};
+                    constexpr std::array<std::array<uint8_t, 5>, 4> call_bytes{{
+                        {0xE8, 0xB2, 0x1B, 0xC3, 0xFE},
+                        {0xE8, 0x6C, 0x18, 0xC3, 0xFE},
+                        {0xE8, 0xB7, 0xC6, 0xC2, 0xFE},
+                        {0xE8, 0xDB, 0xC2, 0xC2, 0xFE},
+                    }};
+                    constexpr std::array<std::array<uint8_t, 7>, 4> store_bytes{{
+                        {0x48, 0x89, 0x05, 0x80, 0x6E, 0xFE, 0x00},
+                        {0x48, 0x89, 0x05, 0x3D, 0x6B, 0xFE, 0x00},
+                        {0x48, 0x89, 0x05, 0x88, 0x19, 0xFE, 0x00},
+                        {0x48, 0x89, 0x05, 0xAC, 0x15, 0xFE, 0x00},
+                    }};
+                    constexpr std::array<std::array<uint8_t, 5>, 4> post_bytes{{
+                        {0xE8, 0x63, 0x8F, 0x11, 0x00},
+                        {0xE8, 0x50, 0x3A, 0xFF, 0xFF},
+                        {0xE8, 0x2B, 0x18, 0x08, 0x00},
+                        {0xE8, 0xAF, 0xC8, 0x10, 0x00},
+                    }};
+                    for (size_t site = 0; site < call_rvas.size(); ++site)
+                    {
+                        std::array<uint8_t, 5> call_actual{};
+                        std::array<uint8_t, 7> store_actual{};
+                        std::array<uint8_t, 5> post_actual{};
+                        const bool match = this->emu().try_read_memory(base + call_rvas[site], call_actual.data(), call_actual.size()) &&
+                                           this->emu().try_read_memory(base + store_rvas[site], store_actual.data(), store_actual.size()) &&
+                                           this->emu().try_read_memory(base + post_rvas[site], post_actual.data(), post_actual.size()) &&
+                                           call_actual == call_bytes[site] && store_actual == store_bytes[site] &&
+                                           post_actual == post_bytes[site];
+                        if (!match)
+                        {
+                            this->log.warn("BAPCLOCK stage=unavailable reason=runtime_bytes site=%zu call=%#llx "
+                                           "store=%#llx post=%#llx\n",
+                                           site, static_cast<unsigned long long>(base + call_rvas[site]),
+                                           static_cast<unsigned long long>(base + store_rvas[site]),
+                                           static_cast<unsigned long long>(base + post_rvas[site]));
+                            return;
+                        }
+                    }
+                    state->started = std::chrono::steady_clock::now();
+                    try
+                    {
+                        for (size_t site = 0; site < call_rvas.size(); ++site)
+                        {
+                            state->hooks[site * 2] = this->emu().hook_memory_execution_with_mode(
+                                base + call_rvas[site], hook_interface::memory_execution_hook_mode::int3,
+                                [this, state, site, read_clock, retire](cpu_interface& cpu, uint64_t) {
+                                    const std::scoped_lock kernel_guard(this->kernel_lock_);
+                                    const std::scoped_lock state_guard(state->mutex);
+                                    if (state->retired)
+                                    {
+                                        return;
+                                    }
+                                    ++state->hits;
+                                    if (state->hits >= 8192 || std::chrono::steady_clock::now() - state->started >= std::chrono::minutes(3))
+                                    {
+                                        retire("exhausted");
+                                        return;
+                                    }
+                                    auto& vcpu = this->vcpu(cpu.index());
+                                    const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                                    if (!state->threads.contains(tid) && state->threads.size() >= 128)
+                                    {
+                                        retire("thread_cap");
+                                        return;
+                                    }
+                                    auto& thread = state->threads[tid];
+                                    thread.before = read_clock(vcpu.cpu);
+                                    thread.site = site;
+                                    thread.pending = true;
+                                });
+                            state->hooks[site * 2 + 1] = this->emu().hook_memory_execution_with_mode(
+                                base + post_rvas[site], hook_interface::memory_execution_hook_mode::int3,
+                                [this, state, site, read_clock, log_pair, retire](cpu_interface& cpu, uint64_t) {
+                                    const std::scoped_lock kernel_guard(this->kernel_lock_);
+                                    const std::scoped_lock state_guard(state->mutex);
+                                    if (state->retired)
+                                    {
+                                        return;
+                                    }
+                                    ++state->hits;
+                                    if (state->hits >= 8192 || std::chrono::steady_clock::now() - state->started >= std::chrono::minutes(3))
+                                    {
+                                        retire("exhausted");
+                                        return;
+                                    }
+                                    auto& vcpu = this->vcpu(cpu.index());
+                                    const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                                    const auto found = state->threads.find(tid);
+                                    if (found == state->threads.end() || !found->second.pending || found->second.site != site)
+                                    {
+                                        return;
+                                    }
+                                    auto& thread = found->second;
+                                    thread.pending = false;
+                                    const auto after = read_clock(vcpu.cpu);
+                                    const auto result = vcpu.cpu.reg<uint64_t>(x86_register::rax);
+                                    const auto before = thread.before;
+                                    const auto last = thread.last;
+                                    const bool last_valid = thread.last_valid;
+                                    ++state->pairs;
+                                    if (!thread.baseline_logged)
+                                    {
+                                        const bool already_high =
+                                            (before.tls_read && before.tls >> 32) || (before.global_read && before.global >> 32);
+                                        log_pair(already_high ? "first_seen_already_high" : "baseline", vcpu.cpu, tid, site, before, after,
+                                                 last, last_valid, result);
+                                        thread.baseline_logged = true;
+                                        if (already_high)
+                                        {
+                                            retire("first_seen_already_high");
+                                            return;
+                                        }
+                                    }
+                                    const bool tls_advanced = before.tls_read && after.tls_read && (after.tls >> 32) > (before.tls >> 32);
+                                    const bool static_advanced =
+                                        before.global_read && after.global_read && (after.global >> 32) > (before.global >> 32);
+                                    const bool between_pairs =
+                                        last_valid && last.tls_read && after.tls_read && (after.tls >> 32) > (last.tls >> 32);
+                                    const bool low_regressed = before.tls_read && after.tls_read &&
+                                                               static_cast<uint32_t>(after.tls) < static_cast<uint32_t>(before.tls);
+                                    if (tls_advanced || static_advanced || between_pairs || low_regressed)
+                                    {
+                                        log_pair(between_pairs && !tls_advanced ? "between_pairs" : "transition", vcpu.cpu, tid, site,
+                                                 before, after, last, last_valid, result);
+                                        retire("transition");
+                                        return;
+                                    }
+                                    thread.last = after;
+                                    thread.last_valid = after.tls_read && after.global_read;
+                                });
+                            if (!state->hooks[site * 2] || !state->hooks[site * 2 + 1])
+                            {
+                                retire("hook_unavailable");
+                                return;
+                            }
+                        }
+                        this->log.info("BAPCLOCK stage=installed base=%#llx pairs=4 mode=int3 hit_cap=8192 "
+                                       "host_deadline_ms=180000\n",
+                                       static_cast<unsigned long long>(base));
+                    }
+                    catch (const std::exception& error)
+                    {
+                        this->log.warn("BAPCLOCK stage=unavailable reason=hook error=%s\n", error.what());
+                        retire("hook_error");
+                    }
+                });
+                this->callbacks.on_module_unload.add([state, retire, base](mapped_module& module) {
+                    if (module.image_base == base)
+                    {
+                        const std::scoped_lock state_guard(state->mutex);
+                        retire("module_unload");
+                    }
+                });
+            }
+        }
         if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_TIMEOUT_BRANCH_PROBE");
             probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
         {
@@ -2196,6 +2491,10 @@ namespace sogen
 
     void windows_emulator::publish_activity_status()
     {
+        if (this->clock_probe_expire_)
+        {
+            this->clock_probe_expire_();
+        }
         static const bool guest_memory_enabled = [] {
             const char* configured = std::getenv("SOGEN_GUEST_MEMORY_SHM");
             return configured && std::strcmp(configured, "1") == 0;
