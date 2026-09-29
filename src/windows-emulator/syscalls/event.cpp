@@ -2,6 +2,7 @@
 #include "../emulator_utils.hpp"
 #include "../kusd_mmio.hpp"
 #include "../syscall_utils.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -116,6 +117,87 @@ namespace sogen
                 }
             }
 
+            void emit_bap_fatal_stack_probe(const syscall_context& c, const std::string_view message)
+            {
+                static const bool enabled = [] {
+                    const char* const value = std::getenv("SOGEN_BAP_FATAL_STACK_PROBE");
+                    return value != nullptr && std::string_view{value} == "1";
+                }();
+                if (!enabled || message.find("Fatal error '_connection_failure_timed_out' raised.") == std::string_view::npos)
+                {
+                    return;
+                }
+
+                static std::atomic_flag captured = ATOMIC_FLAG_INIT;
+                if (captured.test_and_set(std::memory_order_relaxed))
+                {
+                    return;
+                }
+
+                const uint64_t rip = c.emu.reg<uint64_t>(x86_register::rip);
+                const uint64_t rsp = c.emu.reg<uint64_t>(x86_register::rsp);
+                const uint32_t tid = c.vcpu.active_thread ? c.vcpu.active_thread->id : 0;
+                uint64_t first_word{};
+                bool first_read{};
+                size_t readable{};
+                size_t candidates_logged{};
+                std::string candidates;
+                candidates.reserve(960);
+                constexpr size_t max_stack_words = 64;
+                constexpr size_t max_candidates = 12;
+                for (size_t index = 0; index < max_stack_words; ++index)
+                {
+                    const uint64_t offset = index * sizeof(uint64_t);
+                    uint64_t word{};
+                    if (!rsp || rsp > UINT64_MAX - offset - sizeof(word) || !c.emu.try_read_memory(rsp + offset, &word, sizeof(word)))
+                    {
+                        continue;
+                    }
+                    ++readable;
+                    if (index == 0)
+                    {
+                        first_word = word;
+                        first_read = true;
+                    }
+                    if (candidates_logged == max_candidates)
+                    {
+                        continue;
+                    }
+                    const auto* module = c.win_emu.mod_manager.find_by_address(word);
+                    if (!module)
+                    {
+                        continue;
+                    }
+                    std::array<char, 96> candidate{};
+                    const int length = std::snprintf(candidate.data(), candidate.size(), "%ss%zu:%.*s+%#llx", candidates.empty() ? "" : ",",
+                                                     index, static_cast<int>(std::min<size_t>(module->name.size(), 40)),
+                                                     module->name.c_str(), static_cast<unsigned long long>(word - module->image_base));
+                    if (length > 0 && static_cast<size_t>(length) < candidate.size())
+                    {
+                        candidates.append(candidate.data(), static_cast<size_t>(length));
+                        ++candidates_logged;
+                    }
+                }
+
+                const auto* rip_module = c.win_emu.mod_manager.find_by_address(rip);
+                std::string rip_module_name = "<unmapped>";
+                if (rip_module)
+                {
+                    rip_module_name.clear();
+                    for (const char character : rip_module->name.substr(0, 40))
+                    {
+                        const auto byte = static_cast<unsigned char>(character);
+                        rip_module_name.push_back(byte >= 0x20 && byte <= 0x7E ? character : '?');
+                    }
+                }
+                c.win_emu.log.warn("BAPFATALSTACK kind=raw_stack_candidates tid=%u vcpu=%zu rip=%#llx rip_module=%s rip_rva=%#llx "
+                                   "rsp=%#llx first_word=%#llx first_read=%u readable=%zu scanned=%zu candidates=[%s]\n",
+                                   tid, c.emu.index(), static_cast<unsigned long long>(rip), rip_module_name.c_str(),
+                                   rip_module ? static_cast<unsigned long long>(rip - rip_module->image_base) : 0ull,
+                                   static_cast<unsigned long long>(rsp), static_cast<unsigned long long>(first_word),
+                                   static_cast<unsigned>(first_read), readable, max_stack_words, candidates.c_str());
+            }
+
             std::optional<handle> open_named_event(process_context& process, const std::u16string_view name, const bool case_insensitive)
             {
                 const auto matches = [&](const std::u16string_view candidate) {
@@ -168,6 +250,7 @@ namespace sogen
                     {
                         c.win_emu.callbacks.on_debug_string(message);
                         emit_guest_clock_probe(c, message);
+                        emit_bap_fatal_stack_probe(c, message);
                     }
                     if (c.win_emu.package_reads_trace.trigger_on_oodle(message) && c.win_emu.callbacks.on_debug_string)
                     {

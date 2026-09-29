@@ -5,6 +5,7 @@
 #include "scheduler_vm_gate.hpp"
 #include "telemetry_shared_memory.hpp"
 #include "exception_shared_memory.hpp"
+#include "guest_memory_shared_memory.hpp"
 
 #include <atomic>
 #include <cctype>
@@ -1883,6 +1884,33 @@ namespace sogen
 
     void windows_emulator::publish_activity_status()
     {
+        static const bool guest_memory_enabled = [] {
+            const char* configured = std::getenv("SOGEN_GUEST_MEMORY_SHM");
+            return configured && std::strcmp(configured, "1") == 0;
+        }();
+        if (guest_memory_enabled)
+        {
+            static detail::guest_memory_shared_memory mapping;
+            mapping.service([this](const uint64_t address, const uint32_t length, detail::guest_memory_packet& packet) {
+                const auto* module = this->mod_manager.find_by_address(address);
+                if (module)
+                {
+                    packet.module_base = module->image_base;
+                    packet.module_size = module->size_of_image;
+                    const auto name_length = (std::min)(module->name.size(), sizeof(packet.module_name) - 1);
+                    std::memcpy(packet.module_name, module->name.data(), name_length);
+                }
+                if (this->memory.try_read_memory(address, packet.data, length))
+                {
+                    packet.status = 0;
+                    packet.bytes_read = length;
+                }
+                else
+                {
+                    packet.status = 1;
+                }
+            });
+        }
         static const std::filesystem::path directory = [] {
             const char* configured = std::getenv("SOGEN_GPU_STATUS_DIR");
             return configured && *configured ? std::filesystem::path(configured) : std::filesystem::path{};
