@@ -1831,9 +1831,22 @@ namespace sogen::whp
             {
                 std::unique_lock lock(this->partition_mutex_);
 
+                return this->hook_memory_execution_locked(address, this->memory_execution_hook_mode_, std::move(callback));
+            }
+
+            emulator_hook* hook_memory_execution_with_mode(const uint64_t address, const memory_execution_hook_mode mode,
+                                                           memory_execution_hook_callback callback) override
+            {
+                std::unique_lock lock(this->partition_mutex_);
+                return this->hook_memory_execution_locked(address, mode, std::move(callback));
+            }
+
+            emulator_hook* hook_memory_execution_locked(const uint64_t address, const memory_execution_hook_mode mode,
+                                                        memory_execution_hook_callback callback)
+            {
                 auto* hook = this->make_hook();
 
-                switch (this->memory_execution_hook_mode_)
+                switch (mode)
                 {
                 case memory_execution_hook_mode::automatic:
                     this->memory_execution_hooks_[hook] = execution_hook_entry{.address = address, .callback = std::move(callback)};

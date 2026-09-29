@@ -108,6 +108,17 @@ namespace sogen
 
         virtual emulator_hook* hook_memory_execution(memory_execution_hook_callback callback) = 0;
         virtual emulator_hook* hook_memory_execution(uint64_t address, memory_execution_hook_callback callback) = 0;
+
+        virtual emulator_hook* hook_memory_execution_with_mode(uint64_t address, memory_execution_hook_mode mode,
+                                                               memory_execution_hook_callback callback)
+        {
+            if (mode != memory_execution_hook_mode::automatic)
+            {
+                throw std::runtime_error("The selected emulator backend does not support int3 memory execution hooks");
+            }
+
+            return this->hook_memory_execution(address, std::move(callback));
+        }
         virtual emulator_hook* hook_memory_range_execution(uint64_t address, uint64_t size, memory_execution_hook_callback callback) = 0;
         virtual emulator_hook* hook_memory_read(uint64_t address, uint64_t size, memory_access_hook_callback callback) = 0;
         virtual emulator_hook* hook_memory_write(uint64_t address, uint64_t size, memory_access_hook_callback callback) = 0;

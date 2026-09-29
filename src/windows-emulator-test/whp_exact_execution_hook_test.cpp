@@ -272,4 +272,34 @@ namespace sogen::test
         }
         EXPECT_GT(total_hits, 0u);
     }
+
+    TEST(WhpExactExecutionHook, PerHookInt3LeavesAutomaticModeUnchanged)
+    {
+        auto emu = create_x86_64_emulator(backend_type::whp);
+        memory_manager memory(*emu);
+        const auto code = memory.allocate_memory(0x1000, memory_permission::all);
+        const auto stack = memory.allocate_memory(0x1000, memory_permission::read_write);
+        ASSERT_NE(code, 0u);
+        ASSERT_NE(stack, 0u);
+
+        constexpr std::array<uint8_t, 11> guest{0xB9, 0xA0, 0x86, 0x01, 0x00, 0xFF, 0xC9, 0x75, 0xFC, 0x90, 0xF4};
+        emu->write_memory(code, guest.data(), guest.size());
+        emu->reg(x86_register::rip, code);
+        emu->reg(x86_register::rsp, stack + 0x800);
+
+        uint32_t hits = 0;
+        auto* hook = emu->hook_memory_execution_with_mode(code + 9, hook_interface::memory_execution_hook_mode::int3,
+                                                          [&](cpu_interface& cpu, uint64_t rip) {
+                                                              EXPECT_EQ(rip, code + 9);
+                                                              ++hits;
+                                                              cpu.stop();
+                                                          });
+        ASSERT_NE(hook, nullptr);
+        emu->start(0);
+        EXPECT_EQ(hits, 1u);
+        EXPECT_EQ(emu->reg<uint32_t>(x86_register::rcx), 0u);
+        emu->delete_hook(hook);
+        EXPECT_EQ(emu->read_memory<uint8_t>(code + 9), 0x90u);
+        emu->start(0);
+    }
 }

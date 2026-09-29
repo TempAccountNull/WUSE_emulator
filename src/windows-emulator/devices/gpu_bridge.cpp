@@ -16,6 +16,18 @@
 #include <chrono>
 #include <bit>
 #include <cstdio>
+#include <future>
+#include <limits>
+
+#ifdef OS_WINDOWS
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace sogen
 {
@@ -32,6 +44,13 @@ namespace sogen
             void create(windows_emulator& win_emu, const io_device_creation_data&) override
             {
                 this->memory_ = &win_emu.memory;
+                if (const char* enabled = std::getenv("SOGEN_GPU_FRAME_CAPTURE"); enabled && std::string_view(enabled) == "1")
+                {
+                    if (const char* directory = std::getenv("SOGEN_GPU_STATUS_DIR"); directory && *directory)
+                    {
+                        this->frame_capture_path_ = std::filesystem::path(directory) / "latest-frame.bmp";
+                    }
+                }
                 this->vulkan_.set_debug_utils_sink([this](vulkan_host::debug_utils_delivery delivered) {
                     const uint32_t tid = delivered.guest_thread_id;
                     return this->debug_callbacks_.push(
@@ -123,7 +142,7 @@ namespace sogen
                 }
                 for (auto& frame : this->vulkan_.poll_presented_frames())
                 {
-                    present_surface_if_ready(win_emu, frame.hwnd, frame.width, frame.height, frame.pixels);
+                    this->present_surface_if_ready(win_emu, frame.hwnd, frame.width, frame.height, std::move(frame.pixels));
                 }
             }
 
@@ -550,6 +569,11 @@ namespace sogen
                 }};
             vulkan_host& vulkan_{*this->vulkan_owner_};
             memory_manager* memory_{};
+            std::filesystem::path frame_capture_path_{};
+            std::mutex frame_capture_mutex_{};
+            std::future<bool> frame_capture_write_{};
+            std::chrono::steady_clock::time_point last_frame_capture_{};
+            bool frame_capture_failure_logged_{};
 
             // VkDeviceMemory aliased directly into the guest address space (see handle_map_memory_direct),
             // keyed by memory object id, so unmap can release the guest range and the host mapping.
@@ -612,8 +636,135 @@ namespace sogen
                 }
             }
 
-            static void present_surface_if_ready(windows_emulator& win_emu, const uint64_t hwnd_value, const uint32_t width,
-                                                 const uint32_t height, const std::vector<std::byte>& pixels)
+            static bool write_bgra_bmp_atomic(const std::filesystem::path& destination, const uint32_t width, const uint32_t height,
+                                              const std::vector<std::byte>& pixels) noexcept
+            {
+                try
+                {
+                    constexpr uint64_t max_image_bytes = 256ull * 1024 * 1024;
+                    const uint64_t image_bytes = static_cast<uint64_t>(width) * height * 4;
+                    if (width == 0 || height == 0 || width > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) ||
+                        height > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) || image_bytes > max_image_bytes ||
+                        image_bytes != pixels.size())
+                    {
+                        return false;
+                    }
+
+                    std::array<uint8_t, 122> header{};
+                    const auto put16 = [&header](const size_t offset, const uint16_t value) {
+                        header[offset] = static_cast<uint8_t>(value);
+                        header[offset + 1] = static_cast<uint8_t>(value >> 8);
+                    };
+                    const auto put32 = [&header](const size_t offset, const uint32_t value) {
+                        for (size_t index = 0; index != 4; ++index)
+                        {
+                            header[offset + index] = static_cast<uint8_t>(value >> (8 * index));
+                        }
+                    };
+                    header[0] = 'B';
+                    header[1] = 'M';
+                    put32(2, static_cast<uint32_t>(header.size() + image_bytes));
+                    put32(10, static_cast<uint32_t>(header.size()));
+                    put32(14, 108);
+                    put32(18, width);
+                    put32(22, static_cast<uint32_t>(-static_cast<int32_t>(height)));
+                    put16(26, 1);
+                    put16(28, 32);
+                    put32(30, 3);
+                    put32(34, static_cast<uint32_t>(image_bytes));
+                    put32(54, 0x00ff0000);
+                    put32(58, 0x0000ff00);
+                    put32(62, 0x000000ff);
+                    put32(66, 0xff000000);
+                    put32(70, 0x73524742);
+
+                    auto temporary = destination;
+                    temporary += ".tmp";
+                    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+                    output.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+                    output.write(reinterpret_cast<const char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()));
+                    output.close();
+                    if (!output)
+                    {
+                        std::error_code ignored;
+                        std::filesystem::remove(temporary, ignored);
+                        return false;
+                    }
+
+                    std::error_code error;
+#ifdef OS_WINDOWS
+                    if (!MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                    {
+                        std::filesystem::remove(temporary, error);
+                        return false;
+                    }
+#else
+                    std::filesystem::rename(temporary, destination, error);
+                    if (error)
+                    {
+                        std::filesystem::remove(temporary, error);
+                        return false;
+                    }
+#endif
+                    return true;
+                }
+                catch (...)
+                {
+                    return false;
+                }
+            }
+
+            void capture_frame_if_enabled(windows_emulator& win_emu, const uint32_t width, const uint32_t height,
+                                          std::vector<std::byte> pixels) noexcept
+            {
+                if (this->frame_capture_path_.empty())
+                {
+                    return;
+                }
+
+                std::scoped_lock lock(this->frame_capture_mutex_);
+                if (this->frame_capture_write_.valid())
+                {
+                    if (this->frame_capture_write_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                    {
+                        return;
+                    }
+                    if (!this->frame_capture_write_.get() && !this->frame_capture_failure_logged_)
+                    {
+                        win_emu.log.warn("[gpu-bridge] frame capture write failed\n");
+                        this->frame_capture_failure_logged_ = true;
+                    }
+                }
+
+                const auto now = std::chrono::steady_clock::now();
+                if (this->last_frame_capture_ != std::chrono::steady_clock::time_point{} &&
+                    now - this->last_frame_capture_ < std::chrono::seconds(15))
+                {
+                    return;
+                }
+                const uint64_t image_bytes = static_cast<uint64_t>(width) * height * 4;
+                if (width == 0 || height == 0 || image_bytes > 256ull * 1024 * 1024 || image_bytes != pixels.size())
+                {
+                    return;
+                }
+
+                try
+                {
+                    auto destination = this->frame_capture_path_;
+                    this->frame_capture_write_ =
+                        std::async(std::launch::async, [destination = std::move(destination), width, height, pixels = std::move(pixels)] {
+                            return write_bgra_bmp_atomic(destination, width, height, pixels);
+                        });
+                    this->last_frame_capture_ = now;
+                }
+                catch (...)
+                {
+                    this->last_frame_capture_ = {};
+                }
+            }
+
+            void present_surface_if_ready(windows_emulator& win_emu, const uint64_t hwnd_value, const uint32_t width, const uint32_t height,
+                                          std::vector<std::byte> pixels)
             {
                 if (hwnd_value == 0 || pixels.empty())
                 {
@@ -627,6 +778,7 @@ namespace sogen
                                                                                 .format = ui_surface_format::bgra8,
                                                                                 .pixels = pixels.data(),
                                                                             });
+                this->capture_frame_if_enabled(win_emu, width, height, std::move(pixels));
             }
 
             // Reads a fixed-size request struct from the guest input buffer.
@@ -2522,7 +2674,7 @@ namespace sogen
                 // seam GDI EndPaint uses). The swapchain is B8G8R8A8, matching bgra8, so no swizzle.
                 if (result == 0 /* VK_SUCCESS */)
                 {
-                    present_surface_if_ready(win_emu, hwnd_value, width, height, pixels);
+                    this->present_surface_if_ready(win_emu, hwnd_value, width, height, std::move(pixels));
                 }
                 this->presentation_activity_->record(win_emu, result == 0 ? 1u : 0u, result == 0 ? 0u : 1u);
 

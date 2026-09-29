@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <utility>
 #include <cstring>
 #include <unordered_map>
@@ -1391,6 +1392,196 @@ namespace sogen
                 this->log.info("TASK0TIMEOUTPROBE installed base=%#llx state_rip=%#llx failure_rip=%#llx\n",
                                static_cast<unsigned long long>(base), static_cast<unsigned long long>(base + state_rva),
                                static_cast<unsigned long long>(base + failure_rva));
+            }
+        }
+        if (const char* probe = std::getenv("SOGEN_DESTINY_STATE23_FLAG_PROBE");
+            probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
+        {
+            constexpr uint64_t writer_rva = 0x1787C89;
+            constexpr std::array<uint8_t, 7> writer_expected{0xC6, 0x87, 0x99, 0xC7, 0x01, 0x00, 0x01};
+            const uint64_t base = executable->image_base;
+            if (executable->size_of_image >= writer_rva + writer_expected.size() &&
+                base <= UINT64_MAX - writer_rva - writer_expected.size())
+            {
+                struct state23_probe_state
+                {
+                    std::mutex mutex{};
+                    emulator_hook* reader_hook{};
+                    emulator_hook* writer_hook{};
+                    uint64_t installed_tick{};
+                    bool attempted{};
+                    bool clear_logged{};
+                };
+
+                auto state = std::make_shared<state23_probe_state>();
+                this->callbacks.on_debug_string.add([this, state, base](const std::string_view message) {
+                    const std::scoped_lock state_lock(state->mutex);
+                    if (!state->attempted && message.find("Entering state 'bootflow:investment_signin'") != std::string_view::npos)
+                    {
+                        state->attempted = true;
+                        constexpr uint64_t site_rva = 0xD3ED79;
+                        constexpr std::array<uint8_t, 7> expected{0x80, 0xB8, 0x99, 0xC7, 0x01, 0x00, 0x00};
+                        std::array<uint8_t, expected.size()> actual{};
+                        if (!this->emu().try_read_memory(base + site_rva, actual.data(), actual.size()) || actual != expected)
+                        {
+                            this->log.warn(
+                                "STATE23FLAG unavailable reason=runtime_bytes address=%#llx bytes=%02x%02x%02x%02x%02x%02x%02x\n",
+                                static_cast<unsigned long long>(base + site_rva), actual[0], actual[1], actual[2], actual[3], actual[4],
+                                actual[5], actual[6]);
+                            return;
+                        }
+
+                        constexpr uint64_t writer_rva = 0x1787C89;
+                        constexpr std::array<uint8_t, 7> writer_expected{0xC6, 0x87, 0x99, 0xC7, 0x01, 0x00, 0x01};
+                        std::array<uint8_t, writer_expected.size()> writer_actual{};
+                        if (!this->emu().try_read_memory(base + writer_rva, writer_actual.data(), writer_actual.size()) ||
+                            writer_actual != writer_expected)
+                        {
+                            this->log.warn("STATE23FLAG unavailable reason=writer_bytes address=%#llx "
+                                           "bytes=%02x%02x%02x%02x%02x%02x%02x\n",
+                                           static_cast<unsigned long long>(base + writer_rva), writer_actual[0], writer_actual[1],
+                                           writer_actual[2], writer_actual[3], writer_actual[4], writer_actual[5], writer_actual[6]);
+                            return;
+                        }
+
+                        state->installed_tick = GetTickCount64();
+                        try
+                        {
+                            state->reader_hook = this->emu().hook_memory_execution_with_mode(
+                                base + site_rva, hook_interface::memory_execution_hook_mode::int3,
+                                [this, state](cpu_interface& cpu, const uint64_t rip) {
+                                    const std::scoped_lock kernel_guard(this->kernel_lock_);
+                                    const std::scoped_lock state_guard(state->mutex);
+                                    if (!state->reader_hook)
+                                    {
+                                        return;
+                                    }
+                                    const uint64_t now = GetTickCount64();
+                                    if (now - state->installed_tick >= 35000)
+                                    {
+                                        this->log.info("STATE23FLAG retired reason=budget elapsed_ms=%llu\n",
+                                                       static_cast<unsigned long long>(now - state->installed_tick));
+                                        this->emu().delete_hook(std::exchange(state->reader_hook, nullptr));
+                                        if (state->writer_hook)
+                                        {
+                                            this->emu().delete_hook(std::exchange(state->writer_hook, nullptr));
+                                        }
+                                        return;
+                                    }
+
+                                    auto& vcpu = this->vcpu(cpu.index());
+                                    auto& acting = vcpu.cpu;
+                                    const uint64_t object = acting.reg<uint64_t>(x86_register::rax);
+                                    constexpr uint64_t flag_offset = 0x1C799;
+                                    uint8_t value{};
+                                    const bool flag_read = object <= UINT64_MAX - flag_offset - sizeof(value) &&
+                                                           acting.try_read_memory(object + flag_offset, &value, sizeof(value));
+                                    if (flag_read && value == 0 && state->clear_logged)
+                                    {
+                                        return;
+                                    }
+                                    state->clear_logged = flag_read && value == 0;
+
+                                    const uint64_t rsp = acting.reg<uint64_t>(x86_register::rsp);
+                                    uint64_t caller{};
+                                    const bool caller_read = rsp <= UINT64_MAX - 0x318 - sizeof(caller) &&
+                                                             acting.try_read_memory(rsp + 0x318, &caller, sizeof(caller));
+                                    const uint64_t interrupt_100ns = this->process.kusd.access([](const KUSER_SHARED_DATA64& kusd) {
+                                        return (static_cast<uint64_t>(static_cast<uint32_t>(kusd.InterruptTime.High1Time)) << 32) |
+                                               kusd.InterruptTime.LowPart;
+                                    });
+                                    const auto guest_steady_ns =
+                                        std::chrono::duration_cast<std::chrono::nanoseconds>(this->clock().steady_now().time_since_epoch())
+                                            .count();
+                                    const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                                    this->log.warn("STATE23FLAG value=%u value_read=%u object=%#llx flag_address=%#llx tid=%u vcpu=%zu "
+                                                   "rip=%#llx caller=%#llx caller_read=%u guest_steady_ns=%lld kusd_interrupt_100ns=%llu "
+                                                   "host_tick_ms=%llu elapsed_ms=%llu\n",
+                                                   static_cast<unsigned>(value), static_cast<unsigned>(flag_read),
+                                                   static_cast<unsigned long long>(object),
+                                                   static_cast<unsigned long long>(flag_read ? object + flag_offset : 0), tid, cpu.index(),
+                                                   static_cast<unsigned long long>(rip), static_cast<unsigned long long>(caller),
+                                                   static_cast<unsigned>(caller_read), static_cast<long long>(guest_steady_ns),
+                                                   static_cast<unsigned long long>(interrupt_100ns), static_cast<unsigned long long>(now),
+                                                   static_cast<unsigned long long>(now - state->installed_tick));
+
+                                    if (!flag_read || value != 0)
+                                    {
+                                        this->emu().delete_hook(std::exchange(state->reader_hook, nullptr));
+                                    }
+                                });
+                            state->writer_hook = this->emu().hook_memory_execution_with_mode(
+                                base + writer_rva, hook_interface::memory_execution_hook_mode::int3,
+                                [this, state](cpu_interface& cpu, const uint64_t rip) {
+                                    const std::scoped_lock kernel_guard(this->kernel_lock_);
+                                    const std::scoped_lock state_guard(state->mutex);
+                                    if (!state->writer_hook)
+                                    {
+                                        return;
+                                    }
+                                    const uint64_t now = GetTickCount64();
+                                    if (now - state->installed_tick >= 35000)
+                                    {
+                                        this->emu().delete_hook(std::exchange(state->writer_hook, nullptr));
+                                        if (state->reader_hook)
+                                        {
+                                            this->emu().delete_hook(std::exchange(state->reader_hook, nullptr));
+                                        }
+                                        return;
+                                    }
+                                    auto& vcpu = this->vcpu(cpu.index());
+                                    auto& acting = vcpu.cpu;
+                                    const uint64_t object = acting.reg<uint64_t>(x86_register::rdi);
+                                    constexpr uint64_t flag_offset = 0x1C799;
+                                    uint8_t prior{};
+                                    const bool prior_read = object <= UINT64_MAX - flag_offset - sizeof(prior) &&
+                                                            acting.try_read_memory(object + flag_offset, &prior, sizeof(prior));
+                                    const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                                    this->log.warn("STATE23FLAG writer object=%#llx flag_address=%#llx prior=%u "
+                                                   "prior_read=%u tid=%u vcpu=%zu rip=%#llx host_tick_ms=%llu elapsed_ms=%llu\n",
+                                                   static_cast<unsigned long long>(object),
+                                                   static_cast<unsigned long long>(prior_read ? object + flag_offset : 0),
+                                                   static_cast<unsigned>(prior), static_cast<unsigned>(prior_read), tid, cpu.index(),
+                                                   static_cast<unsigned long long>(rip), static_cast<unsigned long long>(now),
+                                                   static_cast<unsigned long long>(now - state->installed_tick));
+                                    this->emu().delete_hook(std::exchange(state->writer_hook, nullptr));
+                                });
+                        }
+                        catch (const std::exception& error)
+                        {
+                            if (state->reader_hook)
+                            {
+                                this->emu().delete_hook(std::exchange(state->reader_hook, nullptr));
+                            }
+                            if (state->writer_hook)
+                            {
+                                this->emu().delete_hook(std::exchange(state->writer_hook, nullptr));
+                            }
+                            this->log.warn("STATE23FLAG unavailable reason=hook error=%s\n", error.what());
+                            return;
+                        }
+                        this->log.info("STATE23FLAG installed reader=%#llx writer=%#llx mode=int3\n",
+                                       static_cast<unsigned long long>(base + site_rva),
+                                       static_cast<unsigned long long>(base + writer_rva));
+                        return;
+                    }
+
+                    if ((state->reader_hook || state->writer_hook) && (message.find("Entering state 'cleanup'") != std::string_view::npos ||
+                                                                       GetTickCount64() - state->installed_tick >= 35000))
+                    {
+                        const uint64_t elapsed = GetTickCount64() - state->installed_tick;
+                        this->log.info("STATE23FLAG retired reason=state_or_budget elapsed_ms=%llu\n",
+                                       static_cast<unsigned long long>(elapsed));
+                        if (state->reader_hook)
+                        {
+                            this->emu().delete_hook(std::exchange(state->reader_hook, nullptr));
+                        }
+                        if (state->writer_hook)
+                        {
+                            this->emu().delete_hook(std::exchange(state->writer_hook, nullptr));
+                        }
+                    }
+                });
             }
         }
         // The 21122 Shadowkeep vhalt entry is sampled only when explicitly requested.
