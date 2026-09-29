@@ -1136,6 +1136,8 @@ namespace sogen
                     uint64_t host_tick{};
                     uint32_t raw_time{};
                     std::array<uint32_t, 3> kusd{};
+                    std::array<uint32_t, 3> guest_interrupt_time{};
+                    bool guest_interrupt_time_read{};
                     bool seen{};
                     bool first_change_logged{};
                 };
@@ -1266,6 +1268,49 @@ namespace sogen
                                                                        static_cast<uint32_t>(data.InterruptTime.High1Time),
                                                                        static_cast<uint32_t>(data.InterruptTime.High2Time)};
                                     });
+                                    // This reads the guest-mapped WHP backing page, not the internal KUSD model.
+                                    // It is a post-timeGetTime snapshot, not a witness of the exact in-function load.
+                                    std::array<uint32_t, 3> guest_interrupt_time{};
+                                    const bool guest_interrupt_time_read =
+                                        state->input_only &&
+                                        acting.try_read_memory(kusd_mmio::address() + offsetof(KUSER_SHARED_DATA64, InterruptTime),
+                                                               guest_interrupt_time.data(), sizeof(guest_interrupt_time));
+                                    const auto log_winmm_inputs = [this, &acting, base, site, tid](const char* stage) {
+                                        constexpr uint64_t timer_data_rva = 0xB7B00;
+                                        constexpr uint64_t tick_baseline_rva = 0xB7B08;
+                                        constexpr uint64_t init_once_rva = 0xB7F40;
+                                        constexpr uint64_t time_get_time_iat_rva = 0x20BB3B0;
+                                        const auto* kernel32 = this->mod_manager.find_by_name("kernel32.dll");
+                                        const bool kernel32_valid = kernel32 &&
+                                                                    kernel32->size_of_image > init_once_rva + sizeof(uint64_t);
+                                        const uint64_t kernel32_base = kernel32_valid ? kernel32->image_base : 0;
+                                        uint64_t timer_data{}, init_once{}, iat_target{};
+                                        uint32_t tick_baseline{};
+                                        const bool timer_read = kernel32_valid &&
+                                                                acting.try_read_memory(kernel32_base + timer_data_rva, &timer_data,
+                                                                                       sizeof(timer_data));
+                                        const bool baseline_read = kernel32_valid &&
+                                                                   acting.try_read_memory(kernel32_base + tick_baseline_rva,
+                                                                                          &tick_baseline, sizeof(tick_baseline));
+                                        const bool init_read = kernel32_valid &&
+                                                               acting.try_read_memory(kernel32_base + init_once_rva, &init_once,
+                                                                                      sizeof(init_once));
+                                        const bool iat_read = acting.try_read_memory(base + time_get_time_iat_rva, &iat_target,
+                                                                                     sizeof(iat_target));
+                                        const auto* target_module = iat_read ? this->mod_manager.find_by_address(iat_target) : nullptr;
+                                        const uint64_t target_rva = target_module ? iat_target - target_module->image_base : 0;
+                                        this->log.warn("BAPEARLYCLOCK winmm_inputs stage=%s site=%zu tid=%u kernel32_base=%#llx "
+                                                       "timer_read=%u timer_data=%#llx baseline_read=%u tick_baseline=%#x "
+                                                       "init_read=%u init_once=%#llx iat_read=%u iat_target=%#llx "
+                                                       "target_module=%s target_rva=%#llx\n",
+                                                       stage, site, tid, static_cast<unsigned long long>(kernel32_base),
+                                                       static_cast<unsigned>(timer_read), static_cast<unsigned long long>(timer_data),
+                                                       static_cast<unsigned>(baseline_read), tick_baseline,
+                                                       static_cast<unsigned>(init_read), static_cast<unsigned long long>(init_once),
+                                                       static_cast<unsigned>(iat_read), static_cast<unsigned long long>(iat_target),
+                                                       target_module ? target_module->name.c_str() : "<unmapped>",
+                                                       static_cast<unsigned long long>(target_rva));
+                                    };
                                     if (!state->threads.contains(tid) && state->threads.size() >= 128)
                                     {
                                         retire("thread_cap");
@@ -1281,7 +1326,12 @@ namespace sogen
                                                        static_cast<unsigned long long>(old_value), raw, clock_base, low,
                                                        static_cast<unsigned>((old_value >> 32) != 0),
                                                        static_cast<unsigned long long>(host_tick));
-                                        thread = {address, old_value, host_tick, raw, kusd, true, false};
+                                        thread = {address, old_value, host_tick, raw, kusd, guest_interrupt_time,
+                                                  guest_interrupt_time_read, true, false};
+                                        if (state->input_only)
+                                        {
+                                            log_winmm_inputs("first_seen");
+                                        }
                                     }
                                     else if (!thread.first_change_logged && (old_value >> 32) > (thread.value >> 32))
                                     {
@@ -1301,13 +1351,19 @@ namespace sogen
                                                            "old=%#llx previous_raw_valid=%u previous_raw=%#x raw=%#x "
                                                            "base=%#x low=%#x previous_kusd_low=%#x previous_kusd_high1=%#x "
                                                            "previous_kusd_high2=%#x input_kusd_low=%#x input_kusd_high1=%#x "
-                                                           "input_kusd_high2=%#x\n",
+                                                           "input_kusd_high2=%#x previous_guest_read=%u previous_guest_low=%#x "
+                                                           "previous_guest_high1=%#x previous_guest_high2=%#x input_guest_read=%u "
+                                                           "input_guest_low=%#x input_guest_high1=%#x input_guest_high2=%#x\n",
                                                            site, tid, cpu.index(), static_cast<unsigned long long>(address),
                                                            static_cast<unsigned long long>(old_value),
                                                            static_cast<unsigned>(previous_sample_valid), thread.raw_time, raw,
                                                            clock_base, low, thread.kusd[0], thread.kusd[1], thread.kusd[2], kusd[0],
-                                                           kusd[1], kusd[2]);
+                                                           kusd[1], kusd[2], static_cast<unsigned>(thread.guest_interrupt_time_read),
+                                                           thread.guest_interrupt_time[0], thread.guest_interrupt_time[1],
+                                                           thread.guest_interrupt_time[2], static_cast<unsigned>(guest_interrupt_time_read),
+                                                           guest_interrupt_time[0], guest_interrupt_time[1], guest_interrupt_time[2]);
                                             state->first_candidate_logged = true;
+                                            log_winmm_inputs("first_candidate");
                                         }
                                         if (!state->committed_hooks[site])
                                         {
@@ -1410,6 +1466,8 @@ namespace sogen
                                     thread.host_tick = host_tick;
                                     thread.raw_time = raw;
                                     thread.kusd = kusd;
+                                    thread.guest_interrupt_time = guest_interrupt_time;
+                                    thread.guest_interrupt_time_read = guest_interrupt_time_read;
                                 });
                             if (!state->input_hooks[site])
                             {
