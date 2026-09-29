@@ -161,11 +161,11 @@ namespace sogen
         NTSTATUS handle_NtFreeVirtualMemory(const syscall_context& c, handle process_handle, emulator_object<uint64_t> base_address,
                                             emulator_object<uint64_t> bytes_to_allocate, uint32_t free_type);
         NTSTATUS handle_NtReadVirtualMemory(const syscall_context& c, handle process_handle, emulator_pointer base_address,
-                                            emulator_pointer buffer, ULONG number_of_bytes_to_read,
-                                            emulator_object<ULONG> number_of_bytes_read);
+                                            emulator_pointer buffer, SIZE_T number_of_bytes_to_read,
+                                            emulator_object<SIZE_T> number_of_bytes_read);
         NTSTATUS handle_NtWriteVirtualMemory(const syscall_context& c, handle process_handle, emulator_pointer base_address,
-                                             emulator_pointer buffer, ULONG number_of_bytes_to_write,
-                                             emulator_object<ULONG> number_of_bytes_write);
+                                             emulator_pointer buffer, SIZE_T number_of_bytes_to_write,
+                                             emulator_object<SIZE_T> number_of_bytes_write);
         NTSTATUS handle_NtSetInformationVirtualMemory();
         BOOL handle_NtLockVirtualMemory();
         NTSTATUS handle_NtUnlockVirtualMemory();

@@ -673,8 +673,8 @@ namespace sogen
         }
 
         NTSTATUS handle_NtReadVirtualMemory(const syscall_context& c, const handle process_handle, const emulator_pointer base_address,
-                                            const emulator_pointer buffer, const ULONG number_of_bytes_to_read,
-                                            const emulator_object<ULONG> number_of_bytes_read)
+                                            const emulator_pointer buffer, const SIZE_T number_of_bytes_to_read,
+                                            const emulator_object<SIZE_T> number_of_bytes_read)
         {
             number_of_bytes_read.try_write(0);
 
@@ -717,7 +717,7 @@ namespace sogen
                 bytes_read += chunk_size;
             }
 
-            number_of_bytes_read.try_write(static_cast<ULONG>(bytes_read));
+            number_of_bytes_read.try_write(bytes_read);
             if (bytes_read == number_of_bytes_to_read)
             {
                 return STATUS_SUCCESS;
@@ -727,8 +727,8 @@ namespace sogen
         }
 
         NTSTATUS handle_NtWriteVirtualMemory(const syscall_context& c, const handle process_handle, const emulator_pointer base_address,
-                                             const emulator_pointer buffer, const ULONG number_of_bytes_to_write,
-                                             const emulator_object<ULONG> number_of_bytes_write)
+                                             const emulator_pointer buffer, const SIZE_T number_of_bytes_to_write,
+                                             const emulator_object<SIZE_T> number_of_bytes_write)
         {
             number_of_bytes_write.try_write(0);
 
@@ -771,7 +771,7 @@ namespace sogen
                 bytes_written += chunk_size;
             }
 
-            number_of_bytes_write.try_write(static_cast<ULONG>(bytes_written));
+            number_of_bytes_write.try_write(bytes_written);
             if (bytes_written == number_of_bytes_to_write)
             {
                 return STATUS_SUCCESS;
