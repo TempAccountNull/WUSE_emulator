@@ -2486,6 +2486,191 @@ namespace sogen
                                static_cast<unsigned long long>(base + failure_rva));
             }
         }
+        if (const char* probe = std::getenv("SOGEN_DESTINY_INVESTMENT_TASK_PROBE");
+            probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
+        {
+            struct investment_task_site
+            {
+                uint64_t rva{};
+                std::array<uint8_t, 6> expected{};
+                size_t length{};
+                const char* name{};
+            };
+
+            constexpr std::array sites{
+                investment_task_site{0xD40C4A, {0x41, 0xBE, 0x02, 0x00, 0x00, 0x00}, 6, "watchdog"},
+                investment_task_site{0xD4D93A, {0xBA, 0x04, 0x00, 0x00, 0x00}, 5, "dispatcher"},
+                investment_task_site{0xD4DB86, {0xE8, 0x25, 0x03, 0x0E, 0x00}, 5, "cleanup_reason"},
+            };
+            const uint64_t base = executable->image_base;
+            if (executable->size_of_image >= sites[2].rva + sites[2].length && base <= UINT64_MAX - sites[2].rva - sites[2].length)
+            {
+                struct investment_task_probe_state
+                {
+                    std::mutex mutex{};
+                    std::array<emulator_hook*, 3> hooks{};
+                    uint64_t installed_tick{};
+                    bool attempted{};
+                };
+
+                auto state = std::make_shared<investment_task_probe_state>();
+                const auto retire = [this, state](const char* reason) {
+                    size_t remaining{};
+                    for (auto*& installed : state->hooks)
+                    {
+                        if (installed)
+                        {
+                            ++remaining;
+                            this->emu().delete_hook(std::exchange(installed, nullptr));
+                        }
+                    }
+                    if (remaining)
+                    {
+                        this->log.info("INVESTMENTTASK retired reason=%s remaining=%zu "
+                                       "elapsed_ms=%llu\n",
+                                       reason, remaining, static_cast<unsigned long long>(GetTickCount64() - state->installed_tick));
+                    }
+                };
+                this->callbacks.on_debug_string.add([this, state, retire, base, sites](const std::string_view message) {
+                    const std::scoped_lock state_guard(state->mutex);
+                    if (!state->attempted && message.find("world_controller:state_manager: Entering state 'bootflow:investment_signin'") !=
+                                                 std::string_view::npos)
+                    {
+                        state->attempted = true;
+                        for (size_t site = 0; site < sites.size(); ++site)
+                        {
+                            std::array<uint8_t, 6> actual{};
+                            const bool read = this->emu().try_read_memory(base + sites[site].rva, actual.data(), sites[site].length);
+                            if (!read || std::memcmp(actual.data(), sites[site].expected.data(), sites[site].length) != 0)
+                            {
+                                this->log.warn("INVESTMENTTASK unavailable reason=runtime_bytes "
+                                               "site=%s rva=%#llx read=%u "
+                                               "bytes=%02x%02x%02x%02x%02x%02x\n",
+                                               sites[site].name, static_cast<unsigned long long>(sites[site].rva),
+                                               static_cast<unsigned>(read), actual[0], actual[1], actual[2], actual[3], actual[4],
+                                               actual[5]);
+                                return;
+                            }
+                        }
+
+                        state->installed_tick = GetTickCount64();
+                        try
+                        {
+                            for (size_t site = 0; site < sites.size(); ++site)
+                            {
+                                state->hooks[site] = this->emu().hook_memory_execution_with_mode(
+                                    base + sites[site].rva, hook_interface::memory_execution_hook_mode::int3,
+                                    [this, state, retire, site](cpu_interface& cpu, const uint64_t rip) {
+                                        const std::scoped_lock kernel_guard(this->kernel_lock_);
+                                        const std::scoped_lock state_guard(state->mutex);
+                                        if (!state->hooks[site])
+                                        {
+                                            return;
+                                        }
+                                        const auto elapsed = GetTickCount64() - state->installed_tick;
+                                        if (elapsed >= 300000)
+                                        {
+                                            retire("budget");
+                                            return;
+                                        }
+
+                                        auto& vcpu = this->vcpu(cpu.index());
+                                        auto& acting = vcpu.cpu;
+                                        const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                                        if (site == 0)
+                                        {
+                                            const auto clock = acting.reg<uint64_t>(x86_register::rbp);
+                                            const auto lower = acting.reg<uint64_t>(x86_register::rbx);
+                                            const auto upper = acting.reg<uint64_t>(x86_register::rdi);
+                                            const auto reason_address = acting.reg<uint64_t>(x86_register::rsi);
+                                            uint32_t reason{};
+                                            const bool reason_read = acting.try_read_memory(reason_address, &reason, sizeof(reason));
+                                            this->log.warn("INVESTMENTTASK watchdog tid=%u vcpu=%zu "
+                                                           "rip=%#llx clock=%#llx lower=%#llx "
+                                                           "upper=%#llx reason_address=%#llx reason=%#x "
+                                                           "reason_read=%u elapsed_ms=%llu\n",
+                                                           tid, cpu.index(), static_cast<unsigned long long>(rip),
+                                                           static_cast<unsigned long long>(clock), static_cast<unsigned long long>(lower),
+                                                           static_cast<unsigned long long>(upper),
+                                                           static_cast<unsigned long long>(reason_address), reason,
+                                                           static_cast<unsigned>(reason_read), static_cast<unsigned long long>(elapsed));
+                                        }
+                                        else if (site == 1)
+                                        {
+                                            const auto eax = acting.reg<uint32_t>(x86_register::rax);
+                                            const auto ebx = acting.reg<uint32_t>(x86_register::rbx);
+                                            const auto object = acting.reg<uint64_t>(x86_register::rdi);
+                                            const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
+                                            uint64_t requested_mask{};
+                                            uint32_t initial_reason{};
+                                            const bool mask_read =
+                                                object <= UINT64_MAX - 8 - sizeof(requested_mask) &&
+                                                acting.try_read_memory(object + 8, &requested_mask, sizeof(requested_mask));
+                                            const bool reason_read =
+                                                rsp <= UINT64_MAX - 0x30 - sizeof(initial_reason) &&
+                                                acting.try_read_memory(rsp + 0x30, &initial_reason, sizeof(initial_reason));
+                                            this->log.warn(
+                                                "INVESTMENTTASK dispatcher tid=%u vcpu=%zu "
+                                                "rip=%#llx eax=%#x ebx=%#x "
+                                                "object=%#llx requested_mask=%#llx "
+                                                "mask_read=%u rsp=%#llx "
+                                                "initial_reason=%#x reason_read=%u "
+                                                "elapsed_ms=%llu\n",
+                                                tid, cpu.index(), static_cast<unsigned long long>(rip), eax, ebx,
+                                                static_cast<unsigned long long>(object), static_cast<unsigned long long>(requested_mask),
+                                                static_cast<unsigned>(mask_read), static_cast<unsigned long long>(rsp), initial_reason,
+                                                static_cast<unsigned>(reason_read), static_cast<unsigned long long>(elapsed));
+                                        }
+                                        else
+                                        {
+                                            const auto rcx = acting.reg<uint64_t>(x86_register::rcx);
+                                            const auto edx = acting.reg<uint32_t>(x86_register::rdx);
+                                            this->log.warn("INVESTMENTTASK cleanup_reason tid=%u vcpu=%zu "
+                                                           "rip=%#llx rcx=%#llx "
+                                                           "edx=%#x elapsed_ms=%llu\n",
+                                                           tid, cpu.index(), static_cast<unsigned long long>(rip),
+                                                           static_cast<unsigned long long>(rcx), edx,
+                                                           static_cast<unsigned long long>(elapsed));
+                                        }
+                                        this->emu().delete_hook(std::exchange(state->hooks[site], nullptr));
+                                        if (!state->hooks[0] && !state->hooks[1] && !state->hooks[2])
+                                        {
+                                            this->log.info("INVESTMENTTASK retired reason=all_hits "
+                                                           "elapsed_ms=%llu\n",
+                                                           static_cast<unsigned long long>(elapsed));
+                                        }
+                                    });
+                            }
+                        }
+                        catch (const std::exception& error)
+                        {
+                            retire("hook_error");
+                            this->log.warn("INVESTMENTTASK unavailable reason=hook error=%s\n", error.what());
+                            return;
+                        }
+                        this->log.info("INVESTMENTTASK installed base=%#llx mode=int3 "
+                                       "sites=3 hit_cap=1 "
+                                       "hit_checked_deadline_ms=300000\n",
+                                       static_cast<unsigned long long>(base));
+                        return;
+                    }
+                    if (state->attempted && ((message.find("world_controller:state_manager: Entering state '") != std::string_view::npos &&
+                                              message.find("world_controller:state_manager: Entering state 'bootflow:investment_signin'") ==
+                                                  std::string_view::npos) ||
+                                             GetTickCount64() - state->installed_tick >= 300000))
+                    {
+                        retire("state_or_budget");
+                    }
+                });
+                this->callbacks.on_module_unload.add([state, retire, base](mapped_module& module) {
+                    if (module.image_base == base)
+                    {
+                        const std::scoped_lock state_guard(state->mutex);
+                        retire("module_unload");
+                    }
+                });
+            }
+        }
         if (const char* probe = std::getenv("SOGEN_DESTINY_STATE23_FLAG_PROBE");
             probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
         {
