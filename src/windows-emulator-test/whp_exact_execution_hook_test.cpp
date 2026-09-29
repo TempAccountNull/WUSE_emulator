@@ -409,4 +409,105 @@ namespace sogen::test
             EXPECT_LE(values[1], values[0]);
         }
     }
+
+    TEST(WhpKuserTime, InterruptTimeReadStaysMonotonicDuringPeerRefresh)
+    {
+        auto emu = create_x86_64_emulator(backend_type::whp, 2);
+        memory_manager memory(*emu);
+        const auto code = memory.allocate_memory(0x1000, memory_permission::all);
+        const auto stacks = memory.allocate_memory(0x2000, memory_permission::read_write);
+        ASSERT_NE(code, 0u);
+        ASSERT_NE(stacks, 0u);
+
+        constexpr uint64_t kusd_address = 0x7FFE0000;
+        std::atomic<uint32_t> refreshes{};
+        ASSERT_TRUE(memory.allocate_mmio(
+            kusd_address, 0x1000,
+            [&](uint64_t, void* data, size_t size) {
+                const auto sample = refreshes.fetch_add(1, std::memory_order_relaxed) + 1;
+                const uint64_t value = 0x00000001FFFFFE00ull + static_cast<uint64_t>(sample) * 0x100;
+                const auto high = static_cast<uint32_t>(value >> 32);
+                const auto low = static_cast<uint32_t>(value);
+                std::memset(data, 0, size);
+                std::memcpy(static_cast<uint8_t*>(data) + 8, &low, sizeof(low));
+                std::memcpy(static_cast<uint8_t*>(data) + 12, &high, sizeof(high));
+                std::memcpy(static_cast<uint8_t*>(data) + 16, &high, sizeof(high));
+            },
+            [](uint64_t, const void*, size_t) {}));
+
+        std::array<uint8_t, 47> reader{
+            0x48, 0xBB, 0,    0,    0,    0,    0,    0,    0,    0,    0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9,
+            0x8B, 0x13, 0x8B, 0x43, 0xFC, 0x3B, 0x53, 0x04, 0x75, 0xF6, 0x48, 0xC1, 0xE2, 0x20, 0x48, 0x09,
+            0xD0, 0x4C, 0x39, 0xC0, 0x72, 0x05, 0x49, 0x89, 0xC0, 0xEB, 0xE5, 0x49, 0x89, 0xC1, 0xF4,
+        };
+        constexpr uint64_t interrupt_high1 = kusd_address + 12;
+        std::memcpy(reader.data() + 2, &interrupt_high1, sizeof(interrupt_high1));
+        emu->write_memory(code, reader.data(), reader.size());
+
+        std::array<uint8_t, 11> refresher{0x48, 0xA1, 0, 0, 0, 0, 0, 0, 0, 0, 0xF4};
+        constexpr uint64_t interrupt_low = kusd_address + 8;
+        std::memcpy(refresher.data() + 2, &interrupt_low, sizeof(interrupt_low));
+        emu->write_memory(code + 0x100, refresher.data(), refresher.size());
+
+        auto& reader_cpu = emu->get_cpu(0);
+        auto& refresher_cpu = emu->get_cpu(1);
+        reader_cpu.reg(x86_register::rip, code);
+        reader_cpu.reg(x86_register::rsp, stacks + 0x800);
+        refresher_cpu.reg(x86_register::rsp, stacks + 0x1800);
+
+        std::exception_ptr reader_failure{};
+        std::atomic<bool> reader_finished{};
+        std::thread reader_thread([&] {
+            try
+            {
+                reader_cpu.start(0);
+            }
+            catch (...)
+            {
+                reader_failure = std::current_exception();
+            }
+            reader_finished.store(true, std::memory_order_release);
+        });
+
+        for (uint32_t attempt = 0; attempt < 100 && refreshes.load(std::memory_order_relaxed) < 1; ++attempt)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const bool reader_started = refreshes.load(std::memory_order_relaxed) >= 1;
+        std::exception_ptr refresher_failure{};
+        if (reader_started)
+        {
+            for (uint32_t attempt = 0; attempt < 100 && !reader_finished.load(std::memory_order_acquire); ++attempt)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                refresher_cpu.reg(x86_register::rip, code + 0x100);
+                try
+                {
+                    refresher_cpu.start(0);
+                }
+                catch (...)
+                {
+                    refresher_failure = std::current_exception();
+                    break;
+                }
+            }
+        }
+        reader_cpu.stop();
+        reader_thread.join();
+
+        ASSERT_TRUE(reader_started);
+        if (reader_failure)
+        {
+            std::rethrow_exception(reader_failure);
+        }
+        if (refresher_failure)
+        {
+            std::rethrow_exception(refresher_failure);
+        }
+        EXPECT_GT(refreshes.load(std::memory_order_relaxed), 2u);
+        EXPECT_EQ(reader_cpu.reg<uint64_t>(x86_register::r9), 0u)
+            << "Previous InterruptTime=" << reader_cpu.reg<uint64_t>(x86_register::r8);
+        EXPECT_GE(reader_cpu.reg<uint64_t>(x86_register::r8), 0x0000000200000000ull);
+        EXPECT_GE(refresher_cpu.reg<uint64_t>(x86_register::rax), 0x100u);
+    }
 }
