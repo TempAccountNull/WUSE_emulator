@@ -2500,9 +2500,10 @@ namespace sogen
             constexpr std::array sites{
                 investment_task_site{0xD40C4A, {0x41, 0xBE, 0x02, 0x00, 0x00, 0x00}, 6, "watchdog"},
                 investment_task_site{0xD4D93A, {0xBA, 0x04, 0x00, 0x00, 0x00}, 5, "dispatcher"},
-                investment_task_site{0xD4DB86, {0xE8, 0x25, 0x03, 0x0E, 0x00}, 5, "cleanup_reason"},
+                investment_task_site{0xE1B4D0, {0x48, 0x89, 0x5C, 0x24, 0x20}, 5, "state_setter"},
             };
             const uint64_t base = executable->image_base;
+            const uint64_t image_size = executable->size_of_image;
             if (executable->size_of_image >= sites[2].rva + sites[2].length && base <= UINT64_MAX - sites[2].rva - sites[2].length)
             {
                 struct investment_task_probe_state
@@ -2510,6 +2511,8 @@ namespace sogen
                     std::mutex mutex{};
                     std::array<emulator_hook*, 3> hooks{};
                     uint64_t installed_tick{};
+                    uint64_t setter_calls{};
+                    uint64_t setter_state_read_failures{};
                     bool attempted{};
                 };
 
@@ -2527,11 +2530,13 @@ namespace sogen
                     if (remaining)
                     {
                         this->log.info("INVESTMENTTASK retired reason=%s remaining=%zu "
-                                       "elapsed_ms=%llu\n",
-                                       reason, remaining, static_cast<unsigned long long>(GetTickCount64() - state->installed_tick));
+                                       "elapsed_ms=%llu setter_calls=%llu setter_state_read_failures=%llu\n",
+                                       reason, remaining, static_cast<unsigned long long>(GetTickCount64() - state->installed_tick),
+                                       static_cast<unsigned long long>(state->setter_calls),
+                                       static_cast<unsigned long long>(state->setter_state_read_failures));
                     }
                 };
-                this->callbacks.on_debug_string.add([this, state, retire, base, sites](const std::string_view message) {
+                this->callbacks.on_debug_string.add([this, state, retire, base, image_size, sites](const std::string_view message) {
                     const std::scoped_lock state_guard(state->mutex);
                     if (!state->attempted && message.find("world_controller:state_manager: Entering state 'bootflow:investment_signin'") !=
                                                  std::string_view::npos)
@@ -2560,7 +2565,7 @@ namespace sogen
                             {
                                 state->hooks[site] = this->emu().hook_memory_execution_with_mode(
                                     base + sites[site].rva, hook_interface::memory_execution_hook_mode::int3,
-                                    [this, state, retire, site](cpu_interface& cpu, const uint64_t rip) {
+                                    [this, state, retire, site, base, image_size](cpu_interface& cpu, const uint64_t rip) {
                                         const std::scoped_lock kernel_guard(this->kernel_lock_);
                                         const std::scoped_lock state_guard(state->mutex);
                                         if (!state->hooks[site])
@@ -2623,14 +2628,55 @@ namespace sogen
                                         }
                                         else
                                         {
-                                            const auto rcx = acting.reg<uint64_t>(x86_register::rcx);
-                                            const auto edx = acting.reg<uint32_t>(x86_register::rdx);
-                                            this->log.warn("INVESTMENTTASK cleanup_reason tid=%u vcpu=%zu "
-                                                           "rip=%#llx rcx=%#llx "
-                                                           "edx=%#x elapsed_ms=%llu\n",
-                                                           tid, cpu.index(), static_cast<unsigned long long>(rip),
-                                                           static_cast<unsigned long long>(rcx), edx,
-                                                           static_cast<unsigned long long>(elapsed));
+                                            ++state->setter_calls;
+                                            const auto controller = acting.reg<uint64_t>(x86_register::rcx);
+                                            const auto target = acting.reg<uint32_t>(x86_register::rdx);
+                                            const auto reason = acting.reg<uint32_t>(x86_register::r8);
+                                            uint32_t current{};
+                                            const bool current_read = controller <= UINT64_MAX - 0x390 - sizeof(current) &&
+                                                                      acting.try_read_memory(controller + 0x390, &current, sizeof(current));
+                                            if (!current_read)
+                                            {
+                                                ++state->setter_state_read_failures;
+                                                return;
+                                            }
+                                            if (current != 0x17 || target != 0x1C)
+                                            {
+                                                return;
+                                            }
+                                            const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
+                                            std::array<uint64_t, 8> stack{};
+                                            uint32_t stack_read_mask{};
+                                            for (size_t word = 0; word < stack.size(); ++word)
+                                            {
+                                                const auto offset = word * sizeof(stack[0]);
+                                                if (rsp <= UINT64_MAX - offset - sizeof(stack[0]) &&
+                                                    acting.try_read_memory(rsp + offset, &stack[word], sizeof(stack[word])))
+                                                {
+                                                    stack_read_mask |= 1U << word;
+                                                }
+                                            }
+                                            const auto return_address = stack[0];
+                                            const bool caller_in_image =
+                                                (stack_read_mask & 1U) != 0 && return_address >= base && return_address - base < image_size;
+                                            const auto caller_rva = caller_in_image ? return_address - base : 0;
+                                            this->log.warn(
+                                                "INVESTMENTTASK state_setter tid=%u vcpu=%zu rip=%#llx controller=%#llx "
+                                                "current=%#x target=%#x reason=%#x rsp=%#llx return_address=%#llx "
+                                                "caller_rva=%#llx caller_in_image=%u stack_read_mask=%#x "
+                                                "stack=%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx "
+                                                "setter_calls=%llu elapsed_ms=%llu\n",
+                                                tid, cpu.index(), static_cast<unsigned long long>(rip),
+                                                static_cast<unsigned long long>(controller), current, target, reason,
+                                                static_cast<unsigned long long>(rsp), static_cast<unsigned long long>(return_address),
+                                                static_cast<unsigned long long>(caller_rva), static_cast<unsigned>(caller_in_image),
+                                                stack_read_mask, static_cast<unsigned long long>(stack[0]),
+                                                static_cast<unsigned long long>(stack[1]), static_cast<unsigned long long>(stack[2]),
+                                                static_cast<unsigned long long>(stack[3]), static_cast<unsigned long long>(stack[4]),
+                                                static_cast<unsigned long long>(stack[5]), static_cast<unsigned long long>(stack[6]),
+                                                static_cast<unsigned long long>(stack[7]),
+                                                static_cast<unsigned long long>(state->setter_calls),
+                                                static_cast<unsigned long long>(elapsed));
                                         }
                                         this->emu().delete_hook(std::exchange(state->hooks[site], nullptr));
                                         if (!state->hooks[0] && !state->hooks[1] && !state->hooks[2])
