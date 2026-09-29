@@ -307,6 +307,40 @@ namespace sogen::test
         EXPECT_EQ(stream->incoming.size(), 3u);
     }
 
+    TEST_P(AfdStreamScatterGatherTest, NonblockingEmptyReceiveCanRetryAfterResponseArrives)
+    {
+        const std::array<uint64_t, 2> set_nonblocking{2, 1};
+        emu.memory.write_memory(memory + 0x100, set_nonblocking.data(), sizeof(set_nonblocking));
+        io_device_context mode_context{emu.memory};
+        mode_context.io_control_code = 0x1203b;
+        mode_context.io_status_block = {emu.memory, memory + 0x80};
+        mode_context.input_buffer = memory + 0x100;
+        mode_context.input_buffer_length = sizeof(set_nonblocking);
+        ASSERT_EQ(device->execute_ioctl(emu, mode_context), STATUS_SUCCESS);
+
+        emu.memory.set_memory(memory + 0x300, 0xa5, 6);
+        buffers({{6, memory + 0x300}});
+        ASSERT_EQ(receive(1), STATUS_DEVICE_NOT_READY);
+        EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x80), STATUS_DEVICE_NOT_READY);
+        EXPECT_EQ(information(), 0u);
+        EXPECT_TRUE(emu.process.events.get(completion)->signaled);
+
+        emu.process.events.get(completion)->signaled = false;
+        for (const char value : std::string_view{"BAP251"})
+        {
+            stream->incoming.push_back(static_cast<std::byte>(value));
+        }
+        device->work(emu);
+        EXPECT_FALSE(emu.process.events.get(completion)->signaled);
+        EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x300), 0xa5);
+
+        ASSERT_EQ(receive(1), STATUS_SUCCESS);
+        EXPECT_TRUE(emu.process.events.get(completion)->signaled);
+        EXPECT_EQ(information(), 6u);
+        EXPECT_EQ(read(memory + 0x300, 6), "BAP251");
+        EXPECT_TRUE(stream->incoming.empty());
+    }
+
     TEST_P(AfdStreamScatterGatherTest, InvalidDescriptorRejectsBeforeSocketTransfer)
     {
         buffers({{2, memory + 0x300}, {1, 0}});

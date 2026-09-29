@@ -1123,6 +1123,144 @@ namespace sogen
                 }
             }
         }
+        if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_TIMEOUT_BRANCH_PROBE");
+            probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
+        {
+            constexpr uint64_t site_rva = 0x1742DA8;
+            constexpr uint64_t clock_base_rva = 0x20D0474;
+            constexpr uint64_t override_rva = 0x26B3920;
+            constexpr uint64_t static_clock_rva = 0x26B3928;
+            constexpr uint64_t tls_index_rva = 0x330F0E0;
+            if (executable->size_of_image >= tls_index_rva + sizeof(uint32_t) &&
+                executable->image_base <= UINT64_MAX - tls_index_rva - sizeof(uint32_t))
+            {
+                struct timeout_branch_state
+                {
+                    std::mutex mutex{};
+                    emulator_hook* hook{};
+                    uint32_t samples{};
+                    bool attempted{};
+                };
+
+                const auto base = executable->image_base;
+                auto state = std::make_shared<timeout_branch_state>();
+                this->callbacks.on_debug_string.add([this, state, base](const std::string_view message) {
+                    if (message.find("Entering state 'bootflow:bap_signin'") == std::string_view::npos)
+                    {
+                        return;
+                    }
+                    const std::scoped_lock state_guard(state->mutex);
+                    if (state->attempted)
+                    {
+                        return;
+                    }
+                    state->attempted = true;
+                    constexpr std::array<uint8_t, 5> expected{0xBA, 0x04, 0x00, 0x00, 0x00};
+                    std::array<uint8_t, expected.size()> actual{};
+                    const bool signature_read = this->emu().try_read_memory(base + site_rva, actual.data(), actual.size());
+                    if (!signature_read || actual != expected)
+                    {
+                        this->log.warn("BAPTIMEOUTBRANCH unavailable reason=runtime_bytes address=%#llx read=%u "
+                                       "bytes=%02x%02x%02x%02x%02x\n",
+                                       static_cast<unsigned long long>(base + site_rva), static_cast<unsigned>(signature_read), actual[0],
+                                       actual[1], actual[2], actual[3], actual[4]);
+                        return;
+                    }
+                    try
+                    {
+                        state->hook = this->emu().hook_memory_execution_with_mode(
+                            base + site_rva, hook_interface::memory_execution_hook_mode::int3,
+                            [this, state, base](cpu_interface& cpu, const uint64_t rip) {
+                                const std::scoped_lock kernel_guard(this->kernel_lock_);
+                                const std::scoped_lock state_guard(state->mutex);
+                                if (!state->hook)
+                                {
+                                    return;
+                                }
+
+                                auto& vcpu = this->vcpu(cpu.index());
+                                auto& acting = vcpu.cpu;
+                                const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                                const auto age = acting.reg<uint64_t>(x86_register::rax);
+                                const auto stamp = acting.reg<uint64_t>(x86_register::r14);
+                                const auto limit = acting.reg<uint64_t>(x86_register::r15);
+                                const auto message_address = acting.reg<uint64_t>(x86_register::rdi);
+                                uint32_t message_state{};
+                                uint16_t service{};
+                                uint32_t sequence{};
+                                uint64_t stored_stamp{};
+                                const bool message_address_valid = message_address <= UINT64_MAX - 0x128 - sizeof(stored_stamp);
+                                const bool state_read =
+                                    message_address_valid && acting.try_read_memory(message_address, &message_state, sizeof(message_state));
+                                const bool service_read =
+                                    message_address_valid && acting.try_read_memory(message_address + 0xC, &service, sizeof(service));
+                                const bool sequence_read =
+                                    message_address_valid && acting.try_read_memory(message_address + 0xE, &sequence, sizeof(sequence));
+                                const bool stamp_read =
+                                    message_address_valid &&
+                                    acting.try_read_memory(message_address + 0x128, &stored_stamp, sizeof(stored_stamp));
+
+                                uint8_t clock_override{};
+                                uint32_t clock_base{};
+                                uint32_t tls_index{};
+                                uint64_t tls_array{};
+                                uint64_t tls_block{};
+                                uint64_t tls_clock{};
+                                uint64_t static_clock{};
+                                const bool override_read =
+                                    acting.try_read_memory(base + override_rva, &clock_override, sizeof(clock_override));
+                                const bool base_read = acting.try_read_memory(base + clock_base_rva, &clock_base, sizeof(clock_base));
+                                const bool index_read = acting.try_read_memory(base + tls_index_rva, &tls_index, sizeof(tls_index));
+                                const auto gs_base = acting.get_segment_base(x86_register::gs);
+                                const bool array_read = gs_base <= UINT64_MAX - 0x58 - sizeof(tls_array) &&
+                                                        acting.try_read_memory(gs_base + 0x58, &tls_array, sizeof(tls_array));
+                                const bool block_read =
+                                    array_read && index_read && tls_index < 0x1000 &&
+                                    tls_array <= UINT64_MAX - static_cast<uint64_t>(tls_index) * sizeof(tls_block) - sizeof(tls_block) &&
+                                    acting.try_read_memory(tls_array + static_cast<uint64_t>(tls_index) * sizeof(tls_block), &tls_block,
+                                                           sizeof(tls_block));
+                                const bool tls_read = block_read && tls_block <= UINT64_MAX - 0x10 - sizeof(tls_clock) &&
+                                                      acting.try_read_memory(tls_block + 0x10, &tls_clock, sizeof(tls_clock));
+                                const bool static_read =
+                                    acting.try_read_memory(base + static_clock_rva, &static_clock, sizeof(static_clock));
+                                const bool current_clock_valid = override_read && (clock_override ? static_read : tls_read);
+                                const uint64_t current_clock = clock_override ? static_clock : tls_clock;
+                                const auto sample = ++state->samples;
+                                this->log.warn("BAPTIMEOUTBRANCH stage=taken n=%u tid=%u vcpu=%zu rip=%#llx "
+                                               "message=%#llx state=%u service=%u sequence=%u stamp=%#llx "
+                                               "age=%#llx limit=%#llx register_stamp=%#llx register_clock=%#llx "
+                                               "current_clock=%#llx clock_override=%u clock_base=%#x "
+                                               "tls_clock=%#llx static_clock=%#llx host_tick_ms=%llu "
+                                               "reads=%u%u%u%u%u%u%u%u%u%u%u\n",
+                                               sample, tid, cpu.index(), static_cast<unsigned long long>(rip),
+                                               static_cast<unsigned long long>(message_address), message_state, service, sequence,
+                                               static_cast<unsigned long long>(stored_stamp), static_cast<unsigned long long>(age),
+                                               static_cast<unsigned long long>(limit), static_cast<unsigned long long>(stamp),
+                                               static_cast<unsigned long long>(stamp + age), static_cast<unsigned long long>(current_clock),
+                                               static_cast<unsigned>(clock_override), clock_base,
+                                               static_cast<unsigned long long>(tls_clock), static_cast<unsigned long long>(static_clock),
+                                               static_cast<unsigned long long>(GetTickCount64()), static_cast<unsigned>(state_read),
+                                               static_cast<unsigned>(service_read), static_cast<unsigned>(sequence_read),
+                                               static_cast<unsigned>(stamp_read), static_cast<unsigned>(override_read),
+                                               static_cast<unsigned>(base_read), static_cast<unsigned>(index_read),
+                                               static_cast<unsigned>(array_read), static_cast<unsigned>(block_read),
+                                               static_cast<unsigned>(tls_read), static_cast<unsigned>(current_clock_valid));
+                                if (sample >= 4)
+                                {
+                                    auto* const completed = std::exchange(state->hook, nullptr);
+                                    this->emu().delete_hook(completed);
+                                }
+                            });
+                        this->log.info("BAPTIMEOUTBRANCH installed base=%#llx rip=%#llx mode=int3\n", static_cast<unsigned long long>(base),
+                                       static_cast<unsigned long long>(base + site_rva));
+                    }
+                    catch (const std::exception& error)
+                    {
+                        this->log.warn("BAPTIMEOUTBRANCH unavailable reason=hook error=%s\n", error.what());
+                    }
+                });
+            }
+        }
         if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_TIMEOUT_PROBE");
             probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
         {
