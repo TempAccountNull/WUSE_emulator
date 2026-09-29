@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <iomanip>
 #include <limits>
@@ -32,6 +33,8 @@ namespace sogen::whp
     {
         constexpr size_t maximum_vcpu_count = 64;
         constexpr uint64_t page_size = 0x1000;
+        constexpr uint64_t kuser_page = 0x7FFE0000;
+        constexpr size_t kuser_interrupt_offset = 8;
         constexpr uint64_t trap_flag_bit = 0x100ull;
         constexpr uint64_t syscall_instruction_size = 2;
         constexpr uint64_t page_table_entry_present = 1ull << 0;
@@ -1322,6 +1325,46 @@ namespace sogen::whp
                 this->memory_execution_hook_mode_ = mode;
             }
 
+            void start_mmio_publication_trace(const uint64_t page_base) override
+            {
+                if (page_base != kuser_page)
+                {
+                    return;
+                }
+                const std::scoped_lock lock(this->mmio_trace_mutex_);
+                this->mmio_trace_total_ = 0;
+                this->mmio_trace_dropped_ = 0;
+                this->mmio_trace_count_ = 0;
+                this->mmio_trace_next_ = 0;
+                this->mmio_trace_in_flight_.reset();
+                this->mmio_trace_page_.store(page_base, std::memory_order_release);
+            }
+
+            mmio_publication_snapshot stop_and_take_mmio_publication_trace(const uint64_t page_base) override
+            {
+                mmio_publication_snapshot result{};
+                if (page_base != kuser_page)
+                {
+                    return result;
+                }
+                const std::scoped_lock lock(this->mmio_trace_mutex_);
+                if (this->mmio_trace_page_.exchange(0, std::memory_order_acq_rel) != page_base)
+                {
+                    return result;
+                }
+                result.total = this->mmio_trace_total_;
+                result.dropped = this->mmio_trace_dropped_;
+                result.in_flight = this->mmio_trace_in_flight_;
+                const auto oldest = this->mmio_trace_count_ == this->mmio_trace_records_.size() ? this->mmio_trace_next_ : 0;
+                for (size_t index = 0; index < this->mmio_trace_count_; ++index)
+                {
+                    result.records[index] = this->mmio_trace_records_[(oldest + index) % this->mmio_trace_records_.size()];
+                }
+                result.count = this->mmio_trace_count_;
+                this->mmio_trace_in_flight_.reset();
+                return result;
+            }
+
             size_t vcpu_count() const override
             {
                 return this->vcpus_.size();
@@ -1714,12 +1757,23 @@ namespace sogen::whp
                 // Exclusive: the breakpoint overlay below may update patched-breakpoint bookkeeping.
                 std::unique_lock lock(this->partition_mutex_);
 
+                const bool trace_kuser = this->mmio_trace_page_.load(std::memory_order_acquire) == kuser_page && size &&
+                                         address < kuser_page + page_size && (address >= kuser_page || size > kuser_page - address);
+                const auto kuser_it = trace_kuser ? this->mapped_pages_.find(kuser_page) : this->mapped_pages_.end();
+                const bool trace_mapped = kuser_it != this->mapped_pages_.end() && kuser_it->second && kuser_it->second->host_page;
+                const auto trace_before = trace_mapped ? mmio_trace_interrupt(kuser_it->second->host_page) : mmio_interrupt_sample{};
+
                 if (!this->access_memory(address, const_cast<void*>(data), size, true))
                 {
                     return false;
                 }
 
                 this->overlay_patched_breakpoints(address, data, size);
+                if (trace_mapped)
+                {
+                    this->append_mmio_write_trace(mmio_publication_kind::host_write, UINT32_MAX, trace_before,
+                                                  mmio_trace_interrupt(kuser_it->second->host_page));
+                }
                 return true;
             }
 
@@ -2021,6 +2075,14 @@ namespace sogen::whp
             // runs single-threaded, before any vCPU can execute, and takes no lock.
             mutable std::shared_mutex partition_mutex_{};
             std::mutex mmio_refresh_mutex_{};
+            mutable std::mutex mmio_trace_mutex_{};
+            std::atomic<uint64_t> mmio_trace_page_{};
+            std::array<mmio_publication_record, mmio_publication_snapshot::capacity> mmio_trace_records_{};
+            std::optional<mmio_publication_record> mmio_trace_in_flight_{};
+            uint64_t mmio_trace_total_{};
+            uint64_t mmio_trace_dropped_{};
+            size_t mmio_trace_count_{};
+            size_t mmio_trace_next_{};
 
             std::unordered_map<uint64_t, std::unique_ptr<mapped_page>> mapped_pages_{};
             std::unordered_map<uint64_t, std::shared_ptr<uint8_t>> internal_pages_{};
@@ -2053,6 +2115,109 @@ namespace sogen::whp
             memory_execution_hook_mode memory_execution_hook_mode_ = memory_execution_hook_mode::automatic;
 
             std::vector<std::unique_ptr<whp_vcpu>> vcpus_{};
+
+            static uint64_t mmio_trace_now_ns()
+            {
+                return static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+            }
+
+            static mmio_interrupt_sample mmio_trace_interrupt(const void* page)
+            {
+                mmio_interrupt_sample sample{};
+                const auto* bytes = static_cast<const std::byte*>(page) + kuser_interrupt_offset;
+                std::memcpy(&sample, bytes, sizeof(sample));
+                return sample;
+            }
+
+            void append_mmio_trace_locked(mmio_publication_record record)
+            {
+                record.sequence = ++this->mmio_trace_total_;
+                this->mmio_trace_records_[this->mmio_trace_next_] = record;
+                this->mmio_trace_next_ = (this->mmio_trace_next_ + 1) % this->mmio_trace_records_.size();
+                if (this->mmio_trace_count_ < this->mmio_trace_records_.size())
+                {
+                    ++this->mmio_trace_count_;
+                }
+                else
+                {
+                    ++this->mmio_trace_dropped_;
+                }
+            }
+
+            void begin_mmio_trace(const uint64_t page_base, const uint32_t vcpu_index, const bool is_write)
+            {
+                if (this->mmio_trace_page_.load(std::memory_order_acquire) != page_base)
+                {
+                    return;
+                }
+                const std::scoped_lock lock(this->mmio_trace_mutex_);
+                if (this->mmio_trace_page_.load(std::memory_order_relaxed) == page_base)
+                {
+                    this->mmio_trace_in_flight_ = mmio_publication_record{
+                        .kind = mmio_publication_kind::refresh,
+                        .callback_start_ns = mmio_trace_now_ns(),
+                        .vcpu_index = vcpu_index,
+                        .is_write = is_write,
+                    };
+                }
+            }
+
+            void callback_done_mmio_trace(const uint64_t page_base, const void* refreshed_page)
+            {
+                if (this->mmio_trace_page_.load(std::memory_order_acquire) != page_base)
+                {
+                    return;
+                }
+                const std::scoped_lock lock(this->mmio_trace_mutex_);
+                if (this->mmio_trace_in_flight_)
+                {
+                    this->mmio_trace_in_flight_->callback_done_ns = mmio_trace_now_ns();
+                    this->mmio_trace_in_flight_->callback_value = mmio_trace_interrupt(refreshed_page);
+                }
+            }
+
+            void finish_mmio_trace(const uint64_t page_base, const mmio_interrupt_sample before, const mmio_interrupt_sample after,
+                                   const uint64_t grace_deadline_ns)
+            {
+                if (this->mmio_trace_page_.load(std::memory_order_acquire) != page_base)
+                {
+                    return;
+                }
+                const std::scoped_lock lock(this->mmio_trace_mutex_);
+                if (!this->mmio_trace_in_flight_)
+                {
+                    return;
+                }
+                auto record = *this->mmio_trace_in_flight_;
+                record.before = before;
+                record.after = after;
+                record.publication_ns = mmio_trace_now_ns();
+                record.grace_deadline_ns = grace_deadline_ns;
+                this->append_mmio_trace_locked(record);
+                this->mmio_trace_in_flight_.reset();
+            }
+
+            void append_mmio_write_trace(const mmio_publication_kind kind, const uint32_t vcpu_index, const mmio_interrupt_sample before,
+                                         const mmio_interrupt_sample after, const bool is_write = true)
+            {
+                if (this->mmio_trace_page_.load(std::memory_order_acquire) != kuser_page)
+                {
+                    return;
+                }
+                const std::scoped_lock lock(this->mmio_trace_mutex_);
+                if (this->mmio_trace_page_.load(std::memory_order_relaxed) == kuser_page)
+                {
+                    this->append_mmio_trace_locked(mmio_publication_record{
+                        .kind = kind,
+                        .publication_ns = mmio_trace_now_ns(),
+                        .before = before,
+                        .after = after,
+                        .vcpu_index = vcpu_index,
+                        .is_write = is_write,
+                    });
+                }
+            }
 
             void ensure_platform_support()
             {
@@ -2963,8 +3128,17 @@ namespace sogen::whp
                     {
                         if (this->find_mmio_region(page_base) != nullptr)
                         {
+                            const bool trace_kuser = page_base == kuser_page && page_it->second->host_page &&
+                                                     this->mmio_trace_page_.load(std::memory_order_acquire) == kuser_page;
+                            const auto trace_before =
+                                trace_kuser ? mmio_trace_interrupt(page_it->second->host_page) : mmio_interrupt_sample{};
                             page_it->second->permissions = memory_permission::none;
                             this->remap_page(*page_it->second);
+                            if (trace_kuser)
+                            {
+                                this->append_mmio_write_trace(mmio_publication_kind::grace_expire, static_cast<uint32_t>(vcpu.index()),
+                                                              trace_before, trace_before, false);
+                            }
                         }
                     }
 
@@ -3067,6 +3241,13 @@ namespace sogen::whp
                                     .offset = region_offset + start,
                                     .data = std::vector<std::byte>(current_page + start, current_page + index),
                                 });
+                            }
+
+                            if (state.page_base == kuser_page)
+                            {
+                                this->append_mmio_write_trace(mmio_publication_kind::guest_write, static_cast<uint32_t>(vcpu.index()),
+                                                              mmio_trace_interrupt(state.old_page.data()),
+                                                              mmio_trace_interrupt(current_page));
                             }
                         }
                     }
@@ -3892,6 +4073,12 @@ namespace sogen::whp
                     std::unique_lock refresh_lock(this->mmio_refresh_mutex_);
                     const auto page_base = align_down_to_page(mmio_address);
                     const auto is_write = operation == memory_operation::write;
+                    const bool trace_kuser =
+                        page_base == kuser_page && this->mmio_trace_page_.load(std::memory_order_acquire) == kuser_page;
+                    if (trace_kuser)
+                    {
+                        this->begin_mmio_trace(page_base, static_cast<uint32_t>(vcpu.index()), is_write);
+                    }
 
                     // Refresh the page content through the region callback outside the lock, then
                     // publish it into the backing page under it.
@@ -3899,6 +4086,10 @@ namespace sogen::whp
                     const auto region_offset = static_cast<size_t>(page_base - region_address);
                     const auto bytes_to_read = (std::min)(static_cast<size_t>(page_size), region_size - region_offset);
                     region_read_cb(region_offset, refreshed_page.data(), bytes_to_read);
+                    if (trace_kuser)
+                    {
+                        this->callback_done_mmio_trace(page_base, refreshed_page.data());
+                    }
 
                     std::unique_lock lock(this->partition_mutex_);
 
@@ -3908,7 +4099,9 @@ namespace sogen::whp
                         throw std::runtime_error("MMIO page backing is missing");
                     }
 
+                    const auto trace_before = trace_kuser ? mmio_trace_interrupt(page_it->second->host_page) : mmio_interrupt_sample{};
                     std::memcpy(page_it->second->host_page, refreshed_page.data(), page_size);
+                    const auto trace_after = trace_kuser ? mmio_trace_interrupt(page_it->second->host_page) : mmio_interrupt_sample{};
 
                     if (is_write)
                     {
@@ -3925,7 +4118,19 @@ namespace sogen::whp
                     if (!is_write)
                     {
                         this->grant_mmio_read_grace(page_base);
+                        if (trace_kuser)
+                        {
+                            const auto deadline = this->mmio_read_grace_deadlines_.at(page_base);
+                            const auto deadline_ns = static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch()).count());
+                            this->finish_mmio_trace(page_base, trace_before, trace_after, deadline_ns);
+                        }
                         return true;
+                    }
+
+                    if (trace_kuser)
+                    {
+                        this->finish_mmio_trace(page_base, trace_before, trace_after, 0);
                     }
 
                     if (!this->arm_mmio_single_step(vcpu, page_base, is_write))
@@ -3936,9 +4141,10 @@ namespace sogen::whp
                     return true;
                 }
 
-                // Spurious fault on an actually-backed page whose mapping is momentarily stale for
-                // this vCPU (peer map/commit/reprotect): repair and retry. Guard/no-access pages
-                // (permission 'none') and genuine violations still reach the hook.
+                // Spurious fault on an actually-backed page whose mapping is momentarily
+                // stale for this vCPU (peer map/commit/reprotect): repair and retry.
+                // Guard/no-access pages (permission 'none') and genuine violations still
+                // reach the hook.
                 if (this->try_repair_spurious_fault(vcpu, resolved_address, operation, true))
                 {
                     return true;

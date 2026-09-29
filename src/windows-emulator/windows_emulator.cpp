@@ -1134,6 +1134,7 @@ namespace sogen
                     uint64_t address{};
                     uint64_t value{};
                     uint64_t host_tick{};
+                    uint64_t steady_ns{};
                     uint32_t raw_time{};
                     std::array<uint32_t, 3> kusd{};
                     std::array<uint32_t, 3> guest_interrupt_time{};
@@ -1182,6 +1183,10 @@ namespace sogen
                         return;
                     }
                     state->retired = true;
+                    if (state->input_only)
+                    {
+                        (void)this->emu().stop_and_take_mmio_publication_trace(kusd_mmio::address());
+                    }
                     this->log.warn("BAPEARLYCLOCK retired reason=%s hits=%llu threads=%zu changes=%u pending=%zu\n", reason,
                                    static_cast<unsigned long long>(state->hits), state->threads.size(), state->changes,
                                    state->pending.size());
@@ -1210,6 +1215,10 @@ namespace sogen
                 const auto arm = [this, state, retire, expire, base, input_rvas, input_bytes, committed_rvas, committed_bytes, writer_rvas,
                                   writer_bytes, writer_done_rvas, writer_done_bytes]() {
                     state->started = std::chrono::steady_clock::now();
+                    if (state->input_only)
+                    {
+                        this->emu().start_mmio_publication_trace(kusd_mmio::address());
+                    }
                     try
                     {
                         for (size_t site = 0; site < input_rvas.size(); ++site)
@@ -1263,6 +1272,9 @@ namespace sogen
                                     }
                                     const uint32_t low = raw - clock_base;
                                     const auto host_tick = static_cast<uint64_t>(GetTickCount64());
+                                    const auto steady_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                                     std::chrono::steady_clock::now().time_since_epoch())
+                                                                                     .count());
                                     const auto kusd = this->process.kusd.access([](const KUSER_SHARED_DATA64& data) {
                                         return std::array<uint32_t, 3>{data.InterruptTime.LowPart,
                                                                        static_cast<uint32_t>(data.InterruptTime.High1Time),
@@ -1326,8 +1338,16 @@ namespace sogen
                                                        static_cast<unsigned long long>(old_value), raw, clock_base, low,
                                                        static_cast<unsigned>((old_value >> 32) != 0),
                                                        static_cast<unsigned long long>(host_tick));
-                                        thread = {address, old_value, host_tick, raw, kusd, guest_interrupt_time,
-                                                  guest_interrupt_time_read, true, false};
+                                        thread = {address,
+                                                  old_value,
+                                                  host_tick,
+                                                  steady_ns,
+                                                  raw,
+                                                  kusd,
+                                                  guest_interrupt_time,
+                                                  guest_interrupt_time_read,
+                                                  true,
+                                                  false};
                                         if (state->input_only)
                                         {
                                             log_winmm_inputs("first_seen");
@@ -1345,7 +1365,11 @@ namespace sogen
                                     }
                                     if (!thread.first_change_logged && low < static_cast<uint32_t>(old_value))
                                     {
-                                        if (state->input_only && !state->first_candidate_logged)
+                                        const bool capture_publication = state->input_only && !state->first_candidate_logged;
+                                        const auto publication =
+                                            capture_publication ? this->emu().stop_and_take_mmio_publication_trace(kusd_mmio::address())
+                                                                : mmio_publication_snapshot{};
+                                        if (capture_publication)
                                         {
                                             this->log.warn("BAPEARLYCLOCK first_candidate site=%zu tid=%u vcpu=%zu address=%#llx "
                                                            "old=%#llx previous_raw_valid=%u previous_raw=%#x raw=%#x "
@@ -1356,12 +1380,16 @@ namespace sogen
                                                            "input_guest_low=%#x input_guest_high1=%#x input_guest_high2=%#x\n",
                                                            site, tid, cpu.index(), static_cast<unsigned long long>(address),
                                                            static_cast<unsigned long long>(old_value),
-                                                           static_cast<unsigned>(previous_sample_valid), thread.raw_time, raw,
-                                                           clock_base, low, thread.kusd[0], thread.kusd[1], thread.kusd[2], kusd[0],
-                                                           kusd[1], kusd[2], static_cast<unsigned>(thread.guest_interrupt_time_read),
+                                                           static_cast<unsigned>(previous_sample_valid), thread.raw_time, raw, clock_base,
+                                                           low, thread.kusd[0], thread.kusd[1], thread.kusd[2], kusd[0], kusd[1], kusd[2],
+                                                           static_cast<unsigned>(thread.guest_interrupt_time_read),
                                                            thread.guest_interrupt_time[0], thread.guest_interrupt_time[1],
                                                            thread.guest_interrupt_time[2], static_cast<unsigned>(guest_interrupt_time_read),
                                                            guest_interrupt_time[0], guest_interrupt_time[1], guest_interrupt_time[2]);
+                                            this->log.warn("BAPKUSERPUB candidate_sample tid=%u previous_steady_ns=%llu "
+                                                           "current_steady_ns=%llu\n",
+                                                           tid, static_cast<unsigned long long>(thread.steady_ns),
+                                                           static_cast<unsigned long long>(steady_ns));
                                             state->first_candidate_logged = true;
                                             log_winmm_inputs("first_candidate");
                                         }
@@ -1414,24 +1442,24 @@ namespace sogen
                                                     const auto now = static_cast<uint64_t>(GetTickCount64());
                                                     const bool confirmed = committed_read && (committed >> 32) > (sample.old_value >> 32) &&
                                                                            static_cast<uint32_t>(committed) == sample.low_time;
-                                                    this->log.warn("BAPEARLYCLOCK %s site=%zu tid=%u vcpu=%zu address=%#llx "
-                                                                   "old=%#llx committed=%#llx committed_read=%u "
-                                                                   "previous_raw_valid=%u previous_raw=%#x raw=%#x base=%#x low=%#x "
-                                                                   "previous_host_tick_ms=%llu host_tick_ms=%llu "
-                                                                   "previous_kusd_low=%#x previous_kusd_high1=%#x "
-                                                                   "previous_kusd_high2=%#x input_kusd_low=%#x input_kusd_high1=%#x "
-                                                                   "input_kusd_high2=%#x kusd_low=%#x kusd_high1=%#x kusd_high2=%#x\n",
-                                                                   confirmed ? "first_transition" : "candidate_unconfirmed", site, post_tid,
-                                                                   post_cpu.index(), static_cast<unsigned long long>(sample.address),
-                                                                   static_cast<unsigned long long>(sample.old_value),
-                                                                   static_cast<unsigned long long>(committed), static_cast<unsigned>(committed_read),
-                                                                   static_cast<unsigned>(sample.previous_sample_valid), sample.previous_raw_time,
-                                                                   sample.raw_time,
-                                                                   sample.clock_base, sample.low_time,
-                                                                   static_cast<unsigned long long>(sample.previous_host_tick),
-                                                                   static_cast<unsigned long long>(now), sample.previous_kusd[0],
-                                                                   sample.previous_kusd[1], sample.previous_kusd[2], sample.input_kusd[0],
-                                                                   sample.input_kusd[1], sample.input_kusd[2], kusd[0], kusd[1], kusd[2]);
+                                                    this->log.warn(
+                                                        "BAPEARLYCLOCK %s site=%zu tid=%u vcpu=%zu address=%#llx "
+                                                        "old=%#llx committed=%#llx committed_read=%u "
+                                                        "previous_raw_valid=%u previous_raw=%#x raw=%#x base=%#x low=%#x "
+                                                        "previous_host_tick_ms=%llu host_tick_ms=%llu "
+                                                        "previous_kusd_low=%#x previous_kusd_high1=%#x "
+                                                        "previous_kusd_high2=%#x input_kusd_low=%#x input_kusd_high1=%#x "
+                                                        "input_kusd_high2=%#x kusd_low=%#x kusd_high1=%#x kusd_high2=%#x\n",
+                                                        confirmed ? "first_transition" : "candidate_unconfirmed", site, post_tid,
+                                                        post_cpu.index(), static_cast<unsigned long long>(sample.address),
+                                                        static_cast<unsigned long long>(sample.old_value),
+                                                        static_cast<unsigned long long>(committed), static_cast<unsigned>(committed_read),
+                                                        static_cast<unsigned>(sample.previous_sample_valid), sample.previous_raw_time,
+                                                        sample.raw_time, sample.clock_base, sample.low_time,
+                                                        static_cast<unsigned long long>(sample.previous_host_tick),
+                                                        static_cast<unsigned long long>(now), sample.previous_kusd[0],
+                                                        sample.previous_kusd[1], sample.previous_kusd[2], sample.input_kusd[0],
+                                                        sample.input_kusd[1], sample.input_kusd[2], kusd[0], kusd[1], kusd[2]);
                                                     auto& thread = state->threads[post_tid];
                                                     thread.first_change_logged = confirmed;
                                                     if (committed_read)
@@ -1459,11 +1487,51 @@ namespace sogen
                                                 return;
                                             }
                                         }
-                                        state->pending[tid] = {address, old_value, thread.host_tick, thread.raw_time, raw, low,
-                                                               clock_base, thread.kusd, kusd, site, previous_sample_valid};
+                                        state->pending[tid] = {address, old_value, thread.host_tick,     thread.raw_time,
+                                                               raw,     low,       clock_base,           thread.kusd,
+                                                               kusd,    site,      previous_sample_valid};
+                                        if (capture_publication)
+                                        {
+                                            this->log.warn("BAPKUSERPUB snapshot tid=%u total=%llu dropped=%llu "
+                                                           "retained=%zu "
+                                                           "in_flight=%u "
+                                                           "kind_map=0:refresh,1:guest_write,2:host_write,3:"
+                                                           "grace_expire\n",
+                                                           tid, static_cast<unsigned long long>(publication.total),
+                                                           static_cast<unsigned long long>(publication.dropped), publication.count,
+                                                           static_cast<unsigned>(publication.in_flight.has_value()));
+                                            const auto log_publication = [this](const char* stage, const mmio_publication_record& record) {
+                                                this->log.warn("BAPKUSERPUB %s seq=%llu kind=%u vcpu=%u "
+                                                               "write=%u "
+                                                               "start_ns=%llu callback_done_ns=%llu "
+                                                               "publication_ns=%llu "
+                                                               "grace_deadline_ns=%llu before=%#x:%#x:%#x "
+                                                               "callback=%#x:%#x:%#x after=%#x:%#x:%#x\n",
+                                                               stage, static_cast<unsigned long long>(record.sequence),
+                                                               static_cast<unsigned>(record.kind), record.vcpu_index,
+                                                               static_cast<unsigned>(record.is_write),
+                                                               static_cast<unsigned long long>(record.callback_start_ns),
+                                                               static_cast<unsigned long long>(record.callback_done_ns),
+                                                               static_cast<unsigned long long>(record.publication_ns),
+                                                               static_cast<unsigned long long>(record.grace_deadline_ns),
+                                                               record.before.high1, record.before.low, record.before.high2,
+                                                               record.callback_value.high1, record.callback_value.low,
+                                                               record.callback_value.high2, record.after.high1, record.after.low,
+                                                               record.after.high2);
+                                            };
+                                            for (size_t index = 0; index < publication.count; ++index)
+                                            {
+                                                log_publication("record", publication.records[index]);
+                                            }
+                                            if (publication.in_flight)
+                                            {
+                                                log_publication("in_flight", *publication.in_flight);
+                                            }
+                                        }
                                     }
                                     thread.value = old_value;
                                     thread.host_tick = host_tick;
+                                    thread.steady_ns = steady_ns;
                                     thread.raw_time = raw;
                                     thread.kusd = kusd;
                                     thread.guest_interrupt_time = guest_interrupt_time;

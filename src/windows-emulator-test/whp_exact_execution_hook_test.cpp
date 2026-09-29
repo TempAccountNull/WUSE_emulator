@@ -441,7 +441,7 @@ namespace sogen::test
         ASSERT_NE(code, 0u);
         ASSERT_NE(stacks, 0u);
 
-        constexpr uint64_t mmio_address = 0x7000000000;
+        constexpr uint64_t mmio_address = 0x7FFE0000;
         std::mutex gate{};
         std::condition_variable changed{};
         std::atomic<uint32_t> refreshes{};
@@ -454,6 +454,8 @@ namespace sogen::test
                 const uint64_t value = sample == 1 ? 100 : 101;
                 std::memset(data, 0, size);
                 std::memcpy(data, &value, sizeof(value));
+                const uint32_t low = static_cast<uint32_t>(value);
+                std::memcpy(static_cast<uint8_t*>(data) + 8, &low, sizeof(low));
                 if (sample == 1)
                 {
                     std::unique_lock lock(gate);
@@ -463,6 +465,7 @@ namespace sogen::test
                 }
             },
             [](uint64_t, const void*, size_t) {}));
+        emu->start_mmio_publication_trace(mmio_address);
 
         std::array<uint8_t, 11> guest{0x48, 0xA1, 0, 0, 0, 0, 0, 0, 0, 0, 0xF4};
         std::memcpy(guest.data() + 2, &mmio_address, sizeof(mmio_address));
@@ -515,6 +518,7 @@ namespace sogen::test
         std::thread second([&] { run_cpu(1); });
         first.join();
         second.join();
+        const auto publication = emu->stop_and_take_mmio_publication_trace(mmio_address);
         for (const auto& failure : failures)
         {
             if (failure)
@@ -524,6 +528,23 @@ namespace sogen::test
             }
         }
         ASSERT_GE(refreshes.load(std::memory_order_relaxed), 2u);
+        ASSERT_GE(publication.total, 2u);
+        ASSERT_EQ(publication.dropped, 0u);
+        std::vector<mmio_publication_record> published{};
+        for (size_t index = 0; index < publication.count; ++index)
+        {
+            const auto& record = publication.records[index];
+            if (record.kind == mmio_publication_kind::refresh)
+            {
+                published.push_back(record);
+            }
+        }
+        ASSERT_GE(published.size(), 2u);
+        EXPECT_EQ(published[0].callback_value.low, 100u);
+        EXPECT_EQ(published[0].after.low, 100u);
+        EXPECT_EQ(published[1].before.low, 100u);
+        EXPECT_EQ(published[1].callback_value.low, 101u);
+        EXPECT_EQ(published[1].after.low, 101u);
         ASSERT_NE(completion_order[0], completion_order[1]);
         if (completion_order[0] < completion_order[1])
         {

@@ -24,7 +24,9 @@ real per-vCPU objects (docs/multi-vcpu-design.md).
 #include "typed_cpu.hpp"
 #include "x86_register.hpp"
 
+#include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,6 +34,45 @@ real per-vCPU objects (docs/multi-vcpu-design.md).
 
 namespace sogen
 {
+    enum class mmio_publication_kind : uint8_t
+    {
+        refresh,
+        guest_write,
+        host_write,
+        grace_expire,
+    };
+
+    struct mmio_interrupt_sample
+    {
+        uint32_t low{};
+        uint32_t high1{};
+        uint32_t high2{};
+    };
+
+    struct mmio_publication_record
+    {
+        mmio_publication_kind kind{};
+        uint64_t sequence{};
+        uint64_t callback_start_ns{};
+        uint64_t callback_done_ns{};
+        uint64_t publication_ns{};
+        uint64_t grace_deadline_ns{};
+        mmio_interrupt_sample before{};
+        mmio_interrupt_sample callback_value{};
+        mmio_interrupt_sample after{};
+        uint32_t vcpu_index{UINT32_MAX};
+        bool is_write{};
+    };
+
+    struct mmio_publication_snapshot
+    {
+        static constexpr size_t capacity = 64;
+        uint64_t total{};
+        uint64_t dropped{};
+        std::optional<mmio_publication_record> in_flight{};
+        std::array<mmio_publication_record, capacity> records{};
+        size_t count{};
+    };
 
     // --[Core]--------------------------------------------------------------------------
 
@@ -189,6 +230,15 @@ namespace sogen
         };
 
         virtual std::vector<smp_profile_snapshot> smp_profile() const
+        {
+            return {};
+        }
+
+        virtual void start_mmio_publication_trace(uint64_t /*page_base*/)
+        {
+        }
+
+        virtual mmio_publication_snapshot stop_and_take_mmio_publication_trace(uint64_t /*page_base*/)
         {
             return {};
         }
