@@ -1078,8 +1078,10 @@ namespace sogen
         // Opt-in, exact-address diagnostic. Defer arming until a bootflow marker
         // verifies the decrypted hook targets. Earlier clock changes may be missed.
         if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_EARLY_CLOCK_PROBE");
-            probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
+            probe && (std::strcmp(probe, "1") == 0 || std::strcmp(probe, "INPUT_ONLY") == 0) && executable &&
+            executable->name == "destiny2.exe")
         {
+            const bool input_only = std::strcmp(probe, "INPUT_ONLY") == 0;
             constexpr uint64_t clock_base_rva = 0x20D0474;
             constexpr uint64_t static_clock_rva = 0x26B3928;
             constexpr std::array<uint64_t, 2> input_rvas{0x2FE674, 0x2FE6BF};
@@ -1117,10 +1119,14 @@ namespace sogen
                     uint64_t address{};
                     uint64_t old_value{};
                     uint64_t previous_host_tick{};
+                    uint32_t previous_raw_time{};
                     uint32_t raw_time{};
                     uint32_t low_time{};
                     uint32_t clock_base{};
+                    std::array<uint32_t, 3> previous_kusd{};
+                    std::array<uint32_t, 3> input_kusd{};
                     size_t site{};
+                    bool previous_sample_valid{};
                 };
 
                 struct thread_clock
@@ -1129,6 +1135,7 @@ namespace sogen
                     uint64_t value{};
                     uint64_t host_tick{};
                     uint32_t raw_time{};
+                    std::array<uint32_t, 3> kusd{};
                     bool seen{};
                     bool first_change_logged{};
                 };
@@ -1159,11 +1166,14 @@ namespace sogen
                     uint64_t hits{};
                     uint32_t readiness_attempts{};
                     uint32_t changes{};
+                    bool input_only{};
+                    bool first_candidate_logged{};
                     bool armed{};
                     bool retired{};
                 };
 
                 auto state = std::make_shared<early_clock_state>();
+                state->input_only = input_only;
                 const auto retire = [this, state](const char* reason) {
                     if (state->retired)
                     {
@@ -1251,12 +1261,18 @@ namespace sogen
                                     }
                                     const uint32_t low = raw - clock_base;
                                     const auto host_tick = static_cast<uint64_t>(GetTickCount64());
+                                    const auto kusd = this->process.kusd.access([](const KUSER_SHARED_DATA64& data) {
+                                        return std::array<uint32_t, 3>{data.InterruptTime.LowPart,
+                                                                       static_cast<uint32_t>(data.InterruptTime.High1Time),
+                                                                       static_cast<uint32_t>(data.InterruptTime.High2Time)};
+                                    });
                                     if (!state->threads.contains(tid) && state->threads.size() >= 128)
                                     {
                                         retire("thread_cap");
                                         return;
                                     }
                                     auto& thread = state->threads[tid];
+                                    const bool previous_sample_valid = thread.seen && thread.address == address;
                                     if (!thread.seen || thread.address != address)
                                     {
                                         this->log.warn("BAPEARLYCLOCK first_seen site=%zu tid=%u vcpu=%zu address=%#llx old=%#llx "
@@ -1265,7 +1281,7 @@ namespace sogen
                                                        static_cast<unsigned long long>(old_value), raw, clock_base, low,
                                                        static_cast<unsigned>((old_value >> 32) != 0),
                                                        static_cast<unsigned long long>(host_tick));
-                                        thread = {address, old_value, host_tick, raw, true, false};
+                                        thread = {address, old_value, host_tick, raw, kusd, true, false};
                                     }
                                     else if (!thread.first_change_logged && (old_value >> 32) > (thread.value >> 32))
                                     {
@@ -1279,6 +1295,20 @@ namespace sogen
                                     }
                                     if (!thread.first_change_logged && low < static_cast<uint32_t>(old_value))
                                     {
+                                        if (state->input_only && !state->first_candidate_logged)
+                                        {
+                                            this->log.warn("BAPEARLYCLOCK first_candidate site=%zu tid=%u vcpu=%zu address=%#llx "
+                                                           "old=%#llx previous_raw_valid=%u previous_raw=%#x raw=%#x "
+                                                           "base=%#x low=%#x previous_kusd_low=%#x previous_kusd_high1=%#x "
+                                                           "previous_kusd_high2=%#x input_kusd_low=%#x input_kusd_high1=%#x "
+                                                           "input_kusd_high2=%#x\n",
+                                                           site, tid, cpu.index(), static_cast<unsigned long long>(address),
+                                                           static_cast<unsigned long long>(old_value),
+                                                           static_cast<unsigned>(previous_sample_valid), thread.raw_time, raw,
+                                                           clock_base, low, thread.kusd[0], thread.kusd[1], thread.kusd[2], kusd[0],
+                                                           kusd[1], kusd[2]);
+                                            state->first_candidate_logged = true;
+                                        }
                                         if (!state->committed_hooks[site])
                                         {
                                             state->committed_hooks[site] = this->emu().hook_memory_execution_with_mode(
@@ -1329,17 +1359,23 @@ namespace sogen
                                                     const bool confirmed = committed_read && (committed >> 32) > (sample.old_value >> 32) &&
                                                                            static_cast<uint32_t>(committed) == sample.low_time;
                                                     this->log.warn("BAPEARLYCLOCK %s site=%zu tid=%u vcpu=%zu address=%#llx "
-                                                                   "old=%#llx committed=%#llx committed_read=%u raw=%#x base=%#x low=%#x "
+                                                                   "old=%#llx committed=%#llx committed_read=%u "
+                                                                   "previous_raw_valid=%u previous_raw=%#x raw=%#x base=%#x low=%#x "
                                                                    "previous_host_tick_ms=%llu host_tick_ms=%llu "
-                                                                   "kusd_low=%#x kusd_high1=%#x kusd_high2=%#x\n",
+                                                                   "previous_kusd_low=%#x previous_kusd_high1=%#x "
+                                                                   "previous_kusd_high2=%#x input_kusd_low=%#x input_kusd_high1=%#x "
+                                                                   "input_kusd_high2=%#x kusd_low=%#x kusd_high1=%#x kusd_high2=%#x\n",
                                                                    confirmed ? "first_transition" : "candidate_unconfirmed", site, post_tid,
                                                                    post_cpu.index(), static_cast<unsigned long long>(sample.address),
                                                                    static_cast<unsigned long long>(sample.old_value),
-                                                                   static_cast<unsigned long long>(committed),
-                                                                   static_cast<unsigned>(committed_read), sample.raw_time,
+                                                                   static_cast<unsigned long long>(committed), static_cast<unsigned>(committed_read),
+                                                                   static_cast<unsigned>(sample.previous_sample_valid), sample.previous_raw_time,
+                                                                   sample.raw_time,
                                                                    sample.clock_base, sample.low_time,
                                                                    static_cast<unsigned long long>(sample.previous_host_tick),
-                                                                   static_cast<unsigned long long>(now), kusd[0], kusd[1], kusd[2]);
+                                                                   static_cast<unsigned long long>(now), sample.previous_kusd[0],
+                                                                   sample.previous_kusd[1], sample.previous_kusd[2], sample.input_kusd[0],
+                                                                   sample.input_kusd[1], sample.input_kusd[2], kusd[0], kusd[1], kusd[2]);
                                                     auto& thread = state->threads[post_tid];
                                                     thread.first_change_logged = confirmed;
                                                     if (committed_read)
@@ -1350,6 +1386,11 @@ namespace sogen
                                                     if (confirmed)
                                                     {
                                                         ++state->changes;
+                                                        if (state->input_only)
+                                                        {
+                                                            retire("first_transition");
+                                                            return;
+                                                        }
                                                     }
                                                     if (state->changes >= 16)
                                                     {
@@ -1362,11 +1403,13 @@ namespace sogen
                                                 return;
                                             }
                                         }
-                                        state->pending[tid] = {address, old_value, thread.host_tick, raw, low, clock_base, site};
+                                        state->pending[tid] = {address, old_value, thread.host_tick, thread.raw_time, raw, low,
+                                                               clock_base, thread.kusd, kusd, site, previous_sample_valid};
                                     }
                                     thread.value = old_value;
                                     thread.host_tick = host_tick;
                                     thread.raw_time = raw;
+                                    thread.kusd = kusd;
                                 });
                             if (!state->input_hooks[site])
                             {
@@ -1374,7 +1417,7 @@ namespace sogen
                                 break;
                             }
                         }
-                        if (!state->retired)
+                        if (!state->retired && !state->input_only)
                         {
                             for (size_t site = 0; site < writer_rvas.size(); ++site)
                             {
@@ -1466,9 +1509,10 @@ namespace sogen
                         }
                         if (!state->retired)
                         {
-                            this->log.info("BAPEARLYCLOCK installed base=%#llx helpers=2 writers=4 hit_cap=1000000 "
-                                           "change_cap=16 hit_checked_deadline_ms=900000\n",
-                                           static_cast<unsigned long long>(base));
+                            this->log.info("BAPEARLYCLOCK installed base=%#llx mode=%s helpers=2 writers=%u "
+                                           "hit_cap=1000000 change_cap=%u hit_checked_deadline_ms=900000\n",
+                                           static_cast<unsigned long long>(base), state->input_only ? "INPUT_ONLY" : "FULL",
+                                           state->input_only ? 0U : 4U, state->input_only ? 1U : 16U);
                         }
                     }
                     catch (const std::exception& error)
@@ -1517,7 +1561,7 @@ namespace sogen
                         check("input", site, input_rvas[site], input_bytes[site]);
                         check("committed", site, committed_rvas[site], committed_bytes);
                     }
-                    for (size_t site = 0; site < writer_rvas.size(); ++site)
+                    for (size_t site = 0; !state->input_only && site < writer_rvas.size(); ++site)
                     {
                         check("writer", site, writer_rvas[site], writer_bytes[site]);
                         check("writer_done", site, writer_done_rvas[site], writer_done_bytes[site]);
@@ -1540,10 +1584,11 @@ namespace sogen
                     const bool base_read = this->emu().try_read_memory(base + clock_base_rva, &clock_base, sizeof(clock_base));
                     const auto host_tick = static_cast<uint64_t>(GetTickCount64());
                     state->armed = true;
-                    this->log.info("BAPEARLYCLOCK readiness_verified attempt=%u signatures=12 bap_signin=%u late_arm=%u "
+                    this->log.info("BAPEARLYCLOCK readiness_verified attempt=%u signatures=%u mode=%s bap_signin=%u late_arm=%u "
                                    "static_read=%u static=%#llx static_high=%#x base_read=%u clock_base=%#x "
                                    "host_tick_ms=%llu\n",
-                                   attempt, static_cast<unsigned>(bap_signin), static_cast<unsigned>(bap_signin),
+                                   attempt, state->input_only ? 4U : 12U, state->input_only ? "INPUT_ONLY" : "FULL",
+                                   static_cast<unsigned>(bap_signin), static_cast<unsigned>(bap_signin),
                                    static_cast<unsigned>(static_read), static_cast<unsigned long long>(static_clock),
                                    static_cast<uint32_t>(static_clock >> 32), static_cast<unsigned>(base_read), clock_base,
                                    static_cast<unsigned long long>(host_tick));

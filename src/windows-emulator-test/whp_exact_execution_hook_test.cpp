@@ -324,6 +324,84 @@ namespace sogen::test
         EXPECT_GT(total_hits, 0u);
     }
 
+    TEST(WhpExactExecutionHook, EightVcpusCanRetireActiveAndSiblingExactHooks)
+    {
+        constexpr size_t vcpu_count = 8;
+        auto emu = create_x86_64_emulator(backend_type::whp, vcpu_count);
+        memory_manager memory(*emu);
+        const auto code = memory.allocate_memory(0x1000, memory_permission::all);
+        const auto stacks = memory.allocate_memory(vcpu_count * 0x1000, memory_permission::read_write);
+        ASSERT_NE(code, 0u);
+        ASSERT_NE(stacks, 0u);
+
+        // mov eax,0; inc eax; hlt. Each vCPU runs a distinct slot on one shared page.
+        constexpr std::array<uint8_t, 8> guest{0xB8, 0, 0, 0, 0, 0xFF, 0xC0, 0xF4};
+        std::array<emulator_hook*, vcpu_count> active{};
+        std::array<emulator_hook*, vcpu_count> sibling{};
+        std::array<std::atomic<uint32_t>, vcpu_count> hits{};
+        for (size_t index = 0; index < vcpu_count; ++index)
+        {
+            const auto entry = code + index * 0x100;
+            emu->write_memory(entry, guest.data(), guest.size());
+            auto& cpu = emu->get_cpu(index);
+            cpu.reg(x86_register::rip, entry);
+            cpu.reg(x86_register::rsp, stacks + index * 0x1000 + 0x800);
+            sibling[index] = emu->hook_memory_execution_with_mode(entry + 7, hook_interface::memory_execution_hook_mode::int3,
+                                                                  [](cpu_interface&, uint64_t) {});
+            ASSERT_NE(sibling[index], nullptr);
+            active[index] = emu->hook_memory_execution_with_mode(entry + 5, hook_interface::memory_execution_hook_mode::int3,
+                                                                 [&, index](cpu_interface&, uint64_t) {
+                                                                     hits[index].fetch_add(1, std::memory_order_relaxed);
+                                                                     auto* current = std::exchange(active[index], nullptr);
+                                                                     auto* peer = std::exchange(sibling[index], nullptr);
+                                                                     emu->delete_hook(current);
+                                                                     emu->delete_hook(peer);
+                                                                 });
+            ASSERT_NE(active[index], nullptr);
+        }
+
+        std::array<std::exception_ptr, vcpu_count> failures{};
+        std::array<std::thread, vcpu_count> workers{};
+        for (size_t index = 0; index < vcpu_count; ++index)
+        {
+            workers[index] = std::thread([&, index] {
+                try
+                {
+                    emu->get_cpu(index).start(0);
+                }
+                catch (...)
+                {
+                    failures[index] = std::current_exception();
+                }
+            });
+        }
+        for (auto& worker : workers)
+        {
+            worker.join();
+        }
+
+        for (size_t index = 0; index < vcpu_count; ++index)
+        {
+            if (failures[index])
+            {
+                EXPECT_NO_THROW(std::rethrow_exception(failures[index]));
+            }
+            EXPECT_EQ(hits[index].load(std::memory_order_relaxed), 1u);
+            EXPECT_EQ(emu->get_cpu(index).reg<uint32_t>(x86_register::rax), 1u);
+            std::array<uint8_t, guest.size()> after{};
+            emu->read_memory(code + index * 0x100, after.data(), after.size());
+            EXPECT_EQ(after, guest);
+            if (active[index])
+            {
+                emu->delete_hook(active[index]);
+            }
+            if (sibling[index])
+            {
+                emu->delete_hook(sibling[index]);
+            }
+        }
+    }
+
     TEST(WhpExactExecutionHook, PerHookInt3LeavesAutomaticModeUnchanged)
     {
         auto emu = create_x86_64_emulator(backend_type::whp);
