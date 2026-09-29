@@ -2020,6 +2020,7 @@ namespace sogen::whp
             // Never held while invoking a user callback or across WHvRunVirtualProcessor. Construction
             // runs single-threaded, before any vCPU can execute, and takes no lock.
             mutable std::shared_mutex partition_mutex_{};
+            std::mutex mmio_refresh_mutex_{};
 
             std::unordered_map<uint64_t, std::unique_ptr<mapped_page>> mapped_pages_{};
             std::unordered_map<uint64_t, std::shared_ptr<uint8_t>> internal_pages_{};
@@ -3888,6 +3889,7 @@ namespace sogen::whp
 
                 if (found_region)
                 {
+                    std::unique_lock refresh_lock(this->mmio_refresh_mutex_);
                     const auto page_base = align_down_to_page(mmio_address);
                     const auto is_write = operation == memory_operation::write;
 

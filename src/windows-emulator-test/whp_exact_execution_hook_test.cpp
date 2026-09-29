@@ -5,7 +5,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstring>
 #include <exception>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -301,5 +305,108 @@ namespace sogen::test
         emu->delete_hook(hook);
         EXPECT_EQ(emu->read_memory<uint8_t>(code + 9), 0x90u);
         emu->start(0);
+    }
+
+    TEST(WhpExactExecutionHook, MmioRefreshesPublishInSampleOrderAcrossVcpus)
+    {
+        auto emu = create_x86_64_emulator(backend_type::whp, 2);
+        memory_manager memory(*emu);
+        const auto code = memory.allocate_memory(0x1000, memory_permission::all);
+        const auto stacks = memory.allocate_memory(0x2000, memory_permission::read_write);
+        ASSERT_NE(code, 0u);
+        ASSERT_NE(stacks, 0u);
+
+        constexpr uint64_t mmio_address = 0x7000000000;
+        std::mutex gate{};
+        std::condition_variable changed{};
+        std::atomic<uint32_t> refreshes{};
+        bool first_refresh_entered = false;
+        bool second_guest_completed = false;
+        ASSERT_TRUE(memory.allocate_mmio(
+            mmio_address, 0x1000,
+            [&](uint64_t, void* data, size_t size) {
+                const auto sample = refreshes.fetch_add(1, std::memory_order_relaxed) + 1;
+                const uint64_t value = sample == 1 ? 100 : 101;
+                std::memset(data, 0, size);
+                std::memcpy(data, &value, sizeof(value));
+                if (sample == 1)
+                {
+                    std::unique_lock lock(gate);
+                    first_refresh_entered = true;
+                    changed.notify_all();
+                    changed.wait_for(lock, std::chrono::seconds(1), [&] { return second_guest_completed; });
+                }
+            },
+            [](uint64_t, const void*, size_t) {}));
+
+        std::array<uint8_t, 11> guest{0x48, 0xA1, 0, 0, 0, 0, 0, 0, 0, 0, 0xF4};
+        std::memcpy(guest.data() + 2, &mmio_address, sizeof(mmio_address));
+        for (size_t index = 0; index < 2; ++index)
+        {
+            auto& cpu = emu->get_cpu(index);
+            const auto entry = code + index * 0x100;
+            emu->write_memory(entry, guest.data(), guest.size());
+            cpu.reg(x86_register::rip, entry);
+            cpu.reg(x86_register::rsp, stacks + index * 0x1000 + 0x800);
+        }
+
+        std::array<uint64_t, 2> values{};
+        std::array<uint32_t, 2> completion_order{};
+        std::array<std::exception_ptr, 2> failures{};
+        std::atomic<uint32_t> completions{};
+        auto run_cpu = [&](size_t index) {
+            try
+            {
+                auto& cpu = emu->get_cpu(index);
+                cpu.start(0);
+                values[index] = cpu.reg<uint64_t>(x86_register::rax);
+                completion_order[index] = completions.fetch_add(1, std::memory_order_relaxed) + 1;
+            }
+            catch (...)
+            {
+                failures[index] = std::current_exception();
+            }
+            if (index == 1)
+            {
+                const std::scoped_lock lock(gate);
+                second_guest_completed = true;
+                changed.notify_all();
+            }
+        };
+
+        std::thread first([&] { run_cpu(0); });
+        bool first_seen = false;
+        {
+            std::unique_lock lock(gate);
+            first_seen = changed.wait_for(lock, std::chrono::seconds(2), [&] { return first_refresh_entered; });
+        }
+        if (!first_seen)
+        {
+            first.join();
+            FAIL() << "First MMIO refresh did not start";
+            return;
+        }
+
+        std::thread second([&] { run_cpu(1); });
+        first.join();
+        second.join();
+        for (const auto& failure : failures)
+        {
+            if (failure)
+            {
+                EXPECT_NO_THROW(std::rethrow_exception(failure));
+                return;
+            }
+        }
+        ASSERT_GE(refreshes.load(std::memory_order_relaxed), 2u);
+        ASSERT_NE(completion_order[0], completion_order[1]);
+        if (completion_order[0] < completion_order[1])
+        {
+            EXPECT_LE(values[0], values[1]);
+        }
+        else
+        {
+            EXPECT_LE(values[1], values[0]);
+        }
     }
 }
