@@ -80,6 +80,53 @@ namespace sogen::test
         }
     }
 
+    TEST(WhpExactExecutionHook, ArmsPostStoreHookFromPreStoreCallback)
+    {
+        auto emu = create_x86_64_emulator(backend_type::whp);
+        memory_manager memory(*emu);
+        const auto code = memory.allocate_memory(0x1000, memory_permission::all);
+        const auto data = memory.allocate_memory(0x1000, memory_permission::read_write);
+        ASSERT_NE(code, 0u);
+        ASSERT_NE(data, 0u);
+
+        // mov rbx,data; mov rax,0x100000001; mov [rbx],rax; mov rax,[rbx]; hlt.
+        std::array<uint8_t, 27> guest{
+            0x48, 0xBB, 0, 0, 0, 0, 0, 0, 0, 0, 0x48, 0xB8, 1, 0, 0, 0, 1, 0, 0, 0, 0x48, 0x89, 0x03, 0x48, 0x8B, 0x03, 0xF4,
+        };
+        std::memcpy(guest.data() + 2, &data, sizeof(data));
+        emu->write_memory(code, guest.data(), guest.size());
+        emu->write_memory<uint64_t>(data, 1);
+        emu->reg(x86_register::rip, code);
+
+        emulator_hook* post_hook{};
+        uint64_t before = UINT64_MAX;
+        uint64_t after = UINT64_MAX;
+        std::array<uint8_t, 3> observed_opcode{};
+        auto* pre_hook = emu->hook_memory_execution_with_mode(
+            code + 20, hook_interface::memory_execution_hook_mode::int3, [&](cpu_interface& cpu, uint64_t) {
+                (void)cpu;
+                before = emu->read_memory<uint64_t>(data);
+                emu->read_memory(code + 20, observed_opcode.data(), observed_opcode.size());
+                post_hook = emu->hook_memory_execution_with_mode(code + 23, hook_interface::memory_execution_hook_mode::int3,
+                                                                 [&](cpu_interface& post_cpu, uint64_t) {
+                                                                     (void)post_cpu;
+                                                                     after = emu->read_memory<uint64_t>(data);
+                                                                 });
+            });
+        ASSERT_NE(pre_hook, nullptr);
+        emu->start(0);
+        EXPECT_NE(post_hook, nullptr);
+        EXPECT_EQ(before, 1u);
+        EXPECT_EQ(observed_opcode, (std::array<uint8_t, 3>{0x48, 0x89, 0x03}));
+        EXPECT_EQ(after, 0x100000001ull);
+        EXPECT_EQ(emu->read_memory<uint64_t>(data), 0x100000001ull);
+        if (post_hook)
+        {
+            emu->delete_hook(post_hook);
+        }
+        emu->delete_hook(pre_hook);
+    }
+
     TEST(WhpSharedMemory, AliasedPagesStayCoherentAfterOriginalViewIsUnmapped)
     {
         auto emu = create_x86_64_emulator(backend_type::whp);
