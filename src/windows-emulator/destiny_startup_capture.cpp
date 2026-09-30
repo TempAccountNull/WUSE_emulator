@@ -37,7 +37,8 @@ namespace sogen
             hit_budget,
             callback_budget,
             install_failure,
-            output_failure
+            output_failure,
+            reason175_closure
         };
 
         enum observation_flag : uint64_t
@@ -52,7 +53,11 @@ namespace sogen
             sender_matched = 128,
             native_transaction_assignment_matched = 256,
             native_transaction_assignment_unavailable = 512,
-            investment_cleanup_transition_matched = 1024
+            investment_cleanup_transition_matched = 1024,
+            reason175_ambiguous = 2048,
+            reason175_producer_verified = 4096,
+            reason175_setter_verified = 8192,
+            reason175_commit_verified = 16384
         };
 
         struct capture_site
@@ -264,9 +269,19 @@ namespace sogen
                                                               0xFF, 0xFF, 0x48, 0x81, 0xEC, 0x30, 0x04, 0x00, 0x00};
         constexpr std::array<const char*, 9> kind_names{"baseline",   "activation", "gate",    "signature",    "unavailable",
                                                         "retirement", "coverage",   "removed", "cleanup_timer"};
-        constexpr std::array<const char*, 12> reason_names{"active",      "total_budget",         "post_cleanup_budget", "record_budget",
-                                                           "byte_budget", "module_unload",        "destruction",         "positive_gate",
-                                                           "hit_budget",  "callback_time_budget", "install_failure",     "output_failure"};
+        constexpr std::array<const char*, 13> reason_names{"active",
+                                                           "total_budget",
+                                                           "post_cleanup_budget",
+                                                           "record_budget",
+                                                           "byte_budget",
+                                                           "module_unload",
+                                                           "destruction",
+                                                           "positive_gate",
+                                                           "hit_budget",
+                                                           "callback_time_budget",
+                                                           "install_failure",
+                                                           "output_failure",
+                                                           "first_request_closure_budget"};
         constexpr uint64_t resource_rva = 0x1FB5F20;
         constexpr uint64_t user_end = 0x800000000000;
 
@@ -282,6 +297,654 @@ namespace sogen
         {
             return address >= 0x10000 && address < user_end && length && length <= 4096 && length <= user_end - address;
         }
+    }
+
+    void destiny_startup_capture::arm_reason175_locked(const uint64_t now)
+    {
+        record activation_record{};
+        activation_record.kind = activation;
+        activation_record.recorder = 4;
+        activation_record.host_ms = now;
+        activation_record.values = {
+            base_,          image_size_,  destiny_reason175_capture_state::total_ms,  destiny_reason175_capture_state::closure_ms,
+            record_limit(), byte_limit(), destiny_reason175_capture_state::hit_limit, destiny_reason175_capture_state::callback_limit_ns};
+        enqueue_locked(activation_record);
+        bool verified = true;
+        for (size_t index = 0; index < destiny_reason175_capture_state::dependencies.size(); ++index)
+        {
+            const auto& dependency = destiny_reason175_capture_state::dependencies[index];
+            std::array<uint8_t, 75> bytes{};
+            record check{};
+            check.kind = signature;
+            check.recorder = 4;
+            check.site = 250;
+            check.host_ms = now;
+            check.rip = base_ + dependency.rva;
+            const auto readable = dependency.rva <= image_size_ && dependency.length <= image_size_ - dependency.rva &&
+                                  read(check.rip, bytes.data(), dependency.length, check);
+            const auto match = readable && destiny_reason175_capture_state::dependency_matches(index, bytes.data(), dependency.length);
+            check.values = {dependency.rva, dependency.length, index, readable, match};
+            check.length = readable ? static_cast<uint8_t>(std::min(dependency.length, check.bytes.size())) : 0;
+            std::copy_n(bytes.data(), check.length, check.bytes.data());
+            check.flags |= match ? matched : identity_miss;
+            verified = verified && match;
+            enqueue_locked(check);
+        }
+        cleanup_guards_verified_ = verified;
+        for (size_t index = 0; index < selected_site_count(); ++index)
+        {
+            auto& state = sites_[index];
+            state.attempted = true;
+            record check{};
+            check.kind = signature;
+            check.recorder = 4;
+            check.site = static_cast<uint8_t>(index);
+            check.host_ms = now;
+            const auto rva = destiny_reason175_capture_state::rvas[index];
+            const auto length = destiny_reason175_capture_state::lengths[index];
+            check.rip = base_ + rva;
+            check.length = static_cast<uint8_t>(length);
+            const auto readable = rva <= image_size_ && length <= image_size_ - rva && read(check.rip, check.bytes.data(), length, check);
+            check.values = {rva, length, index, readable,
+                            readable && destiny_reason175_capture_state::guard_matches(index, check.bytes.data(), length)};
+            check.length = readable ? static_cast<uint8_t>(length) : 0;
+            if (!readable || !destiny_reason175_capture_state::guard_matches(index, check.bytes.data(), length))
+            {
+                ++state.signature_misses;
+                state.read_failures += readable ? 0 : 1;
+                check.flags |= identity_miss;
+                verified = false;
+            }
+            else
+            {
+                check.flags |= matched;
+            }
+            enqueue_locked(check);
+        }
+        if (!verified)
+        {
+            retire_locked(install_failure, now);
+            remove_hooks_locked();
+            return;
+        }
+        const std::weak_ptr<destiny_startup_capture> weak = shared_from_this();
+        try
+        {
+            for (size_t index = 0; index < selected_site_count(); ++index)
+            {
+                sites_[index].hook = owner_.emu().hook_memory_execution_with_mode(base_ + destiny_reason175_capture_state::rvas[index],
+                                                                                  hook_interface::memory_execution_hook_mode::int3,
+                                                                                  [weak, index](cpu_interface& cpu, const uint64_t rip) {
+                                                                                      if (const auto self = weak.lock())
+                                                                                      {
+                                                                                          self->capture(cpu, rip, index);
+                                                                                      }
+                                                                                  });
+                if (!sites_[index].hook)
+                {
+                    retire_locked(install_failure, now);
+                    remove_hooks_locked();
+                    return;
+                }
+            }
+            record receipt{};
+            receipt.kind = unavailable;
+            receipt.recorder = 4;
+            receipt.site = 249;
+            receipt.host_ms = now_ms();
+            receipt.values = {selected_site_count(), destiny_reason175_capture_state::dependencies.size(), cleanup_guards_verified_, now};
+            enqueue_locked(receipt);
+        }
+        catch (...)
+        {
+            retire_locked(install_failure, now);
+            remove_hooks_locked();
+        }
+    }
+
+    void destiny_startup_capture::reason175_summary_locked(const uint64_t now)
+    {
+        if (reason175_summary_seen_)
+        {
+            return;
+        }
+        reason175_summary_seen_ = true;
+        record summary{};
+        summary.kind = unavailable;
+        summary.recorder = 4;
+        summary.site = 251;
+        summary.host_ms = now;
+        summary.token = reason175_.first_sequence;
+        summary.tid = reason175_.tid;
+        summary.values = {reason175_.reason,      reason175_.source,      reason175_.request_rsp,    reason175_.request_caller,
+                          reason175_.manager,     reason175_.tid,         reason175_.first_sequence, reason175_.first_seen,
+                          reason175_.setter_seen, reason175_.commit_seen, reason175_.ambiguous,      reason175_.producer_verified};
+        if (reason175_.ambiguous)
+        {
+            summary.flags |= reason175_ambiguous;
+        }
+        if (reason175_.producer_verified)
+        {
+            summary.flags |= reason175_producer_verified;
+        }
+        if (reason175_.setter_seen)
+        {
+            summary.flags |= reason175_setter_verified;
+        }
+        if (reason175_.commit_seen)
+        {
+            summary.flags |= reason175_commit_verified;
+        }
+        if (reason175_.producer_verified && reason175_.setter_seen && reason175_.commit_seen && !reason175_.ambiguous)
+        {
+            summary.flags |= matched;
+        }
+        else
+        {
+            summary.flags |= earlier_unobserved;
+        }
+        enqueue_locked(summary, true);
+    }
+
+    void destiny_startup_capture::capture_reason175(cpu_interface& cpu, const uint64_t rip, const size_t site_index)
+    {
+        const auto begin = std::chrono::steady_clock::now();
+        sites_[site_index].raw_traps.fetch_add(1, std::memory_order_relaxed);
+        std::unique_lock kernel_guard(kernel_, std::defer_lock);
+        if (!kernel_.is_held_by_current_thread())
+        {
+            kernel_guard.lock();
+        }
+        const std::scoped_lock state_guard(mutex_);
+        auto& state = sites_[site_index];
+        if (retired_ || shutdown_ || state.retirement)
+        {
+            ++retired_traps_;
+            remove_hooks_locked(cpu.index());
+            return;
+        }
+        if (!state.hook)
+        {
+            return;
+        }
+        ++state.hits;
+        const auto now = now_ms();
+        const auto expired = reason175_.expiry(now);
+        if (!expired.empty())
+        {
+            retire_locked(expired == "total_budget" ? total_budget : reason175_closure, now);
+            remove_hooks_locked(cpu.index());
+            return;
+        }
+        record observation{};
+        observation.kind = gate;
+        observation.recorder = 4;
+        observation.site = static_cast<uint8_t>(site_index);
+        observation.host_ms = now;
+        observation.rip = rip;
+        observation.vcpu = static_cast<uint32_t>(cpu.index());
+        observation.token = ++serial_;
+        bool emit = true;
+        bool terminal{};
+        bool emit_detail{};
+        record detail{};
+        try
+        {
+            auto& vcpu = owner_.vcpu(cpu.index());
+            auto& acting = vcpu.cpu;
+            observation.tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+            const auto reg = [&](const x86_register name) { return acting.reg<uint64_t>(name); };
+            const auto rsp = reg(x86_register::rsp);
+            uint64_t mask{};
+            const auto sampled = [&](const uint64_t address, const uint64_t offset, void* destination, const size_t length,
+                                     const uint64_t bit) {
+                const auto success = read_offset(address, offset, destination, length, observation);
+                if (success)
+                {
+                    mask |= bit;
+                }
+                return success;
+            };
+            switch (site_index)
+            {
+            case 0: {
+                const auto out_reason = reg(x86_register::rbx);
+                const auto native_manager = reg(x86_register::rcx);
+                const auto result = reg(x86_register::rax) & 0xFF;
+                const auto rbp = reg(x86_register::rbp);
+                uint32_t reason{};
+                uint8_t latch{};
+                uint64_t inner_return{};
+                uint64_t middle_return{};
+                uint64_t original_owner{};
+                uint64_t outer_return{};
+                sampled(out_reason, 0, &reason, sizeof(reason), 1);
+                sampled(native_manager, 0x728, &latch, sizeof(latch), 2);
+                sampled(rsp, 0x28, &inner_return, sizeof(inner_return), 4);
+                sampled(rsp, 0x58, &middle_return, sizeof(middle_return), 8);
+                sampled(rsp, 0x78, &original_owner, sizeof(original_owner), 16);
+                sampled(rsp, 0x4C8, &outer_return, sizeof(outer_return), 32);
+                observation.values = {out_reason,     reason,       native_manager, latch,         result, rsp,
+                                      original_owner, outer_return, inner_return,   middle_return, rbp,    mask};
+                const auto valid = destiny_reason175_capture_state::read_complete(mask, 63) && reason == 175 && result == 0 && rbp == 20 &&
+                                   rsp <= user_end - 0x90 && out_reason == rsp + 0x90 && inner_return == base_ + 0xD48934 &&
+                                   middle_return == base_ + 0xD4D8F5;
+                if (blocked_reason_.seen)
+                {
+                    reason175_.ambiguous = true;
+                }
+                else
+                {
+                    blocked_reason_.seen = true;
+                    blocked_reason_.valid = valid;
+                    blocked_reason_.reason_pointer = out_reason;
+                    blocked_reason_.owner = original_owner;
+                    blocked_reason_.outer_return = outer_return;
+                    blocked_reason_.tid = observation.tid;
+                }
+                observation.flags |= valid ? matched : identity_miss;
+                break;
+            }
+            case 1: {
+                const auto target = static_cast<uint32_t>(reg(x86_register::rcx));
+                const auto reason = static_cast<uint32_t>(reg(x86_register::rdx));
+                if (target != 28)
+                {
+                    emit = false;
+                    break;
+                }
+                uint64_t caller{};
+                sampled(rsp, 0, &caller, sizeof(caller), 1);
+                const auto context = reg(x86_register::rsi);
+                const auto config = reg(x86_register::rax);
+                const auto owner = reg(x86_register::rdi);
+                const auto rbp = reg(x86_register::rbp);
+                uint32_t status{};
+                int64_t elapsed{};
+                int32_t limit{};
+                bool producer{};
+                uint8_t source{};
+                if (caller == base_ + 0x1071F9E && reason == 175)
+                {
+                    source = 1;
+                    sampled(context, 0, &status, sizeof(status), 2);
+                    sampled(context, 8, &elapsed, sizeof(elapsed), 4);
+                    sampled(config, 0x20, &limit, sizeof(limit), 8);
+                    producer = destiny_reason175_capture_state::read_complete(mask, 15);
+                }
+                else if (caller == base_ + 0xD4DB8B && reason == 175)
+                {
+                    source = 2;
+                    uint32_t consumed{};
+                    uint64_t outer_return{};
+                    sampled(rsp, 0x38, &consumed, sizeof(consumed), 16);
+                    sampled(rsp, 0x470, &outer_return, sizeof(outer_return), 32);
+                    uint64_t active_stage_mask{};
+                    sampled(owner, 8, &active_stage_mask, sizeof(active_stage_mask), 64);
+                    detail = observation;
+                    detail.recorder = 5;
+                    detail.values = {consumed,
+                                     rsp + 0x38,
+                                     outer_return,
+                                     owner,
+                                     active_stage_mask,
+                                     mask,
+                                     rsp,
+                                     rbp,
+                                     blocked_reason_.reason_pointer,
+                                     blocked_reason_.owner,
+                                     blocked_reason_.outer_return,
+                                     blocked_reason_.tid};
+                    emit_detail = true;
+                    producer = destiny_reason175_capture_state::read_complete(mask, 49) && blocked_reason_.valid &&
+                               blocked_reason_.tid == observation.tid && rsp <= user_end - 0x108 && rbp == rsp + 0x108 &&
+                               blocked_reason_.reason_pointer == rsp + 0x38 && blocked_reason_.owner == owner &&
+                               blocked_reason_.outer_return == outer_return && consumed == 175;
+                }
+                else
+                {
+                    source = 3;
+                    producer = false;
+                }
+                observation.values = {
+                    target, reason, rsp, caller, context, config, status, static_cast<uint64_t>(elapsed), static_cast<uint32_t>(limit),
+                    mask,   owner,  rbp};
+                if (reason175_.observe_request(observation.tid, reason, rsp, caller, now, observation.token))
+                {
+                    reason175_.source = source;
+                    reason175_.producer_verified = producer;
+                }
+                else
+                {
+                    observation.flags |= reason175_ambiguous;
+                }
+                observation.flags |= producer ? reason175_producer_verified : earlier_unobserved;
+                break;
+            }
+            case 2: {
+                const auto target = static_cast<uint32_t>(reg(x86_register::rdx));
+                if (target != 28)
+                {
+                    emit = false;
+                    break;
+                }
+                const auto manager = reg(x86_register::rcx);
+                const auto reason = static_cast<uint32_t>(reg(x86_register::r8));
+                uint64_t caller{};
+                uint64_t wrapper_caller{};
+                sampled(rsp, 0, &caller, sizeof(caller), 1);
+                if (caller == base_ + 0xE2E088)
+                {
+                    sampled(rsp, 0x450, &wrapper_caller, sizeof(wrapper_caller), 2);
+                }
+                const auto state_read = sampled(manager, 0x390, observation.bytes.data(), 24, 4);
+                observation.length = state_read ? 24 : 0;
+                observation.values = {manager,
+                                      field<uint32_t>(observation.bytes, 0),
+                                      field<uint32_t>(observation.bytes, 4),
+                                      field<uint64_t>(observation.bytes, 8),
+                                      field<uint32_t>(observation.bytes, 16),
+                                      field<uint32_t>(observation.bytes, 20),
+                                      target,
+                                      reason,
+                                      rsp,
+                                      caller,
+                                      wrapper_caller,
+                                      mask};
+                const auto frame_valid =
+                    destiny_reason175_capture_state::read_complete(mask, 7) && caller == base_ + 0xE2E088 && rsp <= user_end - 0x450;
+                if (!reason175_.first_seen)
+                {
+                    reason175_.observe_request(observation.tid, reason, frame_valid ? rsp + 0x450 : 0, wrapper_caller, now,
+                                               observation.token);
+                    observation.flags |= earlier_unobserved;
+                }
+                if (reason175_.observe_setter(observation.tid, target, reason, manager, frame_valid ? rsp + 0x450 : 0, wrapper_caller,
+                                              frame_valid))
+                {
+                    observation.flags |= reason175_setter_verified;
+                }
+                else
+                {
+                    observation.flags |= reason175_ambiguous;
+                }
+                break;
+            }
+            case 3: {
+                const auto manager = reg(x86_register::rbx);
+                const auto previous = static_cast<uint32_t>(reg(x86_register::r15));
+                const auto timestamp_register = reg(x86_register::rax);
+                uint64_t caller{};
+                const auto state_read = sampled(manager, 0x390, observation.bytes.data(), 24, 1);
+                sampled(rsp, 0x328, &caller, sizeof(caller), 2);
+                observation.length = state_read ? 24 : 0;
+                const auto current = field<uint32_t>(observation.bytes, 0);
+                const auto reason = field<uint32_t>(observation.bytes, 4);
+                const auto timestamp = field<uint64_t>(observation.bytes, 8);
+                const auto goal = field<uint32_t>(observation.bytes, 16);
+                const auto goal_reason = field<uint32_t>(observation.bytes, 20);
+                observation.values = {manager,
+                                      previous,
+                                      current,
+                                      reason,
+                                      timestamp,
+                                      goal,
+                                      goal_reason,
+                                      timestamp_register,
+                                      caller,
+                                      static_cast<uint32_t>(reg(x86_register::eflags)),
+                                      cleanup_guards_verified_,
+                                      mask};
+                if (destiny_reason175_capture_state::read_complete(mask, 3) && (current != 28 || goal != 28))
+                {
+                    emit = false;
+                    break;
+                }
+                const auto frame_valid = destiny_reason175_capture_state::read_complete(mask, 3) && cleanup_guards_verified_ &&
+                                         caller == base_ + 0xE23568 && timestamp == timestamp_register && current == 28 && goal == 28 &&
+                                         previous != 28 && reason == goal_reason;
+                if (frame_valid && !reason175_.first_seen)
+                {
+                    reason175_.observe_request(observation.tid, reason, 0, 0, now, observation.token);
+                    observation.flags |= earlier_unobserved;
+                }
+                if (reason175_.observe_commit(manager, current, reason, goal, goal_reason, frame_valid))
+                {
+                    observation.flags |= reason175_commit_verified;
+                }
+                else
+                {
+                    observation.flags |= reason175_ambiguous;
+                }
+                terminal = frame_valid;
+                break;
+            }
+            default:
+                emit = false;
+                break;
+            }
+        }
+        catch (...)
+        {
+            observation.flags |= read_failed;
+        }
+        if (observation.flags & read_failed)
+        {
+            reason175_.ambiguous = true;
+            observation.flags |= reason175_ambiguous;
+        }
+        state.identity_misses += (observation.flags & identity_miss) ? 1 : 0;
+        state.read_failures += (observation.flags & read_failed) ? 1 : 0;
+        if (emit && enqueue_locked(observation))
+        {
+            ++state.emitted;
+        }
+        if (emit_detail && enqueue_locked(detail))
+        {
+            ++state.emitted;
+        }
+        const auto elapsed =
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
+        state.callback_ns += elapsed;
+        state.callback_max_ns = std::max(state.callback_max_ns, elapsed);
+        uint64_t callback_total{};
+        for (size_t index = 0; index < selected_site_count(); ++index)
+        {
+            callback_total += sites_[index].callback_ns;
+        }
+        if (!retired_ && terminal)
+        {
+            retire_locked(positive_gate, now);
+        }
+        else if (!retired_ && destiny_reason175_capture_state::callback_exhausted(state.hits, callback_total) &&
+                 state.hits >= destiny_reason175_capture_state::hit_limit)
+        {
+            retire_locked(hit_budget, now);
+        }
+        else if (!retired_ && destiny_reason175_capture_state::callback_exhausted(state.hits, callback_total))
+        {
+            retire_locked(callback_budget, now);
+        }
+        if (retired_)
+        {
+            remove_hooks_locked(cpu.index());
+        }
+    }
+
+    bool destiny_reason175_capture_state::dependency_matches(const size_t dependency, const uint8_t* data, const size_t length)
+    {
+        if (dependency >= dependencies.size() || !data || length != dependencies[dependency].length)
+        {
+            return false;
+        }
+        return std::equal(data, data + length, dependencies[dependency].bytes.begin());
+    }
+
+    bool destiny_reason175_capture_state::callback_exhausted(const uint64_t hits, const uint64_t callback_ns)
+    {
+        return hits >= hit_limit || callback_ns >= callback_limit_ns;
+    }
+
+    bool destiny_reason175_capture_state::guard_matches(const size_t site, const uint8_t* data, const size_t length)
+    {
+        if (site >= site_count || !data || length != lengths[site])
+        {
+            return false;
+        }
+        for (size_t index = 0; index < length; ++index)
+        {
+            if (data[index] != bytes[site][index])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool destiny_reason175_capture_state::quiescent(const bool* running, const size_t count, const size_t executing)
+    {
+        if (!running && count)
+        {
+            return false;
+        }
+        for (size_t index = 0; index < count; ++index)
+        {
+            if (index != executing && running[index])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool destiny_reason175_capture_state::read_complete(const uint64_t mask, const uint64_t required)
+    {
+        return (mask & required) == required;
+    }
+
+    bool destiny_reason175_capture_state::record_allowed(const size_t accepted, const size_t pending, const bool coverage)
+    {
+        return accepted < max_records - (coverage ? 0 : coverage_reserve) && pending < max_records;
+    }
+
+    bool destiny_reason175_capture_state::output_allowed(const size_t records, const size_t output_bytes, const size_t charged_bytes,
+                                                         const bool coverage)
+    {
+        const auto limit = max_bytes - (coverage ? 0 : coverage_reserve * output_line_bytes);
+        return records < max_records && charged_bytes <= limit && output_bytes <= limit - charged_bytes;
+    }
+
+    void destiny_reason175_capture_state::arm(const uint64_t now)
+    {
+        if (!armed)
+        {
+            armed = true;
+            armed_at = now;
+        }
+    }
+
+    std::string_view destiny_reason175_capture_state::expiry(const uint64_t now) const
+    {
+        if (armed && now >= armed_at && now - armed_at >= total_ms)
+        {
+            return "total_budget";
+        }
+        if (first_seen && now >= first_at && now - first_at >= closure_ms)
+        {
+            return "first_request_closure_budget";
+        }
+        return {};
+    }
+
+    bool destiny_reason175_capture_state::observe_request(const uint32_t observed_tid, const uint32_t observed_reason, const uint64_t rsp,
+                                                          const uint64_t caller, const uint64_t now, const uint64_t sequence)
+    {
+        if (first_seen)
+        {
+            ambiguous = true;
+            return false;
+        }
+        first_seen = true;
+        first_at = now;
+        tid = observed_tid;
+        reason = observed_reason;
+        request_rsp = rsp;
+        request_caller = caller;
+        first_sequence = sequence;
+        return true;
+    }
+
+    bool destiny_reason175_capture_state::observe_setter(const uint32_t observed_tid, const uint32_t target, const uint32_t observed_reason,
+                                                         const uint64_t observed_manager, const uint64_t wrapper_rsp,
+                                                         const uint64_t wrapper_caller, const bool frame_valid)
+    {
+        if (target != 28)
+        {
+            return false;
+        }
+        if (!first_seen || setter_seen || !frame_valid || !observed_tid || !tid || !request_rsp || !request_caller || observed_tid != tid ||
+            observed_reason != reason || wrapper_rsp != request_rsp || wrapper_caller != request_caller || !observed_manager)
+        {
+            ambiguous = true;
+            return false;
+        }
+        manager = observed_manager;
+        setter_seen = true;
+        return true;
+    }
+
+    bool destiny_reason175_capture_state::observe_commit(const uint64_t observed_manager, const uint32_t current,
+                                                         const uint32_t current_reason, const uint32_t goal, const uint32_t goal_reason,
+                                                         const bool frame_valid)
+    {
+        if (current != 28 || goal != 28)
+        {
+            return false;
+        }
+        if (!first_seen || !setter_seen || commit_seen || !frame_valid || observed_manager != manager || current_reason != reason ||
+            goal_reason != reason)
+        {
+            ambiguous = true;
+            return false;
+        }
+        commit_seen = true;
+        return true;
+    }
+
+    bool destiny_reason175_capture_state::complete(const uint64_t drops, const uint64_t failed_reads) const
+    {
+        return first_seen && producer_verified && setter_seen && commit_seen && !ambiguous && !drops && !failed_reads;
+    }
+
+    bool destiny_startup_capture::reason175_enabled()
+    {
+        const auto* value = std::getenv("SOGEN_DESTINY_REASON175_CAPTURE");
+        return value && std::strcmp(value, "1") == 0;
+    }
+
+    size_t destiny_startup_capture::selected_site_count() const
+    {
+        return focused_ ? destiny_reason175_capture_state::site_count : sites_.size();
+    }
+
+    size_t destiny_startup_capture::record_limit() const
+    {
+        return focused_ ? destiny_reason175_capture_state::max_records : destiny_startup_capture_budget::max_records;
+    }
+
+    size_t destiny_startup_capture::byte_limit() const
+    {
+        return focused_ ? destiny_reason175_capture_state::max_bytes : destiny_startup_capture_budget::max_bytes;
+    }
+
+    size_t destiny_startup_capture::coverage_reserve() const
+    {
+        return focused_ ? destiny_reason175_capture_state::coverage_reserve : destiny_startup_capture_budget::coverage_reserve;
+    }
+
+    std::string_view destiny_startup_capture::capture_expiry(const uint64_t now) const
+    {
+        return focused_ ? reason175_.expiry(now) : budget_.expiry(now);
     }
 
     void destiny_startup_capture_budget::arm(const uint64_t now)
@@ -323,7 +986,7 @@ namespace sogen
     bool destiny_startup_capture::enabled()
     {
         const auto* value = std::getenv("SOGEN_DESTINY_STARTUP_CAPTURE");
-        return value && std::strcmp(value, "1") == 0;
+        return reason175_enabled() || (value && std::strcmp(value, "1") == 0);
     }
 
     std::shared_ptr<destiny_startup_capture> destiny_startup_capture::create(windows_emulator& owner, kernel_lock& kernel,
@@ -411,10 +1074,14 @@ namespace sogen
 
     bool destiny_startup_capture::enqueue_locked(record observation, const bool is_coverage)
     {
-        const auto limit =
-            destiny_startup_capture_budget::max_records - (is_coverage ? 0 : destiny_startup_capture_budget::coverage_reserve);
-        if (accepted_ >= limit || pending_count_ >= records_.size())
+        const auto limit = record_limit() - (is_coverage ? 0 : coverage_reserve());
+        if ((focused_ && !destiny_reason175_capture_state::record_allowed(accepted_, pending_count_, is_coverage)) ||
+            (!focused_ && (accepted_ >= limit || pending_count_ >= records_.size())))
         {
+            if (focused_)
+            {
+                reason175_.ambiguous = true;
+            }
             ++dropped_;
             if (observation.kind == gate && observation.site < sites_.size())
             {
@@ -529,6 +1196,16 @@ namespace sogen
         }
         const auto now = now_ms();
         const auto investment_entry = message.find("bootflow:investment_signin'") != std::string_view::npos;
+        if (focused_)
+        {
+            if (!reason175_.armed && investment_entry)
+            {
+                budget_.arm(now);
+                reason175_.arm(now);
+                arm_reason175_locked(now);
+            }
+            return;
+        }
         if (!baseline_seen_)
         {
             baseline_seen_ = true;
@@ -604,8 +1281,8 @@ namespace sogen
                                0xE1B0CF,
                                0xE23568,
                                0x328,
-                               destiny_startup_capture_budget::post_cleanup_ms,
-                               destiny_startup_capture_budget::total_ms};
+                               focused_ ? destiny_reason175_capture_state::closure_ms : destiny_startup_capture_budget::post_cleanup_ms,
+                               focused_ ? destiny_reason175_capture_state::total_ms : destiny_startup_capture_budget::total_ms};
         enqueue_locked(availability);
         return verified;
     }
@@ -830,6 +1507,11 @@ namespace sogen
 
     void destiny_startup_capture::capture(cpu_interface& cpu, const uint64_t rip, const size_t site_index)
     {
+        if (focused_)
+        {
+            capture_reason175(cpu, rip, site_index);
+            return;
+        }
         const auto begin = std::chrono::steady_clock::now();
         sites_[site_index].raw_traps.fetch_add(1, std::memory_order_relaxed);
         std::unique_lock kernel_guard(kernel_, std::defer_lock);
@@ -1584,15 +2266,29 @@ namespace sogen
             return;
         }
         retired_ = reason;
+        if (focused_)
+        {
+            reason175_summary_locked(now);
+        }
         record receipt{};
         receipt.kind = retirement;
         receipt.recorder = 3;
         receipt.site = 255;
         receipt.host_ms = now;
-        receipt.values = {reason,   budget_.armed_at, budget_.cleanup_at, budget_.armed,         budget_.cleanup_seen, accepted_,
-                          dropped_, snapshots_,       snapshot_misses_,   host_remove_attempts_, output_records_,      output_bytes_};
+        receipt.values = {reason,
+                          focused_ ? reason175_.armed_at : budget_.armed_at,
+                          focused_ ? reason175_.first_at : budget_.cleanup_at,
+                          focused_ ? reason175_.armed : budget_.armed,
+                          focused_ ? reason175_.first_seen : budget_.cleanup_seen,
+                          accepted_,
+                          dropped_,
+                          snapshots_,
+                          snapshot_misses_,
+                          host_remove_attempts_,
+                          output_records_,
+                          output_bytes_};
         enqueue_locked(receipt, true);
-        for (size_t index = 0; index < sites_.size(); ++index)
+        for (size_t index = 0; index < selected_site_count(); ++index)
         {
             const auto& state = sites_[index];
             record summary{};
@@ -1619,6 +2315,15 @@ namespace sogen
 
     bool destiny_startup_capture::quiescent_locked(const size_t executing_vcpu) const
     {
+        if (focused_ && owner_.vcpu_count() <= 64)
+        {
+            std::array<bool, 64> running{};
+            for (size_t index = 0; index < owner_.vcpu_count(); ++index)
+            {
+                running[index] = owner_.vcpu(index).running.load(std::memory_order_relaxed);
+            }
+            return destiny_reason175_capture_state::quiescent(running.data(), owner_.vcpu_count(), executing_vcpu);
+        }
         for (size_t index = 0; index < owner_.vcpu_count(); ++index)
         {
             if (index != executing_vcpu && owner_.vcpu(index).running.load(std::memory_order_relaxed))
@@ -1697,10 +2402,12 @@ namespace sogen
             bool remove{};
             {
                 const std::scoped_lock state_guard(mutex_);
-                const auto expired = budget_.expiry(now_ms());
+                const auto expired = capture_expiry(now_ms());
                 if (!expired.empty())
                 {
-                    retire_locked(expired == "total_budget" ? total_budget : cleanup_budget, now_ms());
+                    const auto closure_reason = focused_ ? reason175_closure : cleanup_budget;
+                    const auto reason = expired == "total_budget" ? total_budget : closure_reason;
+                    retire_locked(reason, now_ms());
                 }
                 remove = retired_ && !physical_retirement_;
                 for (const auto& site : sites_)
@@ -1778,15 +2485,66 @@ namespace sogen
                     receipt.values[10] += site.raw_traps.load(std::memory_order_relaxed);
                 }
                 receipt.values[11] = retired_traps_;
+                if (focused_)
+                {
+                    receipt.flags = reason175_.complete(dropped_, failed_read_requests_)
+                                        ? matched | reason175_producer_verified | reason175_setter_verified | reason175_commit_verified
+                                        : earlier_unobserved | reason175_ambiguous;
+                }
                 enqueue_locked(receipt, true);
                 continue;
             }
             for (size_t index = 0; index < count; ++index)
             {
                 const auto& observation = batch[index];
-                const auto* site_name = observation.site < sites.size() ? sites[observation.site].name : "control";
-                const auto* fields = observation.site < sites.size() ? sites[observation.site].fields : "control";
-                if (observation.kind == baseline)
+                constexpr std::array<const char*, 4> focused_names{"blocked_reason_post_store", "native_cleanup_request_entry",
+                                                                   "native_cleanup_setter_entry", "native_cleanup_commit"};
+                constexpr std::array<const char*, 4> focused_fields{
+                    "reason_pointer,reason,native_manager,latch,al,rsp,original_owner,outer_return,inner_return,middle_return,stage,read_"
+                    "mask",
+                    "target,reason,rsp,caller,context,config,status,elapsed_i64_bits,limit_i32_bits,read_mask,owner,rbp",
+                    "manager,current,current_reason,timestamp,goal,goal_reason,target,reason,rsp,caller,wrapper_caller,read_mask",
+                    "manager,previous,current,current_reason,timestamp,goal,goal_reason,rax,caller,eflags,guards_verified,read_mask"};
+                const auto* site_name = "control";
+                const auto* fields = "control";
+                if (focused_)
+                {
+                    site_name = observation.site < focused_names.size() ? focused_names[observation.site] : "control";
+                    fields = observation.site < focused_fields.size() ? focused_fields[observation.site] : "control";
+                }
+                else
+                {
+                    site_name = observation.site < sites.size() ? sites[observation.site].name : "control";
+                    fields = observation.site < sites.size() ? sites[observation.site].fields : "control";
+                }
+                if (focused_ && observation.kind == signature && observation.site == 250)
+                {
+                    site_name = "native_frame_role_dependency_guard";
+                    fields = "rva,full_length,dependency_index,readable,all_bytes_verified";
+                }
+                if (focused_ && observation.kind == signature && observation.site < focused_names.size())
+                {
+                    fields = "rva,full_length,site_index,readable,all_bytes_verified";
+                }
+                if (focused_ && observation.kind == unavailable && observation.site == 249)
+                {
+                    site_name = "four_hooks_installed";
+                    fields = "site_count,dependency_span_count,all_dependencies_verified,arming_started_ms";
+                }
+                if (focused_ && observation.recorder == 5 && observation.site == 1)
+                {
+                    site_name = "blocked_request_consumer_frame";
+                    fields =
+                        "consumed_reason,reason_pointer,outer_return,owner,active_stage_mask,read_mask,rsp,rbp,producer_reason_pointer,"
+                        "producer_owner,producer_outer_return,producer_tid";
+                }
+                if (focused_ && observation.kind == unavailable && observation.site == 251)
+                {
+                    site_name = "first_cleanup_chain";
+                    fields = "first_any_reason,source,request_rsp,caller,manager,tid,first_sequence,first_seen,setter_seen,commit_seen,"
+                             "ambiguous,producer_verified";
+                }
+                else if (observation.kind == baseline)
                 {
                     site_name = observation.recorder < 2 ? "safe_resource_snapshot" : "safe_registry_snapshot";
                     fields = observation.recorder < 2 ? "phase,slot,state,detail,live_handle,tag,outstanding"
@@ -1815,7 +2573,11 @@ namespace sogen
                 else if (observation.kind == activation)
                 {
                     site_name = "native_investment_entry";
-                    fields = "image_base,image_size,total_ms,post_cleanup_ms,max_records,max_bytes,site_hit_limit,callback_wall_ns_limit";
+                    fields =
+                        focused_
+                            ? "image_base,image_size,total_ms,first_any_cleanup_closure_ms,max_records,max_bytes,site_hit_limit,callback_"
+                              "wall_ns_limit"
+                            : "image_base,image_size,total_ms,post_cleanup_ms,max_records,max_bytes,site_hit_limit,callback_wall_ns_limit";
                 }
                 else if (observation.kind == cleanup_timer)
                 {
@@ -1833,8 +2595,10 @@ namespace sogen
                 }
                 else if (observation.kind == retirement)
                 {
-                    fields = "reason,armed_ms,cleanup_ms,armed,cleanup_seen,accepted,drops,snapshots,snapshot_misses,host_remove_attempts,"
-                             "output_records,output_bytes";
+                    fields = focused_ ? "reason,armed_ms,first_any_cleanup_ms,armed,first_any_cleanup_seen,accepted,drops,snapshots,"
+                                        "snapshot_misses,host_remove_attempts,output_records,output_bytes"
+                                      : "reason,armed_ms,cleanup_ms,armed,cleanup_seen,accepted,drops,snapshots,snapshot_misses,host_"
+                                        "remove_attempts,output_records,output_bytes";
                 }
                 else if (observation.kind == removed)
                 {
@@ -1846,19 +2610,20 @@ namespace sogen
                 }
                 std::array<char, 2048> line{};
                 const auto& values = observation.values;
-                const auto length = std::snprintf(
-                    line.data(), line.size(),
-                    "DESTINYSTARTUP kind=%s recorder=%u site=%s host_ms=%llu tid=%u vcpu=%u rip=%#llx observation_token=%llu flags=%#llx "
-                    "fields=%s data=[%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx] bytes=",
-                    kind_names[observation.kind], observation.recorder, site_name, static_cast<unsigned long long>(observation.host_ms),
-                    observation.tid, observation.vcpu, static_cast<unsigned long long>(observation.rip),
-                    static_cast<unsigned long long>(observation.token), static_cast<unsigned long long>(observation.flags), fields,
-                    static_cast<unsigned long long>(values[0]), static_cast<unsigned long long>(values[1]),
-                    static_cast<unsigned long long>(values[2]), static_cast<unsigned long long>(values[3]),
-                    static_cast<unsigned long long>(values[4]), static_cast<unsigned long long>(values[5]),
-                    static_cast<unsigned long long>(values[6]), static_cast<unsigned long long>(values[7]),
-                    static_cast<unsigned long long>(values[8]), static_cast<unsigned long long>(values[9]),
-                    static_cast<unsigned long long>(values[10]), static_cast<unsigned long long>(values[11]));
+                const auto length =
+                    std::snprintf(line.data(), line.size(),
+                                  "%s kind=%s recorder=%u site=%s host_ms=%llu tid=%u vcpu=%u rip=%#llx observation_token=%llu flags=%#llx "
+                                  "fields=%s data=[%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx] bytes=",
+                                  focused_ ? "FIRSTREASON175" : "DESTINYSTARTUP", kind_names[observation.kind], observation.recorder,
+                                  site_name, static_cast<unsigned long long>(observation.host_ms), observation.tid, observation.vcpu,
+                                  static_cast<unsigned long long>(observation.rip), static_cast<unsigned long long>(observation.token),
+                                  static_cast<unsigned long long>(observation.flags), fields, static_cast<unsigned long long>(values[0]),
+                                  static_cast<unsigned long long>(values[1]), static_cast<unsigned long long>(values[2]),
+                                  static_cast<unsigned long long>(values[3]), static_cast<unsigned long long>(values[4]),
+                                  static_cast<unsigned long long>(values[5]), static_cast<unsigned long long>(values[6]),
+                                  static_cast<unsigned long long>(values[7]), static_cast<unsigned long long>(values[8]),
+                                  static_cast<unsigned long long>(values[9]), static_cast<unsigned long long>(values[10]),
+                                  static_cast<unsigned long long>(values[11]));
                 size_t used = length > 0 ? std::min(static_cast<size_t>(length), line.size() - 1) : 0;
                 for (size_t byte = 0; byte < observation.length && used + 3 < line.size(); ++byte)
                 {
@@ -1872,7 +2637,7 @@ namespace sogen
                                                               "controller_cleanup_clock_requires_matched_native_23_to_28_commit;"
                                                               "unobserved_or_unavailable_or_other_previous_state_falls_back_to_300s"));
                 }
-                if (observation.kind == activation)
+                if (observation.kind == activation && !focused_)
                 {
                     used += static_cast<size_t>(std::snprintf(
                         line.data() + used, line.size() - used,
@@ -1889,6 +2654,22 @@ namespace sogen
                         "enter;"
                         "resource_free_does_not_start_it;cleanup_commit_does_not_prove_enter_return_or_task_drain"));
                 }
+                if (focused_ && observation.kind == activation)
+                {
+                    used += static_cast<size_t>(std::snprintf(
+                        line.data() + used, line.size() - used,
+                        " recorder_ids=4_focused,5_consumer_detail;source=0_unobserved,1_deadline,2_blocked_chain,3_other_or_unclassified_"
+                        "request;"
+                        "flags=1_read_failed,2_identity_miss,4_chain_matched,32_earlier_unobserved,2048_ambiguous,4096_producer,8192_"
+                        "setter,16384_commit;"
+                        "read_mask_is_field_availability:missing_bit_means_unavailable_not_zero;setter_commit_state_bytes_only_on_success;"
+                        "first_is_first_admitted_any_reason_in_armed_coverage;serial_is_observer_order_not_guest_execution_order;"
+                        "memory_samples_are_later_nonatomic_corroboration;deadline_taken_branch_proves_decision;"
+                        "bounds_are_admission_limits;physical_removal_waits_quiescent_boundary_without_forcing_peers;"
+                        "retired_INT3_can_exit_and_single_step_until_removed;callback_wall_includes_lock_wait_excludes_hook_removal;"
+                        "final_coverage_required_for_complete_chain;summary_flags_are_provisional_until_final_no_drop_receipt;"
+                        "commit_does_not_prove_enter_return_or_task_drain;charged_bytes_include_ANSI9;logger_sink_may_block_join"));
+                }
                 if (observation.kind == retirement || observation.kind == removed || observation.kind == coverage)
                 {
                     const auto reason = observation.kind == coverage ? values[8] : values[0];
@@ -1904,18 +2685,21 @@ namespace sogen
                     line[used++] = '\n';
                     line[used] = '\0';
                 }
-                const auto is_coverage = observation.kind == coverage || observation.kind == retirement || observation.kind == removed ||
-                                         observation.kind == cleanup_timer || (observation.kind == unavailable && observation.site == 253);
-                const auto byte_limit = destiny_startup_capture_budget::max_bytes -
-                                        (is_coverage ? 0
-                                                     : destiny_startup_capture_budget::coverage_reserve *
-                                                           (line.size() + destiny_startup_capture_budget::logger_envelope_bytes));
+                const auto is_coverage =
+                    observation.kind == coverage || observation.kind == retirement || observation.kind == removed ||
+                    observation.kind == cleanup_timer ||
+                    (observation.kind == unavailable && (observation.site == 253 || (focused_ && observation.site == 251)));
+                const auto output_byte_limit =
+                    byte_limit() -
+                    (is_coverage ? 0 : coverage_reserve() * (line.size() + destiny_startup_capture_budget::logger_envelope_bytes));
                 const auto charged_bytes = used + destiny_startup_capture_budget::logger_envelope_bytes;
                 bool output{};
                 {
                     const std::scoped_lock state_guard(mutex_);
-                    if (output_records_ < destiny_startup_capture_budget::max_records && charged_bytes <= byte_limit &&
-                        output_bytes_ <= byte_limit - charged_bytes)
+                    if ((focused_ &&
+                         destiny_reason175_capture_state::output_allowed(output_records_, output_bytes_, charged_bytes, is_coverage)) ||
+                        (!focused_ && output_records_ < record_limit() && charged_bytes <= output_byte_limit &&
+                         output_bytes_ <= output_byte_limit - charged_bytes))
                     {
                         ++output_records_;
                         output_bytes_ += charged_bytes;
@@ -1927,6 +2711,10 @@ namespace sogen
                         if (observation.site < sites_.size())
                         {
                             ++sites_[observation.site].dropped;
+                        }
+                        if (focused_)
+                        {
+                            reason175_.ambiguous = true;
                         }
                         retire_locked(byte_budget, now_ms());
                     }
@@ -1944,6 +2732,10 @@ namespace sogen
                         if (observation.site < sites_.size())
                         {
                             ++sites_[observation.site].dropped;
+                        }
+                        if (focused_)
+                        {
+                            reason175_.ambiguous = true;
                         }
                         retire_locked(output_failure, now_ms());
                     }
