@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <atomic>
+#include <algorithm>
 #include <limits>
 
 namespace sogen
@@ -13,10 +14,155 @@ namespace sogen
 
     namespace syscalls
     {
+        namespace
+        {
+            NTSTATUS validate_process_debug_object_range(const uint64_t address, const uint32_t length)
+            {
+                if (length == 0)
+                {
+                    return STATUS_SUCCESS;
+                }
+                if ((address & (sizeof(uint32_t) - 1)) != 0)
+                {
+                    return STATUS_DATATYPE_MISALIGNMENT;
+                }
+                if (address >= MAX_ALLOCATION_END_EXCL || length > MAX_ALLOCATION_END_EXCL - address)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                return STATUS_SUCCESS;
+            }
+
+            NTSTATUS validate_process_debug_object_access(memory_manager& memory, const uint64_t address, const uint32_t length,
+                                                          const memory_permission required)
+            {
+                const auto end = address + length;
+                for (auto cursor = address; cursor < end;)
+                {
+                    if (cursor >= MAX_ALLOCATION_END_EXCL)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    const auto region = memory.get_region_info(cursor);
+                    if (!region.is_committed)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    if (region.permissions.is_guarded())
+                    {
+                        memory.protect_memory(page_align_down(cursor), 0x1000, region.permissions & ~memory_permission_ext::guard);
+                        return STATUS_GUARD_PAGE_VIOLATION;
+                    }
+                    if ((region.permissions.common & required) == memory_permission::none)
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    cursor = std::min(end, region.start + region.length);
+                }
+                return STATUS_SUCCESS;
+            }
+
+            NTSTATUS probe_process_debug_object_length(const syscall_context& c, const emulator_object<uint32_t> return_length)
+            {
+                if (!return_length)
+                {
+                    return STATUS_SUCCESS;
+                }
+                if (return_length.value() >= MAX_ALLOCATION_END_EXCL)
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                auto status = validate_process_debug_object_access(c.win_emu.memory, return_length.value(), sizeof(uint32_t),
+                                                                   memory_permission::read);
+                if (status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+                uint32_t previous{};
+                if (!c.win_emu.memory.try_read_memory(return_length.value(), &previous, sizeof(previous)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                status = validate_process_debug_object_access(c.win_emu.memory, return_length.value(), sizeof(uint32_t),
+                                                              memory_permission::write);
+                if (status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+                return return_length.try_write(previous) ? STATUS_SUCCESS : STATUS_ACCESS_VIOLATION;
+            }
+
+            NTSTATUS query_process_debug_object(const syscall_context& c, const handle process_handle, const uint64_t process_information,
+                                                const uint32_t process_information_length, const emulator_object<uint32_t> return_length)
+            {
+                if (c.proc.is_current_process_handle(process_handle))
+                {
+                    c.win_emu.callbacks.on_suspicious_activity("Anti-debug check with ProcessDebugObjectHandle");
+                }
+
+                // The matched 19041 kernel probes the range and ReturnLength before class30 size and handle validation.
+                auto status = validate_process_debug_object_range(process_information, process_information_length);
+                if (status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+                status = probe_process_debug_object_length(c, return_length);
+                if (status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+                constexpr uint32_t required_length = sizeof(uint64_t);
+                if (process_information_length != required_length)
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                if (!c.proc.is_current_process_handle(process_handle))
+                {
+                    if (process_handle == STEAM_PROCESS_HANDLE)
+                    {
+                        return STATUS_NOT_SUPPORTED;
+                    }
+                    const auto resolved = c.proc.resolve_object_pseudo_handle(process_handle, c.vcpu.active_thread);
+                    const auto* store = c.proc.get_handle_store(resolved);
+                    return store && store->contains(resolved) ? STATUS_OBJECT_TYPE_MISMATCH : STATUS_INVALID_HANDLE;
+                }
+
+                status =
+                    validate_process_debug_object_access(c.win_emu.memory, process_information, required_length, memory_permission::write);
+                if (status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+                const emulator_object<uint64_t> output{c.win_emu.memory, process_information};
+                if (!output.try_write(0))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if (return_length)
+                {
+                    status = validate_process_debug_object_access(c.win_emu.memory, return_length.value(), sizeof(uint32_t),
+                                                                  memory_permission::write);
+                    if (status != STATUS_SUCCESS)
+                    {
+                        return status;
+                    }
+                    if (!return_length.try_write(required_length))
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                }
+                return STATUS_PORT_NOT_SET;
+            }
+        }
+
         NTSTATUS handle_NtQueryInformationProcess(const syscall_context& c, const handle process_handle, const uint32_t info_class,
                                                   const uint64_t process_information, const uint32_t process_information_length,
                                                   const emulator_object<uint32_t> return_length)
         {
+            if (info_class == ProcessDebugObjectHandle)
+            {
+                return query_process_debug_object(c, process_handle, process_information, process_information_length, return_length);
+            }
             if (!c.proc.is_current_process_handle(process_handle))
             {
                 // The synthetic Steam process: report it as alive so a guest steam_api's GetExitCodeProcess
@@ -55,8 +201,6 @@ namespace sogen
 
                 return STATUS_NOT_SUPPORTED;
             }
-
-            const auto return_length_info = c.win_emu.memory.get_region_info(return_length.value());
 
             switch (info_class)
             {
@@ -126,30 +270,6 @@ namespace sogen
             case ProcessCookie:
                 return handle_query<uint32_t>(c.emu, process_information, process_information_length, return_length, [](uint32_t& cookie) {
                     cookie = 0x01234567; //
-                });
-
-            case ProcessDebugObjectHandle:
-
-                c.win_emu.callbacks.on_suspicious_activity("Anti-debug check with ProcessDebugObjectHandle");
-
-                if ((process_information & 3) != 0)
-                {
-                    return STATUS_DATATYPE_MISALIGNMENT;
-                }
-
-                if (return_length.value() == 0)
-                {
-                    return STATUS_PORT_NOT_SET;
-                }
-
-                if (!return_length_info.is_reserved)
-                {
-                    return STATUS_ACCESS_VIOLATION;
-                }
-
-                return handle_query<handle>(c.emu, process_information, process_information_length, return_length, [](handle& h) {
-                    h = NULL_HANDLE;
-                    return STATUS_PORT_NOT_SET;
                 });
 
             case ProcessDebugFlags:
@@ -704,13 +824,12 @@ namespace sogen
                             }
                         }
                         const auto* rip_module = c.win_emu.mod_manager.find_by_address(rip);
-                        c.win_emu.log.error(
-                            "[GUEST-HEAP-EXIT] status=0x%08X guest_tid=%u vcpu=%zu rip=0x%llX rip_module=%s rip_rva=0x%llX "
-                            "rsp=0x%llX stack16=[%s] code_candidates=[%s]\n",
-                            static_cast<unsigned>(exit_status), static_cast<unsigned>(guest_tid), c.vcpu.cpu.index(),
-                            static_cast<unsigned long long>(rip), rip_module ? rip_module->name.c_str() : "<unmapped>",
-                            rip_module ? static_cast<unsigned long long>(rip - rip_module->image_base) : 0ull,
-                            static_cast<unsigned long long>(rsp), stack_words.c_str(), code_addresses.c_str());
+                        c.win_emu.log.error("[GUEST-HEAP-EXIT] status=0x%08X guest_tid=%u vcpu=%zu rip=0x%llX rip_module=%s rip_rva=0x%llX "
+                                            "rsp=0x%llX stack16=[%s] code_candidates=[%s]\n",
+                                            static_cast<unsigned>(exit_status), static_cast<unsigned>(guest_tid), c.vcpu.cpu.index(),
+                                            static_cast<unsigned long long>(rip), rip_module ? rip_module->name.c_str() : "<unmapped>",
+                                            rip_module ? static_cast<unsigned long long>(rip - rip_module->image_base) : 0ull,
+                                            static_cast<unsigned long long>(rsp), stack_words.c_str(), code_addresses.c_str());
                     }
                 }
                 // TERMCTX: name the terminating caller - dump registers + a guest stack chain of
