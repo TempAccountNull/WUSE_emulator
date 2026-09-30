@@ -1,5 +1,6 @@
 #include "std_include.hpp"
 #include "windows_emulator.hpp"
+#include "destiny_startup_capture.hpp"
 #include "guest_thread_affinity.hpp"
 #include "host_wait_idle_policy.hpp"
 #include "scheduler_vm_gate.hpp"
@@ -1034,6 +1035,12 @@ namespace sogen
 
     windows_emulator::~windows_emulator()
     {
+        if (this->startup_capture_)
+        {
+            this->startup_capture_->shutdown();
+            this->startup_capture_.reset();
+        }
+
         if (this->ui().native_presentation_active())
         {
             for (auto& [id, thread] : this->process.threads)
@@ -1076,11 +1083,16 @@ namespace sogen
         this->install_section_first_execution_hooks();
 
         const auto* executable = this->mod_manager.executable;
+        if (destiny_startup_capture::enabled() && executable && executable->name == "destiny2.exe" && !this->startup_capture_)
+        {
+            this->startup_capture_ =
+                destiny_startup_capture::create(*this, this->kernel_lock_, executable->image_base, executable->size_of_image);
+        }
         // Opt-in, exact-address diagnostic. Defer arming until a bootflow marker
         // verifies the decrypted hook targets. Earlier clock changes may be missed.
         if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_EARLY_CLOCK_PROBE");
-            probe && (std::strcmp(probe, "1") == 0 || std::strcmp(probe, "INPUT_ONLY") == 0) && executable &&
-            executable->name == "destiny2.exe")
+            !destiny_startup_capture::enabled() && probe && (std::strcmp(probe, "1") == 0 || std::strcmp(probe, "INPUT_ONLY") == 0) &&
+            executable && executable->name == "destiny2.exe")
         {
             const bool input_only = std::strcmp(probe, "INPUT_ONLY") == 0;
             constexpr uint64_t clock_base_rva = 0x20D0474;
@@ -1782,8 +1794,9 @@ namespace sogen
                 }
             }
         }
-        if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_CLOCK_TRANSITION_PROBE");
-            probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
+        if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_CLOCK_TRANSITION_PROBE"); !destiny_startup_capture::enabled() && probe &&
+                                                                                         std::strcmp(probe, "1") == 0 && executable &&
+                                                                                         executable->name == "destiny2.exe")
         {
             constexpr uint64_t static_clock_rva = 0x26B3928;
             constexpr uint64_t clock_base_rva = 0x20D0474;
@@ -2076,8 +2089,9 @@ namespace sogen
                 });
             }
         }
-        if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_TIMEOUT_BRANCH_PROBE");
-            probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
+        if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_TIMEOUT_BRANCH_PROBE"); !destiny_startup_capture::enabled() && probe &&
+                                                                                       std::strcmp(probe, "1") == 0 && executable &&
+                                                                                       executable->name == "destiny2.exe")
         {
             constexpr uint64_t site_rva = 0x1742DA8;
             constexpr uint64_t clock_base_rva = 0x20D0474;
@@ -2214,8 +2228,9 @@ namespace sogen
                 });
             }
         }
-        if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_TIMEOUT_PROBE");
-            probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
+        if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_TIMEOUT_PROBE"); !destiny_startup_capture::enabled() && probe &&
+                                                                                std::strcmp(probe, "1") == 0 && executable &&
+                                                                                executable->name == "destiny2.exe")
         {
             constexpr uint64_t site_rva = 0x1742D2F;
             constexpr uint64_t clock_base_rva = 0x20D0474;
@@ -2341,8 +2356,9 @@ namespace sogen
                                static_cast<unsigned long long>(base + site_rva));
             }
         }
-        if (const char* probe = std::getenv("SOGEN_DESTINY_TASK0_TIMEOUT_PROBE");
-            probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
+        if (const char* probe = std::getenv("SOGEN_DESTINY_TASK0_TIMEOUT_PROBE"); !destiny_startup_capture::enabled() && probe &&
+                                                                                  std::strcmp(probe, "1") == 0 && executable &&
+                                                                                  executable->name == "destiny2.exe")
         {
             constexpr uint64_t state_rva = 0xD40A3D;
             constexpr uint64_t failure_rva = 0xD40C4A;
@@ -2486,8 +2502,9 @@ namespace sogen
                                static_cast<unsigned long long>(base + failure_rva));
             }
         }
-        if (const char* probe = std::getenv("SOGEN_DESTINY_INVESTMENT_TASK_PROBE");
-            probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
+        if (const char* probe = std::getenv("SOGEN_DESTINY_INVESTMENT_TASK_PROBE"); !destiny_startup_capture::enabled() && probe &&
+                                                                                    std::strcmp(probe, "1") == 0 && executable &&
+                                                                                    executable->name == "destiny2.exe")
         {
             struct investment_task_site
             {
@@ -2865,8 +2882,9 @@ namespace sogen
                 });
             }
         }
-        if (const char* probe = std::getenv("SOGEN_DESTINY_STATE23_FLAG_PROBE");
-            probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
+        if (const char* probe = std::getenv("SOGEN_DESTINY_STATE23_FLAG_PROBE"); !destiny_startup_capture::enabled() && probe &&
+                                                                                 std::strcmp(probe, "1") == 0 && executable &&
+                                                                                 executable->name == "destiny2.exe")
         {
             constexpr uint64_t writer_rva = 0x1787C89;
             constexpr std::array<uint8_t, 7> writer_expected{0xC6, 0x87, 0x99, 0xC7, 0x01, 0x00, 0x01};
@@ -3055,8 +3073,9 @@ namespace sogen
                 });
             }
         }
-        if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_RESPONSE_PROBE");
-            probe && std::strcmp(probe, "1") == 0 && executable && executable->name == "destiny2.exe")
+        if (const char* probe = std::getenv("SOGEN_DESTINY_BAP_RESPONSE_PROBE"); !destiny_startup_capture::enabled() && probe &&
+                                                                                 std::strcmp(probe, "1") == 0 && executable &&
+                                                                                 executable->name == "destiny2.exe")
         {
             struct response_site
             {
@@ -3733,7 +3752,8 @@ namespace sogen
             json += "]}";
         }
 
-        if (const char* probe = std::getenv("SOGEN_DAWN_CALLBACK_PROBE"); probe && std::strcmp(probe, "1") == 0)
+        if (const char* probe = std::getenv("SOGEN_DAWN_CALLBACK_PROBE");
+            !destiny_startup_capture::enabled() && probe && std::strcmp(probe, "1") == 0)
         {
             const auto calls = this->dawn_callback_probe_calls_.load(std::memory_order_relaxed);
             const auto last_tick = this->dawn_callback_probe_last_tick_ms_.load(std::memory_order_relaxed);
@@ -4360,7 +4380,8 @@ namespace sogen
         });
 
 #ifdef _WIN32
-        if (const auto* probe = std::getenv("SOGEN_DAWN_QUEUEZ_SCAN_PROBE"); probe && std::strcmp(probe, "1") == 0)
+        if (const auto* probe = std::getenv("SOGEN_DAWN_QUEUEZ_SCAN_PROBE");
+            !destiny_startup_capture::enabled() && probe && std::strcmp(probe, "1") == 0)
         {
             struct scan_probe_state
             {
@@ -4523,7 +4544,8 @@ namespace sogen
 
         // Opt-in exact-export observation of Dawn's callback-driven BAP pump.
         // WHP traps the containing code page, so leave this disabled by default.
-        if (const char* probe = std::getenv("SOGEN_DAWN_CALLBACK_PROBE"); probe && std::strcmp(probe, "1") == 0)
+        if (const char* probe = std::getenv("SOGEN_DAWN_CALLBACK_PROBE");
+            !destiny_startup_capture::enabled() && probe && std::strcmp(probe, "1") == 0)
         {
             auto hooks = std::make_shared<std::unordered_map<uint64_t, emulator_hook*>>();
             this->callbacks.on_module_load.add([this, hooks](mapped_module& mod) {

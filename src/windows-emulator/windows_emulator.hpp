@@ -31,6 +31,7 @@ namespace sogen
 {
 
     struct io_device;
+    class destiny_startup_capture;
 
     struct emulator_callbacks : module_manager::callbacks, process_context::callbacks
     {
@@ -565,6 +566,7 @@ namespace sogen
         // bridge uses). Lets a watcher tell "grinding through a silent decrypt" from "stopped".
         void publish_activity_status();
         std::function<void()> clock_probe_expire_{};
+        std::shared_ptr<destiny_startup_capture> startup_capture_{};
         std::chrono::steady_clock::time_point activity_status_last_{};
         std::vector<uint64_t> activity_status_prev_instructions_{};
         std::vector<x86_64_emulator::smp_profile_snapshot> activity_status_prev_smp_profile_{};
