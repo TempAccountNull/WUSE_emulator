@@ -5845,17 +5845,40 @@ namespace sogen
     {
         const std::scoped_lock lock(this->kernel_lock_);
 
+        static const bool input_trace_enabled = [] {
+            const auto* value = std::getenv("SOGEN_DESTINY_INPUT_TRACE");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        static std::atomic<uint32_t> input_trace_count{};
+        const bool trace_enter =
+            input_trace_enabled &&
+            (event.message == WM_KEYDOWN || event.message == WM_KEYUP || event.message == WM_SYSKEYDOWN || event.message == WM_SYSKEYUP) &&
+            event.wParam == VK_RETURN;
+        const auto trace_input = [&](const char* stage, const uint32_t owner_tid) {
+            if (trace_enter && input_trace_count.fetch_add(1, std::memory_order_relaxed) < 64)
+            {
+                this->log.info("INPUTTRACE source=guest stage=%s window=%#llx message=%#x vk=%#llx lparam=%#llx owner_tid=%u "
+                               "foreground=%#llx raw_registered=%u\n",
+                               stage, static_cast<unsigned long long>(event.window), event.message,
+                               static_cast<unsigned long long>(event.wParam), static_cast<unsigned long long>(event.lParam), owner_tid,
+                               static_cast<unsigned long long>(this->process.foreground_window),
+                               static_cast<unsigned>(this->process.raw_keyboard_registered));
+            }
+        };
         const auto* win = this->process.windows.get(event.window);
         if (!win)
         {
+            trace_input("unknown_window", 0);
             return;
         }
 
         auto* thread = get_thread_by_id(this->process, win->thread_id);
         if (!thread)
         {
+            trace_input("unknown_owner_thread", win->thread_id);
             return;
         }
+        trace_input("received", win->thread_id);
 
         msg m{};
         m.window = event.window;
@@ -5983,6 +6006,7 @@ namespace sogen
         }
 
         thread->post_message(*this, m, true);
+        trace_input("queued", win->thread_id);
 
         if (event.message == WM_CLOSE || event.message == WM_COMMAND || is_key_down_message(event.message) ||
             is_mouse_button_message(event.message) || is_mouse_wheel_message(event.message))

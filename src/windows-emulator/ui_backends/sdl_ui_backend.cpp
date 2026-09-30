@@ -3,6 +3,8 @@
 #include "sdl_native_presentation_window.hpp"
 #include "gpu_window_title.hpp"
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include <SDL3/SDL.h>
 
@@ -827,6 +829,44 @@ namespace sogen
                 this->deliver_pending_key_releases();
 
                 SDL_Event event{};
+                static const bool input_trace_enabled = [] {
+                    const auto* value = std::getenv("SOGEN_DESTINY_INPUT_TRACE");
+                    return value && std::strcmp(value, "1") == 0;
+                }();
+                static uint32_t focus_trace_count{};
+                static uint32_t enter_trace_count{};
+                const auto trace_input = [&](const char* stage, const uint32_t window_id, const hwnd guest, const uint64_t key,
+                                             const uint64_t scan) {
+                    if (!input_trace_enabled)
+                    {
+                        return;
+                    }
+                    const bool enter_event = key != 0 || scan != 0;
+                    auto& count = enter_event ? enter_trace_count : focus_trace_count;
+                    if (count >= (enter_event ? 64u : 12u))
+                    {
+                        return;
+                    }
+                    ++count;
+                    auto* focused_window = SDL_GetKeyboardFocus();
+                    const auto focused_id = focused_window ? SDL_GetWindowID(focused_window) : 0;
+                    std::fprintf(stderr,
+                                 "INPUTTRACE source=sdl stage=%s window_id=%u focused_id=%u guest=%#llx active=%#llx key=%llu scan=%llu\n",
+                                 stage, window_id, focused_id, static_cast<unsigned long long>(guest),
+                                 static_cast<unsigned long long>(this->active_window_), static_cast<unsigned long long>(key),
+                                 static_cast<unsigned long long>(scan));
+                };
+                static uint32_t previous_focus_id = UINT32_MAX;
+                if (input_trace_enabled)
+                {
+                    auto* focused_window = SDL_GetKeyboardFocus();
+                    const uint32_t focused_id = focused_window ? SDL_GetWindowID(focused_window) : 0;
+                    if (focused_id != previous_focus_id)
+                    {
+                        trace_input("focus_state", focused_id, this->resolve_guest(focused_id), 0, 0);
+                        previous_focus_id = focused_id;
+                    }
+                }
                 while (SDL_PollEvent(&event))
                 {
                     switch (event.type)
@@ -852,10 +892,13 @@ namespace sogen
                     case SDL_EVENT_WINDOW_FOCUS_GAINED:
                     case SDL_EVENT_WINDOW_MOUSE_ENTER:
                         this->set_window_active(this->resolve_guest(event.window.windowID), true);
+                        trace_input(event.type == SDL_EVENT_WINDOW_FOCUS_GAINED ? "focus_gained" : "mouse_enter", event.window.windowID,
+                                    this->resolve_guest(event.window.windowID), 0, 0);
                         break;
 
                     case SDL_EVENT_WINDOW_FOCUS_LOST:
                         this->set_window_active(this->resolve_guest(event.window.windowID), false);
+                        trace_input("focus_lost", event.window.windowID, this->resolve_guest(event.window.windowID), 0, 0);
                         break;
 
                     // The guest renders at its own fixed resolution; the host window can be any size. On a
@@ -872,15 +915,29 @@ namespace sogen
                         break;
 
                     case SDL_EVENT_KEY_DOWN: {
+                        const bool trace_enter = event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER ||
+                                                 event.key.scancode == SDL_SCANCODE_RETURN || event.key.scancode == SDL_SCANCODE_KP_ENTER;
                         const auto guest = this->resolve_guest(event.key.windowID);
+                        if (trace_enter)
+                        {
+                            trace_input("enter_down_received", event.key.windowID, guest, event.key.key, event.key.scancode);
+                        }
                         if (guest == 0)
                         {
+                            if (trace_enter)
+                            {
+                                trace_input("enter_down_unknown_window", event.key.windowID, guest, event.key.key, event.key.scancode);
+                            }
                             break;
                         }
 
                         const auto vk = map_sdl_keycode(event.key.key);
                         if (vk == 0)
                         {
+                            if (trace_enter)
+                            {
+                                trace_input("enter_down_unknown_key", event.key.windowID, guest, event.key.key, event.key.scancode);
+                            }
                             break;
                         }
 
@@ -902,6 +959,10 @@ namespace sogen
                         const auto scan = map_sdl_scancode(event.key.scancode, context);
                         if (scan == 0)
                         {
+                            if (trace_enter)
+                            {
+                                trace_input("enter_down_unknown_scan", event.key.windowID, guest, event.key.key, event.key.scancode);
+                            }
                             break;
                         }
 
@@ -914,11 +975,21 @@ namespace sogen
                         const uint32_t message = (is_alt || vk == VK_F10 || alt_context) ? WM_SYSKEYDOWN : WM_KEYDOWN;
 
                         this->post_event(guest, message, vk, scan);
+                        if (trace_enter)
+                        {
+                            trace_input("enter_down_forwarded", event.key.windowID, guest, vk, scan);
+                        }
                         break;
                     }
 
                     case SDL_EVENT_KEY_UP: {
+                        const bool trace_enter = event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER ||
+                                                 event.key.scancode == SDL_SCANCODE_RETURN || event.key.scancode == SDL_SCANCODE_KP_ENTER;
                         const auto guest = this->resolve_guest(event.key.windowID);
+                        if (trace_enter)
+                        {
+                            trace_input("enter_up_received", event.key.windowID, guest, event.key.key, event.key.scancode);
+                        }
                         if (guest == 0)
                         {
                             break;
@@ -953,6 +1024,10 @@ namespace sogen
                         }
 
                         this->post_event(guest, message, vk, scan);
+                        if (trace_enter)
+                        {
+                            trace_input("enter_up_forwarded", event.key.windowID, guest, vk, scan);
+                        }
                         break;
                     }
 
