@@ -2501,18 +2501,22 @@ namespace sogen
                 investment_task_site{0xD40C4A, {0x41, 0xBE, 0x02, 0x00, 0x00, 0x00}, 6, "watchdog"},
                 investment_task_site{0xD4D93A, {0xBA, 0x04, 0x00, 0x00, 0x00}, 5, "dispatcher"},
                 investment_task_site{0xE1B4D0, {0x48, 0x89, 0x5C, 0x24, 0x20}, 5, "state_setter"},
+                investment_task_site{0x107289E, {0x83, 0xF8, 0x03}, 3, "task0_result"},
+                investment_task_site{0x10728D3, {0x83, 0xF8, 0x03}, 3, "task2_result"},
             };
             const uint64_t base = executable->image_base;
             const uint64_t image_size = executable->size_of_image;
-            if (executable->size_of_image >= sites[2].rva + sites[2].length && base <= UINT64_MAX - sites[2].rva - sites[2].length)
+            if (image_size >= sites.back().rva + sites.back().length && base <= UINT64_MAX - sites.back().rva - sites.back().length)
             {
                 struct investment_task_probe_state
                 {
                     std::mutex mutex{};
-                    std::array<emulator_hook*, 3> hooks{};
+                    std::array<emulator_hook*, 5> hooks{};
                     uint64_t installed_tick{};
                     uint64_t setter_calls{};
                     uint64_t setter_state_read_failures{};
+                    std::array<uint64_t, 2> scheduler_identity_misses{};
+                    std::array<uint64_t, 2> scheduler_identity_read_failures{};
                     bool attempted{};
                 };
 
@@ -2530,10 +2534,15 @@ namespace sogen
                     if (remaining)
                     {
                         this->log.info("INVESTMENTTASK retired reason=%s remaining=%zu "
-                                       "elapsed_ms=%llu setter_calls=%llu setter_state_read_failures=%llu\n",
+                                       "elapsed_ms=%llu setter_calls=%llu setter_state_read_failures=%llu "
+                                       "scheduler_identity_misses=%llu,%llu scheduler_identity_read_failures=%llu,%llu\n",
                                        reason, remaining, static_cast<unsigned long long>(GetTickCount64() - state->installed_tick),
                                        static_cast<unsigned long long>(state->setter_calls),
-                                       static_cast<unsigned long long>(state->setter_state_read_failures));
+                                       static_cast<unsigned long long>(state->setter_state_read_failures),
+                                       static_cast<unsigned long long>(state->scheduler_identity_misses[0]),
+                                       static_cast<unsigned long long>(state->scheduler_identity_misses[1]),
+                                       static_cast<unsigned long long>(state->scheduler_identity_read_failures[0]),
+                                       static_cast<unsigned long long>(state->scheduler_identity_read_failures[1]));
                     }
                 };
                 this->callbacks.on_debug_string.add([this, state, retire, base, image_size, sites](const std::string_view message) {
@@ -2626,7 +2635,7 @@ namespace sogen
                                                 static_cast<unsigned>(mask_read), static_cast<unsigned long long>(rsp), initial_reason,
                                                 static_cast<unsigned>(reason_read), static_cast<unsigned long long>(elapsed));
                                         }
-                                        else
+                                        else if (site == 2)
                                         {
                                             ++state->setter_calls;
                                             const auto controller = acting.reg<uint64_t>(x86_register::rcx);
@@ -2678,8 +2687,68 @@ namespace sogen
                                                 static_cast<unsigned long long>(state->setter_calls),
                                                 static_cast<unsigned long long>(elapsed));
                                         }
+                                        else
+                                        {
+                                            const auto slot = acting.reg<uint32_t>(x86_register::rdi);
+                                            if ((site == 3 && slot != 0) || (site == 4 && slot != 2))
+                                            {
+                                                return;
+                                            }
+                                            const auto result = acting.reg<uint32_t>(x86_register::rax);
+                                            const auto scheduler = acting.reg<uint64_t>(x86_register::rbx);
+                                            const auto slot_context = acting.reg<uint64_t>(x86_register::r14);
+                                            const auto expected_slot_offset = site == 3 ? 0x10ULL : 0x50ULL;
+                                            if (scheduler > UINT64_MAX - expected_slot_offset ||
+                                                slot_context != scheduler + expected_slot_offset)
+                                            {
+                                                ++state->scheduler_identity_misses[site - 3];
+                                                return;
+                                            }
+                                            const auto callback_offset = site == 3 ? 8ULL : 0ULL;
+                                            uint64_t callback{};
+                                            if (slot_context > UINT64_MAX - callback_offset - sizeof(callback) ||
+                                                !acting.try_read_memory(slot_context + callback_offset, &callback, sizeof(callback)))
+                                            {
+                                                ++state->scheduler_identity_read_failures[site - 3];
+                                                return;
+                                            }
+                                            const auto expected_callback_rva = site == 3 ? 0x1071F10ULL : 0xD3C850ULL;
+                                            if (callback != base + expected_callback_rva)
+                                            {
+                                                ++state->scheduler_identity_misses[site - 3];
+                                                return;
+                                            }
+                                            constexpr std::array<uint64_t, 4> offsets{0x108, 0x110, 0x118, 0x120};
+                                            std::array<uint64_t, 4> masks{};
+                                            uint32_t masks_read{};
+                                            for (size_t index = 0; index < masks.size(); ++index)
+                                            {
+                                                if (scheduler <= UINT64_MAX - offsets[index] - sizeof(masks[index]) &&
+                                                    acting.try_read_memory(scheduler + offsets[index], &masks[index], sizeof(masks[index])))
+                                                {
+                                                    masks_read |= 1U << index;
+                                                }
+                                            }
+                                            this->log.warn(
+                                                "INVESTMENTTASK scheduler_result site=%s tid=%u vcpu=%zu rip=%#llx "
+                                                "slot=%u result=%#x scheduler=%#llx slot_context=%#llx callback=%#llx "
+                                                "masks_read=%#x requested=%#llx started=%#llx failed=%#llx completed=%#llx "
+                                                "elapsed_ms=%llu\n",
+                                                site == 3 ? "task0_callback" : "task2_callback", tid, cpu.index(),
+                                                static_cast<unsigned long long>(rip), slot, result,
+                                                static_cast<unsigned long long>(scheduler), static_cast<unsigned long long>(slot_context),
+                                                static_cast<unsigned long long>(callback), masks_read,
+                                                static_cast<unsigned long long>(masks[0]), static_cast<unsigned long long>(masks[1]),
+                                                static_cast<unsigned long long>(masks[2]), static_cast<unsigned long long>(masks[3]),
+                                                static_cast<unsigned long long>(elapsed));
+                                        }
                                         this->emu().delete_hook(std::exchange(state->hooks[site], nullptr));
-                                        if (!state->hooks[0] && !state->hooks[1] && !state->hooks[2])
+                                        bool any_hooks{};
+                                        for (const auto* hook : state->hooks)
+                                        {
+                                            any_hooks |= hook != nullptr;
+                                        }
+                                        if (!any_hooks)
                                         {
                                             this->log.info("INVESTMENTTASK retired reason=all_hits "
                                                            "elapsed_ms=%llu\n",
@@ -2695,7 +2764,7 @@ namespace sogen
                             return;
                         }
                         this->log.info("INVESTMENTTASK installed base=%#llx mode=int3 "
-                                       "sites=3 hit_cap=1 "
+                                       "sites=5 hit_cap=1 "
                                        "hit_checked_deadline_ms=300000\n",
                                        static_cast<unsigned long long>(base));
                         return;
