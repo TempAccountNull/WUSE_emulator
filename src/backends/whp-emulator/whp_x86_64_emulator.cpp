@@ -3670,7 +3670,6 @@ namespace sogen::whp
 
                     this->expire_mmio_read_grace_pages(vcpu);
                     WHV_RUN_VP_EXIT_CONTEXT exit_context{};
-                    const auto start_rip = vcpu.read_instruction_pointer();
                     vcpu.run_active_ = true;
                     const auto run_hr = WHvRunVirtualProcessor(this->partition_, vcpu.vp_index_, &exit_context, sizeof(exit_context));
                     vcpu.run_active_ = false;
@@ -3690,7 +3689,6 @@ namespace sogen::whp
                         // (another vCPU changed the shared page tables) - never from a real stop, which
                         // always sets stop_requested_ first. Re-enter so the pending TLB flush is applied
                         // at the loop top; do not treat it as a stop regardless of whether rip advanced.
-                        (void)start_rip;
                         continue;
                     }
                     case WHvRunVpExitReasonX64Halt:
