@@ -1286,14 +1286,15 @@ namespace sogen
         void commit_file_data(const std::string_view data, memory_interface& emu,
                               const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const uint64_t buffer)
         {
+            emu.write_memory(buffer, data.data(), data.size());
+
             if (io_status_block)
             {
-                IO_STATUS_BLOCK<EmulatorTraits<Emu64>> block{};
-                block.Information = data.size();
-                io_status_block.write(block);
+                auto& status_memory = *io_status_block.get_memory_interface();
+                const auto information_address = io_status_block.value() + offsetof(IO_STATUS_BLOCK<EmulatorTraits<Emu64>>, Information);
+                status_memory.write_memory(information_address, static_cast<EmulatorTraits<Emu64>::ULONG_PTR>(data.size()));
+                status_memory.write_memory(io_status_block.value(), EmulatorTraits<Emu64>::PVOID{});
             }
-
-            emu.write_memory(buffer, data.data(), data.size());
         }
 
         void write_lock_io_status(const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const NTSTATUS status,
