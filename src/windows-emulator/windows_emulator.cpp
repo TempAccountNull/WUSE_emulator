@@ -188,8 +188,7 @@ namespace sogen
             for (size_t i = 0; i < (N - 1) / 2; ++i)
             {
                 uint8_t byte{};
-                const bool ok = address != 0 && address <= UINT64_MAX - i &&
-                                cpu.try_read_memory(address + i, &byte, sizeof(byte));
+                const bool ok = address != 0 && address <= UINT64_MAX - i && cpu.try_read_memory(address + i, &byte, sizeof(byte));
                 output[i * 2] = ok ? digits[byte >> 4] : '?';
                 output[i * 2 + 1] = ok ? digits[byte & 15] : '?';
                 readable += ok;
@@ -781,10 +780,10 @@ namespace sogen
             set_worker_lock_phase(worker_lock_phase::selection_restore);
 
             auto& context = win_emu.process;
-            return detail::select_next_guest_thread(
-                context.threads | std::views::values, vcpu.active_thread, static_cast<uint32_t>(vcpu.cpu.index()),
-                guest_thread_affinity_enabled() && win_emu.vcpu_count() > 1,
-                [&](emulator_thread& thread) { return switch_to_thread(win_emu, vcpu, thread); });
+            return detail::select_next_guest_thread(context.threads | std::views::values, vcpu.active_thread,
+                                                    static_cast<uint32_t>(vcpu.cpu.index()),
+                                                    guest_thread_affinity_enabled() && win_emu.vcpu_count() > 1,
+                                                    [&](emulator_thread& thread) { return switch_to_thread(win_emu, vcpu, thread); });
         }
 
         struct instruction_tick_clock : utils::tick_clock
@@ -867,8 +866,10 @@ namespace sogen
             // Opt-in only (SOGEN_ICOUNT_CLOCK=1): a pure icount clock FREEZES while a guest
             // thread sleeps/waits (no instructions retire), so wait deadlines never arrive and
             // the sample's thread joins deadlock. Falsified as the lean-crash fix anyway.
-            const bool icount_clock_requested =
-                [] { const char* v = std::getenv("SOGEN_ICOUNT_CLOCK"); return v && *v == '1'; }();
+            const bool icount_clock_requested = [] {
+                const char* v = std::getenv("SOGEN_ICOUNT_CLOCK");
+                return v && *v == '1';
+            }();
             if (use_relative_time || !emu.has_deterministic_instruction_count() || !icount_clock_requested)
             {
                 return base;
@@ -1293,22 +1294,19 @@ namespace sogen
                                         constexpr uint64_t init_once_rva = 0xB7F40;
                                         constexpr uint64_t time_get_time_iat_rva = 0x20BB3B0;
                                         const auto* kernel32 = this->mod_manager.find_by_name("kernel32.dll");
-                                        const bool kernel32_valid = kernel32 &&
-                                                                    kernel32->size_of_image > init_once_rva + sizeof(uint64_t);
+                                        const bool kernel32_valid = kernel32 && kernel32->size_of_image > init_once_rva + sizeof(uint64_t);
                                         const uint64_t kernel32_base = kernel32_valid ? kernel32->image_base : 0;
                                         uint64_t timer_data{}, init_once{}, iat_target{};
                                         uint32_t tick_baseline{};
-                                        const bool timer_read = kernel32_valid &&
-                                                                acting.try_read_memory(kernel32_base + timer_data_rva, &timer_data,
-                                                                                       sizeof(timer_data));
-                                        const bool baseline_read = kernel32_valid &&
-                                                                   acting.try_read_memory(kernel32_base + tick_baseline_rva,
-                                                                                          &tick_baseline, sizeof(tick_baseline));
-                                        const bool init_read = kernel32_valid &&
-                                                               acting.try_read_memory(kernel32_base + init_once_rva, &init_once,
-                                                                                      sizeof(init_once));
-                                        const bool iat_read = acting.try_read_memory(base + time_get_time_iat_rva, &iat_target,
-                                                                                     sizeof(iat_target));
+                                        const bool timer_read = kernel32_valid && acting.try_read_memory(kernel32_base + timer_data_rva,
+                                                                                                         &timer_data, sizeof(timer_data));
+                                        const bool baseline_read =
+                                            kernel32_valid && acting.try_read_memory(kernel32_base + tick_baseline_rva, &tick_baseline,
+                                                                                     sizeof(tick_baseline));
+                                        const bool init_read = kernel32_valid && acting.try_read_memory(kernel32_base + init_once_rva,
+                                                                                                        &init_once, sizeof(init_once));
+                                        const bool iat_read =
+                                            acting.try_read_memory(base + time_get_time_iat_rva, &iat_target, sizeof(iat_target));
                                         const auto* target_module = iat_read ? this->mod_manager.find_by_address(iat_target) : nullptr;
                                         const uint64_t target_rva = target_module ? iat_target - target_module->image_base : 0;
                                         this->log.warn("BAPEARLYCLOCK winmm_inputs stage=%s site=%zu tid=%u kernel32_base=%#llx "
@@ -1714,10 +1712,9 @@ namespace sogen
                                    "static_read=%u static=%#llx static_high=%#x base_read=%u clock_base=%#x "
                                    "host_tick_ms=%llu\n",
                                    attempt, state->input_only ? 4U : 12U, state->input_only ? "INPUT_ONLY" : "FULL",
-                                   static_cast<unsigned>(bap_signin), static_cast<unsigned>(bap_signin),
-                                   static_cast<unsigned>(static_read), static_cast<unsigned long long>(static_clock),
-                                   static_cast<uint32_t>(static_clock >> 32), static_cast<unsigned>(base_read), clock_base,
-                                   static_cast<unsigned long long>(host_tick));
+                                   static_cast<unsigned>(bap_signin), static_cast<unsigned>(bap_signin), static_cast<unsigned>(static_read),
+                                   static_cast<unsigned long long>(static_clock), static_cast<uint32_t>(static_clock >> 32),
+                                   static_cast<unsigned>(base_read), clock_base, static_cast<unsigned long long>(host_tick));
                     arm();
                 });
                 this->log.info("BAPEARLYCLOCK readiness_wait base=%#llx trigger=bootflow_debug_string\n",
@@ -1734,8 +1731,8 @@ namespace sogen
         // A narrow, opt-in diagnostic for the Destiny 2 /GS failure at image RVA 0x187d164.
         // These exact-address hooks preserve the guest instruction and do not enable broad
         // per-instruction analysis. The RVAs belong to the 21122.0.0.0 Shadowkeep image.
-        if (const char* probe = std::getenv("SOGEN_DESTINY_GS_COOKIE_PROBE"); probe && *probe == '1' &&
-            executable && executable->name == "destiny2.exe")
+        if (const char* probe = std::getenv("SOGEN_DESTINY_GS_COOKIE_PROBE");
+            probe && *probe == '1' && executable && executable->name == "destiny2.exe")
         {
             constexpr std::array<uint64_t, 3> sites{0x3a52a9, 0x3b41ca, 0x187c480};
             constexpr uint64_t cookie_rva = 0x20a9a88;
@@ -1764,19 +1761,23 @@ namespace sogen
                         size_t route = site;
                         if (site == 2)
                         {
-                            route = stack_read && stack_word == base + 0x3a52ae ? 2 :
-                                    stack_read && stack_word == base + 0x3b41cf ? 3 : 4;
+                            route = stack_read && stack_word == base + 0x3a52ae ? 2 : stack_read && stack_word == base + 0x3b41cf ? 3 : 4;
                         }
                         const size_t kind = !cookie_read ? 2 : mismatch ? 1 : 0;
                         const size_t bucket = route * 2 + (tid == 12 ? 1 : 0);
-                        if ((*samples)[bucket][kind]) return;
+                        if ((*samples)[bucket][kind])
+                        {
+                            return;
+                        }
                         (*samples)[bucket][kind] = true;
-                        this->log.error("GSCOOKIE site=%s route=%zu tid=%u vcpu=%zu rip=%#llx rsp=%#llx rcx=%#llx expected=%#llx stack0=%#llx cookie_read=%u stack_read=%u mismatch=%u upper16_nonzero=%u\n",
-                                        site == 0 ? "caller_new" : site == 1 ? "caller_old" : "checker",
-                                        route, tid, cpu.index(),
-                                        (unsigned long long)rip, (unsigned long long)rsp,
-                                        (unsigned long long)rcx, (unsigned long long)expected_cookie,
-                                        (unsigned long long)stack_word, cookie_read, stack_read, mismatch, upper16_nonzero);
+                        this->log.error("GSCOOKIE site=%s route=%zu tid=%u vcpu=%zu rip=%#llx rsp=%#llx rcx=%#llx expected=%#llx "
+                                        "stack0=%#llx cookie_read=%u stack_read=%u mismatch=%u upper16_nonzero=%u\n",
+                                        site == 0   ? "caller_new"
+                                        : site == 1 ? "caller_old"
+                                                    : "checker",
+                                        route, tid, cpu.index(), (unsigned long long)rip, (unsigned long long)rsp, (unsigned long long)rcx,
+                                        (unsigned long long)expected_cookie, (unsigned long long)stack_word, cookie_read, stack_read,
+                                        mismatch, upper16_nonzero);
                     });
                 }
             }
@@ -1896,8 +1897,7 @@ namespace sogen
                         base_read && after.tls_read ? static_cast<uint32_t>(after.tls) + clock_base : 0, kusd_sample[0], kusd_sample[1],
                         kusd_sample[2], static_cast<unsigned long long>(GetTickCount64()), static_cast<unsigned>(before.tls_read),
                         static_cast<unsigned>(before.global_read), static_cast<unsigned>(after.tls_read),
-                        static_cast<unsigned>(after.global_read), static_cast<unsigned>(base_read),
-                        static_cast<unsigned>(last_valid));
+                        static_cast<unsigned>(after.global_read), static_cast<unsigned>(base_read), static_cast<unsigned>(last_valid));
                 };
                 this->clock_probe_expire_ = [state, retire] {
                     const std::scoped_lock state_guard(state->mutex);
@@ -2503,15 +2503,18 @@ namespace sogen
                 investment_task_site{0xE1B4D0, {0x48, 0x89, 0x5C, 0x24, 0x20}, 5, "state_setter"},
                 investment_task_site{0x107289E, {0x83, 0xF8, 0x03}, 3, "task0_result"},
                 investment_task_site{0x10728D3, {0x83, 0xF8, 0x03}, 3, "task2_result"},
+                investment_task_site{0xD3C896, {0xE8, 0xF5, 0x86, 0xE0, 0xFF}, 5, "resource_request"},
+                investment_task_site{0xB440CC, {0x83, 0xFB, 0x03}, 3, "resource_completion"},
+                investment_task_site{0x1071F99, {0xE8, 0x12, 0xBF, 0xDB, 0xFF}, 5, "task0_deadline"},
             };
             const uint64_t base = executable->image_base;
             const uint64_t image_size = executable->size_of_image;
-            if (image_size >= sites.back().rva + sites.back().length && base <= UINT64_MAX - sites.back().rva - sites.back().length)
+            if (image_size >= 0x1FB5F84 && base <= UINT64_MAX - 0x1FB5F84)
             {
                 struct investment_task_probe_state
                 {
                     std::mutex mutex{};
-                    std::array<emulator_hook*, 5> hooks{};
+                    std::array<emulator_hook*, 8> hooks{};
                     uint64_t installed_tick{};
                     uint64_t setter_calls{};
                     uint64_t setter_state_read_failures{};
@@ -2591,6 +2594,23 @@ namespace sogen
                                         auto& vcpu = this->vcpu(cpu.index());
                                         auto& acting = vcpu.cpu;
                                         const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                                        const auto report_resource = [&](const char* phase) {
+                                            constexpr uint64_t resource_rva = 0x1FB5F20;
+                                            std::array<uint32_t, 3> slot{};
+                                            uint32_t outstanding{};
+                                            const bool slot_read =
+                                                acting.try_read_memory(base + resource_rva + 3 * 12, slot.data(), sizeof(slot));
+                                            const bool outstanding_read =
+                                                acting.try_read_memory(base + resource_rva + 0x60, &outstanding, sizeof(outstanding));
+                                            this->log.warn(
+                                                "INVESTMENTTASK resource phase=%s name=client_startup_globals "
+                                                "tid=%u vcpu=%zu address=%#llx read=%u state=%d detail=%#x "
+                                                "handle=%#x identifier=%#x outstanding=%u outstanding_read=%u elapsed_ms=%llu\n",
+                                                phase, tid, cpu.index(), static_cast<unsigned long long>(base + resource_rva + 3 * 12),
+                                                static_cast<unsigned>(slot_read), static_cast<int>(static_cast<int8_t>(slot[0] & 0xFF)),
+                                                (slot[0] >> 8) & 0xFF, slot[1], slot[2], outstanding,
+                                                static_cast<unsigned>(outstanding_read), static_cast<unsigned long long>(elapsed));
+                                        };
                                         if (site == 0)
                                         {
                                             const auto clock = acting.reg<uint64_t>(x86_register::rbp);
@@ -2653,6 +2673,7 @@ namespace sogen
                                             {
                                                 return;
                                             }
+                                            report_resource("cleanup");
                                             const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
                                             std::array<uint64_t, 8> stack{};
                                             uint32_t stack_read_mask{};
@@ -2686,6 +2707,60 @@ namespace sogen
                                                 static_cast<unsigned long long>(stack[7]),
                                                 static_cast<unsigned long long>(state->setter_calls),
                                                 static_cast<unsigned long long>(elapsed));
+                                        }
+                                        else if (site == 5)
+                                        {
+                                            if (acting.reg<uint64_t>(x86_register::rcx) != base + 0x1FB5F20 ||
+                                                acting.reg<uint32_t>(x86_register::rdx) != 3)
+                                            {
+                                                return;
+                                            }
+                                            report_resource("request_entry");
+                                        }
+                                        else if (site == 6)
+                                        {
+                                            if (acting.reg<uint64_t>(x86_register::r14) != base + 0x1FB5F20 ||
+                                                acting.reg<uint32_t>(x86_register::rbp) != 3 ||
+                                                acting.reg<uint64_t>(x86_register::r15) != base + 0x1FB5F44)
+                                            {
+                                                return;
+                                            }
+                                            report_resource("completion_before_state_update");
+                                            this->log.warn("INVESTMENTTASK resource_completion tid=%u vcpu=%zu rip=%#llx "
+                                                           "loader_status=%#x elapsed_ms=%llu\n",
+                                                           tid, cpu.index(), static_cast<unsigned long long>(rip),
+                                                           acting.reg<uint32_t>(x86_register::rbx),
+                                                           static_cast<unsigned long long>(elapsed));
+                                        }
+                                        else if (site == 7)
+                                        {
+                                            if (acting.reg<uint32_t>(x86_register::rcx) != 0x1C ||
+                                                acting.reg<uint32_t>(x86_register::rdx) != 0xAF)
+                                            {
+                                                return;
+                                            }
+                                            const auto context = acting.reg<uint64_t>(x86_register::rsi);
+                                            const auto config = acting.reg<uint64_t>(x86_register::rax);
+                                            int64_t guest_elapsed{};
+                                            int32_t limit{};
+                                            uint32_t context_status{};
+                                            const bool elapsed_read =
+                                                context <= UINT64_MAX - 8 - sizeof(guest_elapsed) &&
+                                                acting.try_read_memory(context + 8, &guest_elapsed, sizeof(guest_elapsed));
+                                            const bool status_read =
+                                                context <= UINT64_MAX - sizeof(context_status) &&
+                                                acting.try_read_memory(context, &context_status, sizeof(context_status));
+                                            const bool limit_read = config <= UINT64_MAX - 0x20 - sizeof(limit) &&
+                                                                    acting.try_read_memory(config + 0x20, &limit, sizeof(limit));
+                                            this->log.warn("INVESTMENTTASK task0_deadline tid=%u vcpu=%zu rip=%#llx "
+                                                           "context=%#llx context_status=%#x config=%#llx guest_elapsed_ms=%lld "
+                                                           "limit_ms=%d reads=%u%u%u elapsed_ms=%llu\n",
+                                                           tid, cpu.index(), static_cast<unsigned long long>(rip),
+                                                           static_cast<unsigned long long>(context), context_status,
+                                                           static_cast<unsigned long long>(config), static_cast<long long>(guest_elapsed),
+                                                           limit, static_cast<unsigned>(elapsed_read), static_cast<unsigned>(status_read),
+                                                           static_cast<unsigned>(limit_read), static_cast<unsigned long long>(elapsed));
+                                            report_resource("task0_deadline");
                                         }
                                         else
                                         {
@@ -2729,6 +2804,10 @@ namespace sogen
                                                     masks_read |= 1U << index;
                                                 }
                                             }
+                                            if (site == 4)
+                                            {
+                                                report_resource("first_task2_result");
+                                            }
                                             this->log.warn(
                                                 "INVESTMENTTASK scheduler_result site=%s tid=%u vcpu=%zu rip=%#llx "
                                                 "slot=%u result=%#x scheduler=%#llx slot_context=%#llx callback=%#llx "
@@ -2764,7 +2843,7 @@ namespace sogen
                             return;
                         }
                         this->log.info("INVESTMENTTASK installed base=%#llx mode=int3 "
-                                       "sites=5 hit_cap=1 "
+                                       "sites=8 hit_cap=1 "
                                        "hit_checked_deadline_ms=300000\n",
                                        static_cast<unsigned long long>(base));
                         return;
@@ -3156,64 +3235,60 @@ namespace sogen
         {
             constexpr uint64_t vhalt_rva = 0x1310D60;
             auto samples = std::make_shared<uint32_t>(0);
-            this->emu().hook_memory_execution(
-                executable->image_base + vhalt_rva, [this, samples](cpu_interface& cpu, const uint64_t rip) {
-                    const std::scoped_lock lock(this->kernel_lock_);
-                    if (*samples >= 8)
+            this->emu().hook_memory_execution(executable->image_base + vhalt_rva, [this, samples](cpu_interface& cpu, const uint64_t rip) {
+                const std::scoped_lock lock(this->kernel_lock_);
+                if (*samples >= 8)
+                {
+                    return;
+                }
+                const auto sample = ++*samples;
+                auto& vcpu = this->vcpu(cpu.index());
+                auto& acting = vcpu.cpu;
+                const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                const auto rcx = acting.reg<uint64_t>(x86_register::rcx);
+                const auto rdx = acting.reg<uint64_t>(x86_register::rdx);
+                const auto r8 = acting.reg<uint64_t>(x86_register::r8);
+                const auto r9 = acting.reg<uint64_t>(x86_register::r9);
+                const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
+                const auto rbp = acting.reg<uint64_t>(x86_register::rbp);
+                std::array<char, 16 * 17 + 1> stack_hex{};
+                constexpr char digits[] = "0123456789abcdef";
+                uint16_t stack_valid_mask = 0;
+                uint64_t return_address = 0;
+                for (size_t i = 0; i < 16; ++i)
+                {
+                    uint64_t word = 0;
+                    const bool valid =
+                        rsp <= UINT64_MAX - i * sizeof(word) && acting.try_read_memory(rsp + i * sizeof(word), &word, sizeof(word));
+                    if (valid)
                     {
-                        return;
+                        stack_valid_mask |= static_cast<uint16_t>(1u << i);
                     }
-                    const auto sample = ++*samples;
-                    auto& vcpu = this->vcpu(cpu.index());
-                    auto& acting = vcpu.cpu;
-                    const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
-                    const auto rcx = acting.reg<uint64_t>(x86_register::rcx);
-                    const auto rdx = acting.reg<uint64_t>(x86_register::rdx);
-                    const auto r8 = acting.reg<uint64_t>(x86_register::r8);
-                    const auto r9 = acting.reg<uint64_t>(x86_register::r9);
-                    const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
-                    const auto rbp = acting.reg<uint64_t>(x86_register::rbp);
-                    std::array<char, 16 * 17 + 1> stack_hex{};
-                    constexpr char digits[] = "0123456789abcdef";
-                    uint16_t stack_valid_mask = 0;
-                    uint64_t return_address = 0;
-                    for (size_t i = 0; i < 16; ++i)
+                    if (i == 0)
                     {
-                        uint64_t word = 0;
-                        const bool valid = rsp <= UINT64_MAX - i * sizeof(word) &&
-                            acting.try_read_memory(rsp + i * sizeof(word), &word, sizeof(word));
-                        if (valid)
-                        {
-                            stack_valid_mask |= static_cast<uint16_t>(1u << i);
-                        }
-                        if (i == 0)
-                        {
-                            return_address = word;
-                        }
-                        for (size_t nibble = 0; nibble < 16; ++nibble)
-                        {
-                            stack_hex[i * 17 + nibble] = valid ?
-                                digits[(word >> ((15 - nibble) * 4)) & 0xf] : '?';
-                        }
-                        stack_hex[i * 17 + 16] = i == 15 ? '\0' : ',';
+                        return_address = word;
                     }
-                    const bool return_valid = (stack_valid_mask & 1u) != 0;
-                    const auto* caller = return_valid ? this->mod_manager.find_by_address(return_address) : nullptr;
-                    std::array<char, 129> rdx_hex{};
-                    const auto rdx_readable = capture_guest_hex(acting, rdx, rdx_hex);
-                    this->log.error(
-                        "[VHALTENTRY] n=%u tid=%u vcpu=%zu rip=%#llx rcx=%#llx rdx=%#llx r8=%#llx r9=%#llx "
-                        "rsp=%#llx rbp=%#llx return_valid=%u return=%#llx return_module=%s return_rva=%#llx "
-                        "stack_valid_mask=%#x stack_qwords=%s rdx_readable=%u/64 rdx_bytes=%s\n",
-                        sample, tid, cpu.index(), static_cast<unsigned long long>(rip),
-                        static_cast<unsigned long long>(rcx), static_cast<unsigned long long>(rdx),
-                        static_cast<unsigned long long>(r8), static_cast<unsigned long long>(r9),
-                        static_cast<unsigned long long>(rsp), static_cast<unsigned long long>(rbp),
-                        static_cast<unsigned>(return_valid), static_cast<unsigned long long>(return_address),
-                        caller ? caller->name.c_str() : "<unmapped>",
-                        static_cast<unsigned long long>(caller ? return_address - caller->image_base : 0),
-                        static_cast<unsigned>(stack_valid_mask), stack_hex.data(), rdx_readable, rdx_hex.data());
-                });
+                    for (size_t nibble = 0; nibble < 16; ++nibble)
+                    {
+                        stack_hex[i * 17 + nibble] = valid ? digits[(word >> ((15 - nibble) * 4)) & 0xf] : '?';
+                    }
+                    stack_hex[i * 17 + 16] = i == 15 ? '\0' : ',';
+                }
+                const bool return_valid = (stack_valid_mask & 1u) != 0;
+                const auto* caller = return_valid ? this->mod_manager.find_by_address(return_address) : nullptr;
+                std::array<char, 129> rdx_hex{};
+                const auto rdx_readable = capture_guest_hex(acting, rdx, rdx_hex);
+                this->log.error("[VHALTENTRY] n=%u tid=%u vcpu=%zu rip=%#llx rcx=%#llx rdx=%#llx r8=%#llx r9=%#llx "
+                                "rsp=%#llx rbp=%#llx return_valid=%u return=%#llx return_module=%s return_rva=%#llx "
+                                "stack_valid_mask=%#x stack_qwords=%s rdx_readable=%u/64 rdx_bytes=%s\n",
+                                sample, tid, cpu.index(), static_cast<unsigned long long>(rip), static_cast<unsigned long long>(rcx),
+                                static_cast<unsigned long long>(rdx), static_cast<unsigned long long>(r8),
+                                static_cast<unsigned long long>(r9), static_cast<unsigned long long>(rsp),
+                                static_cast<unsigned long long>(rbp), static_cast<unsigned>(return_valid),
+                                static_cast<unsigned long long>(return_address), caller ? caller->name.c_str() : "<unmapped>",
+                                static_cast<unsigned long long>(caller ? return_address - caller->image_base : 0),
+                                static_cast<unsigned>(stack_valid_mask), stack_hex.data(), rdx_readable, rdx_hex.data());
+            });
         }
         const auto* ntdll = this->mod_manager.ntdll;
         const auto* win32u = this->mod_manager.win32u;
@@ -3299,9 +3374,9 @@ namespace sogen
                     {
                         if (thread.smp_visibility_mark != 0 && !this->emu().smp_op_applied(thread.smp_visibility_mark))
                         {
-                            this->log.error("GATEDIAG tid=%u mark=%llu stuck: suspended=%u terminated=%u %s\n",
-                                            thread.id, static_cast<unsigned long long>(thread.smp_visibility_mark),
-                                            thread.suspended, thread.is_terminated(), this->emu().smp_gate_debug().c_str());
+                            this->log.error("GATEDIAG tid=%u mark=%llu stuck: suspended=%u terminated=%u %s\n", thread.id,
+                                            static_cast<unsigned long long>(thread.smp_visibility_mark), thread.suspended,
+                                            thread.is_terminated(), this->emu().smp_gate_debug().c_str());
                             break;
                         }
                     }
@@ -3368,15 +3443,13 @@ namespace sogen
     {
         const kernel_lock::attribution_scope lock_site("vcpu_worker", vcpu.cpu.index());
         this->emu().set_scheduler_worker_context(vcpu.cpu.index(), true);
-        const auto clear_scheduler_worker = utils::finally([this, &vcpu] {
-            this->emu().set_scheduler_worker_context(vcpu.cpu.index(), false);
-        });
+        const auto clear_scheduler_worker =
+            utils::finally([this, &vcpu] { this->emu().set_scheduler_worker_context(vcpu.cpu.index(), false); });
         // One line per worker, only when requested. The host TID lets a bounded external
         // sampler attribute CPU use during a status stall without per-call tracing.
         if (const auto* probe = std::getenv("SOGEN_SMP_WORKER_PROBE"); probe && *probe == '1')
         {
-            std::fprintf(stderr, "[SMPWORKER] vcpu=%zu host_tid=%lu\n", vcpu.cpu.index(),
-                         static_cast<unsigned long>(GetCurrentThreadId()));
+            std::fprintf(stderr, "[SMPWORKER] vcpu=%zu host_tid=%lu\n", vcpu.cpu.index(), static_cast<unsigned long>(GetCurrentThreadId()));
         }
         std::unique_lock<kernel_lock> lock(this->kernel_lock_, std::defer_lock);
         acquire_scheduler_vm_parked(this->emu(), vcpu.cpu.index(), lock);
@@ -3494,8 +3567,7 @@ namespace sogen
         }
 
         const auto now = std::chrono::steady_clock::now();
-        if (this->activity_status_last_.time_since_epoch().count() != 0 &&
-            now - this->activity_status_last_ < std::chrono::seconds(1))
+        if (this->activity_status_last_.time_since_epoch().count() != 0 && now - this->activity_status_last_ < std::chrono::seconds(1))
         {
             return; // 1 Hz is plenty for a human-facing meter
         }
@@ -3527,9 +3599,8 @@ namespace sogen
         }
 
         std::string json{"{"};
-        const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               std::chrono::system_clock::now().time_since_epoch())
-                               .count();
+        const auto stamp =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         char buf[512];
 
         std::snprintf(buf, sizeof(buf), "\"t\":%lld,\"vcpu_count\":%zu,\"instruction_counts_available\":%s,\"total_instructions\":",
@@ -3549,9 +3620,7 @@ namespace sogen
 
             const auto* module_name = this->mod_manager.find_name(entry.rip);
             const auto instructions_delta = entry.instructions > previous ? entry.instructions - previous : 0;
-            const auto mips = elapsed_seconds > 0.0
-                                  ? static_cast<double>(instructions_delta) / (elapsed_seconds * 1000000.0)
-                                  : 0.0;
+            const auto mips = elapsed_seconds > 0.0 ? static_cast<double>(instructions_delta) / (elapsed_seconds * 1000000.0) : 0.0;
             const auto& vcpu = *this->vcpus_[i];
             const auto* owner = vcpu.active_thread;
             const auto running = vcpu.running.load(std::memory_order_relaxed);
@@ -3574,9 +3643,10 @@ namespace sogen
                 const auto* owner = vcpu.active_thread;
                 const auto running = vcpu.running.load(std::memory_order_relaxed);
                 std::snprintf(buf, sizeof(buf),
-                              "%s{\"i\":%zu,\"rip\":null,\"module\":null,\"instructions\":null,\"mips\":null,\"active\":%s,\"tid\":%u,\"running\":%s,\"idle\":%s}",
-                              i == 0 ? "" : ",", i, owner ? "true" : "false", owner ? owner->id : 0,
-                              running ? "true" : "false", !running && !owner ? "true" : "false");
+                              "%s{\"i\":%zu,\"rip\":null,\"module\":null,\"instructions\":null,\"mips\":null,\"active\":%s,\"tid\":%u,"
+                              "\"running\":%s,\"idle\":%s}",
+                              i == 0 ? "" : ",", i, owner ? "true" : "false", owner ? owner->id : 0, running ? "true" : "false",
+                              !running && !owner ? "true" : "false");
                 json += buf;
             }
         }
@@ -3622,8 +3692,7 @@ namespace sogen
         if (this->cmapi_interface_profile.enabled())
         {
             const auto profile = this->cmapi_interface_profile.read();
-            json += ",\"cmapi_interface_profile\":{\"guid_capacity\":" +
-                    std::to_string(cm_api_interface_profile::guid_capacity);
+            json += ",\"cmapi_interface_profile\":{\"guid_capacity\":" + std::to_string(cm_api_interface_profile::guid_capacity);
             json += ",\"tracked_unique_guids\":" + std::to_string(profile.tracked_unique_guids);
             json += ",\"untracked_guid_calls\":" + std::to_string(profile.untracked_guid_calls);
             json += ",\"untracked_guid_nanos\":" + std::to_string(profile.untracked_guid_nanos);
@@ -3639,25 +3708,22 @@ namespace sogen
             }
             json += "},\"top_guids\":[";
             std::array<size_t, cm_api_interface_profile::guid_capacity> by_cost{};
-            for (size_t i = 0; i < profile.tracked_unique_guids; ++i) by_cost[i] = i;
+            for (size_t i = 0; i < profile.tracked_unique_guids; ++i)
+            {
+                by_cost[i] = i;
+            }
             std::sort(by_cost.begin(), by_cost.begin() + profile.tracked_unique_guids,
-                [&](size_t left, size_t right)
-                {
-                    return profile.by_guid[left].timing.nanos > profile.by_guid[right].timing.nanos;
-                });
+                      [&](size_t left, size_t right) { return profile.by_guid[left].timing.nanos > profile.by_guid[right].timing.nanos; });
             const auto top_count = std::min<size_t>(profile.tracked_unique_guids, 4);
             for (size_t rank = 0; rank < top_count; ++rank)
             {
                 const auto& entry = profile.by_guid[by_cost[rank]];
                 const auto& g = entry.guid;
                 char guid_text[37];
-                std::snprintf(guid_text, sizeof(guid_text),
-                    "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
-                    g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6],
-                    g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+                std::snprintf(guid_text, sizeof(guid_text), "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X", g[3],
+                              g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
                 json += rank == 0 ? "" : ",";
-                json += "{\"guid\":\"" + std::string(guid_text) + "\",\"calls\":" +
-                        std::to_string(entry.timing.calls);
+                json += "{\"guid\":\"" + std::string(guid_text) + "\",\"calls\":" + std::to_string(entry.timing.calls);
                 json += ",\"nanos\":" + std::to_string(entry.timing.nanos);
                 json += ",\"max_nanos\":" + std::to_string(entry.timing.max_nanos);
                 json += ",\"all_registered_calls\":" + std::to_string(entry.calls_by_flags[0]);
@@ -3667,8 +3733,7 @@ namespace sogen
             json += "]}";
         }
 
-        if (const char* probe = std::getenv("SOGEN_DAWN_CALLBACK_PROBE");
-            probe && std::strcmp(probe, "1") == 0)
+        if (const char* probe = std::getenv("SOGEN_DAWN_CALLBACK_PROBE"); probe && std::strcmp(probe, "1") == 0)
         {
             const auto calls = this->dawn_callback_probe_calls_.load(std::memory_order_relaxed);
             const auto last_tick = this->dawn_callback_probe_last_tick_ms_.load(std::memory_order_relaxed);
@@ -3757,11 +3822,14 @@ namespace sogen
                 // Peer aliasing runs during queue drain, outside the issuer's map timer.
                 // The maximum is cumulative; the other peer-map fields are 1 Hz deltas.
                 json += ",\"invalidate_queued\":" + std::to_string(delta(current.invalidate_queued, previous.invalidate_queued));
-                json += ",\"invalidate_queue_nanos\":" + std::to_string(delta(current.invalidate_queue_nanos, previous.invalidate_queue_nanos));
+                json +=
+                    ",\"invalidate_queue_nanos\":" + std::to_string(delta(current.invalidate_queue_nanos, previous.invalidate_queue_nanos));
                 json += ",\"invalidate_applied\":" + std::to_string(delta(current.invalidate_applied, previous.invalidate_applied));
                 json += ",\"invalidate_no_change\":" + std::to_string(delta(current.invalidate_no_change, previous.invalidate_no_change));
-                json += ",\"invalidate_apply_nanos\":" + std::to_string(delta(current.invalidate_apply_nanos, previous.invalidate_apply_nanos));
-                json += ",\"invalidate_adjacent_same_pages\":" + std::to_string(delta(current.invalidate_adjacent_same_pages, previous.invalidate_adjacent_same_pages));
+                json +=
+                    ",\"invalidate_apply_nanos\":" + std::to_string(delta(current.invalidate_apply_nanos, previous.invalidate_apply_nanos));
+                json += ",\"invalidate_adjacent_same_pages\":" +
+                        std::to_string(delta(current.invalidate_adjacent_same_pages, previous.invalidate_adjacent_same_pages));
                 json += ",\"peer_map_calls\":" + std::to_string(delta(current.peer_map_calls, previous.peer_map_calls));
                 json += ",\"peer_map_pages\":" + std::to_string(delta(current.peer_map_pages, previous.peer_map_pages));
                 json += ",\"peer_map_nanos\":" + std::to_string(delta(current.peer_map_nanos, previous.peer_map_nanos));
@@ -3802,9 +3870,7 @@ namespace sogen
             {
                 this->activity_status_prev_jit_profile_ = jit_profile;
             }
-            const auto delta = [](uint64_t current, uint64_t previous) {
-                return current >= previous ? current - previous : uint64_t{0};
-            };
+            const auto delta = [](uint64_t current, uint64_t previous) { return current >= previous ? current - previous : uint64_t{0}; };
             json += ",\"jit_profile\":{\"window_seconds\":" + std::to_string(elapsed_seconds) + ",\"vcpus\":[";
             for (size_t i = 0; i < jit_profile.size(); ++i)
             {
@@ -3814,8 +3880,7 @@ namespace sogen
                               "%s{\"i\":%zu,\"compile_calls\":%llu,\"compile_nanos\":%llu,\"reset_calls\":%llu,"
                               "\"recompile_calls\":%llu,\"recompile_nanos\":%llu,"
                               "\"recompile_compile_calls\":%llu,\"recompile_compile_nanos\":%llu,",
-                              i == 0 ? "" : ",", i,
-                              static_cast<unsigned long long>(delta(current.compile_calls, previous.compile_calls)),
+                              i == 0 ? "" : ",", i, static_cast<unsigned long long>(delta(current.compile_calls, previous.compile_calls)),
                               static_cast<unsigned long long>(delta(current.compile_nanos, previous.compile_nanos)),
                               static_cast<unsigned long long>(delta(current.reset_calls, previous.reset_calls)),
                               static_cast<unsigned long long>(delta(current.recompile_calls, previous.recompile_calls)),
@@ -3836,16 +3901,20 @@ namespace sogen
                               static_cast<unsigned long long>(delta(current.flush_code_nanos, previous.flush_code_nanos)),
                               static_cast<unsigned long long>(delta(current.jit_reset_nanos, previous.jit_reset_nanos)));
                 json += buf;
-                std::snprintf(buf, sizeof(buf),
-                              "\"origin_first_address_compiles\":%llu,\"origin_repeat_after_reset_compiles\":%llu,"
-                              "\"origin_repeat_in_generation_compiles\":%llu,\"origin_periodic_recompile_compiles\":%llu,"
-                              "\"origin_unclassified_compiles\":%llu,\"origin_generation_number\":%llu}",
-                              static_cast<unsigned long long>(delta(current.origin_first_address_compiles, previous.origin_first_address_compiles)),
-                              static_cast<unsigned long long>(delta(current.origin_repeat_after_reset_compiles, previous.origin_repeat_after_reset_compiles)),
-                              static_cast<unsigned long long>(delta(current.origin_repeat_in_generation_compiles, previous.origin_repeat_in_generation_compiles)),
-                              static_cast<unsigned long long>(delta(current.origin_periodic_recompile_compiles, previous.origin_periodic_recompile_compiles)),
-                              static_cast<unsigned long long>(delta(current.origin_unclassified_compiles, previous.origin_unclassified_compiles)),
-                              static_cast<unsigned long long>(current.origin_generation_number));
+                std::snprintf(
+                    buf, sizeof(buf),
+                    "\"origin_first_address_compiles\":%llu,\"origin_repeat_after_reset_compiles\":%llu,"
+                    "\"origin_repeat_in_generation_compiles\":%llu,\"origin_periodic_recompile_compiles\":%llu,"
+                    "\"origin_unclassified_compiles\":%llu,\"origin_generation_number\":%llu}",
+                    static_cast<unsigned long long>(delta(current.origin_first_address_compiles, previous.origin_first_address_compiles)),
+                    static_cast<unsigned long long>(
+                        delta(current.origin_repeat_after_reset_compiles, previous.origin_repeat_after_reset_compiles)),
+                    static_cast<unsigned long long>(
+                        delta(current.origin_repeat_in_generation_compiles, previous.origin_repeat_in_generation_compiles)),
+                    static_cast<unsigned long long>(
+                        delta(current.origin_periodic_recompile_compiles, previous.origin_periodic_recompile_compiles)),
+                    static_cast<unsigned long long>(delta(current.origin_unclassified_compiles, previous.origin_unclassified_compiles)),
+                    static_cast<unsigned long long>(current.origin_generation_number));
                 json += buf;
             }
             json += "]}";
@@ -4169,6 +4238,7 @@ namespace sogen
             size_t foreign_next{0};
             bool foreign_full{false};
         };
+
         std::mutex leandiag_trail_mutex{};
         std::unordered_map<uint32_t, leandiag_block_trail> leandiag_trails{};
     } // namespace
@@ -4275,8 +4345,8 @@ namespace sogen
                 if (full && windows_emulator::leandiag_thread_is_young(tid))
                 {
                     const auto* owner = this->mod_manager.find_name(block.address);
-                    this->log.error("FULLTRACE tid=%u block=%llX (%s)\n", tid,
-                                    (unsigned long long)block.address, owner ? owner : "no module");
+                    this->log.error("FULLTRACE tid=%u block=%llX (%s)\n", tid, (unsigned long long)block.address,
+                                    owner ? owner : "no module");
                 }
             });
         }
@@ -4453,8 +4523,7 @@ namespace sogen
 
         // Opt-in exact-export observation of Dawn's callback-driven BAP pump.
         // WHP traps the containing code page, so leave this disabled by default.
-        if (const char* probe = std::getenv("SOGEN_DAWN_CALLBACK_PROBE");
-            probe && std::strcmp(probe, "1") == 0)
+        if (const char* probe = std::getenv("SOGEN_DAWN_CALLBACK_PROBE"); probe && std::strcmp(probe, "1") == 0)
         {
             auto hooks = std::make_shared<std::unordered_map<uint64_t, emulator_hook*>>();
             this->callbacks.on_module_load.add([this, hooks](mapped_module& mod) {
@@ -4467,43 +4536,34 @@ namespace sogen
                 constexpr uint64_t dispatcher_rva = 0x33EEF0;
                 constexpr uint64_t service_rva = 0x3AB9A0;
                 constexpr std::array<uint8_t, 5> callback_bytes{0xE9, 0x9B, 0xCB, 0x33, 0x00};
-                constexpr std::array<uint8_t, 16> dispatcher_bytes{
-                    0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41,
-                    0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0xAC};
-                constexpr std::array<uint8_t, 16> service_bytes{
-                    0x40, 0x55, 0x57, 0x48, 0x8D, 0xAC, 0x24, 0x38,
-                    0xF8, 0xFF, 0xFF, 0x48, 0x81, 0xEC, 0xC8, 0x08};
+                constexpr std::array<uint8_t, 16> dispatcher_bytes{0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41,
+                                                                   0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0xAC};
+                constexpr std::array<uint8_t, 16> service_bytes{0x40, 0x55, 0x57, 0x48, 0x8D, 0xAC, 0x24, 0x38,
+                                                                0xF8, 0xFF, 0xFF, 0x48, 0x81, 0xEC, 0xC8, 0x08};
                 std::array<uint8_t, callback_bytes.size()> actual_callback{};
                 std::array<uint8_t, dispatcher_bytes.size()> actual_dispatcher{};
                 std::array<uint8_t, service_bytes.size()> actual_service{};
-                const bool match = mod.size_of_image == image_size &&
-                    mod.find_export("SteamAPI_RunCallbacks") == mod.image_base + callback_rva &&
-                    this->emu().try_read_memory(mod.image_base + callback_rva,
-                                                actual_callback.data(), actual_callback.size()) &&
-                    this->emu().try_read_memory(mod.image_base + dispatcher_rva,
-                                                actual_dispatcher.data(), actual_dispatcher.size()) &&
-                    this->emu().try_read_memory(mod.image_base + service_rva,
-                                                actual_service.data(), actual_service.size()) &&
-                    actual_callback == callback_bytes && actual_dispatcher == dispatcher_bytes &&
-                    actual_service == service_bytes;
+                const bool match =
+                    mod.size_of_image == image_size && mod.find_export("SteamAPI_RunCallbacks") == mod.image_base + callback_rva &&
+                    this->emu().try_read_memory(mod.image_base + callback_rva, actual_callback.data(), actual_callback.size()) &&
+                    this->emu().try_read_memory(mod.image_base + dispatcher_rva, actual_dispatcher.data(), actual_dispatcher.size()) &&
+                    this->emu().try_read_memory(mod.image_base + service_rva, actual_service.data(), actual_service.size()) &&
+                    actual_callback == callback_bytes && actual_dispatcher == dispatcher_bytes && actual_service == service_bytes;
                 if (!match)
                 {
-                    this->log.warn("[DAWNCALLBACKPROBE] skipped module=%s image_size=%#llx export=%#llx\n",
-                                   mod.name.c_str(), static_cast<unsigned long long>(mod.size_of_image),
+                    this->log.warn("[DAWNCALLBACKPROBE] skipped module=%s image_size=%#llx export=%#llx\n", mod.name.c_str(),
+                                   static_cast<unsigned long long>(mod.size_of_image),
                                    static_cast<unsigned long long>(mod.find_export("SteamAPI_RunCallbacks")));
                     return;
                 }
-                auto* hook = this->emu().hook_memory_execution(
-                    mod.image_base + callback_rva,
-                    [this](cpu_interface&, uint64_t) {
-                        this->dawn_callback_probe_calls_.fetch_add(1, std::memory_order_relaxed);
-                        this->dawn_callback_probe_last_tick_ms_.store(
-                            static_cast<uint64_t>(GetTickCount64()), std::memory_order_relaxed);
-                    });
+                auto* hook = this->emu().hook_memory_execution(mod.image_base + callback_rva, [this](cpu_interface&, uint64_t) {
+                    this->dawn_callback_probe_calls_.fetch_add(1, std::memory_order_relaxed);
+                    this->dawn_callback_probe_last_tick_ms_.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_relaxed);
+                });
                 hooks->emplace(mod.image_base, hook);
                 this->dawn_callback_probe_installed_.store(true, std::memory_order_relaxed);
-                this->log.info("[DAWNCALLBACKPROBE] installed module=%s rva=%#llx\n",
-                               mod.name.c_str(), static_cast<unsigned long long>(callback_rva));
+                this->log.info("[DAWNCALLBACKPROBE] installed module=%s rva=%#llx\n", mod.name.c_str(),
+                               static_cast<unsigned long long>(callback_rva));
             });
             this->callbacks.on_module_unload.add([this, hooks](mapped_module& mod) {
                 if (auto entry = hooks->extract(mod.image_base); entry)
@@ -4531,31 +4591,23 @@ namespace sogen
                 *attempted = true;
                 constexpr uint64_t expected_image_size = 0x1ABEB000;
                 constexpr uint64_t entry_rva = 0x2260;
-                constexpr std::array<uint8_t, 18> expected_entry{
-                    0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0x48, 0x8B, 0x1D,
-                    0x83, 0xC3, 0x49, 0x12, 0xE8, 0x4E, 0xF4, 0x05, 0x00};
+                constexpr std::array<uint8_t, 18> expected_entry{0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0x48, 0x8B, 0x1D,
+                                                                 0x83, 0xC3, 0x49, 0x12, 0xE8, 0x4E, 0xF4, 0x05, 0x00};
                 constexpr std::array<uint64_t, 30> site_rvas{
-                    entry_rva, 0x2295, 0x22BD, 0x22D3, 0x2303, 0x2348,
-                    0x180850, 0x180959, 0x1809BD, 0x180A09, 0x180A7D, 0x180AC4,
-                    0x199290, 0x199302, 0x19931A, 0x19935F, 0x19939E,
-                    0x19937E, 0x19938A, 0x1993A4, 0x199390, 0x1993BE,
-                    0x199100, 0x199148, 0x1991C8, 0x1991DA,
-                    0x1991ED, 0x199248, 0x199267, 0x199270};
-                constexpr std::array<std::array<uint8_t, 2>, 30> expected_sites{{
-                    {{0x40, 0x53}}, {{0x74, 0x6C}}, {{0x74, 0x37}}, {{0x75, 0x36}},
-                    {{0x32, 0xC0}}, {{0xB0, 0x01}}, {{0x48, 0x89}}, {{0x0F, 0x84}},
-                    {{0x74, 0x6B}}, {{0x74, 0x1F}}, {{0x48, 0x8D}}, {{0xC3, 0xCC}},
-                    {{0x48, 0x89}}, {{0x0F, 0x85}}, {{0x0F, 0x85}}, {{0x74, 0x31}},
-                    {{0x85, 0xC0}}, {{0x85, 0xC0}}, {{0x84, 0xC0}}, {{0xE8, 0x87}},
-                    {{0xEB, 0x2E}}, {{0x32, 0xC0}}, {{0x48, 0x83}}, {{0x85, 0xDB}},
-                    {{0x48, 0x85}}, {{0x83, 0xF8}}, {{0x85, 0xC0}}, {{0x83, 0xF8}},
-                    {{0xB0, 0x01}}, {{0x32, 0xC0}}}};
-                const bool range_valid = mod.image_base <= UINT64_MAX - 0x1993BE &&
-                                         mod.size_of_image == expected_image_size &&
+                    entry_rva, 0x2295,   0x22BD,   0x22D3,   0x2303,   0x2348,   0x180850, 0x180959, 0x1809BD, 0x180A09,
+                    0x180A7D,  0x180AC4, 0x199290, 0x199302, 0x19931A, 0x19935F, 0x19939E, 0x19937E, 0x19938A, 0x1993A4,
+                    0x199390,  0x1993BE, 0x199100, 0x199148, 0x1991C8, 0x1991DA, 0x1991ED, 0x199248, 0x199267, 0x199270};
+                constexpr std::array<std::array<uint8_t, 2>, 30> expected_sites{
+                    {{{0x40, 0x53}}, {{0x74, 0x6C}}, {{0x74, 0x37}}, {{0x75, 0x36}}, {{0x32, 0xC0}}, {{0xB0, 0x01}},
+                     {{0x48, 0x89}}, {{0x0F, 0x84}}, {{0x74, 0x6B}}, {{0x74, 0x1F}}, {{0x48, 0x8D}}, {{0xC3, 0xCC}},
+                     {{0x48, 0x89}}, {{0x0F, 0x85}}, {{0x0F, 0x85}}, {{0x74, 0x31}}, {{0x85, 0xC0}}, {{0x85, 0xC0}},
+                     {{0x84, 0xC0}}, {{0xE8, 0x87}}, {{0xEB, 0x2E}}, {{0x32, 0xC0}}, {{0x48, 0x83}}, {{0x85, 0xDB}},
+                     {{0x48, 0x85}}, {{0x83, 0xF8}}, {{0x85, 0xC0}}, {{0x83, 0xF8}}, {{0xB0, 0x01}}, {{0x32, 0xC0}}}};
+                const bool range_valid = mod.image_base <= UINT64_MAX - 0x1993BE && mod.size_of_image == expected_image_size &&
                                          mod.find_export("SteamAPI_Init") == mod.image_base + entry_rva;
                 std::array<uint8_t, expected_entry.size()> actual_entry{};
-                const bool entry_read = range_valid &&
-                    this->emu().try_read_memory(mod.image_base + entry_rva, actual_entry.data(), actual_entry.size());
+                const bool entry_read =
+                    range_valid && this->emu().try_read_memory(mod.image_base + entry_rva, actual_entry.data(), actual_entry.size());
                 const bool entry_match = entry_read && actual_entry == expected_entry;
                 size_t first_bad_site = site_rvas.size();
                 bool bad_site_read = false;
@@ -4565,8 +4617,7 @@ namespace sogen
                     for (size_t site = 0; site < site_rvas.size(); ++site)
                     {
                         std::array<uint8_t, 2> actual{};
-                        const bool read = this->emu().try_read_memory(
-                            mod.image_base + site_rvas[site], actual.data(), actual.size());
+                        const bool read = this->emu().try_read_memory(mod.image_base + site_rvas[site], actual.data(), actual.size());
                         if (!read || actual != expected_sites[site])
                         {
                             first_bad_site = site;
@@ -4578,18 +4629,16 @@ namespace sogen
                 }
                 if (!entry_match || first_bad_site != site_rvas.size())
                 {
-                    this->log.error(
-                        "[STEAMINITPROBE] skipped module=%s base=%#llx image_size=%#llx expected_size=%#llx "
-                        "export=%#llx entry_read=%u entry_match=%u bad_site_rva=%#llx "
-                        "bad_site_read=%u bad_site_bytes=%02x%02x\n",
-                        mod.name.c_str(), static_cast<unsigned long long>(mod.image_base),
-                        static_cast<unsigned long long>(mod.size_of_image),
-                        static_cast<unsigned long long>(expected_image_size),
-                        static_cast<unsigned long long>(mod.find_export("SteamAPI_Init")),
-                        static_cast<unsigned>(entry_read), static_cast<unsigned>(entry_match),
-                        static_cast<unsigned long long>(
-                            first_bad_site < site_rvas.size() ? site_rvas[first_bad_site] : 0),
-                        static_cast<unsigned>(bad_site_read), bad_site_bytes[0], bad_site_bytes[1]);
+                    this->log.error("[STEAMINITPROBE] skipped module=%s base=%#llx image_size=%#llx expected_size=%#llx "
+                                    "export=%#llx entry_read=%u entry_match=%u bad_site_rva=%#llx "
+                                    "bad_site_read=%u bad_site_bytes=%02x%02x\n",
+                                    mod.name.c_str(), static_cast<unsigned long long>(mod.image_base),
+                                    static_cast<unsigned long long>(mod.size_of_image),
+                                    static_cast<unsigned long long>(expected_image_size),
+                                    static_cast<unsigned long long>(mod.find_export("SteamAPI_Init")), static_cast<unsigned>(entry_read),
+                                    static_cast<unsigned>(entry_match),
+                                    static_cast<unsigned long long>(first_bad_site < site_rvas.size() ? site_rvas[first_bad_site] : 0),
+                                    static_cast<unsigned>(bad_site_read), bad_site_bytes[0], bad_site_bytes[1]);
                     return;
                 }
 
@@ -4607,16 +4656,27 @@ namespace sogen
                             bool condition_failed = false;
                             switch (site)
                             {
-                            case 22: condition_failed = rax == UINT64_MAX; break; // INVALID_HANDLE_VALUE
-                            case 23: condition_failed = static_cast<uint32_t>(rbx) == 0; break; // Thread32First
-                            case 24: condition_failed = rax == 0; break; // OpenThread
-                            case 25: condition_failed = static_cast<uint32_t>(rax) != 0x57; break; // ERROR_INVALID_PARAMETER
-                            case 26: condition_failed = static_cast<uint32_t>(rax) != 0; break; // DetourUpdateThread
-                            case 27: condition_failed = static_cast<uint32_t>(rax) != 0x12; break; // ERROR_NO_MORE_FILES
+                            case 22:
+                                condition_failed = rax == UINT64_MAX;
+                                break; // INVALID_HANDLE_VALUE
+                            case 23:
+                                condition_failed = static_cast<uint32_t>(rbx) == 0;
+                                break; // Thread32First
+                            case 24:
+                                condition_failed = rax == 0;
+                                break; // OpenThread
+                            case 25:
+                                condition_failed = static_cast<uint32_t>(rax) != 0x57;
+                                break; // ERROR_INVALID_PARAMETER
+                            case 26:
+                                condition_failed = static_cast<uint32_t>(rax) != 0;
+                                break; // DetourUpdateThread
+                            case 27:
+                                condition_failed = static_cast<uint32_t>(rax) != 0x12;
+                                break; // ERROR_NO_MORE_FILES
                             }
                             // Repeated calls retain the first success and first failure only.
-                            auto& observed = site >= 22 && site <= 27 && condition_failed ?
-                                (*failed_seen)[site] : (*seen)[site];
+                            auto& observed = site >= 22 && site <= 27 && condition_failed ? (*failed_seen)[site] : (*seen)[site];
                             const uint8_t limit = site == 7 ? 3 : 1;
                             if (observed >= limit)
                             {
@@ -4634,42 +4694,58 @@ namespace sogen
                             const bool stack0_valid = acting.try_read_memory(rsp, &stack0, sizeof(stack0));
                             // Deployed Dawn frame sizes: begin reserves 0x3030 bytes;
                             // enlist_snapshot saves eight registers and reserves 0x58 bytes.
-                            const uint64_t return_offset = site == 0 || site == 6 || site == 11 || site == 12 ?
-                                0 : site < 6 ? 0x38 : site < 12 ? 0x268 : site < 22 ? 0x3038 : 0x98;
+                            const uint64_t return_offset = site == 0 || site == 6 || site == 11 || site == 12 ? 0
+                                                           : site < 6                                         ? 0x38
+                                                           : site < 12                                        ? 0x268
+                                                           : site < 22                                        ? 0x3038
+                                                                                                              : 0x98;
                             const bool return_slot_valid = rsp <= UINT64_MAX - return_offset;
                             const auto return_slot = return_slot_valid ? rsp + return_offset : 0;
                             uint64_t return_address = 0;
-                            const bool return_valid = return_slot_valid &&
-                                acting.try_read_memory(return_slot, &return_address, sizeof(return_address));
+                            const bool return_valid =
+                                return_slot_valid && acting.try_read_memory(return_slot, &return_address, sizeof(return_address));
                             const auto* caller = return_valid ? this->mod_manager.find_by_address(return_address) : nullptr;
-                            constexpr std::array<const char*, 30> names{
-                                "entry", "egress_result", "core_result", "package_trust_result",
-                                "return_false", "return_true", "egress_entry", "loader_result",
-                                "export_resolution_result", "detours_result", "egress_failure_cleanup", "egress_return",
-                                "begin_entry", "owner_global_check", "owner_cmpxchg",
-                                "trampoline_protect_result", "trampoline_get_last_error",
-                                "update_current_thread_result", "thread_enlist_result",
-                                "begin_abort", "begin_success_branch", "begin_false",
-                                "snapshot_result", "thread_first_result", "open_thread_result",
-                                "open_thread_last_error", "update_other_thread_result",
-                                "thread_next_last_error", "enlist_success", "enlist_failure"};
-                            this->log.error(
-                                "[STEAMINITPROBE] site=%s n=%u tid=%u vcpu=%zu rip=%#llx rva=%#llx "
-                                "rax=%#llx rcx=%#llx rdi=%#llx eflags=%#x zf=%u rsp=%#llx stack0_valid=%u stack0=%#llx "
-                                "return_valid=%u return=%#llx return_module=%s return_rva=%#llx\n",
-                                names[site], static_cast<unsigned>(hit), tid, cpu.index(),
-                                static_cast<unsigned long long>(rip),
-                                static_cast<unsigned long long>(rip - base),
-                                static_cast<unsigned long long>(rax), static_cast<unsigned long long>(rcx),
-                                static_cast<unsigned long long>(rdi), eflags,
-                                static_cast<unsigned>((eflags & 0x40u) != 0),
-                                static_cast<unsigned long long>(rsp),
-                                static_cast<unsigned>(stack0_valid),
-                                static_cast<unsigned long long>(stack0),
-                                static_cast<unsigned>(return_valid),
-                                static_cast<unsigned long long>(return_address),
-                                caller ? caller->name.c_str() : "<unmapped>",
-                                static_cast<unsigned long long>(caller ? return_address - caller->image_base : 0));
+                            constexpr std::array<const char*, 30> names{"entry",
+                                                                        "egress_result",
+                                                                        "core_result",
+                                                                        "package_trust_result",
+                                                                        "return_false",
+                                                                        "return_true",
+                                                                        "egress_entry",
+                                                                        "loader_result",
+                                                                        "export_resolution_result",
+                                                                        "detours_result",
+                                                                        "egress_failure_cleanup",
+                                                                        "egress_return",
+                                                                        "begin_entry",
+                                                                        "owner_global_check",
+                                                                        "owner_cmpxchg",
+                                                                        "trampoline_protect_result",
+                                                                        "trampoline_get_last_error",
+                                                                        "update_current_thread_result",
+                                                                        "thread_enlist_result",
+                                                                        "begin_abort",
+                                                                        "begin_success_branch",
+                                                                        "begin_false",
+                                                                        "snapshot_result",
+                                                                        "thread_first_result",
+                                                                        "open_thread_result",
+                                                                        "open_thread_last_error",
+                                                                        "update_other_thread_result",
+                                                                        "thread_next_last_error",
+                                                                        "enlist_success",
+                                                                        "enlist_failure"};
+                            this->log.error("[STEAMINITPROBE] site=%s n=%u tid=%u vcpu=%zu rip=%#llx rva=%#llx "
+                                            "rax=%#llx rcx=%#llx rdi=%#llx eflags=%#x zf=%u rsp=%#llx stack0_valid=%u stack0=%#llx "
+                                            "return_valid=%u return=%#llx return_module=%s return_rva=%#llx\n",
+                                            names[site], static_cast<unsigned>(hit), tid, cpu.index(), static_cast<unsigned long long>(rip),
+                                            static_cast<unsigned long long>(rip - base), static_cast<unsigned long long>(rax),
+                                            static_cast<unsigned long long>(rcx), static_cast<unsigned long long>(rdi), eflags,
+                                            static_cast<unsigned>((eflags & 0x40u) != 0), static_cast<unsigned long long>(rsp),
+                                            static_cast<unsigned>(stack0_valid), static_cast<unsigned long long>(stack0),
+                                            static_cast<unsigned>(return_valid), static_cast<unsigned long long>(return_address),
+                                            caller ? caller->name.c_str() : "<unmapped>",
+                                            static_cast<unsigned long long>(caller ? return_address - caller->image_base : 0));
                             if (site >= 22)
                             {
                                 if (site == 22)
@@ -4677,28 +4753,23 @@ namespace sogen
                                     const auto gs_base = acting.get_segment_base(x86_register::gs);
                                     uint32_t last_error = 0;
                                     const bool last_error_read = gs_base <= UINT64_MAX - 0x68 &&
-                                        acting.try_read_memory(gs_base + 0x68, &last_error, sizeof(last_error));
-                                    this->log.error(
-                                        "[STEAMINITPROBE] snapshot_last_error tid=%u vcpu=%zu "
-                                        "teb=%#llx valid=%u value=%#x\n",
-                                        tid, cpu.index(), static_cast<unsigned long long>(gs_base),
-                                        static_cast<unsigned>(last_error_read), last_error);
+                                                                 acting.try_read_memory(gs_base + 0x68, &last_error, sizeof(last_error));
+                                    this->log.error("[STEAMINITPROBE] snapshot_last_error tid=%u vcpu=%zu "
+                                                    "teb=%#llx valid=%u value=%#x\n",
+                                                    tid, cpu.index(), static_cast<unsigned long long>(gs_base),
+                                                    static_cast<unsigned>(last_error_read), last_error);
                                 }
                                 // ThreadEntry32 fields in the deployed enlist_snapshot stack frame.
                                 uint32_t target_tid = 0;
                                 uint32_t owner_pid = 0;
-                                const bool target_valid = site >= 24 && site <= 26 &&
-                                    rsp <= UINT64_MAX - 0x30 &&
-                                    acting.try_read_memory(rsp + 0x28, &target_tid, sizeof(target_tid)) &&
-                                    acting.try_read_memory(rsp + 0x2C, &owner_pid, sizeof(owner_pid));
-                                this->log.error(
-                                    "[STEAMINITPROBE] enlist_detail site=%s failure=%u rbx=%#llx "
-                                    "current_tid=%#llx current_pid=%#llx target_valid=%u target_tid=%u owner_pid=%u\n",
-                                    names[site], static_cast<unsigned>(condition_failed),
-                                    static_cast<unsigned long long>(rbx),
-                                    static_cast<unsigned long long>(r12),
-                                    static_cast<unsigned long long>(r15),
-                                    static_cast<unsigned>(target_valid), target_tid, owner_pid);
+                                const bool target_valid = site >= 24 && site <= 26 && rsp <= UINT64_MAX - 0x30 &&
+                                                          acting.try_read_memory(rsp + 0x28, &target_tid, sizeof(target_tid)) &&
+                                                          acting.try_read_memory(rsp + 0x2C, &owner_pid, sizeof(owner_pid));
+                                this->log.error("[STEAMINITPROBE] enlist_detail site=%s failure=%u rbx=%#llx "
+                                                "current_tid=%#llx current_pid=%#llx target_valid=%u target_tid=%u owner_pid=%u\n",
+                                                names[site], static_cast<unsigned>(condition_failed), static_cast<unsigned long long>(rbx),
+                                                static_cast<unsigned long long>(r12), static_cast<unsigned long long>(r15),
+                                                static_cast<unsigned>(target_valid), target_tid, owner_pid);
                             }
                             if (site == 9)
                             {
@@ -4707,15 +4778,13 @@ namespace sogen
                                 std::array<uint8_t, 24> failure{};
                                 const bool address_valid = rsp <= UINT64_MAX - 0x30;
                                 const auto address = address_valid ? rsp + 0x30 : 0;
-                                const bool readable = address_valid &&
-                                    acting.try_read_memory(address, failure.data(), failure.size());
+                                const bool readable = address_valid && acting.try_read_memory(address, failure.data(), failure.size());
                                 std::array<char, 3 * failure.size() + 1> bytes{};
                                 if (readable)
                                 {
                                     for (size_t i = 0; i < failure.size(); ++i)
                                     {
-                                        std::snprintf(bytes.data() + i * 3, 4, "%02X%s", failure[i],
-                                                      i + 1 == failure.size() ? "" : " ");
+                                        std::snprintf(bytes.data() + i * 3, 4, "%02X%s", failure[i], i + 1 == failure.size() ? "" : " ");
                                     }
                                 }
                                 uint32_t phase = 0;
@@ -4727,20 +4796,18 @@ namespace sogen
                                     std::memcpy(&index, failure.data() + 8, sizeof(index));
                                     std::memcpy(&error, failure.data() + 0x10, sizeof(error));
                                 }
-                                this->log.error(
-                                    "[STEAMINITPROBE] detours_status tid=%u vcpu=%zu address=%#llx valid=%u "
-                                    "phase=%u index=%#llx error=%#x attach_failed=%u bytes=%s\n",
-                                    tid, cpu.index(), static_cast<unsigned long long>(address),
-                                    static_cast<unsigned>(readable), phase,
-                                    static_cast<unsigned long long>(index), error,
-                                    readable ? static_cast<unsigned>(failure[0x14]) : 0,
-                                    readable ? bytes.data() : "<unreadable>");
+                                this->log.error("[STEAMINITPROBE] detours_status tid=%u vcpu=%zu address=%#llx valid=%u "
+                                                "phase=%u index=%#llx error=%#x attach_failed=%u bytes=%s\n",
+                                                tid, cpu.index(), static_cast<unsigned long long>(address), static_cast<unsigned>(readable),
+                                                phase, static_cast<unsigned long long>(index), error,
+                                                readable ? static_cast<unsigned>(failure[0x14]) : 0,
+                                                readable ? bytes.data() : "<unreadable>");
                             }
                         });
                 }
                 hooks->emplace(base, installed);
-                this->log.error("[STEAMINITPROBE] installed module=%s base=%#llx sites=%zu\n",
-                                mod.name.c_str(), static_cast<unsigned long long>(base),
+                this->log.error("[STEAMINITPROBE] installed module=%s base=%#llx sites=%zu\n", mod.name.c_str(),
+                                static_cast<unsigned long long>(base),
                                 static_cast<size_t>(std::ranges::count_if(installed, [](const auto* hook) { return hook != nullptr; })));
             });
             this->callbacks.on_module_unload.add([this, hooks](mapped_module& mod) {
@@ -4759,58 +4826,51 @@ namespace sogen
             // at these three sites. This opt-in trace keeps only eight hits per site.
             // Image size and bytes identify the authorized guest kernel32 build.
             auto snapshot_status_seen = std::make_shared<std::array<uint8_t, 3>>();
-            auto snapshot_status_hooks =
-                std::make_shared<std::unordered_map<uint64_t, std::array<emulator_hook*, 3>>>();
-            this->callbacks.on_module_load.add(
-                [this, snapshot_status_seen, snapshot_status_hooks](mapped_module& mod) {
-                    if (mod.name != "kernel32.dll")
-                    {
-                        return;
-                    }
-                    constexpr uint64_t expected_size = 0xC2000;
-                    constexpr std::array<uint64_t, 3> rvas{0x1E118, 0x1D583, 0x1D5D4};
-                    constexpr std::array<uint8_t, 5> expected{0x0F, 0x1F, 0x44, 0x00, 0x00};
-                    bool match = mod.size_of_image == expected_size;
-                    for (const auto rva : rvas)
-                    {
-                        std::array<uint8_t, 5> actual{};
-                        match = match && this->emu().try_read_memory(
-                            mod.image_base + rva, actual.data(), actual.size()) && actual == expected;
-                    }
-                    if (!match)
-                    {
-                        this->log.error("[STEAMINITPROBE] kernel32 snapshot status probe skipped image_size=%#llx\n",
-                                        static_cast<unsigned long long>(mod.size_of_image));
-                        return;
-                    }
-                    constexpr std::array<const char*, 3> names{
-                        "NtQuerySystemInformation", "NtCreateSection", "NtMapViewOfSection"};
-                    std::array<emulator_hook*, 3> installed{};
-                    for (size_t i = 0; i < rvas.size(); ++i)
-                    {
-                        installed[i] = this->emu().hook_memory_execution(
-                            mod.image_base + rvas[i],
-                            [this, snapshot_status_seen, i, names](cpu_interface& cpu, const uint64_t rip) {
-                                const std::scoped_lock lock(this->kernel_lock_);
-                                auto& samples = (*snapshot_status_seen)[i];
-                                if (samples >= 8)
-                                {
-                                    return;
-                                }
-                                ++samples;
-                                auto& vcpu = this->vcpu(cpu.index());
-                                const auto rax = vcpu.cpu.reg<uint64_t>(x86_register::rax);
-                                this->log.error(
-                                    "[STEAMINITPROBE] toolhelp_native site=%s n=%u tid=%u vcpu=%zu "
-                                    "rip=%#llx status=%#x rax=%#llx\n",
-                                    names[i], static_cast<unsigned>(samples),
-                                    vcpu.active_thread ? vcpu.active_thread->id : 0, cpu.index(),
-                                    static_cast<unsigned long long>(rip),
-                                    static_cast<uint32_t>(rax), static_cast<unsigned long long>(rax));
-                            });
-                    }
-                    snapshot_status_hooks->emplace(mod.image_base, installed);
-                });
+            auto snapshot_status_hooks = std::make_shared<std::unordered_map<uint64_t, std::array<emulator_hook*, 3>>>();
+            this->callbacks.on_module_load.add([this, snapshot_status_seen, snapshot_status_hooks](mapped_module& mod) {
+                if (mod.name != "kernel32.dll")
+                {
+                    return;
+                }
+                constexpr uint64_t expected_size = 0xC2000;
+                constexpr std::array<uint64_t, 3> rvas{0x1E118, 0x1D583, 0x1D5D4};
+                constexpr std::array<uint8_t, 5> expected{0x0F, 0x1F, 0x44, 0x00, 0x00};
+                bool match = mod.size_of_image == expected_size;
+                for (const auto rva : rvas)
+                {
+                    std::array<uint8_t, 5> actual{};
+                    match = match && this->emu().try_read_memory(mod.image_base + rva, actual.data(), actual.size()) && actual == expected;
+                }
+                if (!match)
+                {
+                    this->log.error("[STEAMINITPROBE] kernel32 snapshot status probe skipped image_size=%#llx\n",
+                                    static_cast<unsigned long long>(mod.size_of_image));
+                    return;
+                }
+                constexpr std::array<const char*, 3> names{"NtQuerySystemInformation", "NtCreateSection", "NtMapViewOfSection"};
+                std::array<emulator_hook*, 3> installed{};
+                for (size_t i = 0; i < rvas.size(); ++i)
+                {
+                    installed[i] = this->emu().hook_memory_execution(
+                        mod.image_base + rvas[i], [this, snapshot_status_seen, i, names](cpu_interface& cpu, const uint64_t rip) {
+                            const std::scoped_lock lock(this->kernel_lock_);
+                            auto& samples = (*snapshot_status_seen)[i];
+                            if (samples >= 8)
+                            {
+                                return;
+                            }
+                            ++samples;
+                            auto& vcpu = this->vcpu(cpu.index());
+                            const auto rax = vcpu.cpu.reg<uint64_t>(x86_register::rax);
+                            this->log.error("[STEAMINITPROBE] toolhelp_native site=%s n=%u tid=%u vcpu=%zu "
+                                            "rip=%#llx status=%#x rax=%#llx\n",
+                                            names[i], static_cast<unsigned>(samples), vcpu.active_thread ? vcpu.active_thread->id : 0,
+                                            cpu.index(), static_cast<unsigned long long>(rip), static_cast<uint32_t>(rax),
+                                            static_cast<unsigned long long>(rax));
+                        });
+                }
+                snapshot_status_hooks->emplace(mod.image_base, installed);
+            });
             this->callbacks.on_module_unload.add([this, snapshot_status_hooks](mapped_module& mod) {
                 if (auto entry = snapshot_status_hooks->extract(mod.image_base); entry)
                 {
@@ -4842,17 +4902,13 @@ namespace sogen
             constexpr uint64_t dxgi_throw_rva = 0x36296c;
             constexpr uint64_t dxvk_terminate_rva = 0x5334f4;
             constexpr uint64_t dxvk_abort_rva = 0x536904;
-            constexpr std::array<uint8_t, 8> dxvk_terminate_entry{
-                0x48, 0x83, 0xec, 0x28, 0xe8, 0x43, 0xc4, 0x00};
-            constexpr std::array<uint8_t, 8> dxvk_abort_entry{
-                0x48, 0x83, 0xec, 0x28, 0xe8, 0x8f, 0x13, 0x01};
-            constexpr std::array<uint8_t, 16> dxvk_throw_entry{
-                0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x74,
-                0x24, 0x20, 0x57, 0x48, 0x83, 0xec, 0x50, 0x48};
+            constexpr std::array<uint8_t, 8> dxvk_terminate_entry{0x48, 0x83, 0xec, 0x28, 0xe8, 0x43, 0xc4, 0x00};
+            constexpr std::array<uint8_t, 8> dxvk_abort_entry{0x48, 0x83, 0xec, 0x28, 0xe8, 0x8f, 0x13, 0x01};
+            constexpr std::array<uint8_t, 16> dxvk_throw_entry{0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x74,
+                                                               0x24, 0x20, 0x57, 0x48, 0x83, 0xec, 0x50, 0x48};
             constexpr uint64_t dxvk_join_rva = 0x325f10;
             constexpr uint64_t dxvk_join_throw_call_rva = 0x326004;
-            constexpr std::array<uint8_t, 10> dxvk_join_entry{
-                0x48, 0x89, 0x5c, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x70};
+            constexpr std::array<uint8_t, 10> dxvk_join_entry{0x48, 0x89, 0x5c, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x70};
             constexpr std::array<uint8_t, 5> dxvk_join_throw_call{0xe8, 0x5f, 0x8b, 0x1c, 0x00};
             uint64_t dxvk_throw_rva = 0;
             if (const auto* rva_text = std::getenv("SOGEN_GUEST_CXX_THROW_RVA"))
@@ -4864,10 +4920,9 @@ namespace sogen
                     dxvk_throw_rva = parsed;
                 }
             }
-            this->callbacks.on_module_load.add(
-                [this, samples, terminal_samples, load_records, hooks, dxvk_throw_rva, dxvk_throw_entry,
-                 dxvk_join_rva, dxvk_join_throw_call_rva, dxvk_join_entry, dxvk_join_throw_call,
-                 dxvk_terminate_entry, dxvk_abort_entry](mapped_module& mod) {
+            this->callbacks.on_module_load.add([this, samples, terminal_samples, load_records, hooks, dxvk_throw_rva, dxvk_throw_entry,
+                                                dxvk_join_rva, dxvk_join_throw_call_rva, dxvk_join_entry, dxvk_join_throw_call,
+                                                dxvk_terminate_entry, dxvk_abort_entry](mapped_module& mod) {
                 if (hooks->contains(mod.image_base))
                 {
                     return;
@@ -4891,15 +4946,13 @@ namespace sogen
                     if (throw_rva && mod.size_of_image == expected_image_size)
                     {
                         reason = "rva_range";
-                        if (throw_rva <= mod.size_of_image - dxvk_throw_entry.size() &&
-                            mod.image_base <= UINT64_MAX - throw_rva)
+                        if (throw_rva <= mod.size_of_image - dxvk_throw_entry.size() && mod.image_base <= UINT64_MAX - throw_rva)
                         {
                             const auto candidate = mod.image_base + throw_rva;
                             std::array<uint8_t, dxvk_throw_entry.size()> actual{};
                             signature_read = this->emu().try_read_memory(candidate, actual.data(), actual.size());
                             signature_match = signature_read && actual == dxvk_throw_entry;
-                            reason = signature_match ? "ready" :
-                                     signature_read ? "signature_mismatch" : "signature_unreadable";
+                            reason = signature_match ? "ready" : signature_read ? "signature_mismatch" : "signature_unreadable";
                             if (signature_match)
                             {
                                 entry = candidate;
@@ -4909,34 +4962,28 @@ namespace sogen
                                 {
                                     std::array<uint8_t, dxvk_join_entry.size()> actual_join{};
                                     std::array<uint8_t, dxvk_join_throw_call.size()> actual_call{};
-                                    join_layout_match =
-                                        this->emu().try_read_memory(mod.image_base + dxvk_join_rva,
-                                                                    actual_join.data(), actual_join.size()) &&
-                                        this->emu().try_read_memory(mod.image_base + dxvk_join_throw_call_rva,
-                                                                    actual_call.data(), actual_call.size()) &&
-                                        actual_join == dxvk_join_entry && actual_call == dxvk_join_throw_call;
+                                    join_layout_match = this->emu().try_read_memory(mod.image_base + dxvk_join_rva, actual_join.data(),
+                                                                                    actual_join.size()) &&
+                                                        this->emu().try_read_memory(mod.image_base + dxvk_join_throw_call_rva,
+                                                                                    actual_call.data(), actual_call.size()) &&
+                                                        actual_join == dxvk_join_entry && actual_call == dxvk_join_throw_call;
                                 }
                             }
                         }
                     }
                 }
-                const auto report_dxvk = [&](const char* result, const uint64_t installed,
-                                             const uint64_t terminate, const uint64_t abort) {
-                    if ((d3d11_module || dxgi_module) &&
-                        load_records->fetch_add(1, std::memory_order_relaxed) < 8)
+                const auto report_dxvk = [&](const char* result, const uint64_t installed, const uint64_t terminate, const uint64_t abort) {
+                    if ((d3d11_module || dxgi_module) && load_records->fetch_add(1, std::memory_order_relaxed) < 8)
                     {
-                        this->log.error(
-                            "[GUESTCXXPROBE] module=%.*s base=%#llx requested_rva=%#llx image_size=%#llx "
-                            "expected_size=%#llx signature_read=%u signature_match=%u installed=%#llx "
-                            "reason=%s terminate_hook=%#llx abort_hook=%#llx\n",
-                            static_cast<int>(std::min<size_t>(mod.name.size(), 32)), mod.name.c_str(),
-                            static_cast<unsigned long long>(mod.image_base),
-                            static_cast<unsigned long long>(throw_rva),
-                            static_cast<unsigned long long>(mod.size_of_image),
-                            static_cast<unsigned long long>(expected_image_size),
-                            static_cast<unsigned>(signature_read), static_cast<unsigned>(signature_match),
-                            static_cast<unsigned long long>(installed), result,
-                            static_cast<unsigned long long>(terminate), static_cast<unsigned long long>(abort));
+                        this->log.error("[GUESTCXXPROBE] module=%.*s base=%#llx requested_rva=%#llx image_size=%#llx "
+                                        "expected_size=%#llx signature_read=%u signature_match=%u installed=%#llx "
+                                        "reason=%s terminate_hook=%#llx abort_hook=%#llx\n",
+                                        static_cast<int>(std::min<size_t>(mod.name.size(), 32)), mod.name.c_str(),
+                                        static_cast<unsigned long long>(mod.image_base), static_cast<unsigned long long>(throw_rva),
+                                        static_cast<unsigned long long>(mod.size_of_image),
+                                        static_cast<unsigned long long>(expected_image_size), static_cast<unsigned>(signature_read),
+                                        static_cast<unsigned>(signature_match), static_cast<unsigned long long>(installed), result,
+                                        static_cast<unsigned long long>(terminate), static_cast<unsigned long long>(abort));
                     }
                 };
                 if (!entry || !mod.contains(entry))
@@ -4947,90 +4994,83 @@ namespace sogen
                 const auto runtime_name = mod.name;
                 const auto runtime_image_base = mod.image_base;
                 const auto runtime_image_size = mod.size_of_image;
-                auto* hook = this->emu().hook_memory_execution(
-                    entry, [this, samples, runtime_name, runtime_image_base, runtime_image_size,
-                            join_layout_match](cpu_interface& cpu, const uint64_t rip) {
-                        const std::scoped_lock lock(this->kernel_lock_);
-                        if (*samples >= 8)
-                        {
-                            return;
-                        }
-                        const auto sample = ++*samples;
-                        const auto& vcpu = this->vcpu(cpu.index());
-                        auto& acting = vcpu.cpu;
-                        const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
-                        const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
-                        const auto object = acting.reg<uint64_t>(x86_register::rcx);
-                        const auto throw_info = acting.reg<uint64_t>(x86_register::rdx);
-                        uint64_t return_address{};
-                        const bool return_ok = acting.try_read_memory(rsp, &return_address, sizeof(return_address));
-                        const auto* caller = return_ok ? this->mod_manager.find_by_address(return_address) : nullptr;
-                        const bool return_in_runtime = return_ok && return_address >= runtime_image_base &&
-                            return_address - runtime_image_base < runtime_image_size;
-                        const std::string_view caller_name = caller ? std::string_view{caller->name} :
-                            return_in_runtime ? std::string_view{runtime_name} : "<unmapped>";
-                        const auto caller_rva = caller ? return_address - caller->image_base :
-                            return_in_runtime ? return_address - runtime_image_base : 0;
-                        // This exact DXVK throw site is the WAIT_FAILED branch of dxvk::thread::join.
-                        // Preserve its thread handle and Win32 error before stack unwinding destroys them.
-                        const bool join_failure = is_d3d11_throw_module(caller_name) && caller_rva == 0x326009;
-                        const auto join_this = acting.reg<uint64_t>(x86_register::rdi);
-                        uint64_t join_data{};
-                        uint64_t join_handle{};
-                        const bool join_data_read = join_failure &&
-                            acting.try_read_memory(join_this, &join_data, sizeof(join_data));
-                        const bool join_handle_read = join_data_read &&
-                            acting.try_read_memory(join_data, &join_handle, sizeof(join_handle));
-                        const auto gs_base = acting.get_segment_base(x86_register::gs);
-                        uint32_t last_error{};
-                        const bool last_error_read = join_failure && gs_base <= UINT64_MAX - 0x68 &&
-                            acting.try_read_memory(gs_base + 0x68, &last_error, sizeof(last_error));
-                        uint64_t outer_return_address{};
-                        const bool outer_return_read = join_failure && join_layout_match && rsp <= UINT64_MAX - 0x80 &&
-                            acting.try_read_memory(rsp + 0x80, &outer_return_address, sizeof(outer_return_address));
-                        const auto* outer_caller =
-                            outer_return_read ? this->mod_manager.find_by_address(outer_return_address) : nullptr;
-                        const bool outer_return_in_runtime = outer_return_read &&
-                            outer_return_address >= runtime_image_base &&
-                            outer_return_address - runtime_image_base < runtime_image_size;
-                        const std::string_view outer_caller_name =
-                            outer_caller ? std::string_view{outer_caller->name} :
-                            outer_return_in_runtime ? std::string_view{runtime_name} : "<unmapped>";
-                        const auto outer_caller_rva = outer_caller ? outer_return_address - outer_caller->image_base :
-                            outer_return_in_runtime ? outer_return_address - runtime_image_base : 0;
-                        std::array<char, 65> object_hex{};
-                        std::array<char, 33> throw_info_hex{};
-                        const auto object_readable = capture_guest_hex(acting, object, object_hex);
-                        const auto info_readable = capture_guest_hex(acting, throw_info, throw_info_hex);
-                        this->log.error(
-                            "[GUESTCXXTHROW] n=%u tid=%u vcpu=%zu runtime=%.*s rip=%#llx rsp=%#llx object=%#llx "
-                            "throw_info=%#llx caller_ret=%#llx ret_ok=%u caller=%.*s+%#llx "
-                            "object_bytes=%s object_readable=%u throw_info_bytes=%s info_readable=%u\n",
-                            sample, tid, cpu.index(), static_cast<int>(std::min<size_t>(runtime_name.size(), 32)),
-                            runtime_name.c_str(), static_cast<unsigned long long>(rip),
-                            static_cast<unsigned long long>(rsp), static_cast<unsigned long long>(object),
-                            static_cast<unsigned long long>(throw_info),
-                            static_cast<unsigned long long>(return_address), static_cast<unsigned>(return_ok),
-                            static_cast<int>(std::min<size_t>(caller_name.size(), 48)), caller_name.data(),
-                            static_cast<unsigned long long>(caller_rva), object_hex.data(), object_readable,
-                            throw_info_hex.data(), info_readable);
-                        if (join_failure)
-                        {
-                            this->log.error(
-                                "[GUESTDXVKJOINFAIL] tid=%u vcpu=%zu this=%#llx data=%#llx data_read=%u "
-                                "handle=%#llx handle_read=%u last_error=%#x last_error_read=%u "
-                                "join_layout_match=%u outer_ret=%#llx outer_ret_read=%u outer_caller=%.*s+%#llx\n",
-                                tid, cpu.index(), static_cast<unsigned long long>(join_this),
-                                static_cast<unsigned long long>(join_data), static_cast<unsigned>(join_data_read),
-                                static_cast<unsigned long long>(join_handle), static_cast<unsigned>(join_handle_read),
-                                last_error, static_cast<unsigned>(last_error_read),
-                                static_cast<unsigned>(join_layout_match),
-                                static_cast<unsigned long long>(outer_return_address),
-                                static_cast<unsigned>(outer_return_read),
-                                static_cast<int>(std::min<size_t>(outer_caller_name.size(), 48)),
-                                outer_caller_name.data(), static_cast<unsigned long long>(outer_caller_rva));
-                        }
-                    });
+                auto* hook = this->emu().hook_memory_execution(entry, [this, samples, runtime_name, runtime_image_base, runtime_image_size,
+                                                                       join_layout_match](cpu_interface& cpu, const uint64_t rip) {
+                    const std::scoped_lock lock(this->kernel_lock_);
+                    if (*samples >= 8)
+                    {
+                        return;
+                    }
+                    const auto sample = ++*samples;
+                    const auto& vcpu = this->vcpu(cpu.index());
+                    auto& acting = vcpu.cpu;
+                    const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                    const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
+                    const auto object = acting.reg<uint64_t>(x86_register::rcx);
+                    const auto throw_info = acting.reg<uint64_t>(x86_register::rdx);
+                    uint64_t return_address{};
+                    const bool return_ok = acting.try_read_memory(rsp, &return_address, sizeof(return_address));
+                    const auto* caller = return_ok ? this->mod_manager.find_by_address(return_address) : nullptr;
+                    const bool return_in_runtime =
+                        return_ok && return_address >= runtime_image_base && return_address - runtime_image_base < runtime_image_size;
+                    const std::string_view caller_name = caller              ? std::string_view{caller->name}
+                                                         : return_in_runtime ? std::string_view{runtime_name}
+                                                                             : "<unmapped>";
+                    const auto caller_rva = caller              ? return_address - caller->image_base
+                                            : return_in_runtime ? return_address - runtime_image_base
+                                                                : 0;
+                    // This exact DXVK throw site is the WAIT_FAILED branch of dxvk::thread::join.
+                    // Preserve its thread handle and Win32 error before stack unwinding destroys them.
+                    const bool join_failure = is_d3d11_throw_module(caller_name) && caller_rva == 0x326009;
+                    const auto join_this = acting.reg<uint64_t>(x86_register::rdi);
+                    uint64_t join_data{};
+                    uint64_t join_handle{};
+                    const bool join_data_read = join_failure && acting.try_read_memory(join_this, &join_data, sizeof(join_data));
+                    const bool join_handle_read = join_data_read && acting.try_read_memory(join_data, &join_handle, sizeof(join_handle));
+                    const auto gs_base = acting.get_segment_base(x86_register::gs);
+                    uint32_t last_error{};
+                    const bool last_error_read = join_failure && gs_base <= UINT64_MAX - 0x68 &&
+                                                 acting.try_read_memory(gs_base + 0x68, &last_error, sizeof(last_error));
+                    uint64_t outer_return_address{};
+                    const bool outer_return_read = join_failure && join_layout_match && rsp <= UINT64_MAX - 0x80 &&
+                                                   acting.try_read_memory(rsp + 0x80, &outer_return_address, sizeof(outer_return_address));
+                    const auto* outer_caller = outer_return_read ? this->mod_manager.find_by_address(outer_return_address) : nullptr;
+                    const bool outer_return_in_runtime = outer_return_read && outer_return_address >= runtime_image_base &&
+                                                         outer_return_address - runtime_image_base < runtime_image_size;
+                    const std::string_view outer_caller_name = outer_caller              ? std::string_view{outer_caller->name}
+                                                               : outer_return_in_runtime ? std::string_view{runtime_name}
+                                                                                         : "<unmapped>";
+                    const auto outer_caller_rva = outer_caller              ? outer_return_address - outer_caller->image_base
+                                                  : outer_return_in_runtime ? outer_return_address - runtime_image_base
+                                                                            : 0;
+                    std::array<char, 65> object_hex{};
+                    std::array<char, 33> throw_info_hex{};
+                    const auto object_readable = capture_guest_hex(acting, object, object_hex);
+                    const auto info_readable = capture_guest_hex(acting, throw_info, throw_info_hex);
+                    this->log.error("[GUESTCXXTHROW] n=%u tid=%u vcpu=%zu runtime=%.*s rip=%#llx rsp=%#llx object=%#llx "
+                                    "throw_info=%#llx caller_ret=%#llx ret_ok=%u caller=%.*s+%#llx "
+                                    "object_bytes=%s object_readable=%u throw_info_bytes=%s info_readable=%u\n",
+                                    sample, tid, cpu.index(), static_cast<int>(std::min<size_t>(runtime_name.size(), 32)),
+                                    runtime_name.c_str(), static_cast<unsigned long long>(rip), static_cast<unsigned long long>(rsp),
+                                    static_cast<unsigned long long>(object), static_cast<unsigned long long>(throw_info),
+                                    static_cast<unsigned long long>(return_address), static_cast<unsigned>(return_ok),
+                                    static_cast<int>(std::min<size_t>(caller_name.size(), 48)), caller_name.data(),
+                                    static_cast<unsigned long long>(caller_rva), object_hex.data(), object_readable, throw_info_hex.data(),
+                                    info_readable);
+                    if (join_failure)
+                    {
+                        this->log.error("[GUESTDXVKJOINFAIL] tid=%u vcpu=%zu this=%#llx data=%#llx data_read=%u "
+                                        "handle=%#llx handle_read=%u last_error=%#x last_error_read=%u "
+                                        "join_layout_match=%u outer_ret=%#llx outer_ret_read=%u outer_caller=%.*s+%#llx\n",
+                                        tid, cpu.index(), static_cast<unsigned long long>(join_this),
+                                        static_cast<unsigned long long>(join_data), static_cast<unsigned>(join_data_read),
+                                        static_cast<unsigned long long>(join_handle), static_cast<unsigned>(join_handle_read), last_error,
+                                        static_cast<unsigned>(last_error_read), static_cast<unsigned>(join_layout_match),
+                                        static_cast<unsigned long long>(outer_return_address), static_cast<unsigned>(outer_return_read),
+                                        static_cast<int>(std::min<size_t>(outer_caller_name.size(), 48)), outer_caller_name.data(),
+                                        static_cast<unsigned long long>(outer_caller_rva));
+                    }
+                });
                 std::array<emulator_hook*, 3> installed{hook, nullptr, nullptr};
                 if (hook && is_d3d11_throw_module(mod.name))
                 {
@@ -5046,39 +5086,37 @@ namespace sogen
                         {
                             return nullptr;
                         }
-                        return this->emu().hook_memory_execution(
-                            address, [this, terminal_samples, runtime_name, kind](cpu_interface& cpu, uint64_t rip) {
-                                const std::scoped_lock lock(this->kernel_lock_);
-                                if (*terminal_samples >= 4)
-                                {
-                                    return;
-                                }
-                                const auto sample = ++*terminal_samples;
-                                const auto& vcpu = this->vcpu(cpu.index());
-                                auto& acting = vcpu.cpu;
-                                const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
-                                const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
-                                uint64_t return_address{};
-                                const bool return_ok = acting.try_read_memory(rsp, &return_address, sizeof(return_address));
-                                const auto* caller = return_ok ? this->mod_manager.find_by_address(return_address) : nullptr;
-                                const std::string_view caller_name = caller ? std::string_view{caller->name} : "<unmapped>";
-                                const auto caller_rva = caller ? return_address - caller->image_base : 0;
-                                std::array<char, 65> stack_hex{};
-                                const auto stack_readable = capture_guest_hex(acting, rsp, stack_hex);
-                                this->log.error(
-                                    "[GUESTCXXTERM] n=%u kind=%s tid=%u vcpu=%zu runtime=%.*s rip=%#llx rsp=%#llx "
-                                    "caller_ret=%#llx ret_ok=%u caller=%.*s+%#llx rcx=%#llx rdx=%#llx "
-                                    "stack_bytes=%s stack_readable=%u\n",
-                                    sample, kind, tid, cpu.index(),
-                                    static_cast<int>(std::min<size_t>(runtime_name.size(), 32)), runtime_name.c_str(),
-                                    static_cast<unsigned long long>(rip), static_cast<unsigned long long>(rsp),
-                                    static_cast<unsigned long long>(return_address), static_cast<unsigned>(return_ok),
-                                    static_cast<int>(std::min<size_t>(caller_name.size(), 48)), caller_name.data(),
-                                    static_cast<unsigned long long>(caller_rva),
-                                    static_cast<unsigned long long>(acting.reg<uint64_t>(x86_register::rcx)),
-                                    static_cast<unsigned long long>(acting.reg<uint64_t>(x86_register::rdx)),
-                                    stack_hex.data(), stack_readable);
-                            });
+                        return this->emu().hook_memory_execution(address, [this, terminal_samples, runtime_name, kind](cpu_interface& cpu,
+                                                                                                                       uint64_t rip) {
+                            const std::scoped_lock lock(this->kernel_lock_);
+                            if (*terminal_samples >= 4)
+                            {
+                                return;
+                            }
+                            const auto sample = ++*terminal_samples;
+                            const auto& vcpu = this->vcpu(cpu.index());
+                            auto& acting = vcpu.cpu;
+                            const auto tid = vcpu.active_thread ? vcpu.active_thread->id : 0;
+                            const auto rsp = acting.reg<uint64_t>(x86_register::rsp);
+                            uint64_t return_address{};
+                            const bool return_ok = acting.try_read_memory(rsp, &return_address, sizeof(return_address));
+                            const auto* caller = return_ok ? this->mod_manager.find_by_address(return_address) : nullptr;
+                            const std::string_view caller_name = caller ? std::string_view{caller->name} : "<unmapped>";
+                            const auto caller_rva = caller ? return_address - caller->image_base : 0;
+                            std::array<char, 65> stack_hex{};
+                            const auto stack_readable = capture_guest_hex(acting, rsp, stack_hex);
+                            this->log.error("[GUESTCXXTERM] n=%u kind=%s tid=%u vcpu=%zu runtime=%.*s rip=%#llx rsp=%#llx "
+                                            "caller_ret=%#llx ret_ok=%u caller=%.*s+%#llx rcx=%#llx rdx=%#llx "
+                                            "stack_bytes=%s stack_readable=%u\n",
+                                            sample, kind, tid, cpu.index(), static_cast<int>(std::min<size_t>(runtime_name.size(), 32)),
+                                            runtime_name.c_str(), static_cast<unsigned long long>(rip),
+                                            static_cast<unsigned long long>(rsp), static_cast<unsigned long long>(return_address),
+                                            static_cast<unsigned>(return_ok), static_cast<int>(std::min<size_t>(caller_name.size(), 48)),
+                                            caller_name.data(), static_cast<unsigned long long>(caller_rva),
+                                            static_cast<unsigned long long>(acting.reg<uint64_t>(x86_register::rcx)),
+                                            static_cast<unsigned long long>(acting.reg<uint64_t>(x86_register::rdx)), stack_hex.data(),
+                                            stack_readable);
+                        });
                     };
                     installed[1] = install_terminal(dxvk_terminate_rva, dxvk_terminate_entry, "terminate");
                     installed[2] = install_terminal(dxvk_abort_rva, dxvk_abort_entry, "abort");
@@ -5087,8 +5125,7 @@ namespace sogen
                 {
                     hooks->emplace(mod.image_base, installed);
                 }
-                report_dxvk(hook ? "installed" : "hook_failed", hook ? entry : 0,
-                            installed[1] ? mod.image_base + dxvk_terminate_rva : 0,
+                report_dxvk(hook ? "installed" : "hook_failed", hook ? entry : 0, installed[1] ? mod.image_base + dxvk_terminate_rva : 0,
                             installed[2] ? mod.image_base + dxvk_abort_rva : 0);
             });
             this->callbacks.on_module_unload.add([this, hooks](mapped_module& mod) {
@@ -5109,8 +5146,7 @@ namespace sogen
             // LEANDIAG: the loader deregisters a failed DLL from the manager BEFORE the unmap
             // syscall, so unmap-time and raise-time lookups both miss it. Name it here - the
             // last module unloaded right before STATUS_DLL_INIT_FAILED is the failing DLL.
-            this->log.error("LEANDIAG module-unload name=%s base=%#llx\n", mod.name.c_str(),
-                            (unsigned long long)mod.image_base);
+            this->log.error("LEANDIAG module-unload name=%s base=%#llx\n", mod.name.c_str(), (unsigned long long)mod.image_base);
             this->last_executed_section_ = {};
             const auto hooks = this->section_first_execution_hooks_.extract(mod.image_base);
             if (hooks)
@@ -5127,7 +5163,8 @@ namespace sogen
 
         this->emu().hook_instruction(x86_hookable_instructions::syscall, [&](cpu_interface& cpu, uint64_t) {
             const auto lock_detail = kernel_lock::attribution_enabled()
-                                         ? (static_cast<uint64_t>(cpu.index()) << 32) | static_cast<uint32_t>(this->vcpu(cpu.index()).cpu.reg<uint64_t>(x86_register::rax))
+                                         ? (static_cast<uint64_t>(cpu.index()) << 32) |
+                                               static_cast<uint32_t>(this->vcpu(cpu.index()).cpu.reg<uint64_t>(x86_register::rax))
                                          : static_cast<uint64_t>(cpu.index());
             const kernel_lock::attribution_scope lock_site("syscall", lock_detail);
             const std::scoped_lock lock(this->kernel_lock_);
@@ -5215,15 +5252,13 @@ namespace sogen
                 // exception at the original RIP, rather than treating the missing IDT gate as a read fault.
                 const auto rip = acting.read_instruction_pointer();
                 uint8_t first{};
-                if ((acting.reg<uint16_t>(x86_register::cs) & 3) == 3 &&
-                    acting.try_read_memory(rip, &first, sizeof(first)))
+                if ((acting.reg<uint16_t>(x86_register::cs) & 3) == 3 && acting.try_read_memory(rip, &first, sizeof(first)))
                 {
                     const auto has_rex = (first & 0xf0) == 0x40;
                     std::array<uint8_t, 3> opcode{};
                     if (rip <= UINT64_MAX - static_cast<uint64_t>(has_rex) &&
-                        acting.try_read_memory(rip + static_cast<uint64_t>(has_rex), opcode.data(), opcode.size()) &&
-                        opcode[0] == 0x0f && (opcode[1] == 0x20 || opcode[1] == 0x22) &&
-                        (opcode[2] & 0xc0) == 0xc0)
+                        acting.try_read_memory(rip + static_cast<uint64_t>(has_rex), opcode.data(), opcode.size()) && opcode[0] == 0x0f &&
+                        (opcode[1] == 0x20 || opcode[1] == 0x22) && (opcode[2] & 0xc0) == 0xc0)
                     {
                         dispatch_exception(*this, vcpu, STATUS_PRIVILEGED_INSTRUCTION, {});
                         return;
@@ -5308,8 +5343,8 @@ namespace sogen
                             const auto post_ip = acting.read_instruction_pointer();
                             std::array<uint8_t, 2> opcode{};
                             if (post_ip >= opcode.size() &&
-                                this->memory.try_read_memory(post_ip - opcode.size(), opcode.data(), opcode.size()) &&
-                                opcode[0] == 0xCD && opcode[1] == 0x2D)
+                                this->memory.try_read_memory(post_ip - opcode.size(), opcode.data(), opcode.size()) && opcode[0] == 0xCD &&
+                                opcode[1] == 0x2D)
                             {
                                 acting.reg(x86_register::rip, post_ip - opcode.size());
                             }
@@ -5350,9 +5385,8 @@ namespace sogen
             // A near-null guest read after a mapped GS read can mean the active TEB has lost
             // its Self/PEB pointers. Capture the first few such faults before exception
             // dispatch changes the guest stack. This is diagnostic only: no repair or mapping.
-            if (type == memory_violation_type::unmapped && operation == memory_operation::read &&
-                address < 0x1000 && acting.reg<uint16_t>(x86_register::cs) == 0x33 &&
-                this->emu().get_name() == "icicle-emu")
+            if (type == memory_violation_type::unmapped && operation == memory_operation::read && address < 0x1000 &&
+                acting.reg<uint16_t>(x86_register::cs) == 0x33 && this->emu().get_name() == "icicle-emu")
             {
                 static std::atomic<unsigned> emitted{0};
                 if (emitted.fetch_add(1, std::memory_order_relaxed) < 8)
@@ -5385,33 +5419,31 @@ namespace sogen
                         const auto cpu_fields = read_fields(acting.memory());
                         const auto manager_fields = read_fields(this->memory);
                         const auto teb_region = this->memory.get_region_info(gs_base);
-                        std::fprintf(
-                            stderr,
-                            "[GSFAULT] tid=%u vcpu=%zu fault=%#llx rip=%#llx gs=%#llx expected_gs=%#llx teb=%#llx "
-                            "rax=%#llx r14=%#llx cpu_self_ok=%d cpu_self=%#llx cpu_peb_ok=%d cpu_peb=%#llx "
-                            "manager_self_ok=%d manager_self=%#llx manager_peb_ok=%d manager_peb=%#llx "
-                            "region_start=%#llx region_len=%zu alloc=%#llx alloc_len=%zu reserved=%d committed=%d "
-                            "perm=%u guard=%d kind=%u\n",
-                            thread.id, acting.index(), static_cast<unsigned long long>(address),
-                            static_cast<unsigned long long>(acting.read_instruction_pointer()),
-                            static_cast<unsigned long long>(gs_base), static_cast<unsigned long long>(expected_gs),
-                            static_cast<unsigned long long>(teb_base),
-                            static_cast<unsigned long long>(acting.reg(x86_register::rax)),
-                            static_cast<unsigned long long>(acting.reg(x86_register::r14)),
-                            static_cast<int>(cpu_fields.self_ok), static_cast<unsigned long long>(cpu_fields.self),
-                            static_cast<int>(cpu_fields.peb_ok), static_cast<unsigned long long>(cpu_fields.peb),
-                            static_cast<int>(manager_fields.self_ok), static_cast<unsigned long long>(manager_fields.self),
-                            static_cast<int>(manager_fields.peb_ok), static_cast<unsigned long long>(manager_fields.peb),
-                            static_cast<unsigned long long>(teb_region.start), teb_region.length,
-                            static_cast<unsigned long long>(teb_region.allocation_base), teb_region.allocation_length,
-                            static_cast<int>(teb_region.is_reserved), static_cast<int>(teb_region.is_committed),
-                            static_cast<unsigned>(teb_region.permissions.common),
-                            static_cast<int>(teb_region.permissions.is_guarded()), static_cast<unsigned>(teb_region.kind));
+                        std::fprintf(stderr,
+                                     "[GSFAULT] tid=%u vcpu=%zu fault=%#llx rip=%#llx gs=%#llx expected_gs=%#llx teb=%#llx "
+                                     "rax=%#llx r14=%#llx cpu_self_ok=%d cpu_self=%#llx cpu_peb_ok=%d cpu_peb=%#llx "
+                                     "manager_self_ok=%d manager_self=%#llx manager_peb_ok=%d manager_peb=%#llx "
+                                     "region_start=%#llx region_len=%zu alloc=%#llx alloc_len=%zu reserved=%d committed=%d "
+                                     "perm=%u guard=%d kind=%u\n",
+                                     thread.id, acting.index(), static_cast<unsigned long long>(address),
+                                     static_cast<unsigned long long>(acting.read_instruction_pointer()),
+                                     static_cast<unsigned long long>(gs_base), static_cast<unsigned long long>(expected_gs),
+                                     static_cast<unsigned long long>(teb_base),
+                                     static_cast<unsigned long long>(acting.reg(x86_register::rax)),
+                                     static_cast<unsigned long long>(acting.reg(x86_register::r14)), static_cast<int>(cpu_fields.self_ok),
+                                     static_cast<unsigned long long>(cpu_fields.self), static_cast<int>(cpu_fields.peb_ok),
+                                     static_cast<unsigned long long>(cpu_fields.peb), static_cast<int>(manager_fields.self_ok),
+                                     static_cast<unsigned long long>(manager_fields.self), static_cast<int>(manager_fields.peb_ok),
+                                     static_cast<unsigned long long>(manager_fields.peb), static_cast<unsigned long long>(teb_region.start),
+                                     teb_region.length, static_cast<unsigned long long>(teb_region.allocation_base),
+                                     teb_region.allocation_length, static_cast<int>(teb_region.is_reserved),
+                                     static_cast<int>(teb_region.is_committed), static_cast<unsigned>(teb_region.permissions.common),
+                                     static_cast<int>(teb_region.permissions.is_guarded()), static_cast<unsigned>(teb_region.kind));
                     }
                     catch (...)
                     {
-                        std::fprintf(stderr, "[GSFAULT] diagnostic unavailable tid=%u fault=%#llx\n",
-                                     vcpu.thread().id, static_cast<unsigned long long>(address));
+                        std::fprintf(stderr, "[GSFAULT] diagnostic unavailable tid=%u fault=%#llx\n", vcpu.thread().id,
+                                     static_cast<unsigned long long>(address));
                     }
                 }
             }
@@ -5430,8 +5462,7 @@ namespace sogen
                     dispatch_exception(*this, vcpu, STATUS_STACK_OVERFLOW, {});
                     return memory_violation_continuation::resume;
                 }
-                this->memory.protect_memory(page_align_down(address), 0x1000,
-                                            region.permissions & ~memory_permission_ext::guard);
+                this->memory.protect_memory(page_align_down(address), 0x1000, region.permissions & ~memory_permission_ext::guard);
                 dispatch_guard_page_violation(*this, vcpu, address, operation);
             }
             else
@@ -6089,9 +6120,8 @@ namespace sogen
         }
 
         constexpr std::array<x86_register, 16> registers{
-            x86_register::rax, x86_register::rbx, x86_register::rcx, x86_register::rdx,
-            x86_register::rsi, x86_register::rdi, x86_register::rbp, x86_register::rsp,
-            x86_register::r8, x86_register::r9, x86_register::r10, x86_register::r11,
+            x86_register::rax, x86_register::rbx, x86_register::rcx, x86_register::rdx, x86_register::rsi, x86_register::rdi,
+            x86_register::rbp, x86_register::rsp, x86_register::r8,  x86_register::r9,  x86_register::r10, x86_register::r11,
             x86_register::r12, x86_register::r13, x86_register::r14, x86_register::r15,
         };
         for (size_t i = 0; i < registers.size(); ++i)
@@ -6214,9 +6244,8 @@ namespace sogen
         for (const auto& e : entries)
         {
             this->log.error("  [%llu] status 0x%08x vcpu %u tid %u\n      rip  0x%llx %s\n      addr 0x%llx %s\n",
-                            static_cast<unsigned long long>(e.ordinal), e.status,
-                            e.vcpu, e.tid, static_cast<unsigned long long>(e.rip), describe(e.rip).c_str(),
-                            static_cast<unsigned long long>(e.info), describe(e.info).c_str());
+                            static_cast<unsigned long long>(e.ordinal), e.status, e.vcpu, e.tid, static_cast<unsigned long long>(e.rip),
+                            describe(e.rip).c_str(), static_cast<unsigned long long>(e.info), describe(e.info).c_str());
         }
     }
 
@@ -6362,8 +6391,7 @@ namespace sogen
                 // Older snapshots persisted absolute host-monotonic deadlines without an anchor. The saved
                 // KUSER_SHARED_DATA InterruptTime is the last sampled value of the same guest steady clock.
                 const auto ticks = emulator.process.kusd.access([](const KUSER_SHARED_DATA64& kusd) {
-                    return (static_cast<uint64_t>(static_cast<uint32_t>(kusd.InterruptTime.High1Time)) << 32) |
-                           kusd.InterruptTime.LowPart;
+                    return (static_cast<uint64_t>(static_cast<uint32_t>(kusd.InterruptTime.High1Time)) << 32) | kusd.InterruptTime.LowPart;
                 });
                 saved_steady_time = std::chrono::steady_clock::time_point{std::chrono::nanoseconds{ticks * 100}};
             }
