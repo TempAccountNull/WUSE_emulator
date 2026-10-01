@@ -239,6 +239,52 @@ namespace sogen::test
         EXPECT_FALSE(win.has_active_dispatch_context());
     }
 
+    TEST_F(NativeMarkerObserver, CleanupPoolSkippedWhenCoreLayoutIncomplete)
+    {
+        write(image_base + 0xB440DF, uint8_t{0});
+        native_marker_observer observer{"1"};
+        const auto first = dispatched_capture(observer, detail::native_marker_capture_state::investment_marker);
+        ASSERT_TRUE(first);
+        EXPECT_FALSE(first->core_complete);
+        EXPECT_FALSE(first->request_pool);
+        if (first->completion.reason != detail::native_marker_stop::none)
+        {
+            GTEST_SKIP() << "Observer retired under the existing elapsed-time bound";
+        }
+        const auto cleanup = dispatched_capture(observer, detail::native_marker_capture_state::cleanup_marker);
+        ASSERT_TRUE(cleanup);
+        EXPECT_FALSE(cleanup->core_complete);
+        EXPECT_FALSE(cleanup->request_pool);
+        EXPECT_EQ(cleanup->budget.read_limit, uint32_t{23});
+        EXPECT_EQ(cleanup->budget.byte_limit, uint32_t{196});
+    }
+
+    TEST_F(NativeMarkerObserver, CleanupResolverFailurePreservesEarlierCoreWitness)
+    {
+        native_marker_observer observer{"1"};
+        const auto first = dispatched_capture(observer, detail::native_marker_capture_state::investment_marker);
+        ASSERT_TRUE(first);
+        EXPECT_FALSE(first->request_pool);
+        if (first->completion.reason != detail::native_marker_stop::none)
+        {
+            GTEST_SKIP() << "Observer retired under the existing elapsed-time bound";
+        }
+        const auto cleanup = dispatched_capture(observer, detail::native_marker_capture_state::cleanup_marker);
+        ASSERT_TRUE(cleanup);
+        if (!cleanup->core_complete)
+        {
+            EXPECT_FALSE(cleanup->request_pool);
+            GTEST_SKIP() << "Core capture remained partial under its existing deadline";
+        }
+        ASSERT_TRUE(cleanup->request_pool);
+        EXPECT_EQ(cleanup->request_pool->reason, detail::native_marker_pool_reason::resolver_unavailable);
+        EXPECT_LE(cleanup->core_ended_steady_ns, cleanup->ended_steady_ns);
+        if (!cleanup->budget.time_exhausted && !cleanup->budget.clock_invalid)
+        {
+            EXPECT_TRUE(cleanup->complete);
+        }
+    }
+
     TEST_F(NativeMarkerObserver, FirstInvestmentMarkerIsAdmittedOnlyOnce)
     {
         native_marker_observer observer{"1"};

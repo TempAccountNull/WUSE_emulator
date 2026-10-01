@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <native_marker_resource_memory.hpp>
+#include <native_marker_request_pool_memory.hpp>
 #include <windows_emulator.hpp>
 #ifdef _WIN32
 #include <windows.h>
@@ -176,25 +177,57 @@ namespace sogen
                     return sample.budget.try_reserve(size, marker_now()) && win.memory.try_read_memory(address, value, size);
                 },
                 [&](uint64_t, const size_t size) { return sample.budget.can_read(size, marker_now()); });
+            sample.core_ended_steady_ns = marker_now();
+            sample.budget.expired(sample.core_ended_steady_ns);
+            sample.core_complete = marker_core_complete(sample);
+            std::shared_ptr<detail::native_marker_pool_sample> pool;
+            if (sample.core_complete && reservation.event == detail::native_marker_event::cleanup_entry)
+            {
+                sample.budget.allow_cleanup_pool();
+                pool = std::make_shared<detail::native_marker_pool_sample>(detail::sample_native_marker_request_pool_memory(
+                    win.memory, identity.module_base, identity.module_size, sample.resources, guard, sample.budget, marker_now));
+            }
             sample.ended_steady_ns = marker_now();
             sample.budget.expired(sample.ended_steady_ns);
-            sample.complete = marker_core_complete(sample);
+            if (pool && (sample.budget.time_exhausted || sample.budget.clock_invalid))
+            {
+                detail::native_marker_pool_unqualify(*pool, detail::native_marker_pool_reason::time_or_clock_limit);
+            }
+            sample.complete = sample.core_complete && !sample.budget.time_exhausted && !sample.budget.clock_invalid;
             sample.completion = state_.finish(identity, reservation.sequence, sample.complete, sample.ended_steady_ns);
+            if (pool && !sample.completion.accepted)
+            {
+                detail::native_marker_pool_unqualify(*pool, detail::native_marker_pool_reason::capture_rejected);
+            }
             sample.complete = sample.complete && sample.completion.accepted && sample.completion.complete;
             sample.counts = state_.counts();
+            sample.request_pool = std::move(pool);
             return result;
         }
         catch (...)
         {
-            state_.cancel();
             coverage_sent_ = true;
+            if (result && result->reservation)
+            {
+                try
+                {
+                    result->ended_steady_ns = marker_now();
+                    result->budget.expired(result->ended_steady_ns);
+                    result->completion = state_.finish(result->identity, result->reservation.sequence, false, result->ended_steady_ns);
+                }
+                catch (...)
+                {
+                    result->budget.clock_invalid = true;
+                }
+            }
+            state_.cancel();
             if (result)
             {
                 try
                 {
                     result->complete = false;
-                    result->error = "marker diagnostic exception";
-                    result->completion.reason = detail::native_marker_stop::cancelled;
+                    result->error = "marker cancel";
+                    result->completion = {false, false, detail::native_marker_stop::cancelled};
                     result->counts = state_.counts();
                 }
                 catch (...)

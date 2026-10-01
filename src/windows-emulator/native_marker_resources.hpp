@@ -33,6 +33,8 @@ namespace sogen::detail
     {
         static constexpr uint32_t max_reads = 23;
         static constexpr uint32_t max_bytes = 196;
+        static constexpr uint32_t maximum_extended_reads = 85;
+        static constexpr uint32_t maximum_extended_bytes = 1717;
         static constexpr uint64_t max_elapsed_ns = 2000000;
 
         uint64_t started_ns{};
@@ -42,6 +44,14 @@ namespace sogen::detail
         bool clock_invalid{};
         bool read_exhausted{};
         bool byte_exhausted{};
+        uint32_t read_limit{max_reads};
+        uint32_t byte_limit{max_bytes};
+
+        void allow_cleanup_pool()
+        {
+            this->read_limit = maximum_extended_reads;
+            this->byte_limit = maximum_extended_bytes;
+        }
 
         bool expired(const uint64_t now_ns)
         {
@@ -62,12 +72,12 @@ namespace sogen::detail
             {
                 return false;
             }
-            if (this->reads >= max_reads)
+            if (this->reads >= this->read_limit)
             {
                 this->read_exhausted = true;
                 return false;
             }
-            if (this->bytes > max_bytes || size > max_bytes - this->bytes)
+            if (this->bytes > this->byte_limit || size > this->byte_limit - this->bytes)
             {
                 this->byte_exhausted = true;
                 return false;

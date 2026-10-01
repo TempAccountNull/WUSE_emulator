@@ -146,6 +146,17 @@ namespace sogen
                 this->output_ += '"';
             }
 
+            void signed_field(std::string_view key, const int32_t value)
+            {
+                this->key(key);
+                const auto wide = int64_t{value};
+                if (wide < 0)
+                {
+                    this->output_ += '-';
+                }
+                append_unsigned(this->output_, static_cast<uint64_t>(wide < 0 ? -wide : wide));
+            }
+
             void optional_hex_field(std::string_view key, const std::optional<uint64_t>& value)
             {
                 if (value.has_value())
@@ -878,6 +889,164 @@ namespace sogen
                 });
             }
 
+            static void write_native_marker_pool(json_object_builder& item, const detail::native_marker_pool_sample& pool)
+            {
+                item.field("selected", pool.selected);
+                item.field("scope", "bounded_type2_chain_depth4");
+                item.field("atomic", pool.atomic);
+                item.field("strong_lifetime", pool.strong_lifetime);
+                item.field("consistency", "best_effort_repeated_bytes_and_generation_bits");
+                item.field("resolver_matched", pool.resolver_matched);
+                item.field("reason", static_cast<uint32_t>(pool.reason));
+                item.field("traversal_reason", static_cast<uint32_t>(pool.traversal_reason));
+                item.field("reads", pool.reads);
+                item.field("bytes", pool.bytes);
+                item.field("max_reads", pool.max_reads);
+                item.field("max_bytes", pool.max_bytes);
+                item.field("max_nodes", pool.max_nodes);
+                item.field("visited_nodes", pool.visited_nodes);
+                item.field("roots_repeat_complete", pool.roots_repeat_complete);
+                item.field("roots_repeat_equal", pool.roots_repeat_equal);
+                const auto raw_value = []<size_t Size>(auto& owner, const std::string_view name,
+                                                       const detail::native_marker_pool_field<Size>& value) {
+                    owner.object_field(name, [&](auto& entry) {
+                        entry.field("width_bytes", static_cast<uint32_t>(Size));
+                        entry.field("status", static_cast<uint32_t>(value.raw.status));
+                        entry.field("address_available", value.address_available);
+                        if (value.address_available)
+                        {
+                            entry.hex_field("address", value.address);
+                        }
+                        const bool available = detail::native_marker_pool_complete(value);
+                        entry.field("available", available);
+                        if (available)
+                        {
+                            entry.field("raw_bytes_hex", detail::native_marker_raw_hex(std::as_bytes(std::span{*value.raw.bytes})));
+                        }
+                    });
+                };
+                raw_value(item, "resolver", pool.resolver);
+                raw_value(item, "directory", pool.directory);
+                raw_value(item, "table", pool.table);
+                raw_value(item, "directory_repeat", pool.directory_repeat);
+                raw_value(item, "table_repeat", pool.table_repeat);
+                raw_value(item, "resource3_repeat", pool.resource3_repeat);
+                item.array_field("nodes", [&](const auto& append) {
+                    for (uint32_t index = 0; index < pool.visited_nodes && index < pool.max_nodes; ++index)
+                    {
+                        append([&](std::string& output) {
+                            json_object_builder entry(output);
+                            const auto& node = pool.nodes[index];
+                            entry.field("depth", index);
+                            if (node.handle)
+                            {
+                                entry.hex_field("full_handle", *node.handle);
+                            }
+                            entry.field("group", node.group);
+                            entry.field("index", node.index);
+                            entry.field("reason", static_cast<uint32_t>(node.reason));
+                            entry.field("repeat_complete", node.repeat_complete);
+                            entry.field("repeat_equal", node.repeat_equal);
+                            entry.field("best_effort_current_owner", node.best_effort_current_owner);
+                            const auto node_bytes = [&](auto& owner, const auto& bytes) {
+                                raw_value(owner, "descriptor", bytes.descriptor);
+                                raw_value(owner, "allocator", bytes.allocator);
+                                raw_value(owner, "inner", bytes.inner);
+                                raw_value(owner, "counter", bytes.counter);
+                                raw_value(owner, "free_link", bytes.free_link);
+                                raw_value(owner, "encoded", bytes.encoded);
+                                raw_value(owner, "header", bytes.header);
+                            };
+                            entry.object_field("initial", [&](auto& owner) { node_bytes(owner, node.initial); });
+                            entry.object_field("repeat", [&](auto& owner) { node_bytes(owner, node.repeat); });
+                            if (node.counter)
+                            {
+                                entry.field("counter", *node.counter);
+                            }
+                            if (node.counter_mask)
+                            {
+                                entry.hex_field("counter_mask", *node.counter_mask);
+                            }
+                            if (node.config)
+                            {
+                                entry.hex_field("config", *node.config);
+                            }
+                            if (node.reconstructed_handle)
+                            {
+                                entry.hex_field("reconstructed_handle", *node.reconstructed_handle);
+                            }
+                            if (node.counter_within_mask)
+                            {
+                                entry.field("counter_within_mask", *node.counter_within_mask);
+                            }
+                            if (node.generation_bits_match)
+                            {
+                                entry.field("generation_bits_match", *node.generation_bits_match);
+                            }
+                            if (node.released)
+                            {
+                                entry.field("released", *node.released);
+                            }
+                            if (node.free_tag)
+                            {
+                                entry.field("free_tag", *node.free_tag);
+                            }
+                            if (node.bitmap_range_start)
+                            {
+                                entry.field("bitmap_range_start", static_cast<uint32_t>(*node.bitmap_range_start));
+                            }
+                            if (node.bitmap_range_end)
+                            {
+                                entry.field("bitmap_range_end", static_cast<uint32_t>(*node.bitmap_range_end));
+                            }
+                            if (node.linked_mode)
+                            {
+                                entry.field("linked_mode", *node.linked_mode);
+                            }
+                            if (node.type)
+                            {
+                                entry.field("type", static_cast<uint32_t>(*node.type));
+                            }
+                            if (node.stored_status)
+                            {
+                                entry.signed_field("stored_status", *node.stored_status);
+                            }
+                            if (node.stored_detail)
+                            {
+                                entry.signed_field("stored_detail", *node.stored_detail);
+                            }
+                            if (node.related_handle)
+                            {
+                                entry.hex_field("related_full_handle", *node.related_handle);
+                            }
+                        });
+                    }
+                });
+                item.object_field("conditional_stored_values", [&](auto& entry) {
+                    entry.field("native_getter_executed", false);
+                    entry.field("status_available", pool.conditional_stored_status.has_value());
+                    entry.field("detail_available", pool.conditional_stored_detail.has_value());
+                    entry.field("status_reason", static_cast<uint32_t>(pool.status_reason));
+                    entry.field("detail_reason", static_cast<uint32_t>(pool.detail_reason));
+                    if (pool.conditional_stored_status)
+                    {
+                        entry.signed_field("status", *pool.conditional_stored_status);
+                    }
+                    if (pool.conditional_stored_detail)
+                    {
+                        entry.signed_field("detail", *pool.conditional_stored_detail);
+                    }
+                    if (pool.status_node)
+                    {
+                        entry.field("status_node", *pool.status_node);
+                    }
+                    if (pool.detail_node)
+                    {
+                        entry.field("detail_node", *pool.detail_node);
+                    }
+                });
+            }
+
             static void write_native_marker_snapshot(json_object_builder& object, const detail::native_marker_snapshot& snapshot)
             {
                 object.field("schema_version", 1U);
@@ -894,6 +1063,8 @@ namespace sogen
                 object.field("atomic", false);
                 object.field("complete", snapshot.complete);
                 object.field("complete_scope", "five_plain_roots_gpr_rip_stack");
+                object.field("core_complete", snapshot.core_complete);
+                object.field("core_ended_steady_ns", snapshot.core_ended_steady_ns);
                 const auto error = std::string_view(snapshot.error);
                 auto error_text_bytes = (std::min)(error.size(), size_t{512});
                 while (error_text_bytes < error.size() && error_text_bytes &&
@@ -1043,14 +1214,26 @@ namespace sogen
                         }
                     }
                 });
+                object.object_field("request_pool", [&](auto& item) {
+                    if (snapshot.request_pool)
+                    {
+                        write_native_marker_pool(item, *snapshot.request_pool);
+                    }
+                    else
+                    {
+                        item.field("selected", false);
+                        item.field("scope", "bounded_type2_chain_depth4");
+                        item.field("reason", static_cast<uint32_t>(detail::native_marker_pool_reason::not_selected));
+                    }
+                });
                 object.object_field("budget", [&](auto& item) {
                     const auto& budget = snapshot.budget;
-                    item.field("scope", "Core stack and resource reads; layout qualification is separate");
+                    item.field("scope", "Core first; optional cleanup pool shares deadline; layout qualification is separate");
                     item.field("started_ns", budget.started_ns);
                     item.field("reads", budget.reads);
                     item.field("bytes", budget.bytes);
-                    item.field("max_reads", detail::native_marker_read_budget::max_reads);
-                    item.field("max_bytes", detail::native_marker_read_budget::max_bytes);
+                    item.field("max_reads", budget.read_limit);
+                    item.field("max_bytes", budget.byte_limit);
                     item.field("max_elapsed_ns", detail::native_marker_read_budget::max_elapsed_ns);
                     item.field("time_exhausted", budget.time_exhausted);
                     item.field("clock_invalid", budget.clock_invalid);
@@ -1058,8 +1241,8 @@ namespace sogen
                     item.field("byte_exhausted", budget.byte_exhausted);
                     item.field("total_memory_reads", uint64_t{budget.reads} + snapshot.qualification_reads);
                     item.field("total_memory_bytes", uint64_t{budget.bytes} + snapshot.qualification_bytes);
-                    item.field("max_total_memory_reads", 25U);
-                    item.field("max_total_memory_bytes", 204U);
+                    item.field("max_total_memory_reads", budget.read_limit + 2U);
+                    item.field("max_total_memory_bytes", budget.byte_limit + 8U);
                 });
                 object.object_field("counts", [&](auto& item) {
                     const auto& counts = snapshot.counts;
