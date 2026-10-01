@@ -10,20 +10,98 @@
 #include <array>
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sogen::syscalls
 {
     NTSTATUS handle_NtClose(const syscall_context&, handle);
+    NTSTATUS handle_NtDeviceIoControlFile(const syscall_context&, handle, handle, emulator_pointer, emulator_pointer,
+                                          emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>, ULONG, emulator_pointer, ULONG,
+                                          emulator_pointer, ULONG);
 }
 
 namespace sogen::test
 {
     namespace
     {
+        class observed_iosb_memory final : public memory_interface
+        {
+          public:
+            explicit observed_iosb_memory(memory_interface& backing)
+                : backing_(backing)
+            {
+            }
+
+            std::vector<std::pair<uint64_t, size_t>> stores;
+            std::function<void()> after_byte_store;
+
+            void read_memory(const uint64_t address, void* data, const size_t size) const override
+            {
+                this->backing_.read_memory(address, data, size);
+            }
+
+            bool try_read_memory(const uint64_t address, void* data, const size_t size) const override
+            {
+                return this->backing_.try_read_memory(address, data, size);
+            }
+
+            void write_memory(const uint64_t address, const void* data, const size_t size) override
+            {
+                this->stores.emplace_back(address, size);
+                const auto* bytes = static_cast<const std::byte*>(data);
+                for (size_t index = 0; index < size; ++index)
+                {
+                    this->backing_.write_memory(address + index, bytes + index, 1);
+                    if (this->after_byte_store)
+                    {
+                        this->after_byte_store();
+                    }
+                }
+            }
+
+            bool try_write_memory(const uint64_t address, const void* data, const size_t size) override
+            {
+                this->stores.emplace_back(address, size);
+                const auto* bytes = static_cast<const std::byte*>(data);
+                for (size_t index = 0; index < size; ++index)
+                {
+                    if (!this->backing_.try_write_memory(address + index, bytes + index, 1))
+                    {
+                        return false;
+                    }
+                    if (this->after_byte_store)
+                    {
+                        this->after_byte_store();
+                    }
+                }
+                return true;
+            }
+
+          private:
+            memory_interface& backing_;
+
+            void map_mmio(uint64_t, size_t, mmio_read_callback, mmio_write_callback) override
+            {
+            }
+
+            void map_memory(uint64_t, size_t, memory_permission) override
+            {
+            }
+
+            void unmap_memory(uint64_t, size_t) override
+            {
+            }
+
+            void apply_memory_protection(uint64_t, size_t, memory_permission) override
+            {
+            }
+        };
+
         struct adjustable_clock final : utils::clock
         {
             steady_time_point steady{std::chrono::steady_clock::now()};
@@ -292,7 +370,8 @@ namespace sogen::test
 
         template <typename Guest>
         NTSTATUS transfer(bool is_send, ULONG tdi_flags = 0, io_device* endpoint = nullptr, handle file_handle = {},
-                          uint32_t issuer_thread_id = 0, uint64_t apc_routine = 0, uint64_t apc_context = 0)
+                          uint32_t issuer_thread_id = 0, uint64_t apc_routine = 0, uint64_t apc_context = 0, ULONG afd_flags = 0,
+                          memory_interface* status_memory = nullptr)
         {
             using Traits = EmulatorTraits<Guest>;
             const uint64_t info = memory + (is_send ? 0x120 : 0x100);
@@ -307,29 +386,35 @@ namespace sogen::test
             context.issuer_thread_id = issuer_thread_id;
             context.apc_routine = apc_routine;
             context.apc_context = apc_context;
-            context.io_status_block = {emu.memory, info};
+            context.io_status_block = {status_memory ? *status_memory : static_cast<memory_interface&>(emu.memory), info};
             context.event = is_send ? send_event : receive_event;
             context.input_buffer = request;
             context.input_buffer_length = is_send ? sizeof(AFD_SEND_INFO<Traits>) : sizeof(AFD_RECV_INFO<Traits>);
             if (is_send)
             {
-                const AFD_SEND_INFO<Traits> input{.BufferArray = static_cast<typename Traits::PVOID>(descriptor), .BufferCount = 1};
+                const AFD_SEND_INFO<Traits> input{
+                    .BufferArray = static_cast<typename Traits::PVOID>(descriptor), .BufferCount = 1, .AfdFlags = afd_flags};
                 emu.memory.write_memory(request, &input, sizeof(input));
             }
             else
             {
-                const AFD_RECV_INFO<Traits> input{
-                    .BufferArray = static_cast<typename Traits::PVOID>(descriptor), .BufferCount = 1, .TdiFlags = tdi_flags};
+                const AFD_RECV_INFO<Traits> input{.BufferArray = static_cast<typename Traits::PVOID>(descriptor),
+                                                  .BufferCount = 1,
+                                                  .AfdFlags = afd_flags,
+                                                  .TdiFlags = tdi_flags};
                 emu.memory.write_memory(request, &input, sizeof(input));
             }
             return (endpoint ? endpoint : device.get())->execute_ioctl(emu, context);
         }
 
         NTSTATUS transfer(bool is_send, ULONG tdi_flags = 0, io_device* endpoint = nullptr, handle file_handle = {},
-                          uint32_t issuer_thread_id = 0, uint64_t apc_routine = 0, uint64_t apc_context = 0)
+                          uint32_t issuer_thread_id = 0, uint64_t apc_routine = 0, uint64_t apc_context = 0, ULONG afd_flags = 0,
+                          memory_interface* status_memory = nullptr)
         {
-            return GetParam() ? transfer<Emu32>(is_send, tdi_flags, endpoint, file_handle, issuer_thread_id, apc_routine, apc_context)
-                              : transfer<Emu64>(is_send, tdi_flags, endpoint, file_handle, issuer_thread_id, apc_routine, apc_context);
+            return GetParam() ? transfer<Emu32>(is_send, tdi_flags, endpoint, file_handle, issuer_thread_id, apc_routine, apc_context,
+                                                afd_flags, status_memory)
+                              : transfer<Emu64>(is_send, tdi_flags, endpoint, file_handle, issuer_thread_id, apc_routine, apc_context,
+                                                afd_flags, status_memory);
         }
 
         IO_STATUS_BLOCK<EmulatorTraits<Emu64>> status(bool is_send)
@@ -1307,6 +1392,136 @@ namespace sogen::test
         EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
     }
 
+    TEST_P(AfdPendingRequestTest, SendPollIgnoresWritablePendingConnectAndCompactsQualifiedHandles)
+    {
+        emu.process.is_wow64_process = GetParam();
+        const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
+        emu.memory.write_memory(memory, creation.data(), sizeof(creation));
+        const auto connecting_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        const auto ready_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        auto* connecting = emu.process.devices.get(connecting_handle);
+        ASSERT_NE(connecting, nullptr);
+        ASSERT_NE(emu.process.devices.get(ready_handle), nullptr);
+        socket->connect_blocked = true;
+        socket->send_blocked = false;
+
+        const auto run = [&]<typename Guest>() {
+            using Traits = EmulatorTraits<Guest>;
+            using poll_info = AFD_POLL_INFO<Traits>;
+            using poll_handle = AFD_POLL_HANDLE_INFO<Traits>;
+            constexpr auto prefix = offsetof(poll_info, Handles);
+            constexpr uint64_t poll_buffer = memory + 0x800;
+            constexpr uint64_t mixed_buffer = memory + 0xa00;
+            constexpr uint64_t poll_iosb = memory + 0x780;
+            constexpr uint64_t mixed_iosb = memory + 0x620;
+            const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Pointer = 0xaabbccdd4a4b4c4dull, .Information = 0x1122334455667788ull};
+
+            AFD_CONNECT_JOIN_INFO_TL<Traits> connect_input{};
+            connect_input.RemoteAddress.sa_family = 2;
+            emu.memory.write_memory(memory + 0x900, &connect_input, sizeof(connect_input));
+            emu.memory.write_memory(memory + 0x100, &initial, sizeof(initial));
+            io_device_context connect_request{emu.memory};
+            connect_request.file_handle = connecting_handle;
+            connect_request.io_control_code = 0x12007;
+            connect_request.io_status_block = {emu.memory, memory + 0x100};
+            connect_request.event = receive_event;
+            connect_request.input_buffer = memory + 0x900;
+            connect_request.input_buffer_length = sizeof(connect_input);
+            ASSERT_EQ(connecting->execute_ioctl(emu, connect_request), STATUS_PENDING);
+            EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+            EXPECT_FALSE(socket->connected);
+
+            poll_info input{};
+            input.Timeout.QuadPart = -10'000'000;
+            input.NumberOfHandles = 1;
+            input.Handles[0].Handle = static_cast<typename Traits::HANDLE>(connecting_handle.bits);
+            input.Handles[0].PollEvents = AFD_POLL_SEND;
+            input.Handles[0].Status = static_cast<NTSTATUS>(0x4a4b4c4d);
+            emu.memory.write_memory(poll_buffer, &input, sizeof(input));
+            emu.memory.write_memory(poll_iosb, &initial, sizeof(initial));
+            const auto original_input = emu.memory.read_memory(poll_buffer, sizeof(input));
+            const auto original_iosb = emu.memory.read_memory(poll_iosb, sizeof(initial));
+            io_device_context request{emu.memory};
+            request.io_control_code = 0x12024;
+            request.io_status_block = {emu.memory, poll_iosb};
+            request.event = poll_event;
+            request.input_buffer = poll_buffer;
+            request.input_buffer_length = sizeof(input);
+            request.output_buffer = poll_buffer;
+            request.output_buffer_length = sizeof(input);
+            ASSERT_EQ(device->execute_ioctl(emu, request), STATUS_PENDING);
+            EXPECT_EQ(emu.memory.read_memory(poll_buffer, sizeof(input)), original_input);
+            EXPECT_EQ(emu.memory.read_memory(poll_iosb, sizeof(initial)), original_iosb);
+            EXPECT_FALSE(emu.process.events.get(poll_event)->signaled);
+
+            connecting->work(emu);
+            device->work(emu);
+            EXPECT_EQ(emu.memory.read_memory(poll_buffer, sizeof(input)), original_input);
+            EXPECT_EQ(emu.memory.read_memory(poll_iosb, sizeof(initial)), original_iosb);
+            EXPECT_FALSE(emu.process.events.get(poll_event)->signaled);
+            EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+            EXPECT_FALSE(socket->connected);
+
+            const auto mixed_size = prefix + 2 * sizeof(poll_handle);
+            poll_info mixed_input = input;
+            mixed_input.NumberOfHandles = 2;
+            const poll_handle ready{.Handle = static_cast<typename Traits::HANDLE>(ready_handle.bits),
+                                    .PollEvents = AFD_POLL_SEND,
+                                    .Status = static_cast<NTSTATUS>(0x51525354)};
+            emu.memory.set_memory(mixed_buffer, 0xcc, mixed_size);
+            emu.memory.write_memory(mixed_buffer, &mixed_input, sizeof(mixed_input));
+            emu.memory.write_memory(mixed_buffer + prefix + sizeof(poll_handle), &ready, sizeof(ready));
+            const auto trailing_row = emu.memory.read_memory(mixed_buffer + prefix + sizeof(poll_handle), sizeof(poll_handle));
+            emu.memory.write_memory(mixed_iosb, &initial, sizeof(initial));
+            io_device_context mixed_request{emu.memory};
+            mixed_request.io_control_code = 0x12024;
+            mixed_request.io_status_block = {emu.memory, mixed_iosb};
+            mixed_request.event = second_send_event;
+            mixed_request.input_buffer = mixed_buffer;
+            mixed_request.input_buffer_length = static_cast<ULONG>(mixed_size);
+            mixed_request.output_buffer = mixed_buffer;
+            mixed_request.output_buffer_length = static_cast<ULONG>(mixed_size);
+            ASSERT_EQ(device->execute_ioctl(emu, mixed_request), STATUS_SUCCESS);
+            const auto mixed_result = emu.memory.read_memory<poll_info>(mixed_buffer);
+            EXPECT_EQ(mixed_result.NumberOfHandles, 1u);
+            EXPECT_EQ(mixed_result.Handles[0].Handle, static_cast<typename Traits::HANDLE>(ready_handle.bits));
+            EXPECT_EQ(mixed_result.Handles[0].PollEvents, static_cast<ULONG>(AFD_POLL_SEND));
+            EXPECT_EQ(mixed_result.Handles[0].Status, STATUS_SUCCESS);
+            EXPECT_EQ(mixed_request.io_status_block.read().Status, STATUS_SUCCESS);
+            EXPECT_EQ(mixed_request.io_status_block.read().Information, prefix + sizeof(poll_handle));
+            EXPECT_TRUE(emu.process.events.get(second_send_event)->signaled);
+            EXPECT_EQ(emu.memory.read_memory(mixed_buffer + prefix + sizeof(poll_handle), sizeof(poll_handle)), trailing_row);
+            EXPECT_EQ(emu.memory.read_memory(poll_buffer, sizeof(input)), original_input);
+            EXPECT_EQ(emu.memory.read_memory(poll_iosb, sizeof(initial)), original_iosb);
+            EXPECT_FALSE(emu.process.events.get(poll_event)->signaled);
+
+            socket->connect_blocked = false;
+            connecting->work(emu);
+            EXPECT_TRUE(socket->connected);
+            EXPECT_EQ(connect_request.io_status_block.read().Status, STATUS_SUCCESS);
+            EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+            device->work(emu);
+            const auto result = emu.memory.read_memory<poll_info>(poll_buffer);
+            EXPECT_EQ(result.NumberOfHandles, 1u);
+            EXPECT_EQ(result.Handles[0].Handle, static_cast<typename Traits::HANDLE>(connecting_handle.bits));
+            EXPECT_EQ(result.Handles[0].PollEvents, static_cast<ULONG>(AFD_POLL_SEND));
+            EXPECT_EQ(result.Handles[0].Status, STATUS_SUCCESS);
+            EXPECT_EQ(request.io_status_block.read().Status, STATUS_SUCCESS);
+            EXPECT_EQ(request.io_status_block.read().Information, prefix + sizeof(poll_handle));
+            EXPECT_TRUE(emu.process.events.get(poll_event)->signaled);
+        };
+        if (GetParam())
+        {
+            run.template operator()<Emu32>();
+        }
+        else
+        {
+            run.template operator()<Emu64>();
+        }
+    }
+
     TEST_P(AfdPendingRequestTest, UnsupportedStreamPeekDoesNotConsumeInput)
     {
         for (const char value : std::string_view{"abc"})
@@ -1392,7 +1607,7 @@ namespace sogen::test
 
         const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Status = static_cast<NTSTATUS>(0x4A4B4C4D), .Information = 0x11223344};
         emu.memory.write_memory(memory + 0x120, &initial, sizeof(initial));
-        ASSERT_EQ(transfer(true, 0, endpoint, endpoint_handle), STATUS_PENDING);
+        ASSERT_EQ(transfer(true, 0, endpoint, endpoint_handle, 0, 0, 0xfeed), STATUS_PENDING);
         EXPECT_EQ(status(true).Status, initial.Status);
         EXPECT_EQ(status(true).Information, initial.Information);
         EXPECT_TRUE(emu.process.io_completions.get(port_handle)->queue.empty());
@@ -1404,8 +1619,203 @@ namespace sogen::test
         ASSERT_NE(port, nullptr);
         ASSERT_EQ(port->queue.size(), 1u);
         EXPECT_EQ(port->queue.front().key_context, 0x9876u);
+        EXPECT_EQ(port->queue.front().apc_context, 0xfeedu);
         EXPECT_EQ(port->queue.front().io_status_block.Status, STATUS_SUCCESS);
         EXPECT_EQ(port->queue.front().io_status_block.Information, 3u);
+    }
+
+    TEST_P(AfdPendingRequestTest, DefaultPendingReceiveUsesCapturedCompletionContext)
+    {
+        emu.process.is_wow64_process = GetParam();
+        const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
+        emu.memory.write_memory(memory, creation.data(), sizeof(creation));
+        const auto endpoint_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        auto* endpoint = emu.process.devices.get(endpoint_handle);
+        ASSERT_NE(endpoint, nullptr);
+        socket->connected = true;
+        const auto port_handle = emu.process.io_completions.store(io_completion{});
+        endpoint->completion_port = port_handle;
+        endpoint->completion_key = 0x1234;
+        auto* port = emu.process.io_completions.get(port_handle);
+        ASSERT_NE(port, nullptr);
+        const auto check = [&]<typename Guest>() {
+            using Traits = EmulatorTraits<Guest>;
+            for (const uint64_t captured_context : {0ull, 0x5678ull})
+            {
+                SCOPED_TRACE(testing::Message() << "captured_context=" << captured_context);
+                port->queue.clear();
+                socket->incoming.clear();
+                emu.process.events.get(receive_event)->signaled = false;
+                emu.process.events.get(send_event)->signaled = false;
+                emu.memory.set_memory(memory + 0x400, 0xcc, 16);
+                const EMU_WSABUF<Traits> buffer{.len = 3, .buf = static_cast<typename Traits::PVOID>(memory + 0x400)};
+                const AFD_RECV_INFO<Traits> input{
+                    .BufferArray = static_cast<typename Traits::PVOID>(memory + 0x300), .BufferCount = 1, .AfdFlags = 2, .TdiFlags = 0x20};
+                emu.memory.write_memory(memory + 0x300, &buffer, sizeof(buffer));
+                emu.memory.write_memory(memory + 0x200, &input, sizeof(input));
+                const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> sentinel{.Pointer = 0xaabbccdd4a4b4c4dull,
+                                                                      .Information = 0x1122334455667788ull};
+                emu.memory.write_memory(memory + 0x100, &sentinel, sizeof(sentinel));
+                emu.memory.write_memory(memory + 0x180, &sentinel, sizeof(sentinel));
+                const auto original = emu.memory.read_memory(memory + 0x100, sizeof(sentinel));
+                io_device_context request{emu.memory};
+                request.file_handle = endpoint_handle;
+                request.event = receive_event;
+                request.apc_context = captured_context;
+                request.io_status_block = {emu.memory, memory + 0x100};
+                request.io_control_code = 0x12017;
+                request.input_buffer = memory + 0x200;
+                request.input_buffer_length = sizeof(input);
+                ASSERT_EQ(endpoint->capture_completion_mode(emu, request), device_ioctl_completion_mode::default_completion);
+                ASSERT_EQ(endpoint->execute_ioctl(emu, request), STATUS_PENDING);
+                EXPECT_EQ(emu.memory.read_memory(memory + 0x100, sizeof(sentinel)), original);
+                EXPECT_TRUE(port->queue.empty());
+                EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+                request.apc_context = captured_context ? 0 : 0x9999;
+                request.event = send_event;
+                request.file_handle = {};
+                request.io_status_block = {emu.memory, memory + 0x180};
+                for (const char byte : std::string_view{"abc"})
+                {
+                    socket->incoming.push_back(static_cast<std::byte>(byte));
+                }
+                endpoint->work(emu);
+                EXPECT_EQ(status(false).Status, STATUS_SUCCESS);
+                EXPECT_EQ(status(false).Information, 3u);
+                EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x104), 0u);
+                EXPECT_EQ((emu.memory.read_memory<std::array<char, 3>>(memory + 0x400)), (std::array<char, 3>{'a', 'b', 'c'}));
+                EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x403), 0xccu);
+                EXPECT_EQ(emu.memory.read_memory(memory + 0x180, sizeof(sentinel)), original);
+                EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+                EXPECT_FALSE(emu.process.events.get(send_event)->signaled);
+                if (captured_context == 0)
+                {
+                    EXPECT_TRUE(port->queue.empty());
+                }
+                else
+                {
+                    ASSERT_EQ(port->queue.size(), 1u);
+                    EXPECT_EQ(port->queue.front().key_context, 0x1234u);
+                    EXPECT_EQ(port->queue.front().apc_context, captured_context);
+                    EXPECT_EQ(port->queue.front().io_status_block.Status, STATUS_SUCCESS);
+                    EXPECT_EQ(port->queue.front().io_status_block.Information, 3u);
+                }
+                const auto completed_count = port->queue.size();
+                endpoint->work(emu);
+                EXPECT_EQ(port->queue.size(), completed_count);
+            }
+        };
+        if (GetParam())
+        {
+            check.template operator()<Emu32>();
+        }
+        else
+        {
+            check.template operator()<Emu64>();
+        }
+    }
+
+    TEST_P(AfdPendingRequestTest, PollCompletionUsesCapturedContextAndPreservesReadyOutputAndEvent)
+    {
+        emu.process.is_wow64_process = GetParam();
+        const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
+        emu.memory.write_memory(memory, creation.data(), sizeof(creation));
+        const auto endpoint_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        auto* endpoint = emu.process.devices.get(endpoint_handle);
+        ASSERT_NE(endpoint, nullptr);
+        socket->connected = true;
+        const auto port_handle = emu.process.io_completions.store(io_completion{});
+        endpoint->completion_port = port_handle;
+        endpoint->completion_key = 0x1234;
+        auto* port = emu.process.io_completions.get(port_handle);
+        ASSERT_NE(port, nullptr);
+        const auto check = [&]<typename Guest>() {
+            using Traits = EmulatorTraits<Guest>;
+            constexpr ULONG requested_mask = AFD_POLL_RECEIVE | AFD_POLL_DISCONNECT | AFD_POLL_ABORT | AFD_POLL_ACCEPT;
+            static_assert(requested_mask == 0x99);
+            constexpr auto completed_bytes = offsetof(AFD_POLL_INFO<Traits>, Handles) + sizeof(AFD_POLL_HANDLE_INFO<Traits>);
+            for (const bool initially_ready : {false, true})
+            {
+                for (const uint64_t captured_context : {0ull, 0x5678ull})
+                {
+                    SCOPED_TRACE(testing::Message() << "ready=" << initially_ready << " captured_context=" << captured_context);
+                    port->queue.clear();
+                    socket->incoming.clear();
+                    emu.process.events.get(poll_event)->signaled = false;
+                    AFD_POLL_INFO<Traits> input{};
+                    input.Timeout.QuadPart = -10000000; // One second, never the separate zero-timeout path.
+                    input.NumberOfHandles = 1;
+                    input.Handles[0].Handle = static_cast<typename Traits::HANDLE>(endpoint_handle.bits);
+                    input.Handles[0].PollEvents = requested_mask;
+                    emu.memory.write_memory(memory + 0x800, &input, sizeof(input));
+                    const auto original_input = emu.memory.read_memory(memory + 0x800, sizeof(input));
+                    const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> sentinel{.Pointer = 0xaabbccdd4a4b4c4dull,
+                                                                          .Information = 0x1122334455667788ull};
+                    emu.memory.write_memory(memory + 0x780, &sentinel, sizeof(sentinel));
+                    const auto original_status = emu.memory.read_memory(memory + 0x780, sizeof(sentinel));
+                    io_device_context request{emu.memory};
+                    request.file_handle = endpoint_handle;
+                    request.event = poll_event;
+                    request.apc_context = captured_context;
+                    request.io_control_code = 0x12024;
+                    request.io_status_block = {emu.memory, memory + 0x780};
+                    request.input_buffer = memory + 0x800;
+                    request.input_buffer_length = sizeof(input);
+                    request.output_buffer = request.input_buffer;
+                    request.output_buffer_length = request.input_buffer_length;
+                    ASSERT_EQ(endpoint->capture_completion_mode(emu, request), device_ioctl_completion_mode::default_completion);
+                    if (initially_ready)
+                    {
+                        socket->incoming.push_back(std::byte{'a'});
+                    }
+                    ASSERT_EQ(endpoint->execute_ioctl(emu, request), initially_ready ? STATUS_SUCCESS : STATUS_PENDING);
+                    if (!initially_ready)
+                    {
+                        EXPECT_EQ(emu.memory.read_memory(memory + 0x800, sizeof(input)), original_input);
+                        EXPECT_EQ(emu.memory.read_memory(memory + 0x780, sizeof(sentinel)), original_status);
+                        EXPECT_FALSE(emu.process.events.get(poll_event)->signaled);
+                        EXPECT_TRUE(port->queue.empty());
+                        request.apc_context = captured_context ? 0 : 0x9999;
+                        socket->incoming.push_back(std::byte{'a'});
+                        endpoint->work(emu);
+                    }
+                    const auto output = emu.memory.read_memory<AFD_POLL_INFO<Traits>>(memory + 0x800);
+                    EXPECT_EQ(output.NumberOfHandles, 1u);
+                    EXPECT_EQ(output.Handles[0].Handle, static_cast<typename Traits::HANDLE>(endpoint_handle.bits));
+                    EXPECT_EQ(output.Handles[0].PollEvents, AFD_POLL_RECEIVE);
+                    EXPECT_EQ(output.Handles[0].Status, STATUS_SUCCESS);
+                    const auto final_status = emu.memory.read_memory<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>(memory + 0x780);
+                    EXPECT_EQ(final_status.Status, STATUS_SUCCESS);
+                    EXPECT_EQ(final_status.Information, completed_bytes);
+                    EXPECT_TRUE(emu.process.events.get(poll_event)->signaled);
+                    if (captured_context == 0)
+                    {
+                        EXPECT_TRUE(port->queue.empty());
+                    }
+                    else
+                    {
+                        ASSERT_EQ(port->queue.size(), 1u);
+                        EXPECT_EQ(port->queue.front().key_context, 0x1234u);
+                        EXPECT_EQ(port->queue.front().apc_context, captured_context);
+                        EXPECT_EQ(port->queue.front().io_status_block.Status, STATUS_SUCCESS);
+                        EXPECT_EQ(port->queue.front().io_status_block.Information, completed_bytes);
+                    }
+                    const auto completed_count = port->queue.size();
+                    endpoint->work(emu);
+                    EXPECT_EQ(port->queue.size(), completed_count);
+                }
+            }
+        };
+        if (GetParam())
+        {
+            check.template operator()<Emu32>();
+        }
+        else
+        {
+            check.template operator()<Emu64>();
+        }
     }
 
     TEST_P(AfdPendingRequestTest, SynchronousSendSkipsApcButPendingSendQueuesIt)
@@ -1453,6 +1863,523 @@ namespace sogen::test
         EXPECT_EQ(thread->pending_apcs.front().apc_routine, 0x567800u);
         EXPECT_EQ(thread->pending_apcs.front().apc_argument1, 0xfeedu);
         EXPECT_EQ(thread->pending_apcs.front().apc_argument2, memory + 0x120);
+    }
+
+    TEST_P(AfdPendingRequestTest, StreamCallbackModeQueuesSynchronousApcAndRetainsStatusUnion)
+    {
+        static_assert(sizeof(AFD_SEND_INFO<EmulatorTraits<Emu32>>) == 16);
+        static_assert(sizeof(AFD_RECV_INFO<EmulatorTraits<Emu32>>) == 16);
+        static_assert(offsetof(AFD_SEND_INFO<EmulatorTraits<Emu32>>, AfdFlags) == 8);
+        static_assert(offsetof(AFD_RECV_INFO<EmulatorTraits<Emu32>>, AfdFlags) == 8);
+        static_assert(sizeof(AFD_SEND_INFO<EmulatorTraits<Emu64>>) == 24);
+        static_assert(sizeof(AFD_RECV_INFO<EmulatorTraits<Emu64>>) == 24);
+        static_assert(offsetof(AFD_SEND_INFO<EmulatorTraits<Emu64>>, AfdFlags) == 12);
+        static_assert(offsetof(AFD_RECV_INFO<EmulatorTraits<Emu64>>, AfdFlags) == 12);
+        static_assert(sizeof(IO_STATUS_BLOCK<EmulatorTraits<Emu32>>) == 8);
+        static_assert(offsetof(IO_STATUS_BLOCK<EmulatorTraits<Emu32>>, Information) == 4);
+        static_assert(sizeof(IO_STATUS_BLOCK<EmulatorTraits<Emu64>>) == 16);
+        static_assert(offsetof(IO_STATUS_BLOCK<EmulatorTraits<Emu64>>, Information) == 8);
+
+        emu.process.is_wow64_process = GetParam();
+        const bool qualified = !GetParam();
+        const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
+        emu.memory.write_memory(memory, creation.data(), sizeof(creation));
+        const auto endpoint_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        auto* endpoint = emu.process.devices.get(endpoint_handle);
+        ASSERT_NE(endpoint, nullptr);
+        emulator_thread issuer{emu.memory};
+        issuer.id = 0x1234;
+        const auto thread_handle = emu.process.threads.store(std::move(issuer));
+        emu.process.thread_handles_by_id.emplace(0x1234, thread_handle);
+        auto* thread = emu.process.threads.get(thread_handle);
+        ASSERT_NE(thread, nullptr);
+        socket->send_blocked = false;
+
+        for (const bool is_send : {false, true})
+        {
+            for (const ULONG flags : {0u, 3u})
+            {
+                SCOPED_TRACE(testing::Message() << "send=" << is_send << " flags=" << flags);
+                const bool callback_mode = qualified && flags == 3;
+                thread->pending_apcs.clear();
+                const auto iosb = memory + (is_send ? 0x120 : 0x100);
+                const auto signal = is_send ? send_event : receive_event;
+                const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Pointer = 0xaabbccdd4a4b4c4dull,
+                                                                     .Information = 0x1122334455667788ull};
+                emu.memory.write_memory(iosb, &initial, sizeof(initial));
+                emu.process.events.get(signal)->signaled = false;
+                observed_iosb_memory observed{emu.memory};
+                size_t terminal_observations = 0;
+                observed.after_byte_store = [&] {
+                    if (!qualified)
+                    {
+                        return;
+                    }
+                    EXPECT_EQ(emu.memory.read_memory<uint32_t>(iosb + 4), 0xaabbccddu);
+                    if (status(is_send).Status == STATUS_SUCCESS)
+                    {
+                        ++terminal_observations;
+                        EXPECT_EQ(status(is_send).Information, 3u);
+                        if (!is_send)
+                        {
+                            EXPECT_EQ((emu.memory.read_memory<std::array<char, 3>>(memory + 0x400)), (std::array<char, 3>{'a', 'b', 'c'}));
+                        }
+                        else
+                        {
+                            EXPECT_GE(socket->outgoing.size(), 3u);
+                        }
+                    }
+                };
+                if (!is_send)
+                {
+                    for (const char value : std::string_view{"abc"})
+                    {
+                        socket->incoming.push_back(static_cast<std::byte>(value));
+                    }
+                }
+                ASSERT_EQ(transfer(is_send, is_send ? 0 : 0x20, endpoint, endpoint_handle, 0x1234, 0x567800, 0xfeed, flags,
+                                   flags == 3 ? &observed : nullptr),
+                          STATUS_SUCCESS);
+                io_device_context mode_request{emu.memory};
+                mode_request.io_control_code = is_send ? 0x1201f : 0x12017;
+                mode_request.input_buffer = memory + (is_send ? 0x240 : 0x200);
+                mode_request.input_buffer_length =
+                    GetParam() ? sizeof(AFD_SEND_INFO<EmulatorTraits<Emu32>>) : sizeof(AFD_SEND_INFO<EmulatorTraits<Emu64>>);
+                EXPECT_EQ(endpoint->capture_completion_mode(emu, mode_request), callback_mode
+                                                                                    ? device_ioctl_completion_mode::afd_stream_callback
+                                                                                    : device_ioctl_completion_mode::default_completion);
+                if (callback_mode)
+                {
+                    EXPECT_GT(terminal_observations, 0u);
+                    EXPECT_EQ(observed.stores, (std::vector<std::pair<uint64_t, size_t>>{{iosb + 8, 8}, {iosb, 4}}));
+                }
+                else if (flags == 3)
+                {
+                    EXPECT_EQ(observed.stores, (std::vector<std::pair<uint64_t, size_t>>{
+                                                   {iosb, sizeof(initial)}, {iosb, sizeof(initial)}, {iosb, sizeof(initial)}}));
+                }
+                if (is_send)
+                {
+                    ASSERT_EQ(socket->outgoing.size(), flags == 3 ? 6u : 3u);
+                    EXPECT_EQ((std::vector<std::byte>(socket->outgoing.end() - 3, socket->outgoing.end())),
+                              (std::vector<std::byte>{std::byte{'X'}, std::byte{'Y'}, std::byte{'Z'}}));
+                }
+                else
+                {
+                    EXPECT_EQ((emu.memory.read_memory<std::array<char, 3>>(memory + 0x400)), (std::array<char, 3>{'a', 'b', 'c'}));
+                }
+                EXPECT_EQ(status(is_send).Status, STATUS_SUCCESS);
+                EXPECT_EQ(status(is_send).Information, 3u);
+                EXPECT_EQ(emu.memory.read_memory<uint32_t>(iosb + 4), callback_mode ? 0xaabbccddu : 0u);
+                EXPECT_TRUE(emu.process.events.get(signal)->signaled);
+                ASSERT_EQ(thread->pending_apcs.size(), callback_mode ? 1u : 0u);
+                if (callback_mode)
+                {
+                    const auto& apc = thread->pending_apcs.front();
+                    EXPECT_EQ(apc.apc_routine, 0x567800u);
+                    EXPECT_EQ(apc.apc_argument1, 0xfeedu);
+                    EXPECT_EQ(apc.apc_argument2, iosb);
+                    EXPECT_EQ(apc.io_status, static_cast<int32_t>(STATUS_SUCCESS));
+                    EXPECT_EQ(apc.io_information, 3u);
+                }
+                endpoint->work(emu);
+                EXPECT_EQ(thread->pending_apcs.size(), callback_mode ? 1u : 0u);
+            }
+        }
+    }
+
+    TEST_P(AfdPendingRequestTest, NoFastStreamWouldBlockPreservesIosbWithoutCompletionSignal)
+    {
+        emu.process.is_wow64_process = GetParam();
+        const bool qualified = !GetParam();
+        const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
+        emu.memory.write_memory(memory, creation.data(), sizeof(creation));
+        const auto endpoint_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        auto* endpoint = emu.process.devices.get(endpoint_handle);
+        ASSERT_NE(endpoint, nullptr);
+        emulator_thread issuer{emu.memory};
+        issuer.id = 0x1234;
+        const auto thread_handle = emu.process.threads.store(std::move(issuer));
+        emu.process.thread_handles_by_id.emplace(0x1234, thread_handle);
+        auto* thread = emu.process.threads.get(thread_handle);
+        ASSERT_NE(thread, nullptr);
+
+        const AFD_INFO nonblocking{.InformationClass = 2, .Information = 1};
+        emu.memory.write_memory(memory + 0x900, &nonblocking, sizeof(nonblocking));
+        io_device_context mode_request{emu.memory};
+        mode_request.io_control_code = 0x1203b;
+        mode_request.input_buffer = memory + 0x900;
+        mode_request.input_buffer_length = sizeof(nonblocking);
+        mode_request.io_status_block = {emu.memory, memory + 0x80};
+        ASSERT_EQ(endpoint->execute_ioctl(emu, mode_request), STATUS_SUCCESS);
+
+        auto& vcpu = emu.vcpu(0);
+        auto* const original_thread = vcpu.active_thread;
+        vcpu.active_thread = thread;
+        const auto restore_thread = utils::finally([&] { vcpu.active_thread = original_thread; });
+        const syscall_context syscall{.win_emu = emu, .emu = vcpu.cpu, .vcpu = vcpu, .proc = emu.process};
+        observed_iosb_memory observed{emu.memory};
+        const auto submit = [&]<typename Guest>(const ULONG flags) {
+            using Traits = EmulatorTraits<Guest>;
+            const EMU_WSABUF<Traits> buffer{.len = 3, .buf = static_cast<typename Traits::PVOID>(memory + 0x400)};
+            const AFD_RECV_INFO<Traits> request{
+                .BufferArray = static_cast<typename Traits::PVOID>(memory + 0x300), .BufferCount = 1, .AfdFlags = flags, .TdiFlags = 0x20};
+            emu.memory.write_memory(memory + 0x300, &buffer, sizeof(buffer));
+            emu.memory.write_memory(memory + 0x200, &request, sizeof(request));
+            io_device_context capture_request{emu.memory};
+            capture_request.io_control_code = 0x12017;
+            capture_request.input_buffer = memory + 0x200;
+            capture_request.input_buffer_length = sizeof(request);
+            EXPECT_EQ(endpoint->capture_completion_mode(emu, capture_request), qualified && flags == 1
+                                                                                   ? device_ioctl_completion_mode::afd_stream_no_fast_io
+                                                                                   : device_ioctl_completion_mode::default_completion);
+            return syscalls::handle_NtDeviceIoControlFile(syscall, endpoint_handle, receive_event, 0x567800, 0xfeed,
+                                                          {observed, memory + 0x100}, 0x12017, memory + 0x200, sizeof(request), 0, 0);
+        };
+
+        for (const ULONG flags : {0u, 1u})
+        {
+            for (const bool initially_signaled : {false, true})
+            {
+                SCOPED_TRACE(testing::Message() << "flags=" << flags << " initial_event=" << initially_signaled);
+                const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Pointer = 0xaabbccdd4a4b4c4dull,
+                                                                     .Information = 0x1122334455667788ull};
+                emu.memory.write_memory(memory + 0x100, &initial, sizeof(initial));
+                const auto original_bytes = emu.memory.read_memory(memory + 0x100, sizeof(initial));
+                emu.process.events.get(receive_event)->signaled = initially_signaled;
+                observed.stores.clear();
+                ASSERT_EQ(GetParam() ? submit.template operator()<Emu32>(flags) : submit.template operator()<Emu64>(flags),
+                          STATUS_DEVICE_NOT_READY);
+                if (qualified && flags == 1)
+                {
+                    EXPECT_EQ(emu.memory.read_memory(memory + 0x100, sizeof(initial)), original_bytes);
+                    EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+                    EXPECT_TRUE(observed.stores.empty());
+                }
+                else
+                {
+                    EXPECT_EQ(status(false).Status, STATUS_DEVICE_NOT_READY);
+                    EXPECT_EQ(status(false).Information, 0u);
+                    EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x104), 0u);
+                    EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+                    EXPECT_EQ(observed.stores, (std::vector<std::pair<uint64_t, size_t>>{{memory + 0x100, sizeof(initial)},
+                                                                                         {memory + 0x100, sizeof(initial)}}));
+                }
+                EXPECT_TRUE(thread->pending_apcs.empty());
+                endpoint->work(emu);
+                EXPECT_TRUE(thread->pending_apcs.empty());
+            }
+        }
+
+        // Flags1 send A3 is not independently measured; keep its existing
+        // completion fallback instead of extending the receive-only omission policy.
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Pointer = 0xaabbccdd4a4b4c4dull, .Information = 0x1122334455667788ull};
+        emu.memory.write_memory(memory + 0x120, &initial, sizeof(initial));
+        socket->send_blocked = true;
+        emu.process.events.get(send_event)->signaled = false;
+        ASSERT_EQ(transfer(true, 0, endpoint, endpoint_handle, 0x1234, 0x567800, 0xfeed, 1), STATUS_DEVICE_NOT_READY);
+        io_device_context capture_request{emu.memory};
+        capture_request.io_control_code = 0x1201f;
+        capture_request.input_buffer = memory + 0x240;
+        capture_request.input_buffer_length =
+            GetParam() ? sizeof(AFD_SEND_INFO<EmulatorTraits<Emu32>>) : sizeof(AFD_SEND_INFO<EmulatorTraits<Emu64>>);
+        EXPECT_EQ(endpoint->capture_completion_mode(emu, capture_request), device_ioctl_completion_mode::default_completion);
+        EXPECT_EQ(status(true).Status, STATUS_DEVICE_NOT_READY);
+        EXPECT_EQ(status(true).Information, 0u);
+        EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x124), 0u);
+        EXPECT_TRUE(emu.process.events.get(send_event)->signaled);
+        EXPECT_TRUE(thread->pending_apcs.empty());
+    }
+
+    TEST_P(AfdPendingRequestTest, CallbackPendingStreamUsesCapturedModeAndRetainsStatusUnion)
+    {
+        emu.process.is_wow64_process = GetParam();
+        const bool qualified = !GetParam();
+        const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
+        emu.memory.write_memory(memory, creation.data(), sizeof(creation));
+        const auto endpoint_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        auto* endpoint = emu.process.devices.get(endpoint_handle);
+        ASSERT_NE(endpoint, nullptr);
+        emulator_thread issuer{emu.memory};
+        issuer.id = 0x1234;
+        const auto thread_handle = emu.process.threads.store(std::move(issuer));
+        emu.process.thread_handles_by_id.emplace(0x1234, thread_handle);
+        auto* thread = emu.process.threads.get(thread_handle);
+        ASSERT_NE(thread, nullptr);
+        for (const bool is_send : {false, true})
+        {
+            SCOPED_TRACE(testing::Message() << "send=" << is_send);
+            thread->pending_apcs.clear();
+            socket->send_blocked = true;
+            const auto iosb = memory + (is_send ? 0x120 : 0x100);
+            const auto input = memory + (is_send ? 0x240 : 0x200);
+            const auto flags_offset = GetParam() ? 8u : 12u;
+            const auto signal = is_send ? send_event : receive_event;
+            const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Pointer = 0xaabbccdd4a4b4c4dull, .Information = 0x1122334455667788ull};
+            emu.memory.write_memory(iosb, &initial, sizeof(initial));
+            const auto original_bytes = emu.memory.read_memory(iosb, sizeof(initial));
+            emu.process.events.get(signal)->signaled = false;
+            observed_iosb_memory observed{emu.memory};
+            size_t terminal_observations = 0;
+            observed.after_byte_store = [&] {
+                if (!qualified)
+                {
+                    return;
+                }
+                EXPECT_EQ(emu.memory.read_memory<uint32_t>(iosb + 4), 0xaabbccddu);
+                if (status(is_send).Status == STATUS_SUCCESS)
+                {
+                    ++terminal_observations;
+                    EXPECT_EQ(status(is_send).Information, 3u);
+                    if (!is_send)
+                    {
+                        EXPECT_EQ((emu.memory.read_memory<std::array<char, 3>>(memory + 0x400)), (std::array<char, 3>{'a', 'b', 'c'}));
+                    }
+                    else
+                    {
+                        EXPECT_EQ(socket->outgoing.size(), 3u);
+                    }
+                }
+            };
+            ASSERT_EQ(transfer(is_send, is_send ? 0 : 0x20, endpoint, endpoint_handle, 0x1234, 0x567800, 0xfeed, 3, &observed),
+                      STATUS_PENDING);
+            io_device_context mode_request{emu.memory};
+            mode_request.io_control_code = is_send ? 0x1201f : 0x12017;
+            mode_request.input_buffer = input;
+            mode_request.input_buffer_length =
+                GetParam() ? sizeof(AFD_SEND_INFO<EmulatorTraits<Emu32>>) : sizeof(AFD_SEND_INFO<EmulatorTraits<Emu64>>);
+            EXPECT_EQ(endpoint->capture_completion_mode(emu, mode_request),
+                      qualified ? device_ioctl_completion_mode::afd_stream_callback : device_ioctl_completion_mode::default_completion);
+            EXPECT_EQ(emu.memory.read_memory(iosb, sizeof(initial)), original_bytes);
+            EXPECT_FALSE(emu.process.events.get(signal)->signaled);
+            EXPECT_TRUE(thread->pending_apcs.empty());
+            if (qualified)
+            {
+                EXPECT_TRUE(observed.stores.empty());
+            }
+            else
+            {
+                EXPECT_EQ(observed.stores, (std::vector<std::pair<uint64_t, size_t>>{{iosb, sizeof(initial)}, {iosb, sizeof(initial)}}));
+            }
+            observed.stores.clear();
+            // Completion must use the captured original mode, not caller-mutated input.
+            emulator_object<uint32_t>{emu.memory, input + flags_offset}.write(0u);
+            for (const char value : std::string_view{"abc"})
+            {
+                if (!is_send)
+                {
+                    socket->incoming.push_back(static_cast<std::byte>(value));
+                }
+            }
+            socket->send_blocked = false;
+            endpoint->work(emu);
+            if (qualified)
+            {
+                EXPECT_GT(terminal_observations, 0u);
+                EXPECT_EQ(observed.stores, (std::vector<std::pair<uint64_t, size_t>>{{iosb + 8, 8}, {iosb, 4}}));
+            }
+            else
+            {
+                EXPECT_EQ(observed.stores, (std::vector<std::pair<uint64_t, size_t>>{
+                                               {iosb, sizeof(initial)}, {iosb, sizeof(initial)}, {iosb, sizeof(initial)}}));
+            }
+            if (is_send)
+            {
+                EXPECT_EQ(socket->outgoing, (std::vector<std::byte>{std::byte{'X'}, std::byte{'Y'}, std::byte{'Z'}}));
+            }
+            else
+            {
+                EXPECT_EQ((emu.memory.read_memory<std::array<char, 3>>(memory + 0x400)), (std::array<char, 3>{'a', 'b', 'c'}));
+            }
+            EXPECT_EQ(status(is_send).Status, STATUS_SUCCESS);
+            EXPECT_EQ(status(is_send).Information, 3u);
+            EXPECT_EQ(emu.memory.read_memory<uint32_t>(iosb + 4), qualified ? 0xaabbccddu : 0u);
+            EXPECT_TRUE(emu.process.events.get(signal)->signaled);
+            ASSERT_EQ(thread->pending_apcs.size(), 1u);
+            EXPECT_EQ(thread->pending_apcs.front().apc_routine, 0x567800u);
+            EXPECT_EQ(thread->pending_apcs.front().apc_argument1, 0xfeedu);
+            EXPECT_EQ(thread->pending_apcs.front().apc_argument2, iosb);
+            EXPECT_EQ(thread->pending_apcs.front().io_status, static_cast<int32_t>(STATUS_SUCCESS));
+            EXPECT_EQ(thread->pending_apcs.front().io_information, 3u);
+            endpoint->work(emu);
+            EXPECT_EQ(thread->pending_apcs.size(), 1u);
+        }
+    }
+
+    TEST_P(AfdPendingRequestTest, InvalidStreamHeadersDoNotEnableCallbackCompletionMode)
+    {
+        emu.process.is_wow64_process = GetParam();
+        const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
+        emu.memory.write_memory(memory, creation.data(), sizeof(creation));
+        const auto endpoint_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        auto* endpoint = emu.process.devices.get(endpoint_handle);
+        ASSERT_NE(endpoint, nullptr);
+        emulator_thread issuer{emu.memory};
+        issuer.id = 0x1234;
+        const auto thread_handle = emu.process.threads.store(std::move(issuer));
+        emu.process.thread_handles_by_id.emplace(0x1234, thread_handle);
+        auto* thread = emu.process.threads.get(thread_handle);
+        ASSERT_NE(thread, nullptr);
+        const auto submit = [&]<typename Guest>(const bool wrong_base) {
+            using Traits = EmulatorTraits<Guest>;
+            const AFD_RECV_INFO<Traits> request{.BufferCount = 1, .AfdFlags = 3, .TdiFlags = 0x20};
+            emu.memory.write_memory(memory + 0x200, &request, sizeof(request));
+            io_device_context context{emu.memory};
+            context.file_handle = endpoint_handle;
+            context.issuer_thread_id = 0x1234;
+            context.event = receive_event;
+            context.apc_routine = 0x567800;
+            context.apc_context = 0xfeed;
+            context.io_status_block = {emu.memory, memory + 0x100};
+            context.io_control_code = wrong_base ? 0x13017 : 0x12017;
+            context.input_buffer = memory + 0x200;
+            context.input_buffer_length = wrong_base ? sizeof(request) : sizeof(request) - 1;
+            return endpoint->execute_ioctl(emu, context);
+        };
+        for (const bool wrong_base : {false, true})
+        {
+            SCOPED_TRACE(testing::Message() << "wrong_base=" << wrong_base);
+            const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Pointer = 0xaabbccdd4a4b4c4dull, .Information = 0x1122334455667788ull};
+            emu.memory.write_memory(memory + 0x100, &initial, sizeof(initial));
+            const auto expected = wrong_base ? STATUS_NOT_SUPPORTED : STATUS_BUFFER_TOO_SMALL;
+            EXPECT_EQ(GetParam() ? submit.template operator()<Emu32>(wrong_base) : submit.template operator()<Emu64>(wrong_base), expected);
+            EXPECT_EQ(status(false).Status, expected);
+            EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x104), 0u);
+            EXPECT_TRUE(thread->pending_apcs.empty());
+        }
+
+        observed_iosb_memory observed{emu.memory};
+        const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> wrapping{observed, std::numeric_limits<uint64_t>::max() - 3};
+        EXPECT_THROW(write_irp_io_information(wrapping, 3), std::out_of_range);
+        const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> wrapping_status{observed, std::numeric_limits<uint64_t>::max() - 1};
+        EXPECT_THROW(write_irp_io_status(wrapping_status, STATUS_SUCCESS), std::out_of_range);
+        EXPECT_TRUE(observed.stores.empty());
+    }
+
+    TEST_P(AfdPendingRequestTest, CallbackReceiveIocpRequiresContextForOddAndEvenEventHandles)
+    {
+        emu.process.is_wow64_process = GetParam();
+        const bool qualified = !GetParam();
+        const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
+        emu.memory.write_memory(memory, creation.data(), sizeof(creation));
+        const auto endpoint_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        auto* endpoint = emu.process.devices.get(endpoint_handle);
+        ASSERT_NE(endpoint, nullptr);
+        const AFD_INFO nonblocking{.InformationClass = 2, .Information = 1};
+        emu.memory.write_memory(memory + 0x900, &nonblocking, sizeof(nonblocking));
+        io_device_context mode_request{emu.memory};
+        mode_request.io_control_code = 0x1203b;
+        mode_request.input_buffer = memory + 0x900;
+        mode_request.input_buffer_length = sizeof(nonblocking);
+        mode_request.io_status_block = {emu.memory, memory + 0x80};
+        ASSERT_EQ(endpoint->execute_ioctl(emu, mode_request), STATUS_SUCCESS);
+        socket->connected = true;
+        const auto port_handle = emu.process.io_completions.store(io_completion{});
+        endpoint->completion_port = port_handle;
+        endpoint->completion_key = 0x1234;
+        auto* port = emu.process.io_completions.get(port_handle);
+        ASSERT_NE(port, nullptr);
+        const std::array<handle, 2> signals{send_event, receive_event};
+        ASSERT_EQ(signals[0].bits & 1u, 0u);
+        ASSERT_EQ(signals[1].bits & 1u, 1u);
+        ASSERT_NE(signals[0].bits, signals[1].bits);
+        ASSERT_NE(emu.process.events.get(signals[0]), nullptr);
+        ASSERT_NE(emu.process.events.get(signals[1]), nullptr);
+        ASSERT_NE(emu.process.events.get(signals[0]), emu.process.events.get(signals[1]));
+        const auto submit = [&]<typename Guest>(const handle signal, const uint64_t completion_context) {
+            using Traits = EmulatorTraits<Guest>;
+            const EMU_WSABUF<Traits> buffer{.len = 16, .buf = static_cast<typename Traits::PVOID>(memory + 0x400)};
+            const AFD_RECV_INFO<Traits> input{
+                .BufferArray = static_cast<typename Traits::PVOID>(memory + 0x300), .BufferCount = 1, .AfdFlags = 3, .TdiFlags = 0x20};
+            emu.memory.write_memory(memory + 0x300, &buffer, sizeof(buffer));
+            emu.memory.write_memory(memory + 0x200, &input, sizeof(input));
+            io_device_context request{emu.memory};
+            request.file_handle = endpoint_handle;
+            request.event = signal;
+            request.apc_context = completion_context;
+            request.io_status_block = {emu.memory, memory + 0x100};
+            request.io_control_code = 0x12017;
+            request.input_buffer = memory + 0x200;
+            request.input_buffer_length = sizeof(input);
+            EXPECT_EQ(endpoint->capture_completion_mode(emu, request),
+                      qualified ? device_ioctl_completion_mode::afd_stream_callback : device_ioctl_completion_mode::default_completion);
+            return endpoint->execute_ioctl(emu, request);
+        };
+        for (const bool initially_ready : {false, true})
+        {
+            for (const auto signal : signals)
+            {
+                for (const uint64_t completion_context : {0ull, 0x5678ull})
+                {
+                    SCOPED_TRACE(testing::Message() << "ready=" << initially_ready << " event=" << signal.bits
+                                                    << " raw_low_bit=" << (signal.bits & 1u) << " context=" << completion_context);
+                    port->queue.clear();
+                    socket->incoming.clear();
+                    for (const auto candidate : signals)
+                    {
+                        emu.process.events.get(candidate)->signaled = false;
+                    }
+                    emu.memory.set_memory(memory + 0x400, 0xcc, 16);
+                    const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Pointer = 0xaabbccdd4a4b4c4dull,
+                                                                         .Information = 0x1122334455667788ull};
+                    emu.memory.write_memory(memory + 0x100, &initial, sizeof(initial));
+                    const auto original = emu.memory.read_memory(memory + 0x100, sizeof(initial));
+                    const auto feed = [&] {
+                        for (const char byte : std::string_view{"abc"})
+                        {
+                            socket->incoming.push_back(static_cast<std::byte>(byte));
+                        }
+                    };
+                    if (initially_ready)
+                    {
+                        feed();
+                    }
+                    const auto result = GetParam() ? submit.template operator()<Emu32>(signal, completion_context)
+                                                   : submit.template operator()<Emu64>(signal, completion_context);
+                    ASSERT_EQ(result, initially_ready ? STATUS_SUCCESS : STATUS_PENDING);
+                    if (!initially_ready)
+                    {
+                        EXPECT_EQ(emu.memory.read_memory(memory + 0x100, sizeof(initial)), original);
+                        EXPECT_FALSE(emu.process.events.get(signals[0])->signaled);
+                        EXPECT_FALSE(emu.process.events.get(signals[1])->signaled);
+                        EXPECT_TRUE(port->queue.empty());
+                        const auto flags_offset = GetParam() ? 8u : 12u;
+                        emulator_object<uint32_t>{emu.memory, memory + 0x200 + flags_offset}.write(0u);
+                        feed();
+                        endpoint->work(emu);
+                    }
+                    EXPECT_EQ(status(false).Status, STATUS_SUCCESS);
+                    EXPECT_EQ(status(false).Information, 3u);
+                    EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x104), qualified ? 0xaabbccddu : 0u);
+                    EXPECT_EQ((emu.memory.read_memory<std::array<char, 3>>(memory + 0x400)), (std::array<char, 3>{'a', 'b', 'c'}));
+                    EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x403), 0xccu);
+                    for (const auto candidate : signals)
+                    {
+                        EXPECT_EQ(emu.process.events.get(candidate)->signaled, candidate.bits == signal.bits);
+                    }
+                    if (completion_context == 0)
+                    {
+                        EXPECT_TRUE(port->queue.empty());
+                    }
+                    else
+                    {
+                        ASSERT_EQ(port->queue.size(), 1u);
+                        EXPECT_EQ(port->queue.front().key_context, 0x1234u);
+                        EXPECT_EQ(port->queue.front().apc_context, completion_context);
+                        EXPECT_EQ(port->queue.front().io_status_block.Status, STATUS_SUCCESS);
+                        EXPECT_EQ(port->queue.front().io_status_block.Information, 3u);
+                    }
+                    const auto completed_count = port->queue.size();
+                    endpoint->work(emu);
+                    EXPECT_EQ(port->queue.size(), completed_count);
+                }
+            }
+        }
     }
 
     TEST_P(AfdPendingRequestTest, CancelByIosbCompletesOnlyMatchingRequestAndQueuesApc)
@@ -1519,7 +2446,7 @@ namespace sogen::test
         endpoint->completion_port = port_handle;
         endpoint->completion_key = 0x9876;
 
-        ASSERT_EQ(transfer(true, 0, endpoint, endpoint_handle), STATUS_PENDING);
+        ASSERT_EQ(transfer(true, 0, endpoint, endpoint_handle, 0, 0, 0xfeed), STATUS_PENDING);
         auto& vcpu = emu.vcpu(0);
         const syscall_context context{.win_emu = emu, .emu = vcpu.cpu, .vcpu = vcpu, .proc = emu.process};
         ASSERT_EQ(syscalls::handle_NtClose(context, endpoint_handle), STATUS_SUCCESS);
@@ -1532,6 +2459,7 @@ namespace sogen::test
         ASSERT_NE(port, nullptr);
         ASSERT_EQ(port->queue.size(), 1u);
         EXPECT_EQ(port->queue.front().key_context, 0x9876u);
+        EXPECT_EQ(port->queue.front().apc_context, 0xfeedu);
         EXPECT_EQ(port->queue.front().io_status_block.Status, STATUS_CANCELLED);
         EXPECT_EQ(port->queue.front().io_status_block.Information, 0u);
     }

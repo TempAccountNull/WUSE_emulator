@@ -4,6 +4,8 @@
 #include <chrono>
 #include <memory>
 #include <string_view>
+#include <limits>
+#include <stdexcept>
 #include <arch_emulator.hpp>
 #include <serialization.hpp>
 
@@ -18,12 +20,22 @@ namespace sogen
     struct vcpu_context;
     class emulator_thread;
 
+    enum class device_ioctl_completion_mode
+    {
+        default_completion,
+        afd_stream_no_fast_io,
+        afd_stream_callback,
+    };
+
     struct io_device_context
     {
         handle file_handle{};
         uint32_t issuer_thread_id{};
         uint64_t network_request_id{};
         bool completing_pending{};
+        // Per-dispatch publication policy; recomputed from captured stream flags
+        // on delayed dispatch and deliberately not serialized.
+        device_ioctl_completion_mode completion_mode{device_ioctl_completion_mode::default_completion};
         handle event{};
         emulator_pointer /*PIO_APC_ROUTINE*/ apc_routine{};
         emulator_pointer apc_context{};
@@ -86,7 +98,8 @@ namespace sogen
         }
     };
 
-    void complete_device_ioctl(windows_emulator& win_emu, const io_device_context& context, NTSTATUS status, bool completed_synchronously);
+    void complete_device_ioctl(windows_emulator& win_emu, const io_device_context& context, NTSTATUS status, bool completed_synchronously,
+                               device_ioctl_completion_mode mode = device_ioctl_completion_mode::default_completion);
 
     struct io_device_creation_data
     {
@@ -107,6 +120,35 @@ namespace sogen
         });
 
         return status;
+    }
+
+    inline void write_irp_io_information(const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block,
+                                         const uint64_t information)
+    {
+        if (!io_status_block)
+        {
+            return;
+        }
+        constexpr auto offset = offsetof(IO_STATUS_BLOCK<EmulatorTraits<Emu64>>, Information);
+        static_assert(offset == 8);
+        if (io_status_block.value() > std::numeric_limits<uint64_t>::max() - offset - (sizeof(information) - 1))
+        {
+            throw std::out_of_range("Invalid IRP IOSB Information address");
+        }
+        emulator_object<uint64_t>{*io_status_block.get_memory_interface(), io_status_block.value() + offset}.write(information);
+    }
+
+    inline void write_irp_io_status(const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const NTSTATUS status)
+    {
+        static_assert(sizeof(NTSTATUS) == 4);
+        if (io_status_block)
+        {
+            if (io_status_block.value() > std::numeric_limits<uint64_t>::max() - (sizeof(status) - 1))
+            {
+                throw std::out_of_range("Invalid IRP IOSB Status address");
+            }
+            emulator_object<NTSTATUS>{*io_status_block.get_memory_interface(), io_status_block.value()}.write(status);
+        }
     }
 
     struct io_device : ref_counted_object
@@ -136,6 +178,12 @@ namespace sogen
         virtual bool may_return_pending() const
         {
             return false;
+        }
+
+        // Capture routing before IOSB or output writes can alias the request input.
+        virtual device_ioctl_completion_mode capture_completion_mode(windows_emulator&, const io_device_context&) const
+        {
+            return device_ioctl_completion_mode::default_completion;
         }
 
         // Some invalid AFD requests are rejected before an IRP is completed, whereas
@@ -222,6 +270,7 @@ namespace sogen
         uint32_t cancel_pending_io(windows_emulator& win_emu, uint64_t io_status_block, uint32_t issuer_thread_id) override;
         void rebase_steady_deadlines(std::chrono::steady_clock::duration offset) override;
         bool may_return_pending() const override;
+        device_ioctl_completion_mode capture_completion_mode(windows_emulator& win_emu, const io_device_context& context) const override;
         bool invalid_parameter_completes(const io_device_context& context) const override;
         bool skips_immediate_completion(const io_device_context& context, NTSTATUS status) const override;
         NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& context) override;

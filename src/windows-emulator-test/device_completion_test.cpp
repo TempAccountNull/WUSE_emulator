@@ -7,6 +7,8 @@ namespace sogen::syscalls
 {
     NTSTATUS handle_NtSetInformationFile(const syscall_context&, handle, emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>, uint64_t,
                                          ULONG, FILE_INFORMATION_CLASS);
+    NTSTATUS handle_NtSetIoCompletion(const syscall_context&, handle, emulator_pointer, emulator_pointer, NTSTATUS,
+                                      EmulatorTraits<Emu64>::ULONG_PTR);
     NTSTATUS handle_NtClose(const syscall_context&, handle);
     NTSTATUS handle_NtCancelIoFile(const syscall_context&, handle, emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>);
     NTSTATUS handle_NtCancelIoFileEx(const syscall_context&, handle, uint64_t, emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>);
@@ -180,6 +182,101 @@ namespace sogen::test
         EXPECT_TRUE(emu.process.events.get(event_handle)->signaled);
         EXPECT_TRUE(issuer.pending_apcs.empty());
         EXPECT_EQ(c.io_status_block.read().Information, 7u);
+    }
+
+    TEST_P(DeviceCompletionTest, AutomaticIocpRequiresContextAndKeepsStatusAndNotificationGates)
+    {
+        ASSERT_EQ(associate(), STATUS_SUCCESS);
+        auto* endpoint = emu.process.devices.get(device);
+        auto* queue = emu.process.io_completions.get(port);
+        ASSERT_NE(endpoint, nullptr);
+        ASSERT_NE(queue, nullptr);
+        event signal{};
+        signal.type = SynchronizationEvent;
+        const auto event_handle = emu.process.events.store(std::move(signal));
+        auto c = request();
+        c.event = event_handle;
+        for (const uint64_t completion_context : {0ull, 0x9876ull})
+        {
+            for (const ULONG notification_flags : {0u, 1u})
+            {
+                endpoint->completion_notification_flags = notification_flags;
+                for (const bool synchronous : {false, true})
+                {
+                    for (const NTSTATUS status : {STATUS_SUCCESS, STATUS_NOT_SUPPORTED, STATUS_CANCELLED})
+                    {
+                        SCOPED_TRACE(testing::Message() << "context=" << completion_context << " notification=" << notification_flags
+                                                        << " synchronous=" << synchronous << " status=" << status);
+                        queue->queue.clear();
+                        emu.process.events.get(event_handle)->signaled = false;
+                        c.apc_context = completion_context;
+                        c.io_status_block.write({.Status = status, .Information = status == STATUS_SUCCESS ? 7ull : 0ull});
+                        const auto original =
+                            emu.memory.read_memory(c.io_status_block.value(), sizeof(IO_STATUS_BLOCK<EmulatorTraits<Emu64>>));
+                        complete_device_ioctl(emu, c, status, synchronous);
+                        EXPECT_TRUE(emu.process.events.get(event_handle)->signaled);
+                        EXPECT_EQ(emu.memory.read_memory(c.io_status_block.value(), original.size()), original);
+                        const bool packet_expected =
+                            completion_context != 0 && (!synchronous || (status == STATUS_SUCCESS && notification_flags == 0));
+                        if (packet_expected)
+                        {
+                            ASSERT_EQ(queue->queue.size(), 1u);
+                            EXPECT_EQ(queue->queue.front().key_context, 0x1234u);
+                            EXPECT_EQ(queue->queue.front().apc_context, completion_context);
+                            EXPECT_EQ(queue->queue.front().io_status_block.Status, status);
+                            EXPECT_EQ(queue->queue.front().io_status_block.Information, status == STATUS_SUCCESS ? 7u : 0u);
+                        }
+                        else
+                        {
+                            EXPECT_TRUE(queue->queue.empty());
+                        }
+                    }
+                }
+            }
+        }
+        queue->queue.clear();
+        emu.process.events.get(event_handle)->signaled = false;
+        c.io_status_block.write({.Status = STATUS_PENDING, .Information = 99});
+        complete_device_ioctl(emu, c, STATUS_PENDING, false);
+        EXPECT_FALSE(emu.process.events.get(event_handle)->signaled);
+        EXPECT_TRUE(queue->queue.empty());
+        EXPECT_EQ(c.io_status_block.read().Status, STATUS_PENDING);
+        EXPECT_EQ(c.io_status_block.read().Information, 99u);
+    }
+
+    TEST_P(DeviceCompletionTest, NullContextApcAndExplicitCompletionPacketsRemainDeliverable)
+    {
+        ASSERT_EQ(associate(), STATUS_SUCCESS);
+        auto* queue = emu.process.io_completions.get(port);
+        ASSERT_NE(queue, nullptr);
+        auto& issuer = *emu.vcpu(0).active_thread;
+        auto c = request();
+        c.issuer_thread_id = issuer.id;
+        c.apc_routine = 0x12345000;
+        c.apc_context = 0;
+        for (const bool synchronous : {false, true})
+        {
+            for (const NTSTATUS status : {STATUS_SUCCESS, STATUS_CANCELLED})
+            {
+                c.io_status_block.write({.Status = status, .Information = status == STATUS_SUCCESS ? 7ull : 0ull});
+                const auto previous = issuer.pending_apcs.size();
+                complete_device_ioctl(emu, c, status, synchronous);
+                ASSERT_EQ(issuer.pending_apcs.size(), previous + 1);
+                const auto& apc = issuer.pending_apcs.back();
+                EXPECT_EQ(apc.apc_routine, c.apc_routine);
+                EXPECT_EQ(apc.apc_argument1, 0u);
+                EXPECT_EQ(apc.apc_argument2, c.io_status_block.value());
+                EXPECT_EQ(apc.io_status, static_cast<int32_t>(status));
+                EXPECT_EQ(apc.io_information, status == STATUS_SUCCESS ? 7u : 0u);
+                EXPECT_TRUE(queue->queue.empty());
+            }
+        }
+        ASSERT_EQ(syscalls::handle_NtSetIoCompletion(context(), port, 0x5566, 0, STATUS_CANCELLED, 19), STATUS_SUCCESS);
+        ASSERT_EQ(queue->queue.size(), 1u);
+        EXPECT_EQ(queue->queue.front().key_context, 0x5566u);
+        EXPECT_EQ(queue->queue.front().apc_context, 0u);
+        EXPECT_EQ(queue->queue.front().io_status_block.Status, STATUS_CANCELLED);
+        EXPECT_EQ(queue->queue.front().io_status_block.Information, 19u);
     }
 
     TEST_P(DeviceCompletionTest, CancelSyscallsAcceptDevicesAndReportNoPendingRequest)

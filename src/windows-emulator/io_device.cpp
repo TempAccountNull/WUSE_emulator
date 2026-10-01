@@ -145,12 +145,27 @@ namespace sogen
     }
 
     void complete_device_ioctl(windows_emulator& win_emu, const io_device_context& c, const NTSTATUS status,
-                               const bool completed_synchronously)
+                               const bool completed_synchronously, const device_ioctl_completion_mode mode)
     {
         if (status == STATUS_PENDING)
         {
             return;
         }
+        const std::string_view effective_mode = [mode]() -> std::string_view {
+            switch (mode)
+            {
+            case device_ioctl_completion_mode::default_completion:
+                return "default_completion";
+            case device_ioctl_completion_mode::afd_stream_no_fast_io:
+                return "afd_stream_no_fast_io";
+            case device_ioctl_completion_mode::afd_stream_callback:
+                return "afd_stream_callback";
+            }
+            return "unknown_mode";
+        }();
+        const auto route = [&](const std::string_view decision) {
+            win_emu.network_debug.afd_route(win_emu, c, static_cast<int32_t>(status), completed_synchronously, decision, effective_mode);
+        };
         if (c.network_request_id)
         {
             win_emu.network_debug.afd_completion(win_emu, c, static_cast<int32_t>(status), !completed_synchronously);
@@ -166,10 +181,13 @@ namespace sogen
         const auto* file_object = win_emu.process.devices.get(c.file_handle);
         if (c.apc_routine)
         {
-            if (completed_synchronously && file_object && file_object->get_device_name() == u"Afd\\Endpoint")
+            if (completed_synchronously && file_object && file_object->get_device_name() == u"Afd\\Endpoint" &&
+                (mode != device_ioctl_completion_mode::afd_stream_callback || status != STATUS_SUCCESS))
             {
+                route("synchronous_endpoint_apc_suppressed");
                 return;
             }
+            bool queued = false;
             const auto issuer = win_emu.process.thread_handles_by_id.find(c.issuer_thread_id);
             if (issuer != win_emu.process.thread_handles_by_id.end())
             {
@@ -188,18 +206,27 @@ namespace sogen
                     });
                     win_emu.network_debug.apc_queue(c.network_request_id, c.issuer_thread_id, static_cast<int32_t>(status),
                                                     block.Information);
+                    queued = true;
                 }
             }
+            route(queued ? "issuer_apc_queued" : "issuer_thread_unavailable_apc_not_queued");
             return;
         }
         if (!file_object || !file_object->completion_port.bits)
         {
+            route(file_object ? "no_iocp_association" : "file_object_unavailable");
+            return;
+        }
+        if (!c.apc_context)
+        {
+            route("automatic_iocp_null_context_suppressed");
             return;
         }
         constexpr ULONG skip_port_on_success = 0x1;
         if (completed_synchronously &&
             (status != STATUS_SUCCESS || (file_object->completion_notification_flags & skip_port_on_success) != 0))
         {
+            route(status != STATUS_SUCCESS ? "synchronous_error_iocp_suppressed" : "skip_iocp_on_success");
             return;
         }
         if (auto* port = win_emu.process.io_completions.get(file_object->completion_port))
@@ -211,25 +238,33 @@ namespace sogen
             message.io_status_block = block;
             port->enqueue(message);
             win_emu.network_debug.iocp_queue(c.network_request_id, file_object->completion_port.bits, file_object->completion_key,
-                                             static_cast<int32_t>(status), block.Information);
+                                             static_cast<int32_t>(status), block.Information, message.apc_context);
+            route("iocp_packet_queued");
+        }
+        else
+        {
+            route("associated_iocp_object_unavailable");
         }
     }
 
     NTSTATUS io_device::execute_ioctl(windows_emulator& win_emu, const io_device_context& c)
     {
+        const auto completion_mode = this->capture_completion_mode(win_emu, c);
         const auto original_io_status = this->may_return_pending() && c.io_status_block
                                             ? std::optional{c.io_status_block.read()}
                                             : std::optional<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>>{};
-        if (c.io_status_block)
+        if (c.io_status_block && completion_mode == device_ioctl_completion_mode::default_completion)
         {
             c.io_status_block.write({});
         }
 
-        const auto result = this->io_control(win_emu, c);
+        auto dispatch_context = c;
+        dispatch_context.completion_mode = completion_mode;
+        const auto result = this->io_control(win_emu, dispatch_context);
         if (result == STATUS_PENDING)
         {
             // Native AFD leaves the caller's status block untouched until completion.
-            if (original_io_status)
+            if (original_io_status && completion_mode == device_ioctl_completion_mode::default_completion)
             {
                 c.io_status_block.write(*original_io_status);
             }
@@ -240,25 +275,53 @@ namespace sogen
             return result;
         }
 
+        if (!c.completing_pending && completion_mode == device_ioctl_completion_mode::afd_stream_no_fast_io &&
+            result == STATUS_DEVICE_NOT_READY)
+        {
+            win_emu.network_debug.afd_result(win_emu, c, static_cast<int32_t>(result));
+            win_emu.network_debug.afd_route(win_emu, c, static_cast<int32_t>(result), true,
+                                            "immediate_no_fast_wouldblock_completion_skipped", "afd_stream_no_fast_io");
+            return result;
+        }
+
         if (this->may_return_pending() && !c.completing_pending &&
             ((result == STATUS_INVALID_PARAMETER && !this->invalid_parameter_completes(c)) || this->skips_immediate_completion(c, result)))
         {
             // Native AFD rejects invalid requests before completing an IRP: no IOSB update,
             // event signal, APC, or IOCP packet is delivered.
-            if (original_io_status)
+            if (original_io_status && completion_mode == device_ioctl_completion_mode::default_completion)
             {
                 c.io_status_block.write(*original_io_status);
             }
             win_emu.network_debug.afd_result(win_emu, c, static_cast<int32_t>(result));
+            win_emu.network_debug.afd_route(win_emu, c, static_cast<int32_t>(result), true, "immediate_request_rejected_completion_skipped",
+                                            completion_mode == device_ioctl_completion_mode::default_completion    ? "default_completion"
+                                            : completion_mode == device_ioctl_completion_mode::afd_stream_callback ? "afd_stream_callback"
+                                            : completion_mode == device_ioctl_completion_mode::afd_stream_no_fast_io
+                                                ? "afd_stream_no_fast_io"
+                                                : "unknown_mode");
             return result;
         }
 
-        write_io_status(c.io_status_block, result);
+        if (completion_mode == device_ioctl_completion_mode::default_completion)
+        {
+            write_io_status(c.io_status_block, result);
+        }
+        else
+        {
+            if (result != STATUS_SUCCESS)
+            {
+                write_irp_io_information(c.io_status_block, 0);
+            }
+            // Qualified stream success writes its payload and Information first.
+            // Publish only DWORD Status; never overwrite the union's upper DWORD.
+            write_irp_io_status(c.io_status_block, result);
+        }
         if (!c.completing_pending)
         {
             win_emu.network_debug.afd_result(win_emu, c, static_cast<int32_t>(result));
         }
-        complete_device_ioctl(win_emu, c, result, !c.completing_pending);
+        complete_device_ioctl(win_emu, c, result, !c.completing_pending, completion_mode);
         return result;
     }
 
@@ -266,6 +329,13 @@ namespace sogen
     {
         this->assert_validity();
         return this->device_->may_return_pending();
+    }
+
+    device_ioctl_completion_mode io_device_container::capture_completion_mode(windows_emulator& win_emu,
+                                                                              const io_device_context& context) const
+    {
+        this->assert_validity();
+        return this->device_->capture_completion_mode(win_emu, context);
     }
 
     bool io_device_container::invalid_parameter_completes(const io_device_context& context) const

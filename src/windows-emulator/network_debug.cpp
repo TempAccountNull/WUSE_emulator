@@ -9,6 +9,8 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -35,6 +37,26 @@ namespace sogen
         constexpr size_t bap_stream_limit = 128;
         constexpr uint64_t fnv_offset = 14695981039346656037ull;
         constexpr uint64_t fnv_prime = 1099511628211ull;
+        constexpr size_t raw_afd_request_limit = 64;
+        constexpr size_t raw_afd_record_limit = 4096;
+        using raw_stream_header = AFD_RECV_INFO<EmulatorTraits<Emu64>>;
+        static_assert(sizeof(raw_stream_header) == 24);
+        static_assert(offsetof(raw_stream_header, AfdFlags) == 12);
+        static_assert(offsetof(raw_stream_header, TdiFlags) == 16);
+        static_assert(sizeof(AFD_SEND_INFO<EmulatorTraits<Emu64>>) == 24);
+        static_assert(sizeof(IO_STATUS_BLOCK<EmulatorTraits<Emu64>>) == 16);
+
+        std::string fixed_hex(const uint64_t value, const size_t digits = 16)
+        {
+            static constexpr char alphabet[] = "0123456789abcdef";
+            std::string result(digits + 2, '0');
+            result[1] = 'x';
+            for (size_t i = 0; i < digits; ++i)
+            {
+                result[digits + 1 - i] = alphabet[(value >> (i * 4)) & 0xf];
+            }
+            return result;
+        }
 
         struct bap_stream_state
         {
@@ -218,6 +240,147 @@ namespace sogen
             uint64_t address{};
             uint32_t length{};
         };
+
+        struct raw_afd_state
+        {
+            bool initial_return_recorded{};
+            bool initial_status_pending{};
+            bool terminal_recorded{};
+            std::optional<uint32_t> initial_afd_flags;
+            std::optional<uint32_t> initial_tdi_flags;
+        };
+
+        bool raw_range_valid(const uint64_t address, const size_t size)
+        {
+            return address != 0 && size != 0 && address <= std::numeric_limits<uint64_t>::max() - (size - 1);
+        }
+
+        bool raw_iosb(json_fields& event, windows_emulator& win_emu, const io_device_context& request)
+        {
+            event.string("iosb_pointer", fixed_hex(request.io_status_block.value()));
+            std::array<std::byte, 16> bytes{};
+            const bool readable = raw_range_valid(request.io_status_block.value(), bytes.size()) &&
+                                  win_emu.memory.try_read_memory(request.io_status_block.value(), bytes.data(), bytes.size());
+            event.boolean("iosb_snapshot_available", readable);
+            if (!readable)
+            {
+                event.string("iosb_snapshot_unavailable", !request.io_status_block ? "null_pointer"
+                                                          : !raw_range_valid(request.io_status_block.value(), bytes.size())
+                                                              ? "address_range_overflow"
+                                                              : "unreadable");
+                return false;
+            }
+            uint32_t status{}, upper{};
+            uint64_t information{};
+            std::memcpy(&status, bytes.data(), 4);
+            std::memcpy(&upper, bytes.data() + 4, 4);
+            std::memcpy(&information, bytes.data() + 8, 8);
+            event.string("iosb_snapshot_hex", hex_bytes(bytes));
+            event.string("iosb_status32", fixed_hex(status, 8));
+            event.string("iosb_upper32", fixed_hex(upper, 8));
+            event.string("iosb_information64", fixed_hex(information));
+            event.number("iosb_snapshot_read_bytes", bytes.size());
+            return true;
+        }
+
+        void raw_routing(json_fields& event, windows_emulator& win_emu, const io_device_context& request)
+        {
+            event.string("resolved_file_handle", fixed_hex(request.file_handle.bits));
+            event.string("native_event", fixed_hex(request.event.bits));
+            event.boolean("native_event_bit0", (request.event.bits & 1) != 0);
+            event.string("native_apc_routine", fixed_hex(request.apc_routine));
+            event.string("native_apc_context", fixed_hex(request.apc_context));
+            event.boolean("native_context_zero", request.apc_context == 0);
+            if (const auto* object = win_emu.process.devices.get(request.file_handle))
+            {
+                event.boolean("iocp_association_available", true);
+                event.boolean("iocp_associated", object->completion_port.bits != 0);
+                event.string("iocp_port", fixed_hex(object->completion_port.bits));
+                event.string("iocp_key", fixed_hex(object->completion_key));
+                event.string("completion_notification_flags", fixed_hex(object->completion_notification_flags, 8));
+                event.boolean("skip_iocp_on_success", (object->completion_notification_flags & 1) != 0);
+            }
+            else
+            {
+                event.boolean("iocp_association_available", false);
+                event.string("iocp_association_unavailable", "resolved_device_not_present");
+            }
+            const auto* object = win_emu.process.events.get(request.event);
+            event.boolean("event_object_present", object != nullptr);
+            event.boolean("event_resolution_available", request.event.bits == 0 || object != nullptr);
+            if (object)
+            {
+                event.boolean("resolved_event_signaled", object->signaled);
+                event.string("event_identity_kind", "full_sogen_handle_lookup_no_tag_normalization");
+            }
+            else if (request.event.bits)
+            {
+                event.string("event_resolution_unavailable", "full_handle_not_present");
+            }
+        }
+
+        bool raw_input(json_fields& event, windows_emulator& win_emu, const io_device_context& request, raw_afd_state& state)
+        {
+            event.string("input_buffer", fixed_hex(request.input_buffer));
+            event.number("input_length", request.input_buffer_length);
+            event.string("output_buffer", fixed_hex(request.output_buffer));
+            event.number("output_length", request.output_buffer_length);
+            event.string("input_layout", "x64_connected_stream_24");
+            std::array<std::byte, 24> bytes{};
+            if (request.input_buffer_length != bytes.size() || !raw_range_valid(request.input_buffer, bytes.size()) ||
+                !win_emu.memory.try_read_memory(request.input_buffer, bytes.data(), bytes.size()))
+            {
+                event.boolean("raw_flags_decode_available", false);
+                event.boolean("raw_header_valid", false);
+                event.string("raw_input_unavailable", request.input_buffer_length != bytes.size()            ? "length_not_24"
+                                                      : !request.input_buffer                                ? "null_pointer"
+                                                      : !raw_range_valid(request.input_buffer, bytes.size()) ? "address_range_overflow"
+                                                                                                             : "unreadable");
+                return false;
+            }
+            uint64_t array{};
+            uint32_t count{}, flags{}, tdi{};
+            std::memcpy(&array, bytes.data(), 8);
+            std::memcpy(&count, bytes.data() + 8, 4);
+            std::memcpy(&flags, bytes.data() + 12, 4);
+            std::memcpy(&tdi, bytes.data() + 16, 4);
+            state.initial_afd_flags = flags;
+            state.initial_tdi_flags = tdi;
+            event.boolean("raw_flags_decode_available", true);
+            event.string("raw_flags_decode_source", "entry_header_bytes_offsets12_16");
+            event.string("raw_input_hex", hex_bytes(bytes));
+            event.number("raw_input_read_bytes", bytes.size());
+            event.string("afd_flags", fixed_hex(flags, 8));
+            event.string("tdi_flags", fixed_hex(tdi, 8));
+            event.string("buffer_array", fixed_hex(array));
+            event.number("buffer_count", count);
+            event.boolean("raw_header_valid", array != 0 && count == 1);
+            if (array == 0 || count != 1)
+            {
+                event.boolean("raw_descriptor_available", false);
+                event.string("raw_descriptor_unavailable", "fixture_requires_one_nonnull_descriptor");
+                return false;
+            }
+            std::array<std::byte, 16> descriptor{};
+            if (!raw_range_valid(array, descriptor.size()) || !win_emu.memory.try_read_memory(array, descriptor.data(), descriptor.size()))
+            {
+                event.boolean("raw_descriptor_available", false);
+                event.string("raw_descriptor_unavailable",
+                             !raw_range_valid(array, descriptor.size()) ? "address_range_overflow" : "unreadable");
+                return false;
+            }
+            uint32_t length{};
+            uint64_t buffer{};
+            std::memcpy(&length, descriptor.data(), 4);
+            std::memcpy(&buffer, descriptor.data() + 8, 8);
+            event.boolean("raw_descriptor_available", true);
+            event.string("raw_descriptor_hex", hex_bytes(descriptor));
+            event.number("raw_descriptor_read_bytes", descriptor.size());
+            event.string("declared_buffer", fixed_hex(buffer));
+            event.string("declared_requested_bytes", std::to_string(length));
+            event.boolean("descriptor_nonnull_for_nonzero_length", length == 0 || buffer != 0);
+            return length == 0 || buffer != 0;
+        }
 
         struct request_metadata
         {
@@ -727,6 +890,30 @@ namespace sogen
             const auto seconds =
                 std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
             next_id = static_cast<uint64_t>(seconds) * 1'000'000;
+            const char* enabled = std::getenv("SOGEN_RAW_AFD_TRACE");
+            const char* run = std::getenv("SOGEN_RAW_AFD_RUN_ID");
+            const char* fixture = std::getenv("SOGEN_RAW_AFD_FIXTURE_SHA256");
+            if (enabled &&
+                (std::string_view(enabled) == "winsock-fixture-v1" || std::string_view(enabled) == "winsock-fixture-v1-notification") &&
+                run && fixture)
+            {
+                const std::string_view run_value(run), fixture_value(fixture);
+                const auto safe_run = [](const char ch) {
+                    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' ||
+                           ch == '.';
+                };
+                const auto hex_digit = [](const char ch) {
+                    return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+                };
+                raw_enabled = !run_value.empty() && run_value.size() <= 96 && std::all_of(run_value.begin(), run_value.end(), safe_run) &&
+                              fixture_value.size() == 64 && std::all_of(fixture_value.begin(), fixture_value.end(), hex_digit);
+                if (raw_enabled)
+                {
+                    raw_run_id = run_value;
+                    raw_fixture_sha256 = fixture_value;
+                    raw_notifications_only = std::string_view(enabled) == "winsock-fixture-v1-notification";
+                }
+            }
         }
 
         std::mutex mutex;
@@ -743,6 +930,267 @@ namespace sogen
         std::unordered_map<std::string, idle_summary> idle_summaries;
         std::unordered_map<uint64_t, bap_stream_state> bap_outbound;
         std::unordered_map<uint64_t, bap_stream_state> bap_inbound;
+        bool raw_enabled{};
+        bool raw_notifications_only{};
+        const windows_path raw_fixture_path{u"c:\\winsock-fixture\\guest_winsock_parity.exe"};
+        std::string raw_run_id;
+        std::string raw_fixture_sha256;
+        std::unordered_map<uint64_t, raw_afd_state> raw_requests;
+        uint64_t raw_attempted{}, raw_selected{}, raw_rejected{}, raw_filtered{}, raw_overflow{}, raw_record_failures{};
+        uint64_t raw_required_read_failures{};
+        uint64_t raw_records_written{}, raw_entries_written{}, raw_initial_returns{}, raw_terminal_joins{}, raw_duplicate_stages{};
+        uint64_t raw_stage_exceptions{};
+
+        template <typename Capture>
+        void raw_stage(Capture&& capture) noexcept
+        {
+            try
+            {
+                capture();
+            }
+            catch (...)
+            {
+                ++raw_stage_exceptions;
+                ++raw_record_failures;
+            }
+        }
+
+        bool write_raw(json_fields& event)
+        {
+            auto line = event.finish();
+            if (line.size() + 1 > raw_afd_record_limit)
+            {
+                ++raw_record_failures;
+                return false;
+            }
+            const auto before = bytes_written;
+            write(std::move(line));
+            if (bytes_written == before || !file)
+            {
+                ++raw_record_failures;
+                return false;
+            }
+            ++raw_records_written;
+            return true;
+        }
+
+        void raw_common(json_fields& event, const io_device_context& request, const std::string_view phase)
+        {
+            add_common(event, "afd_raw", phase, request.network_request_id);
+            event.string("kind", "raw_afd_dispatch");
+            event.number("raw_schema", 1);
+            event.string("run_id", raw_run_id);
+            event.string("selection", raw_notifications_only ? "apc_present_or_port_associated" : "all_connected_fixture_requests");
+            event.string("request_id64", fixed_hex(request.network_request_id));
+            event.string("issuer_guest_tid", std::to_string(request.issuer_thread_id));
+            event.string("guest_process_id", std::to_string(process_context::process_id));
+            event.string("ioctl", fixed_hex(request.io_control_code, 8));
+            event.string("origin_reference", "afd_request_record_with_same_request_id");
+            event.string("clock_source", "system_clock_wall_us_nonmonotonic");
+            event.boolean("completing_pending", request.completing_pending);
+            event.boolean("atomic", false);
+            event.boolean("strong_lifetime", false);
+            event.string("iosb_evidence_kind", "snapshot_not_store_width_or_atomicity_proof");
+            event.boolean("host_process_identity_available", false);
+            event.boolean("loaded_provider_hash_verified", false);
+            event.boolean("native_driver_identity_verified", false);
+        }
+
+        void raw_entry(windows_emulator& win_emu, const io_device_context& request, const syscall_context& issuer)
+        {
+            if (!raw_enabled || (request.io_control_code != 0x12017 && request.io_control_code != 0x1201f))
+            {
+                return;
+            }
+            ++raw_attempted;
+            const auto* executable = win_emu.mod_manager.executable;
+            if (win_emu.process.is_wow64_process || !executable || executable->name != "guest_winsock_parity.exe" ||
+                executable->module_path != raw_fixture_path)
+            {
+                ++raw_rejected;
+                return;
+            }
+            if (raw_notifications_only)
+            {
+                const auto* file_object = win_emu.process.devices.get(request.file_handle);
+                if (!request.apc_routine && (!file_object || !file_object->completion_port.bits))
+                {
+                    ++raw_filtered;
+                    return;
+                }
+            }
+            if (raw_requests.size() >= raw_afd_request_limit)
+            {
+                ++raw_overflow;
+                return;
+            }
+            auto& state = raw_requests.emplace(request.network_request_id, raw_afd_state{}).first->second;
+            ++raw_selected;
+            json_fields event;
+            raw_common(event, request, "entry_after_syscall_event_reset_before_device_dispatch");
+            event.string("fixture_sha256_asserted", raw_fixture_sha256);
+            event.string("fixture_identity_source", "launch_environment_requires_external_exe_hash_receipt");
+            event.boolean("fixture_sha256_verified_here", false);
+            event.string("fixture_backing_path", executable->path.string());
+            event.string("fixture_image_base", fixed_hex(executable->image_base));
+            event.string("fixture_image_size", fixed_hex(executable->size_of_image));
+            event.string("issuer_vcpu", std::to_string(issuer.vcpu.cpu.index()));
+            event.boolean("raw_incoming_handle_available", false);
+            event.string("raw_incoming_handle_unavailable", "hook_receives_resolved_context_handle");
+            event.boolean("pre_reset_event_state_available", false);
+            event.boolean("captured_effective_mode_available", false);
+            event.string("captured_effective_mode_unavailable", "entry_precedes_capture_completion_mode");
+            if (!raw_input(event, win_emu, request, state))
+            {
+                ++raw_required_read_failures;
+            }
+            raw_routing(event, win_emu, request);
+            if (!raw_iosb(event, win_emu, request))
+            {
+                ++raw_required_read_failures;
+            }
+            if (write_raw(event))
+            {
+                ++raw_entries_written;
+            }
+        }
+
+        void raw_result(windows_emulator& win_emu, const io_device_context& request, const int32_t status)
+        {
+            if (!raw_enabled)
+            {
+                return;
+            }
+            const auto it = raw_requests.find(request.network_request_id);
+            if (it == raw_requests.end())
+            {
+                return;
+            }
+            if (it->second.initial_return_recorded)
+            {
+                ++raw_duplicate_stages;
+                return;
+            }
+            it->second.initial_return_recorded = true;
+            it->second.initial_status_pending = status == STATUS_PENDING;
+            json_fields event;
+            raw_common(event, request, "initial_device_result_before_syscall_return");
+            event.string("immediate_ntstatus", fixed_hex(static_cast<uint32_t>(status), 8));
+            event.boolean("initial_status_pending", status == STATUS_PENDING);
+            event.boolean("actual_syscall_epilogue_observed", false);
+            if (!raw_iosb(event, win_emu, request))
+            {
+                ++raw_required_read_failures;
+            }
+            if (write_raw(event))
+            {
+                ++raw_initial_returns;
+            }
+        }
+
+        void raw_terminal(windows_emulator& win_emu, const io_device_context& request, const int32_t status,
+                          const bool completed_synchronously, const std::string_view decision, const std::string_view effective_mode)
+        {
+            const auto it = raw_requests.find(request.network_request_id);
+            if (it == raw_requests.end())
+            {
+                return;
+            }
+            if (it->second.terminal_recorded)
+            {
+                ++raw_duplicate_stages;
+                return;
+            }
+            it->second.terminal_recorded = true;
+            json_fields event;
+            raw_common(event, request, "terminal_source_route");
+            event.string("iosb_snapshot_stage", "final_status_policy_observation_before_route_function_return");
+            event.string("event_stage", decision == "immediate_no_fast_wouldblock_completion_skipped" ||
+                                                decision == "immediate_request_rejected_completion_skipped"
+                                            ? "completion_skipped_syscall_reset_retained"
+                                            : "after_completion_event_handling");
+            event.string("terminal_status", fixed_hex(static_cast<uint32_t>(status), 8));
+            event.boolean("completed_synchronously", completed_synchronously);
+            event.boolean("initial_return_seen", it->second.initial_return_recorded);
+            if (it->second.initial_return_recorded)
+            {
+                event.boolean("initial_status_pending", it->second.initial_status_pending);
+            }
+            else
+            {
+                event.string("initial_status_pending_unavailable", "terminal_observed_before_initial_result_hook");
+            }
+            event.string("route_decision", decision);
+            event.string("route_namespace", "sogen_source_policy");
+            event.boolean("captured_effective_mode_available", effective_mode != "unavailable" && effective_mode != "unknown_mode");
+            event.string("captured_effective_mode", effective_mode);
+            event.string("mode_source", request.completing_pending ? "completion_mode_argument_after_pending_capture"
+                                                                   : "completion_mode_argument_after_initial_capture");
+            event.boolean("saved_pending_flags_available", false);
+            event.string("saved_pending_flags_unavailable", "completion_hook_does_not_expose_active_pending_flags");
+            event.string("initial_flags_source", "retained_entry_snapshot_not_final_input_reread");
+            if (it->second.initial_afd_flags)
+            {
+                event.string("initial_afd_flags", fixed_hex(*it->second.initial_afd_flags, 8));
+                event.string("initial_tdi_flags", fixed_hex(*it->second.initial_tdi_flags, 8));
+            }
+            else
+            {
+                event.string("initial_flags_unavailable", "entry_header_decode_failed");
+            }
+            raw_routing(event, win_emu, request);
+            if (!raw_iosb(event, win_emu, request))
+            {
+                ++raw_required_read_failures;
+            }
+            if (write_raw(event))
+            {
+                ++raw_terminal_joins;
+            }
+        }
+
+        void raw_counters()
+        {
+            if (!raw_enabled)
+            {
+                return;
+            }
+            json_fields event;
+            event.number("raw_schema", 1);
+            event.string("kind", "raw_afd_capture_counters");
+            event.string("run_id", raw_run_id);
+            event.string("selection", raw_notifications_only ? "apc_present_or_port_associated" : "all_connected_fixture_requests");
+            event.string("attempted", std::to_string(raw_attempted));
+            event.string("selected", std::to_string(raw_selected));
+            event.string("rejected_scope", std::to_string(raw_rejected));
+            event.string("filtered_by_selection", std::to_string(raw_filtered));
+            event.string("overflowed", std::to_string(raw_overflow));
+            event.string("record_failures", std::to_string(raw_record_failures));
+            event.string("caught_raw_stage_exceptions", std::to_string(raw_stage_exceptions));
+            event.string("entries_written", std::to_string(raw_entries_written));
+            event.string("required_read_failures", std::to_string(raw_required_read_failures));
+            event.boolean("core_tuple_required_reads_complete",
+                          raw_selected != 0 && raw_entries_written == raw_selected && raw_record_failures == 0 &&
+                              raw_stage_exceptions == 0 && raw_rejected == 0 && raw_overflow == 0 && raw_duplicate_stages == 0 &&
+                              raw_initial_returns == raw_selected && raw_terminal_joins == raw_selected && raw_required_read_failures == 0);
+            event.string("initial_returns_written", std::to_string(raw_initial_returns));
+            event.string("terminal_joins_written", std::to_string(raw_terminal_joins));
+            event.string("duplicate_stage_attempts", std::to_string(raw_duplicate_stages));
+            event.string("records_written_before_counters", std::to_string(raw_records_written));
+            event.number("request_limit", raw_afd_request_limit);
+            event.number("record_limit_bytes", raw_afd_record_limit);
+            event.number("max_dispatch_records_per_request", 3);
+            event.number("entry_extra_guest_read_limit", 56);
+            event.number("initial_result_extra_guest_read_limit", 16);
+            event.number("terminal_extra_guest_read_limit", 16);
+            event.boolean("dispatch_stage_capture_complete", raw_selected != 0 && raw_rejected == 0 && raw_overflow == 0 &&
+                                                                 raw_record_failures == 0 && raw_duplicate_stages == 0 &&
+                                                                 raw_stage_exceptions == 0 && raw_entries_written == raw_selected &&
+                                                                 raw_initial_returns == raw_selected && raw_terminal_joins == raw_selected);
+            event.boolean("runtime_acceptance", false);
+            write_raw(event);
+            file.flush();
+        }
 
         void record_bap_transfer(const io_device_context& request, const std::string_view direction,
                                  const std::span<const std::byte> bytes,
@@ -883,6 +1331,14 @@ namespace sogen
 
         ~implementation()
         {
+            try
+            {
+                raw_counters();
+            }
+            catch (...)
+            {
+                // Missing counters unqualify capture; logging never changes guest execution.
+            }
             for (const auto& [key, summary] : idle_summaries)
             {
                 (void)key;
@@ -1081,6 +1537,7 @@ namespace sogen
                 metadata.endpoint = metadata.remote_endpoint ? metadata.remote_endpoint : metadata.local_endpoint;
             }
             request.network_request_id = ++impl_->next_id;
+            impl_->raw_stage([&] { impl_->raw_entry(win_emu, request, issuer); });
             json_fields event;
             add_common(event, "afd", "request", request.network_request_id, captured_at);
             event.string("kind", "afd_request");
@@ -1197,7 +1654,7 @@ namespace sogen
         }
     }
 
-    void network_debug_logger::afd_result(windows_emulator&, const io_device_context& request, const int32_t status) noexcept
+    void network_debug_logger::afd_result(windows_emulator& win_emu, const io_device_context& request, const int32_t status) noexcept
     {
         const auto captured_at = std::chrono::system_clock::now();
         if (!impl_ || !request.network_request_id)
@@ -1207,6 +1664,7 @@ namespace sogen
         try
         {
             std::scoped_lock lock(impl_->mutex);
+            impl_->raw_stage([&] { impl_->raw_result(win_emu, request, status); });
             json_fields event;
             add_common(event, "afd", "result", request.network_request_id, captured_at);
             event.string("kind", "afd_result");
@@ -1257,6 +1715,10 @@ namespace sogen
             json_fields event;
             add_common(event, "afd", "completion", request.network_request_id, captured_at);
             event.string("kind", was_pending ? "afd_pending_complete" : "afd_complete");
+            event.string("publication_stage", "completion_hook_after_iosb_publication_before_event_and_route");
+            event.boolean("was_pending", was_pending);
+            event.boolean("completing_pending", request.completing_pending);
+            event.boolean("route_decision_available_at_this_hook", false);
             event.string("status", hex(static_cast<uint32_t>(status)));
             event.string("operation", afd_operation(request.io_control_code));
             event.string("ioctl", hex(request.io_control_code));
@@ -1472,6 +1934,24 @@ namespace sogen
         }
     }
 
+    void network_debug_logger::afd_route(windows_emulator& win_emu, const io_device_context& request, const int32_t status,
+                                         const bool completed_synchronously, const std::string_view decision,
+                                         const std::string_view effective_mode) noexcept
+    {
+        if (!impl_ || !impl_->raw_enabled || !request.network_request_id)
+        {
+            return;
+        }
+        try
+        {
+            std::scoped_lock lock(impl_->mutex);
+            impl_->raw_stage([&] { impl_->raw_terminal(win_emu, request, status, completed_synchronously, decision, effective_mode); });
+        }
+        catch (...)
+        {
+        }
+    }
+
     void network_debug_logger::host_stream_transfer(const io_device_context& request, const std::string_view direction,
                                                     const std::span<const std::byte> buffer, const size_t transferred) noexcept
     {
@@ -1560,6 +2040,7 @@ namespace sogen
             json_fields event;
             add_common(event, "apc", "queue", request_id);
             event.string("kind", "apc_queue");
+            event.string("completion_stage", "issuer_apc_enqueued_not_guest_callback_execution");
             event.number("thread_id", thread_id);
             event.string("status", hex(static_cast<uint32_t>(status)));
             event.number("completed_bytes", information);
@@ -1583,6 +2064,7 @@ namespace sogen
             json_fields event;
             add_common(event, "apc", "dequeue", request_id);
             event.string("kind", "apc_dispatch");
+            event.string("completion_stage", "issuer_apc_dispatch_not_user_callback_return");
             event.number("thread_id", thread_id);
             impl_->origin_for(event, request_id);
             impl_->write(event.finish());
@@ -1593,7 +2075,7 @@ namespace sogen
     }
 
     void network_debug_logger::iocp_queue(const uint64_t request_id, const uint64_t port, const uint64_t key, const int32_t status,
-                                          const uint64_t information) noexcept
+                                          const uint64_t information, const std::optional<uint64_t> apc_context) noexcept
     {
         if (!impl_ || !request_id)
         {
@@ -1605,6 +2087,17 @@ namespace sogen
             json_fields event;
             add_common(event, "iocp", "queue", request_id);
             event.string("kind", "iocp_queue");
+            event.string("completion_stage", "packet_enqueued");
+            event.boolean("apc_context_available", apc_context.has_value());
+            if (apc_context)
+            {
+                event.string("apc_context", fixed_hex(*apc_context));
+                event.string("apc_context_source", "queued_message_argument");
+            }
+            else
+            {
+                event.string("apc_context_unavailable", "caller_did_not_supply_actual_queue_context");
+            }
             event.string("port", hex(port));
             event.string("key", hex(key));
             event.string("status", hex(static_cast<uint32_t>(status)));
@@ -1629,6 +2122,10 @@ namespace sogen
             json_fields event;
             add_common(event, "iocp", "dequeue", message.network_request_id);
             event.string("kind", "iocp_dequeue");
+            event.string("completion_stage", "packet_dequeued");
+            event.boolean("apc_context_available", true);
+            event.string("apc_context", fixed_hex(message.apc_context));
+            event.string("apc_context_source", "dequeued_message");
             event.string("port", hex(port));
             event.string("key", hex(message.key_context));
             event.string("status", hex(static_cast<uint32_t>(message.io_status_block.Status)));

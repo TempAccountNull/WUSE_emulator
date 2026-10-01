@@ -3,6 +3,7 @@
 #include "afd_types.hpp"
 
 #include <deque>
+#include <type_traits>
 
 #include "../windows_emulator.hpp"
 #include "../network/socket_factory.hpp"
@@ -1069,6 +1070,49 @@ namespace sogen
                 }
             }
 
+            device_ioctl_completion_mode capture_completion_mode(windows_emulator& win_emu, const io_device_context& c) const override
+            {
+                if constexpr (!std::is_same_v<Traits, EmulatorTraits<Emu64>>)
+                {
+                    return device_ioctl_completion_mode::default_completion;
+                }
+                const auto request = _AFD_REQUEST(c.io_control_code);
+                if (_AFD_BASE(c.io_control_code) != FSCTL_AFD_BASE || (request != AFD_SEND && request != AFD_RECEIVE))
+                {
+                    return device_ioctl_completion_mode::default_completion;
+                }
+                static_assert(sizeof(AFD_SEND_INFO<Traits>) == sizeof(AFD_RECV_INFO<Traits>));
+                static_assert(offsetof(AFD_SEND_INFO<Traits>, AfdFlags) == offsetof(AFD_RECV_INFO<Traits>, AfdFlags));
+                if (c.input_buffer_length < sizeof(AFD_SEND_INFO<Traits>))
+                {
+                    return device_ioctl_completion_mode::default_completion;
+                }
+                ULONG flags{};
+                if (this->active_pending_ && !this->active_pending_->stream_buffers.empty())
+                {
+                    flags = this->active_pending_->stream_afd_flags;
+                }
+                else
+                {
+                    AFD_SEND_INFO<Traits> info{};
+                    if (!win_emu.memory.try_read_memory(c.input_buffer, &info, sizeof(info)))
+                    {
+                        return device_ioctl_completion_mode::default_completion;
+                    }
+                    flags = info.AfdFlags;
+                }
+                // These exact measured stream modes qualify the completion policy.
+                if (flags == 1 && request == AFD_RECEIVE)
+                {
+                    return device_ioctl_completion_mode::afd_stream_no_fast_io;
+                }
+                if (flags == 3)
+                {
+                    return device_ioctl_completion_mode::afd_stream_callback;
+                }
+                return device_ioctl_completion_mode::default_completion;
+            }
+
             bool invalid_parameter_completes(const io_device_context& c) const override
             {
                 switch (_AFD_REQUEST(c.io_control_code))
@@ -1877,9 +1921,16 @@ namespace sogen
 
                 if (c.io_status_block)
                 {
-                    status_block block{};
-                    block.Information = static_cast<uint32_t>(bytes_received);
-                    c.io_status_block.write(block);
+                    if (c.completion_mode != device_ioctl_completion_mode::default_completion)
+                    {
+                        write_irp_io_information(c.io_status_block, static_cast<uint64_t>(bytes_received));
+                    }
+                    else
+                    {
+                        status_block block{};
+                        block.Information = static_cast<uint32_t>(bytes_received);
+                        c.io_status_block.write(block);
+                    }
                 }
                 return STATUS_SUCCESS;
             }
@@ -1985,9 +2036,16 @@ namespace sogen
 
                 if (c.io_status_block)
                 {
-                    status_block block{};
-                    block.Information = static_cast<uint32_t>(bytes_sent);
-                    c.io_status_block.write(block);
+                    if (c.completion_mode != device_ioctl_completion_mode::default_completion)
+                    {
+                        write_irp_io_information(c.io_status_block, static_cast<uint64_t>(bytes_sent));
+                    }
+                    else
+                    {
+                        status_block block{};
+                        block.Information = static_cast<uint32_t>(bytes_sent);
+                        c.io_status_block.write(block);
+                    }
                 }
                 win_emu.afd_diagnostics.record_transfer(afd_profile::operation::send, static_cast<uint64_t>(bytes_sent));
                 return STATUS_SUCCESS;
@@ -2072,12 +2130,19 @@ namespace sogen
                     auto entry = handle;
                     entry.PollEvents =
                         map_socket_response_events_to_afd(pfd.revents, handle.PollEvents, pfd.s->is_listening(), is_connecting);
+                    if (entry.PollEvents == 0)
+                    {
+                        continue;
+                    }
                     entry.Status = STATUS_SUCCESS;
 
                     handle_info_obj.write(entry, current_index++);
                 }
 
-                assert(current_index == static_cast<size_t>(count));
+                if (current_index == 0)
+                {
+                    return STATUS_PENDING;
+                }
 
                 const emulator_object<AFD_POLL_INFO<Traits>> info_obj{win_emu.emu(), c.input_buffer};
                 info_obj.access([&](AFD_POLL_INFO<Traits>& info) {
