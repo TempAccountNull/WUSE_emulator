@@ -1,5 +1,6 @@
 #define WHP_EMULATOR_IMPL
 #include "whp_x86_64_emulator.hpp"
+#include "whp_instruction_exit.hpp"
 
 #include <WinHvPlatform.h>
 #include <windows.h>
@@ -3737,7 +3738,7 @@ namespace sogen::whp
                         if (this->handle_instruction_exit(vcpu,
                                                           exit_context.ReadTsc.RdtscInfo.IsRdtscp ? x86_hookable_instructions::rdtscp
                                                                                                   : x86_hookable_instructions::rdtsc,
-                                                          exit_context, 2))
+                                                          exit_context, detail::require_timestamp_instruction_length(exit_context)))
                         {
                             continue;
                         }
@@ -3793,13 +3794,21 @@ namespace sogen::whp
             {
                 const auto callbacks = this->copy_instruction_hooks(type);
                 const bool handled = !callbacks.empty();
+                const bool is_timestamp = type == x86_hookable_instructions::rdtsc || type == x86_hookable_instructions::rdtscp;
                 bool skip = false;
+                bool finalized = false;
 
                 for (const auto& callback : callbacks)
                 {
-                    if (callback(vcpu, 0) == instruction_hook_continuation::skip_instruction)
+                    const auto continuation = callback(vcpu, 0);
+                    if (continuation == instruction_hook_continuation::skip_instruction)
                     {
                         skip = true;
+                    }
+                    else if (is_timestamp && continuation == instruction_hook_continuation::finalized_instruction_pointer)
+                    {
+                        skip = true;
+                        finalized = true;
                     }
                 }
 
@@ -3808,7 +3817,10 @@ namespace sogen::whp
                     apply_default_instruction_exit(vcpu, type, exit_context);
                 }
 
-                vcpu.advance_rip(instruction_size);
+                if (!finalized && (!is_timestamp || !handled || vcpu.read_instruction_pointer() == exit_context.VpContext.Rip))
+                {
+                    vcpu.advance_rip(instruction_size);
+                }
 
                 return handled || type == x86_hookable_instructions::cpuid || type == x86_hookable_instructions::rdtsc ||
                        type == x86_hookable_instructions::rdtscp;

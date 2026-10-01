@@ -497,6 +497,11 @@ namespace sogen::icicle
             {
                 throw std::logic_error("Icicle host-view callback has no register context");
             }
+            // Icicle has no MSR node; forwarding this read makes the Rust bridge panic.
+            if (reg == static_cast<int>(x86_register::msr))
+            {
+                return 0;
+            }
             return icicle_read_register(this->emu_, reg, value, size);
         }
 

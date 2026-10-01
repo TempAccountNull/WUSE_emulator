@@ -709,7 +709,7 @@ namespace sogen
 
         bool switch_to_thread(windows_emulator& win_emu, vcpu_context& vcpu, emulator_thread& thread, const bool force = false)
         {
-            if (thread.is_terminated())
+            if (thread.is_terminated() || (!force && thread.suspended > 0))
             {
                 return false;
             }

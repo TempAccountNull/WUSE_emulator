@@ -1283,18 +1283,31 @@ namespace sogen
             return ret(STATUS_NOT_SUPPORTED);
         }
 
+        void publish_file_read_status(const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const NTSTATUS status,
+                                      const EmulatorTraits<Emu64>::ULONG_PTR information)
+        {
+            if (!io_status_block)
+            {
+                return;
+            }
+
+            constexpr auto block_size = sizeof(IO_STATUS_BLOCK<EmulatorTraits<Emu64>>);
+            if (io_status_block.value() > std::numeric_limits<uint64_t>::max() - (block_size - 1))
+            {
+                throw std::out_of_range("Invalid file read IOSB span");
+            }
+
+            auto& status_memory = *io_status_block.get_memory_interface();
+            const auto information_address = io_status_block.value() + offsetof(IO_STATUS_BLOCK<EmulatorTraits<Emu64>>, Information);
+            status_memory.write_memory(information_address, information);
+            status_memory.write_memory(io_status_block.value(), status);
+        }
+
         void commit_file_data(const std::string_view data, memory_interface& emu,
                               const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const uint64_t buffer)
         {
             emu.write_memory(buffer, data.data(), data.size());
-
-            if (io_status_block)
-            {
-                auto& status_memory = *io_status_block.get_memory_interface();
-                const auto information_address = io_status_block.value() + offsetof(IO_STATUS_BLOCK<EmulatorTraits<Emu64>>, Information);
-                status_memory.write_memory(information_address, static_cast<EmulatorTraits<Emu64>::ULONG_PTR>(data.size()));
-                status_memory.write_memory(io_status_block.value(), EmulatorTraits<Emu64>::PVOID{});
-            }
+            publish_file_read_status(io_status_block, STATUS_SUCCESS, static_cast<EmulatorTraits<Emu64>::ULONG_PTR>(data.size()));
         }
 
         void write_lock_io_status(const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const NTSTATUS status,
@@ -1557,16 +1570,12 @@ namespace sogen
             record_package_read(0);
             const auto status = length > 0 ? STATUS_END_OF_FILE : STATUS_SUCCESS;
 
-            if (io_status_block)
-            {
-                IO_STATUS_BLOCK<EmulatorTraits<Emu64>> block{};
-                block.Status = status;
-                block.Information = 0;
-                io_status_block.write(block);
-            }
+            publish_file_read_status(io_status_block, status, 0);
 
-            deliver_file_io_completion(c, event, apc_routine, apc_context, io_status_block, status, 0);
-            return status;
+            const bool synchronous = (f->file_mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)) != 0;
+            const auto completion_apc_routine = status == STATUS_END_OF_FILE && synchronous ? 0 : apc_routine;
+            deliver_file_io_completion(c, event, completion_apc_routine, apc_context, io_status_block, status, 0);
+            return status == STATUS_END_OF_FILE && !synchronous ? STATUS_PENDING : status;
         }
 
         NTSTATUS handle_NtReadFile(const syscall_context& c, const handle file_handle, const uint64_t event, const uint64_t apc_routine,
