@@ -563,7 +563,9 @@ namespace sogen
         user_handle_table user_handles;
         handle default_monitor_handle{};
         handle default_desktop_window_handle{};
-        handle_store<handle_types::event, event> events{};
+        uint64_t io_event_reference_epoch{1};
+        bool adopting_restored_io_event_references{};
+        handle_store<handle_types::event, event, 2> events{};
         handle_store<handle_types::file, file> files{};
         utils::insensitive_u16string_map<file_lock_ranges> file_locks{};
         directory_notification_manager directory_notifications{};

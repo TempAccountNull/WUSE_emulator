@@ -499,8 +499,8 @@ namespace sogen
                 std::vector<network::address_sort_entry> transport_sort_addresses{};
                 std::vector<uint64_t> transport_sort_guest_pointers{};
 
-                explicit pending_request(const io_device_context& c)
-                    : context(c)
+                explicit pending_request(io_device_context c)
+                    : context(std::move(c))
                 {
                 }
 

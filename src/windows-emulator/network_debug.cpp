@@ -288,6 +288,8 @@ namespace sogen
             event.string("resolved_file_handle", fixed_hex(request.file_handle.bits));
             event.string("native_event", fixed_hex(request.event.bits));
             event.boolean("native_event_bit0", (request.event.bits & 1) != 0);
+            event.number("event_provenance_schema", 2);
+            event.number("native_event_tag_bits", request.event.bits & 3);
             event.string("native_apc_routine", fixed_hex(request.apc_routine));
             event.string("native_apc_context", fixed_hex(request.apc_context));
             event.boolean("native_context_zero", request.apc_context == 0);
@@ -305,17 +307,38 @@ namespace sogen
                 event.boolean("iocp_association_available", false);
                 event.string("iocp_association_unavailable", "resolved_device_not_present");
             }
-            const auto* object = win_emu.process.events.get(request.event);
+            // Observe the completion resolver without acquiring a new event reference.
+            const auto* object = request.completion_event(win_emu.process);
+            const bool no_user_event = request.event.bits == 0 && !request.event_reference;
+            event.boolean("event_reference_captured", request.event_reference_captured);
+            event.boolean("event_reference_present", request.event_reference != nullptr);
+            event.boolean("event_reference_epoch_available", false);
+            event.boolean("event_resolution_applicable", !no_user_event || object != nullptr);
+            event.string("event_resolution_source", request.event_reference_captured ? "captured_reference" : "uncaptured_store_lookup");
+            event.boolean("event_canonical_handle_available", request.event_reference != nullptr);
+            event.boolean("event_canonical_identity_current",
+                          request.event_reference_captured && request.event_reference && object != nullptr);
+            if (request.event_reference)
+            {
+                event.string("event_canonical_handle", fixed_hex(request.event_reference->canonical_handle().bits));
+            }
             event.boolean("event_object_present", object != nullptr);
-            event.boolean("event_resolution_available", request.event.bits == 0 || object != nullptr);
+            event.boolean("event_resolution_available", no_user_event || object != nullptr);
             if (object)
             {
                 event.boolean("resolved_event_signaled", object->signaled);
-                event.string("event_identity_kind", "full_sogen_handle_lookup_no_tag_normalization");
+                event.string("event_identity_kind",
+                             request.event_reference_captured ? "retained_source_event_reference" : "uncaptured_source_event_store_lookup");
             }
-            else if (request.event.bits)
+            else if (!no_user_event)
             {
-                event.string("event_resolution_unavailable", "full_handle_not_present");
+                event.string("event_resolution_unavailable", !request.event_reference_captured ? "uncaptured_lookup_no_object"
+                                                             : request.event_reference         ? "stale_epoch_or_object_mismatch"
+                                                                                               : "capture_selected_no_object");
+            }
+            else
+            {
+                event.string("event_identity_kind", "no_user_event");
             }
         }
 
@@ -1089,7 +1112,8 @@ namespace sogen
         }
 
         void raw_terminal(windows_emulator& win_emu, const io_device_context& request, const int32_t status,
-                          const bool completed_synchronously, const std::string_view decision, const std::string_view effective_mode)
+                          const bool completed_synchronously, const std::string_view decision, const std::string_view effective_mode,
+                          const std::optional<bool> event_signal_assignment_executed)
         {
             const auto it = raw_requests.find(request.network_request_id);
             if (it == raw_requests.end())
@@ -1139,6 +1163,11 @@ namespace sogen
                 event.string("initial_flags_unavailable", "entry_header_decode_failed");
             }
             raw_routing(event, win_emu, request);
+            event.boolean("event_signal_assignment_available", event_signal_assignment_executed.has_value());
+            if (event_signal_assignment_executed)
+            {
+                event.boolean("event_signal_assignment_executed", *event_signal_assignment_executed);
+            }
             if (!raw_iosb(event, win_emu, request))
             {
                 ++raw_required_read_failures;
@@ -1936,7 +1965,8 @@ namespace sogen
 
     void network_debug_logger::afd_route(windows_emulator& win_emu, const io_device_context& request, const int32_t status,
                                          const bool completed_synchronously, const std::string_view decision,
-                                         const std::string_view effective_mode) noexcept
+                                         const std::string_view effective_mode,
+                                         const std::optional<bool> event_signal_assignment_executed) noexcept
     {
         if (!impl_ || !impl_->raw_enabled || !request.network_request_id)
         {
@@ -1945,7 +1975,10 @@ namespace sogen
         try
         {
             std::scoped_lock lock(impl_->mutex);
-            impl_->raw_stage([&] { impl_->raw_terminal(win_emu, request, status, completed_synchronously, decision, effective_mode); });
+            impl_->raw_stage([&] {
+                impl_->raw_terminal(win_emu, request, status, completed_synchronously, decision, effective_mode,
+                                    event_signal_assignment_executed);
+            });
         }
         catch (...)
         {

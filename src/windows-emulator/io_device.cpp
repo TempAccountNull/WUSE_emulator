@@ -14,6 +14,141 @@
 
 namespace sogen
 {
+    referenced_io_event::referenced_io_event(process_context& process, const handle canonical_handle, const bool adopt_reference)
+        : process_(&process),
+          canonical_handle_(canonical_handle),
+          object_(process.events.get(canonical_handle)),
+          epoch_(process.io_event_reference_epoch)
+    {
+        if (!this->object_ || this->object_->ref_count == 0 || process.events.find_handle(this->object_) != canonical_handle)
+        {
+            throw std::runtime_error("Invalid referenced I/O event");
+        }
+        if (!adopt_reference)
+        {
+            if (this->object_->ref_count == std::numeric_limits<uint32_t>::max())
+            {
+                throw std::overflow_error("I/O event reference count exhausted");
+            }
+            (void)process.events.duplicate(canonical_handle);
+        }
+    }
+
+    referenced_io_event::~referenced_io_event()
+    {
+        if (this->get())
+        {
+            this->process_->events.erase(this->canonical_handle_);
+        }
+    }
+
+    event* referenced_io_event::get() const
+    {
+        if (this->process_->io_event_reference_epoch != this->epoch_ ||
+            this->process_->events.get(this->canonical_handle_) != this->object_)
+        {
+            return nullptr;
+        }
+        return this->object_;
+    }
+
+    handle referenced_io_event::canonical_handle() const
+    {
+        return this->canonical_handle_;
+    }
+
+    void io_device_context::capture_event_reference(process_context& process, const bool independent_request)
+    {
+        if (this->event_reference_captured)
+        {
+            if (independent_request && this->event_reference)
+            {
+                auto* object = this->event_reference->get();
+                const auto canonical = this->event_reference->canonical_handle();
+                if (!object || process.events.get(canonical) != object)
+                {
+                    this->event_reference.reset();
+                }
+                else
+                {
+                    this->event_reference = std::make_shared<referenced_io_event>(process, canonical, false);
+                }
+            }
+            return;
+        }
+        this->event_reference_captured = true;
+        if (auto* object = process.events.get(this->event))
+        {
+            this->event_reference = std::make_shared<referenced_io_event>(process, process.events.find_handle(object), false);
+        }
+    }
+
+    event* io_device_context::completion_event(process_context& process) const
+    {
+        if (this->event_reference_captured)
+        {
+            return this->event_reference ? this->event_reference->get() : nullptr;
+        }
+        return process.events.get(this->event);
+    }
+
+    void io_device_context::serialize(utils::buffer_serializer& buffer) const
+    {
+        if (this->event_reference && !this->event_reference->get())
+        {
+            throw std::runtime_error("Cannot serialize stale I/O event reference");
+        }
+        buffer.write(file_handle);
+        buffer.write(issuer_thread_id);
+        buffer.write(network_request_id);
+        buffer.write(completing_pending);
+        buffer.write(event);
+        buffer.write(apc_routine);
+        buffer.write(apc_context);
+        buffer.write(io_status_block);
+        buffer.write(io_control_code);
+        buffer.write(input_buffer);
+        buffer.write(input_buffer_length);
+        buffer.write(output_buffer);
+        buffer.write(output_buffer_length);
+        buffer.write(event_reference_captured);
+        buffer.write(event_reference ? event_reference->canonical_handle() : handle{});
+    }
+
+    void io_device_context::deserialize(utils::buffer_deserializer& buffer)
+    {
+        this->event_reference.reset();
+        buffer.read(file_handle);
+        buffer.read(issuer_thread_id);
+        buffer.read(network_request_id);
+        buffer.read(completing_pending);
+        buffer.read(event);
+        buffer.read(apc_routine);
+        buffer.read(apc_context);
+        buffer.read(io_status_block);
+        buffer.read(io_control_code);
+        buffer.read(input_buffer);
+        buffer.read(input_buffer_length);
+        buffer.read(output_buffer);
+        buffer.read(output_buffer_length);
+        buffer.read(event_reference_captured);
+        const auto retained_handle = buffer.read<handle>();
+        if (!this->event_reference_captured && retained_handle.bits)
+        {
+            throw std::runtime_error("Uncaptured I/O event has a saved reference");
+        }
+        if (retained_handle.bits)
+        {
+            auto& process = buffer.read<windows_emulator_wrapper>().get().process;
+            auto* object = process.events.get(this->event);
+            if (!object || process.events.find_handle(object) != retained_handle)
+            {
+                throw std::runtime_error("Invalid saved I/O event identity");
+            }
+            this->event_reference =
+                std::make_shared<referenced_io_event>(process, retained_handle, process.adopting_restored_io_event_references);
+        }
+    }
 
     namespace
     {
@@ -163,19 +298,19 @@ namespace sogen
             }
             return "unknown_mode";
         }();
+        bool event_signal_assignment_executed = false;
         const auto route = [&](const std::string_view decision) {
-            win_emu.network_debug.afd_route(win_emu, c, static_cast<int32_t>(status), completed_synchronously, decision, effective_mode);
+            win_emu.network_debug.afd_route(win_emu, c, static_cast<int32_t>(status), completed_synchronously, decision, effective_mode,
+                                            event_signal_assignment_executed);
         };
         if (c.network_request_id)
         {
             win_emu.network_debug.afd_completion(win_emu, c, static_cast<int32_t>(status), !completed_synchronously);
         }
-        if (c.event.bits)
+        if (auto* event = c.completion_event(win_emu.process))
         {
-            if (auto* event = win_emu.process.events.get(c.event))
-            {
-                event->signaled = true;
-            }
+            event->signaled = true;
+            event_signal_assignment_executed = true;
         }
         const auto block = c.io_status_block ? c.io_status_block.read() : IO_STATUS_BLOCK<EmulatorTraits<Emu64>>{.Status = status};
         const auto* file_object = win_emu.process.devices.get(c.file_handle);
@@ -249,6 +384,8 @@ namespace sogen
 
     NTSTATUS io_device::execute_ioctl(windows_emulator& win_emu, const io_device_context& c)
     {
+        auto dispatch_context = c;
+        dispatch_context.capture_event_reference(win_emu.process, !c.completing_pending);
         const auto completion_mode = this->capture_completion_mode(win_emu, c);
         const auto original_io_status = this->may_return_pending() && c.io_status_block
                                             ? std::optional{c.io_status_block.read()}
@@ -258,7 +395,6 @@ namespace sogen
             c.io_status_block.write({});
         }
 
-        auto dispatch_context = c;
         dispatch_context.completion_mode = completion_mode;
         const auto result = this->io_control(win_emu, dispatch_context);
         if (result == STATUS_PENDING)
@@ -280,7 +416,7 @@ namespace sogen
         {
             win_emu.network_debug.afd_result(win_emu, c, static_cast<int32_t>(result));
             win_emu.network_debug.afd_route(win_emu, c, static_cast<int32_t>(result), true,
-                                            "immediate_no_fast_wouldblock_completion_skipped", "afd_stream_no_fast_io");
+                                            "immediate_no_fast_wouldblock_completion_skipped", "afd_stream_no_fast_io", false);
             return result;
         }
 
@@ -299,7 +435,8 @@ namespace sogen
                                             : completion_mode == device_ioctl_completion_mode::afd_stream_callback ? "afd_stream_callback"
                                             : completion_mode == device_ioctl_completion_mode::afd_stream_no_fast_io
                                                 ? "afd_stream_no_fast_io"
-                                                : "unknown_mode");
+                                                : "unknown_mode",
+                                            false);
             return result;
         }
 
@@ -321,7 +458,7 @@ namespace sogen
         {
             win_emu.network_debug.afd_result(win_emu, c, static_cast<int32_t>(result));
         }
-        complete_device_ioctl(win_emu, c, result, !c.completing_pending, completion_mode);
+        complete_device_ioctl(win_emu, dispatch_context, result, !c.completing_pending, completion_mode);
         return result;
     }
 

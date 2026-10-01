@@ -297,10 +297,10 @@ namespace sogen
             // switches, so wake the current waiters explicitly while the event is signaled.
             entry->signaled = true;
 
-            const auto event_handle = make_handle(handle);
             for (auto& thread : c.proc.threads | std::views::values)
             {
-                if (std::ranges::find(thread.await_objects, event_handle) != thread.await_objects.end())
+                if (std::ranges::any_of(thread.await_objects,
+                                        [&](const auto waiting_handle) { return c.proc.events.get(waiting_handle) == entry; }))
                 {
                     (void)thread.is_thread_ready(c.win_emu);
                 }

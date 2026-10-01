@@ -7,11 +7,13 @@
 #include "windows_emulator.hpp"
 #include "version/windows_version_manager.hpp"
 
+#include <utils/finally.hpp>
 #include <utils/io.hpp>
 #include <utils/time.hpp>
 #include <utils/buffer_accessor.hpp>
 #include <regex>
 #include <sstream>
+#include <limits>
 
 namespace sogen
 {
@@ -20,6 +22,7 @@ namespace sogen
     {
 
         constexpr int64_t default_critical_section_timeout = -30LL * 24 * 60 * 60 * 10'000'000;
+        constexpr uint64_t event_handle_encoding_marker = 0x324556454E54494FULL;
 
         std::vector<uint8_t> sid_string_to_bytes(const std::string& sid_string)
         {
@@ -652,6 +655,7 @@ namespace sogen
 
     void process_context::serialize(utils::buffer_serializer& buffer, const emulator_thread* active_thread) const
     {
+        buffer.write(event_handle_encoding_marker);
         buffer.write_vector(this->sid);
         buffer.write(this->shared_section_address);
         buffer.write(this->shared_section_size);
@@ -761,6 +765,10 @@ namespace sogen
 
     void process_context::deserialize(utils::buffer_deserializer& buffer, emulator_thread*& active_thread)
     {
+        if (buffer.read<uint64_t>() != event_handle_encoding_marker)
+        {
+            throw std::runtime_error("Incompatible event handle snapshot encoding");
+        }
         buffer.read_vector(this->sid);
         buffer.read(this->shared_section_address);
         buffer.read(this->shared_section_size);
@@ -813,11 +821,21 @@ namespace sogen
         buffer.read(this->user_handles);
         buffer.read(this->default_monitor_handle);
         buffer.read(this->default_desktop_window_handle);
+        if (this->io_event_reference_epoch == std::numeric_limits<uint64_t>::max())
+        {
+            throw std::overflow_error("I/O event reference epoch exhausted");
+        }
+        ++this->io_event_reference_epoch;
         buffer.read(this->events);
         buffer.read(this->files);
         buffer.read_map(this->file_locks);
         buffer.read(this->sections);
-        buffer.read(this->devices);
+        {
+            const auto previous = this->adopting_restored_io_event_references;
+            this->adopting_restored_io_event_references = true;
+            const auto restore = utils::finally([this, previous] { this->adopting_restored_io_event_references = previous; });
+            buffer.read(this->devices);
+        }
         buffer.read(this->console_handle);
         buffer.read(this->semaphores);
         buffer.read(this->io_completions);

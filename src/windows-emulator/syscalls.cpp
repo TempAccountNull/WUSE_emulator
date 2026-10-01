@@ -973,15 +973,15 @@ namespace sogen
                 return STATUS_INVALID_PARAMETER;
             }
 
-            if (auto* e = c.proc.events.get(event))
-            {
-                e->signaled = false;
-            }
-
             io_device_context context{c.emu};
             context.file_handle = resolved_file_handle;
             context.issuer_thread_id = c.thread().id;
             context.event = event;
+            context.capture_event_reference(c.proc);
+            if (auto* referenced_event = context.completion_event(c.proc))
+            {
+                referenced_event->signaled = false;
+            }
             context.apc_routine = apc_routine;
             context.apc_context = apc_context;
             context.io_status_block = io_status_block;

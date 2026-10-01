@@ -19,6 +19,25 @@ namespace sogen
     struct process_context;
     struct vcpu_context;
     class emulator_thread;
+    struct event;
+
+    class referenced_io_event
+    {
+      public:
+        referenced_io_event(process_context& process, handle canonical_handle, bool adopt_reference);
+        ~referenced_io_event();
+        referenced_io_event(const referenced_io_event&) = delete;
+        referenced_io_event& operator=(const referenced_io_event&) = delete;
+
+        event* get() const;
+        handle canonical_handle() const;
+
+      private:
+        process_context* process_{};
+        handle canonical_handle_{};
+        event* object_{};
+        uint64_t epoch_{};
+    };
 
     enum class device_ioctl_completion_mode
     {
@@ -37,6 +56,8 @@ namespace sogen
         // on delayed dispatch and deliberately not serialized.
         device_ioctl_completion_mode completion_mode{device_ioctl_completion_mode::default_completion};
         handle event{};
+        bool event_reference_captured{};
+        std::shared_ptr<referenced_io_event> event_reference{};
         emulator_pointer /*PIO_APC_ROUTINE*/ apc_routine{};
         emulator_pointer apc_context{};
         emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block;
@@ -63,39 +84,10 @@ namespace sogen
         {
         }
 
-        void serialize(utils::buffer_serializer& buffer) const
-        {
-            buffer.write(file_handle);
-            buffer.write(issuer_thread_id);
-            buffer.write(network_request_id);
-            buffer.write(completing_pending);
-            buffer.write(event);
-            buffer.write(apc_routine);
-            buffer.write(apc_context);
-            buffer.write(io_status_block);
-            buffer.write(io_control_code);
-            buffer.write(input_buffer);
-            buffer.write(input_buffer_length);
-            buffer.write(output_buffer);
-            buffer.write(output_buffer_length);
-        }
-
-        void deserialize(utils::buffer_deserializer& buffer)
-        {
-            buffer.read(file_handle);
-            buffer.read(issuer_thread_id);
-            buffer.read(network_request_id);
-            buffer.read(completing_pending);
-            buffer.read(event);
-            buffer.read(apc_routine);
-            buffer.read(apc_context);
-            buffer.read(io_status_block);
-            buffer.read(io_control_code);
-            buffer.read(input_buffer);
-            buffer.read(input_buffer_length);
-            buffer.read(output_buffer);
-            buffer.read(output_buffer_length);
-        }
+        void capture_event_reference(process_context& process, bool independent_request = false);
+        sogen::event* completion_event(process_context& process) const;
+        void serialize(utils::buffer_serializer& buffer) const;
+        void deserialize(utils::buffer_deserializer& buffer);
     };
 
     void complete_device_ioctl(windows_emulator& win_emu, const io_device_context& context, NTSTATUS status, bool completed_synchronously,

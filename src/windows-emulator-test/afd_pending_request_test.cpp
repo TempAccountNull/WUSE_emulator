@@ -1536,6 +1536,144 @@ namespace sogen::test
         EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(received.data()), received.size()), "abc");
     }
 
+    TEST_P(AfdPendingRequestTest, PendingTaggedEventSurvivesWholeProcessSnapshotRestore)
+    {
+        emu.process.is_wow64_process = GetParam();
+        socket->connected = true;
+        const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
+        emu.memory.write_memory(memory, creation.data(), sizeof(creation));
+        const auto endpoint_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        auto* endpoint = emu.process.devices.get(endpoint_handle);
+        ASSERT_NE(endpoint, nullptr);
+        const auto port_handle = emu.process.io_completions.store(io_completion{});
+        endpoint->completion_port = port_handle;
+        endpoint->completion_key = 0x1234;
+        const handle tagged_event{.bits = receive_event.bits | 1u};
+        ASSERT_EQ(receive_event.bits & 3u, 0u);
+        ASSERT_EQ(tagged_event.bits & 3u, 1u);
+        ASSERT_EQ(emu.process.events.get(tagged_event), emu.process.events.get(receive_event));
+        ASSERT_NE(emu.process.events.get(receive_event), emu.process.events.get(send_event));
+        emu.process.events.get(receive_event)->signaled = false;
+        emu.process.events.get(send_event)->signaled = false;
+        emu.memory.set_memory(memory + 0x400, 0xcc, 16);
+        const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Pointer = 0xaabbccdd4a4b4c4dull, .Information = 0x1122334455667788ull};
+        emu.memory.write_memory(memory + 0x100, &initial, sizeof(initial));
+        const auto original_iosb = emu.memory.read_memory(memory + 0x100, sizeof(initial));
+        io_device_context request{emu.memory};
+        request.file_handle = endpoint_handle;
+        request.event = tagged_event;
+        request.apc_context = 0x5678;
+        request.io_status_block = {emu.memory, memory + 0x100};
+        request.io_control_code = 0x12017;
+        request.input_buffer = memory + 0x200;
+        const auto submit = [&]<typename Guest>() {
+            using Traits = EmulatorTraits<Guest>;
+            const EMU_WSABUF<Traits> buffer{.len = 3, .buf = static_cast<typename Traits::PVOID>(memory + 0x400)};
+            const AFD_RECV_INFO<Traits> input{
+                .BufferArray = static_cast<typename Traits::PVOID>(memory + 0x300), .BufferCount = 1, .AfdFlags = 2, .TdiFlags = 0x20};
+            emu.memory.write_memory(memory + 0x300, &buffer, sizeof(buffer));
+            emu.memory.write_memory(memory + 0x200, &input, sizeof(input));
+            request.input_buffer_length = sizeof(input);
+            EXPECT_EQ(endpoint->capture_completion_mode(emu, request), device_ioctl_completion_mode::default_completion);
+            return endpoint->execute_ioctl(emu, request);
+        };
+        ASSERT_EQ(GetParam() ? submit.template operator()<Emu32>() : submit.template operator()<Emu64>(), STATUS_PENDING);
+        ASSERT_FALSE(request.event_reference_captured);
+        ASSERT_EQ(emu.process.events.get(receive_event)->ref_count, 2u);
+        EXPECT_EQ(emu.memory.read_memory(memory + 0x100, sizeof(initial)), original_iosb);
+        const auto original_input = emu.memory.read_memory(memory + 0x200, request.input_buffer_length);
+        const auto descriptor_size = GetParam() ? sizeof(EMU_WSABUF<EmulatorTraits<Emu32>>) : sizeof(EMU_WSABUF<EmulatorTraits<Emu64>>);
+        const auto original_descriptor = emu.memory.read_memory(memory + 0x300, descriptor_size);
+        EXPECT_FALSE(emu.process.events.get(tagged_event)->signaled);
+        EXPECT_FALSE(emu.process.events.get(send_event)->signaled);
+        EXPECT_TRUE(emu.process.io_completions.get(port_handle)->queue.empty());
+
+        // The saved count represents the user handle and the actual pending device request.
+        utils::buffer_serializer saved_device{};
+        endpoint->serialize(saved_device);
+        utils::buffer_serializer saved_process{};
+        auto& active_thread = emu.vcpu(0).active_thread;
+        const auto active_thread_handle = emu.process.threads.find_handle(active_thread);
+        const auto saved_epoch = emu.process.io_event_reference_epoch;
+        emu.process.serialize(saved_process, active_thread);
+
+        // This old-epoch hold is acquired after saving and is absent from the saved count.
+        io_device_context stale_context{emu.memory};
+        stale_context.event = tagged_event;
+        stale_context.capture_event_reference(emu.process);
+        ASSERT_NE(stale_context.event_reference, nullptr);
+        EXPECT_EQ(stale_context.event_reference->canonical_handle(), receive_event);
+        ASSERT_EQ(emu.process.events.get(receive_event)->ref_count, 3u);
+
+        utils::buffer_deserializer input{saved_process};
+        input.register_factory<memory_manager_wrapper>([this] { return memory_manager_wrapper{emu.memory}; });
+        input.register_factory<module_manager_wrapper>([this] { return module_manager_wrapper{emu.mod_manager}; });
+        input.register_factory<x64_emulator_wrapper>([this] { return x64_emulator_wrapper{emu.emu()}; });
+        input.register_factory<windows_emulator_wrapper>([this] { return windows_emulator_wrapper{emu}; });
+        input.register_factory<clock_wrapper>([this] { return clock_wrapper{emu.clock()}; });
+        input.register_factory<socket_factory_wrapper>([this] { return socket_factory_wrapper{emu.socket_factory()}; });
+        input.register_factory<window>([this] { return window{emu.emu()}; });
+        emu.process.deserialize(input, active_thread);
+        EXPECT_EQ(input.get_remaining_size(), 0u);
+        EXPECT_EQ(emu.process.threads.find_handle(active_thread), active_thread_handle);
+        EXPECT_EQ(emu.process.io_event_reference_epoch, saved_epoch + 1);
+        EXPECT_FALSE(emu.process.adopting_restored_io_event_references);
+        ASSERT_NE(emu.process.events.get(receive_event), nullptr);
+        ASSERT_EQ(emu.process.events.get(tagged_event), emu.process.events.get(receive_event));
+        EXPECT_EQ(emu.process.events.find_handle(emu.process.events.get(tagged_event)), receive_event);
+        ASSERT_EQ(emu.process.events.get(receive_event)->ref_count, 2u);
+        EXPECT_EQ(stale_context.completion_event(emu.process), nullptr);
+        stale_context.event_reference.reset();
+        EXPECT_EQ(emu.process.events.get(receive_event)->ref_count, 2u);
+
+        endpoint = emu.process.devices.get(endpoint_handle);
+        ASSERT_NE(endpoint, nullptr);
+        EXPECT_EQ(endpoint->completion_port, port_handle);
+        EXPECT_EQ(endpoint->completion_key, 0x1234u);
+        utils::buffer_serializer restored_device{};
+        endpoint->serialize(restored_device);
+        // Exact pending device bytes include the original tagged event, captured context and canonical hold.
+        EXPECT_EQ(restored_device.get_buffer(), saved_device.get_buffer());
+        EXPECT_EQ(emu.memory.read_memory(memory + 0x200, request.input_buffer_length), original_input);
+        EXPECT_EQ(emu.memory.read_memory(memory + 0x300, descriptor_size), original_descriptor);
+        EXPECT_EQ(emu.memory.read_memory(memory + 0x100, sizeof(initial)), original_iosb);
+        EXPECT_FALSE(emu.process.events.get(tagged_event)->signaled);
+        EXPECT_FALSE(emu.process.events.get(send_event)->signaled);
+        auto* const port = emu.process.io_completions.get(port_handle);
+        ASSERT_NE(port, nullptr);
+        EXPECT_TRUE(port->queue.empty());
+        endpoint->work(emu);
+        EXPECT_EQ(emu.memory.read_memory(memory + 0x100, sizeof(initial)), original_iosb);
+        EXPECT_FALSE(emu.process.events.get(tagged_event)->signaled);
+        EXPECT_TRUE(port->queue.empty());
+        EXPECT_EQ(emu.process.events.get(receive_event)->ref_count, 2u);
+
+        for (const char byte : std::string_view{"abc"})
+        {
+            socket->incoming.push_back(static_cast<std::byte>(byte));
+        }
+        endpoint->work(emu);
+        EXPECT_EQ(status(false).Status, STATUS_SUCCESS);
+        EXPECT_EQ(status(false).Information, 3u);
+        EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x104), 0u);
+        EXPECT_EQ((emu.memory.read_memory<std::array<char, 3>>(memory + 0x400)), (std::array<char, 3>{'a', 'b', 'c'}));
+        EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x403), 0xccu);
+        EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+        EXPECT_TRUE(emu.process.events.get(tagged_event)->signaled);
+        EXPECT_FALSE(emu.process.events.get(send_event)->signaled);
+        EXPECT_EQ(emu.process.events.get(receive_event)->ref_count, 1u);
+        EXPECT_EQ(emu.process.events.get(send_event)->ref_count, 1u);
+        ASSERT_EQ(port->queue.size(), 1u);
+        EXPECT_EQ(port->queue.front().key_context, 0x1234u);
+        EXPECT_EQ(port->queue.front().apc_context, 0x5678u);
+        EXPECT_EQ(port->queue.front().io_status_block.Status, STATUS_SUCCESS);
+        EXPECT_EQ(port->queue.front().io_status_block.Information, 3u);
+        endpoint->work(emu);
+        EXPECT_EQ(port->queue.size(), 1u);
+        EXPECT_EQ(emu.process.events.get(receive_event)->ref_count, 1u);
+    }
+
     TEST_P(AfdPendingRequestTest, PendingRequestsSurviveDeviceSnapshotRoundTrip)
     {
         ASSERT_EQ(transfer(false), STATUS_PENDING);
@@ -1546,6 +1684,7 @@ namespace sogen::test
         utils::buffer_deserializer input{saved};
         input.register_factory<memory_manager_wrapper>([this] { return memory_manager_wrapper{emu.memory}; });
         input.register_factory<x64_emulator_wrapper>([this] { return x64_emulator_wrapper{emu.emu()}; });
+        input.register_factory<windows_emulator_wrapper>([this] { return windows_emulator_wrapper{emu}; });
         input.register_factory<socket_factory_wrapper>([this] { return socket_factory_wrapper{emu.socket_factory()}; });
         auto restored = create_afd_endpoint({.is_32_bit = GetParam()});
         restored->deserialize(input);
@@ -2260,7 +2399,7 @@ namespace sogen::test
         EXPECT_TRUE(observed.stores.empty());
     }
 
-    TEST_P(AfdPendingRequestTest, CallbackReceiveIocpRequiresContextForOddAndEvenEventHandles)
+    TEST_P(AfdPendingRequestTest, ReceiveIocpRequiresContextForBaseAndTaggedEventAliases)
     {
         emu.process.is_wow64_process = GetParam();
         const bool qualified = !GetParam();
@@ -2284,13 +2423,20 @@ namespace sogen::test
         endpoint->completion_key = 0x1234;
         auto* port = emu.process.io_completions.get(port_handle);
         ASSERT_NE(port, nullptr);
-        const std::array<handle, 2> signals{send_event, receive_event};
-        ASSERT_EQ(signals[0].bits & 1u, 0u);
-        ASSERT_EQ(signals[1].bits & 1u, 1u);
-        ASSERT_NE(signals[0].bits, signals[1].bits);
-        ASSERT_NE(emu.process.events.get(signals[0]), nullptr);
-        ASSERT_NE(emu.process.events.get(signals[1]), nullptr);
-        ASSERT_NE(emu.process.events.get(signals[0]), emu.process.events.get(signals[1]));
+        const auto base_event = receive_event;
+        const handle tagged_event{.bits = base_event.bits | 1u};
+        const auto decoy_event = send_event;
+        const std::array<handle, 2> signals{base_event, tagged_event};
+        ASSERT_EQ(base_event.bits & 3u, 0u);
+        ASSERT_EQ(decoy_event.bits & 3u, 0u);
+        ASSERT_EQ(tagged_event.bits & 3u, 1u);
+        ASSERT_NE(base_event.bits, tagged_event.bits);
+        ASSERT_NE(base_event.bits, decoy_event.bits);
+        ASSERT_NE(emu.process.events.get(base_event), nullptr);
+        ASSERT_NE(emu.process.events.get(tagged_event), nullptr);
+        ASSERT_NE(emu.process.events.get(decoy_event), nullptr);
+        ASSERT_EQ(emu.process.events.get(base_event), emu.process.events.get(tagged_event));
+        ASSERT_NE(emu.process.events.get(base_event), emu.process.events.get(decoy_event));
         const auto submit = [&]<typename Guest>(const handle signal, const uint64_t completion_context) {
             using Traits = EmulatorTraits<Guest>;
             const EMU_WSABUF<Traits> buffer{.len = 16, .buf = static_cast<typename Traits::PVOID>(memory + 0x400)};
@@ -2320,10 +2466,8 @@ namespace sogen::test
                                                     << " raw_low_bit=" << (signal.bits & 1u) << " context=" << completion_context);
                     port->queue.clear();
                     socket->incoming.clear();
-                    for (const auto candidate : signals)
-                    {
-                        emu.process.events.get(candidate)->signaled = false;
-                    }
+                    emu.process.events.get(base_event)->signaled = false;
+                    emu.process.events.get(decoy_event)->signaled = false;
                     emu.memory.set_memory(memory + 0x400, 0xcc, 16);
                     const IO_STATUS_BLOCK<EmulatorTraits<Emu64>> initial{.Pointer = 0xaabbccdd4a4b4c4dull,
                                                                          .Information = 0x1122334455667788ull};
@@ -2345,8 +2489,9 @@ namespace sogen::test
                     if (!initially_ready)
                     {
                         EXPECT_EQ(emu.memory.read_memory(memory + 0x100, sizeof(initial)), original);
-                        EXPECT_FALSE(emu.process.events.get(signals[0])->signaled);
-                        EXPECT_FALSE(emu.process.events.get(signals[1])->signaled);
+                        EXPECT_FALSE(emu.process.events.get(base_event)->signaled);
+                        EXPECT_FALSE(emu.process.events.get(tagged_event)->signaled);
+                        EXPECT_FALSE(emu.process.events.get(decoy_event)->signaled);
                         EXPECT_TRUE(port->queue.empty());
                         const auto flags_offset = GetParam() ? 8u : 12u;
                         emulator_object<uint32_t>{emu.memory, memory + 0x200 + flags_offset}.write(0u);
@@ -2358,10 +2503,9 @@ namespace sogen::test
                     EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x104), qualified ? 0xaabbccddu : 0u);
                     EXPECT_EQ((emu.memory.read_memory<std::array<char, 3>>(memory + 0x400)), (std::array<char, 3>{'a', 'b', 'c'}));
                     EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x403), 0xccu);
-                    for (const auto candidate : signals)
-                    {
-                        EXPECT_EQ(emu.process.events.get(candidate)->signaled, candidate.bits == signal.bits);
-                    }
+                    EXPECT_TRUE(emu.process.events.get(base_event)->signaled);
+                    EXPECT_TRUE(emu.process.events.get(tagged_event)->signaled);
+                    EXPECT_FALSE(emu.process.events.get(decoy_event)->signaled);
                     if (completion_context == 0)
                     {
                         EXPECT_TRUE(port->queue.empty());

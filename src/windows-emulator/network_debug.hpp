@@ -32,7 +32,8 @@ namespace sogen
         void afd_result(windows_emulator& win_emu, const io_device_context& request, int32_t status) noexcept;
         void afd_completion(windows_emulator& win_emu, const io_device_context& request, int32_t status, bool was_pending) noexcept;
         void afd_route(windows_emulator& win_emu, const io_device_context& request, int32_t status, bool completed_synchronously,
-                       std::string_view decision, std::string_view effective_mode) noexcept;
+                       std::string_view decision, std::string_view effective_mode,
+                       std::optional<bool> event_signal_assignment_executed = std::nullopt) noexcept;
         void host_stream_transfer(const io_device_context& request, std::string_view direction, std::span<const std::byte> buffer,
                                   size_t transferred) noexcept;
         void apc_queue(uint64_t request_id, uint32_t thread_id, int32_t status, uint64_t information) noexcept;

@@ -2,6 +2,7 @@
 
 #include <serialization.hpp>
 #include <map>
+#include <stdexcept>
 
 // NOLINTBEGIN(cppcoreguidelines-use-enum-class)
 
@@ -190,6 +191,8 @@ namespace sogen
       public:
         using index_type = uint32_t;
         using value_map = std::map<index_type, T>;
+        static_assert(IndexShift < 23);
+        static constexpr index_type maximum_index = (index_type{1} << (23 - IndexShift)) - 1;
 
         bool block_mutation(bool blocked)
         {
@@ -217,6 +220,10 @@ namespace sogen
 
         handle make_handle(const index_type index) const
         {
+            if (index > maximum_index)
+            {
+                throw std::out_of_range("Handle store index is not representable");
+            }
             handle h{};
             h.bits = 0;
             h.value.is_pseudo = false;
@@ -233,6 +240,10 @@ namespace sogen
 
         T* get_by_index(const uint32_t index)
         {
+            if (index > maximum_index)
+            {
+                return nullptr;
+            }
             return this->get(this->make_handle(index));
         }
 
@@ -336,6 +347,14 @@ namespace sogen
         {
             buffer.read(this->block_mutation_);
             buffer.read_map(this->store_);
+            for (const auto& [index, value] : this->store_)
+            {
+                (void)value;
+                if (index == 0 || index > maximum_index)
+                {
+                    throw std::runtime_error("Invalid serialized handle store index");
+                }
+            }
         }
 
         value_map::iterator find(const T& value)
@@ -421,7 +440,7 @@ namespace sogen
         uint32_t find_free_index()
         {
             uint32_t index = 1;
-            for (; index > 0; ++index)
+            for (; index <= maximum_index; ++index)
             {
                 if (!this->store_.contains(index))
                 {
@@ -429,6 +448,10 @@ namespace sogen
                 }
             }
 
+            if (index > maximum_index)
+            {
+                throw std::length_error("Handle store is full");
+            }
             return index;
         }
 
