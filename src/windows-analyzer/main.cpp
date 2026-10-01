@@ -3,6 +3,7 @@
 #include <CLI/CLI.hpp>
 
 #include <windows_emulator.hpp>
+#include <native_child_capture.hpp>
 #include <backend_selection.hpp>
 #include <win_x86_64_gdb_stub_handler.hpp>
 #include <minidump_loader.hpp>
@@ -521,8 +522,7 @@ namespace sogen
                     event.debug_sample = trace.debug_sample;
                     event.gprs = trace.gprs;
                     event.eflags = trace.eflags;
-                    event.stack_words.assign(trace.stack_words.begin(),
-                                             trace.stack_words.begin() + trace.readable_stack_words);
+                    event.stack_words.assign(trace.stack_words.begin(), trace.stack_words.begin() + trace.readable_stack_words);
                     event.code_bytes.reserve(trace.readable_code_bytes * 2);
                     for (size_t i = 0; i < trace.readable_code_bytes; ++i)
                     {
@@ -546,13 +546,15 @@ namespace sogen
 
         void flush_reporters(const analysis_context& c)
         {
-            for (auto* reporter : c.reporters)
-            {
-                reporter->flush();
-            }
+            c.win_emu->synchronize_native_child_capture([&] {
+                for (auto* reporter : c.reporters)
+                {
+                    reporter->flush();
+                }
+            });
         }
 
-        int run_emulation(const analysis_context& c, const analysis_options& options)
+        int run_emulation(const analysis_context& c, const analysis_options& options, native_child_capture_scope& child_capture)
         {
             auto& win_emu = *c.win_emu;
 
@@ -623,12 +625,14 @@ namespace sogen
                 {
                     snapshot_attempted = true;
                     snapshot_saving = true;
-                    snapshot::write_emulator_snapshot(win_emu, options.snapshot_output);
+                    win_emu.synchronize_native_child_capture([&] { snapshot::write_emulator_snapshot(win_emu, options.snapshot_output); },
+                                                             true);
                     snapshot_saving = false;
                 }
             };
 
             auto emit_failure = [&](std::string message) {
+                child_capture.finish();
                 const std::string phase = snapshot_saving ? "snapshot_save" : "emulation";
                 try
                 {
@@ -711,6 +715,7 @@ namespace sogen
                 }
                 else if (!options.minidump_path.empty())
                 {
+                    child_capture.finish();
                     // For minidumps, don't start execution automatically; just report ready state
                     win_emu.log.print(color::green, "Minidump loaded successfully. Process state ready for analysis.\n");
                     c.emit_summary<run_finished_event>([&](auto& event) {
@@ -752,7 +757,8 @@ namespace sogen
                         snapshot_saving = true;
                         try
                         {
-                            snapshot::write_emulator_snapshot(win_emu, checkpoint_path);
+                            win_emu.synchronize_native_child_capture([&] { snapshot::write_emulator_snapshot(win_emu, checkpoint_path); },
+                                                                     true);
                             win_emu.log.force_print(color::pink, "Live checkpoint saved to %s; resuming guest.\n",
                                                     checkpoint_path.string().c_str());
                         }
@@ -770,6 +776,7 @@ namespace sogen
                     }
                 }
 
+                child_capture.finish();
                 save_requested_snapshot();
 
                 if (signals_received > 0 && options.snapshot_output.empty())
@@ -780,7 +787,7 @@ namespace sogen
                     if (write_snapshot)
                     {
                         snapshot_saving = true;
-                        snapshot::write_emulator_snapshot(win_emu);
+                        win_emu.synchronize_native_child_capture([&] { snapshot::write_emulator_snapshot(win_emu); }, true);
                         snapshot_saving = false;
                     }
                 }
@@ -1036,6 +1043,7 @@ namespace sogen
             {
                 context.reporters.push_back(reporter.get());
             }
+            native_child_capture_scope child_capture{*win_emu};
 
             win_emu->log.disable_output(concise_logging);
 
@@ -1271,7 +1279,7 @@ namespace sogen
                 }
             }
 
-            return run_emulation(context, options);
+            return run_emulation(context, options, child_capture);
         }
 
         int run_main(int argc, char** argv)

@@ -338,6 +338,16 @@ namespace sogen
                 return record_content_hash(record);
             }
 
+            static size_t serialized_bytes(const analysis_event& event)
+            {
+                std::string record;
+                {
+                    json_object_builder object{record};
+                    std::visit(make_overloaded([&](const auto& item) { write_record(object, item); }), event);
+                }
+                return record.size() + 1;
+            }
+
           private:
             static constexpr size_t max_window_keys = 4096;
             static constexpr size_t max_retained_keys = 65536;
@@ -1262,6 +1272,291 @@ namespace sogen
                 });
             }
 
+            static bool native_child_removal_measured(const detail::native_child_sample& sample)
+            {
+                bool installed{};
+                for (const auto& state : sample.sites)
+                {
+                    installed = installed || state.installed_ns != 0;
+                    if (state.installed_ns && (!state.retired_ns || !state.removed_ns))
+                    {
+                        return false;
+                    }
+                }
+                return installed;
+            }
+
+            static void write_native_child_lifecycle(json_object_builder& object, const detail::native_child_sample& sample)
+            {
+                object.field("schema_version", 1U);
+                object.field("kind", static_cast<uint32_t>(sample.kind));
+                object.field("reason", static_cast<uint32_t>(sample.reason));
+                object.field("site", sample.site);
+                object.field("sequence", sample.sequence);
+                object.field("ended_steady_ns", sample.ended_ns);
+                object.field("collection_ns", sample.collection_ns);
+                object.field("callback_ns", sample.callback_ns);
+                object.field("output_bytes_before_record", sample.output_bytes);
+                object.field("output_rejections", sample.output_rejections);
+                const auto measured = native_child_removal_measured(sample);
+                object.field("removal_lag_measured_all_registered_sites", measured);
+                object.field("removal_lag_accepted", measured && sample.removal_accepted);
+                object.field("backend_peer_installation_completion_available", false);
+                object.field("backend_peer_removal_completion_available", false);
+                object.object_field("selection", [&](auto& item) {
+                    const auto& selected = sample.selection;
+                    item.field("marker_sequence", selected.marker_sequence);
+                    item.field("selected_steady_ns", selected.selected_ns);
+                    item.field("pid", selected.identity.pid);
+                    item.field("birth", selected.identity.birth);
+                    item.field("generation", selected.identity.generation);
+                    item.hex_field("module_base", selected.identity.module_base);
+                    item.field("module_size", selected.identity.module_size);
+                    if (sample.kind == detail::native_child_kind::selection)
+                    {
+                        item.field("collection_scope", "entry_includes_kernel_wait_initial_service_registers_sampling");
+                        item.field("callback_scope", "entry_until_final_service_excludes_final_service_tail");
+                        item.field("output_scope", "serialized_line_before_report_not_retention_or_flush");
+                        item.field("hook_registration_scope", "API_return_not_all_VM_install_completion");
+                        item.field("generation_scope", "marker_capture_lifetime");
+                        item.hex_field("parent_full_handle", selected.parent_handle);
+                        item.hex_field("child_full_handle", selected.child_handle);
+                        item.hex_field("tag", selected.tag);
+                        item.hex_field("parent_view", selected.parent_view);
+                        item.hex_field("child_view", selected.child_view);
+                        item.field("parent_counter", selected.counters[0]);
+                        item.field("child_counter", selected.counters[1]);
+                        item.field("parent_config", selected.configs[0]);
+                        item.field("child_config", selected.configs[1]);
+                        item.field("allocation_epoch_available", false);
+                        item.field("transaction_epoch_available", false);
+                    }
+                });
+                object.array_field("site_coverage", [&](const auto& append) {
+                    for (size_t index = 0; index < sample.sites.size(); ++index)
+                    {
+                        const auto& state = sample.sites[index];
+                        append([&](std::string& output) {
+                            json_object_builder item(output);
+                            item.field("site", static_cast<uint32_t>(index));
+                            item.field("raw_traps", state.raw_traps);
+                            item.field("active_traps", state.active_traps);
+                            item.field("retired_traps", state.retired_traps);
+                            item.field("filtered", state.filtered);
+                            item.field("deep_attempts", state.attempts);
+                            item.field("accepted", state.accepted);
+                            item.field("hook_registration_return_ns", state.installed_ns);
+                            item.field("logical_retirement_ns", state.retired_ns);
+                            item.field("delete_hook_return_ns", state.removed_ns);
+                            item.field("retirement_reason", static_cast<uint32_t>(state.retirement));
+                            item.field("removal_attempts", state.removal_attempts);
+                            item.field("removal_deferrals", state.removal_deferrals);
+                        });
+                    }
+                });
+                if (sample.kind == detail::native_child_kind::activation)
+                {
+                    object.field("began_steady_ns", sample.began_ns);
+                    object.field("read_attempts", sample.budget.reads);
+                    object.field("requested_bytes", sample.budget.bytes);
+                    const auto guard = [&]<size_t Size>(const std::string_view name, const detail::native_marker_raw_value<Size>& value) {
+                        object.object_field(name, [&](auto& item) {
+                            item.field("width_bytes", static_cast<uint32_t>(Size));
+                            item.field("read_status", static_cast<uint32_t>(value.status));
+                            item.field("available", value.bytes.has_value());
+                            if (value.bytes)
+                            {
+                                item.field("raw_bytes_hex", detail::native_marker_raw_hex(std::as_bytes(std::span{*value.bytes})));
+                            }
+                        });
+                    };
+                    guard("resolver69", sample.resolver_guard[0]);
+                    guard("postpoll30", sample.poll_guard);
+                    guard("prerelease31", sample.release_guard);
+                }
+            }
+
+            static void write_native_child_sample(json_object_builder& object, const detail::native_child_sample& sample)
+            {
+                if (sample.kind != detail::native_child_kind::post_poll && sample.kind != detail::native_child_kind::pre_release)
+                {
+                    write_native_child_lifecycle(object, sample);
+                    return;
+                }
+                object.field("schema_version", 1U);
+                object.field("kind", static_cast<uint32_t>(sample.kind));
+                object.field("reason", static_cast<uint32_t>(sample.reason));
+                object.field("site", sample.site);
+                object.field("sequence", sample.sequence);
+                object.field("began_steady_ns", sample.began_ns);
+                object.field("ended_steady_ns", sample.ended_ns);
+                object.field("resource_identity", sample.resource_identity);
+                object.field("resource_identity_scope",
+                             sample.site == 1 ? "native_registers_and_initial_slot_only" : "fresh_repeated_owner_witnesses");
+                object.field("child_qualified", sample.child_qualified);
+                object.field("effective_terminal", sample.effective_terminal);
+                object.field("effective_terminal_scope", "signed_native_EBX_gt_1_only");
+                object.field("clock_accepted", sample.clock_accepted);
+                object.field("atomic", false);
+                object.field("strong_lifetime", false);
+                object.field("allocation_epoch_available", false);
+                object.field("transaction_epoch_available", false);
+                object.field("exact_consumed_transaction_index_available", false);
+                object.field("collector_executed_native_getter", false);
+                object.field("collector_executed_protected_decoder", false);
+                object.field("native_return_boundary_observed", sample.raw_return.has_value() || sample.effective_status.has_value());
+                object.field("converted_outcome_available", false);
+                object.field("dispatch_raw_state_available", false);
+                object.field("install_entry_available", false);
+                object.field("install_return_available", false);
+                object.field("io_request_join_available", false);
+                object.field("release_caller_available", false);
+                object.field("release_cause_available", false);
+                object.field("actual_cpu", sample.registers.actual_cpu);
+                object.field("actual_tid", sample.registers.actual_tid);
+                object.field("read_attempts", sample.budget.reads);
+                object.field("requested_bytes", sample.budget.bytes);
+                object.field("read_attempt_limit", sample.budget.read_limit);
+                object.field("requested_byte_limit", sample.budget.byte_limit);
+                object.field("collection_ns", sample.collection_ns);
+                object.field("callback_ns", sample.callback_ns);
+                object.field("collection_scope", "entry_includes_kernel_wait_initial_service_registers_sampling");
+                object.field("callback_scope", "entry_until_final_service_excludes_final_service_tail");
+                object.field("output_scope", "serialized_line_before_report_not_retention_or_flush");
+                object.field("output_bytes_before_record", sample.output_bytes);
+                object.field("output_rejections", sample.output_rejections);
+                const auto measured = native_child_removal_measured(sample);
+                object.field("removal_lag_measured_all_registered_sites", measured);
+                object.field("removal_lag_accepted", measured && sample.removal_accepted);
+                object.field("backend_peer_removal_completion_available", false);
+                object.field("backend_peer_installation_completion_available", false);
+                object.object_field("selection", [&](auto& item) {
+                    const auto& selected = sample.selection;
+                    item.field("marker_sequence", selected.marker_sequence);
+                    item.field("scope", "first_cleanup_resource3_observer_selection");
+                    item.field("selected_steady_ns", selected.selected_ns);
+                    item.field("pid", selected.identity.pid);
+                    item.field("birth", selected.identity.birth);
+                    item.field("generation", selected.identity.generation);
+                    item.field("generation_scope", "marker_capture_lifetime");
+                    item.hex_field("module_base", selected.identity.module_base);
+                    item.field("module_size", selected.identity.module_size);
+                    item.hex_field("parent_full_handle", selected.parent_handle);
+                    item.hex_field("child_full_handle", selected.child_handle);
+                    item.hex_field("tag", selected.tag);
+                    item.hex_field("parent_view", selected.parent_view);
+                    item.hex_field("child_view", selected.child_view);
+                    item.field("parent_counter", selected.counters[0]);
+                    item.field("child_counter", selected.counters[1]);
+                    item.field("parent_config", selected.configs[0]);
+                    item.field("child_config", selected.configs[1]);
+                });
+                if (sample.manager)
+                {
+                    object.hex_field(sample.site ? "release_manager" : "poll_manager", *sample.manager);
+                }
+                if (sample.context)
+                {
+                    object.hex_field("native_decoded_context", *sample.context);
+                }
+                if (sample.context_word)
+                {
+                    object.field("repeated_context_word", static_cast<uint32_t>(*sample.context_word));
+                }
+                if (sample.raw_return)
+                {
+                    object.field("raw_native_transaction_state", *sample.raw_return);
+                    object.signed_field("signed_raw_native_transaction_state", std::bit_cast<int32_t>(*sample.raw_return));
+                }
+                if (sample.effective_status)
+                {
+                    object.signed_field("native_effective_status", *sample.effective_status);
+                }
+                if (sample.slot_detail)
+                {
+                    object.field("observed_slot_detail", static_cast<uint32_t>(*sample.slot_detail));
+                }
+                if (sample.detail_return)
+                {
+                    object.field("native_detail_return_AL", static_cast<uint32_t>(*sample.detail_return));
+                }
+                const auto raw = [&]<size_t Size>(auto& item, const detail::native_marker_raw_value<Size>& value) {
+                    item.field("width_bytes", static_cast<uint32_t>(Size));
+                    item.field("read_status", static_cast<uint32_t>(value.status));
+                    item.field("available", value.bytes.has_value());
+                    if (value.bytes)
+                    {
+                        item.field("raw_bytes_hex", detail::native_marker_raw_hex(std::as_bytes(std::span{*value.bytes})));
+                    }
+                };
+                const auto field = [&](const std::string_view name, const auto& value) {
+                    object.object_field(name, [&](auto& item) {
+                        item.field("address_available", value.address_available);
+                        if (value.address_available)
+                        {
+                            item.hex_field("address", value.address);
+                        }
+                        raw(item, value.raw);
+                    });
+                };
+                object.object_field("resource3", [&](auto& item) { raw(item, sample.resource3); });
+                field("active_child_initial", sample.active_initial);
+                field("active_child_repeat", sample.active_repeat);
+                field("context_word_initial", sample.context_initial);
+                field("context_word_repeat", sample.context_repeat);
+                object.object_field("activation_guards", [&](auto& item) {
+                    item.object_field("resolver69", [&](auto& entry) { raw(entry, sample.resolver_guard[0]); });
+                    item.object_field("postpoll30", [&](auto& entry) { raw(entry, sample.poll_guard); });
+                    item.object_field("prerelease31", [&](auto& entry) { raw(entry, sample.release_guard); });
+                });
+                if (sample.pool)
+                {
+                    object.object_field("request_pool", [&](auto& item) { write_native_marker_pool(item, *sample.pool); });
+                }
+                object.array_field("registers", [&](const auto& append) {
+                    detail::for_each_native_marker_register(sample.registers, [&](const detail::native_marker_register_view value) {
+                        if (value.index >= 18)
+                        {
+                            return;
+                        }
+                        append([&](std::string& output) {
+                            json_object_builder item(output);
+                            item.field("name", value.name);
+                            item.field("available", value.available);
+                            item.field("read_error", value.read_error);
+                            if (value.available)
+                            {
+                                item.field("raw_bytes_hex", detail::native_marker_raw_hex(value.raw));
+                            }
+                        });
+                    });
+                });
+                object.array_field("site_coverage", [&](const auto& append) {
+                    for (size_t index = 0; index < sample.sites.size(); ++index)
+                    {
+                        const auto& state = sample.sites[index];
+                        append([&](std::string& output) {
+                            json_object_builder item(output);
+                            item.field("site", static_cast<uint32_t>(index));
+                            item.hex_field("rva", detail::native_child_limits::rvas[index]);
+                            item.field("raw_traps", state.raw_traps);
+                            item.field("active_traps", state.active_traps);
+                            item.field("retired_traps", state.retired_traps);
+                            item.field("filtered", state.filtered);
+                            item.field("deep_attempts", state.attempts);
+                            item.field("accepted", state.accepted);
+                            item.field("hook_registration_return_ns", state.installed_ns);
+                            item.field("hook_registration_scope", "API_return_not_all_VM_install_completion");
+                            item.field("logical_retirement_ns", state.retired_ns);
+                            item.field("delete_hook_return_ns", state.removed_ns);
+                            item.field("retirement_reason", static_cast<uint32_t>(state.retirement));
+                            item.field("removal_attempts", state.removal_attempts);
+                            item.field("removal_deferrals", state.removal_deferrals);
+                        });
+                    }
+                });
+            }
+
             static void write_fields(json_object_builder& object, const debug_string_event& event)
             {
                 object.field("details", event.details);
@@ -1271,6 +1566,11 @@ namespace sogen
                 object.field("encoding", event.encoding);
                 object.field("bytes_hex", event.bytes_hex);
                 object.field("error", event.error);
+                if (event.native_child_capture)
+                {
+                    object.object_field("native_child_capture",
+                                        [&](auto& item) { write_native_child_sample(item, *event.native_child_capture); });
+                }
                 if (event.native_marker_capture)
                 {
                     object.object_field("native_marker_capture",
@@ -1457,9 +1757,8 @@ namespace sogen
                                 entry.field("error", word.error);
                                 if (word.value_location)
                                 {
-                                    entry.object_field("valueLocation", [&](auto& location) {
-                                        write_fault_address(location, *word.value_location);
-                                    });
+                                    entry.object_field("valueLocation",
+                                                       [&](auto& location) { write_fault_address(location, *word.value_location); });
                                 }
                             });
                         }
@@ -1485,8 +1784,7 @@ namespace sogen
                 object.field("debugSample", event.debug_sample);
                 object.hex_field("eflags", event.eflags);
                 constexpr std::array<std::string_view, 16> names{
-                    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
-                    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+                    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
                 };
                 object.object_field("gprs", [&](auto& registers) {
                     for (size_t i = 0; i < names.size(); ++i)
@@ -1727,8 +2025,7 @@ namespace sogen
                     object.hex_field("supplied_security_cookie", event.supplied_security_cookie);
                 }
                 constexpr std::array<std::string_view, 16> names{
-                    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
-                    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+                    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
                 };
                 object.object_field("gprs", [&](auto& registers) {
                     for (size_t i = 0; i < names.size(); ++i)
@@ -1771,11 +2068,11 @@ namespace sogen
         return std::visit(
             make_overloaded([](const run_started_event&) { return false; }, [](const run_finished_event&) { return false; },
                             [](const run_failed_event&) { return false; }, [](const guest_exception_event&) { return false; },
-                            [](const stdout_chunk_event&) { return false; },
-                            [](const buffered_stdout_event&) { return false; }, [](const instruction_summary_event&) { return false; },
-                            [](const execution_progress_event&) { return false; }, [](const thread_switch_event&) { return false; },
-                            [](const memory_violation_event&) { return false; }, [](const fast_fail_event&) { return false; },
-                            [](const entry_point_execution_event&) { return false; }, [](const auto&) { return true; }),
+                            [](const stdout_chunk_event&) { return false; }, [](const buffered_stdout_event&) { return false; },
+                            [](const instruction_summary_event&) { return false; }, [](const execution_progress_event&) { return false; },
+                            [](const thread_switch_event&) { return false; }, [](const memory_violation_event&) { return false; },
+                            [](const fast_fail_event&) { return false; }, [](const entry_point_execution_event&) { return false; },
+                            [](const auto&) { return true; }),
             event);
     }
 
@@ -1875,6 +2172,11 @@ namespace sogen
         return jsonl_analysis_reporter::content_hash(event);
     }
 
+    size_t serialized_analysis_event_bytes(const analysis_event& event)
+    {
+        return jsonl_analysis_reporter::serialized_bytes(event);
+    }
+
     std::string_view event_type_name(const analysis_event& event)
     {
         return jsonl_analysis_reporter::type_name(event);
@@ -1884,8 +2186,7 @@ namespace sogen
     {
         if (hidden_types.empty() || std::holds_alternative<run_started_event>(event) || std::holds_alternative<run_finished_event>(event) ||
             std::holds_alternative<run_failed_event>(event) || std::holds_alternative<guest_exception_event>(event) ||
-            std::holds_alternative<memory_violation_event>(event) ||
-            std::holds_alternative<fast_fail_event>(event))
+            std::holds_alternative<memory_violation_event>(event) || std::holds_alternative<fast_fail_event>(event))
         {
             return false;
         }

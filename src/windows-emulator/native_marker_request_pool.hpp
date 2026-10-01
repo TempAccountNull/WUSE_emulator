@@ -191,10 +191,16 @@ namespace sogen::detail
     native_marker_pool_sample sample_native_marker_request_pool(const uint64_t base, const uint64_t image_size,
                                                                 const native_marker_resource_sample& resources, Kernel& kernel,
                                                                 native_marker_read_budget& budget, PassiveSpan&& passive_span,
-                                                                Reader&& reader, Clock&& clock)
+                                                                Reader&& reader, Clock&& clock,
+                                                                const uint32_t node_limit = native_marker_pool_sample::max_nodes)
     {
         native_marker_pool_sample output{};
         output.selected = true;
+        if (!node_limit || node_limit > native_marker_pool_sample::max_nodes)
+        {
+            output.reason = native_marker_pool_reason::invalid_geometry;
+            return output;
+        }
         output.resource3_initial = resources.resource3;
         const auto finish = [&](const native_marker_pool_reason reason) {
             output.reason = reason;
@@ -389,7 +395,7 @@ namespace sogen::detail
                           : *node.free_tag               ? native_marker_pool_reason::free_slot
                                                          : native_marker_pool_reason::available;
         };
-        for (uint32_t index = 0; index < native_marker_pool_sample::max_nodes; ++index)
+        for (uint32_t index = 0; index < node_limit; ++index)
         {
             auto& node = output.nodes[index];
             ++output.visited_nodes;
@@ -414,7 +420,7 @@ namespace sogen::detail
                 output.traversal_reason = native_marker_pool_reason::cycle;
                 break;
             }
-            if (index + 1 == native_marker_pool_sample::max_nodes)
+            if (index + 1 == node_limit)
             {
                 output.traversal_reason = native_marker_pool_reason::traversal_required;
                 break;

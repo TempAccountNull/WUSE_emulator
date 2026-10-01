@@ -32,6 +32,13 @@ namespace sogen
 
     struct io_device;
     class destiny_startup_capture;
+    class native_child_capture;
+
+    namespace detail
+    {
+        struct native_child_sample;
+        struct native_marker_snapshot;
+    }
 
 #ifdef _WIN32
     namespace detail
@@ -61,6 +68,7 @@ namespace sogen
         opt_func<void(std::string_view description)> on_generic_activity{};
         opt_func<void(std::string_view description)> on_suspicious_activity{};
         utils::callback_list<void(std::string_view message)> on_debug_string{};
+        opt_func<size_t(std::shared_ptr<const detail::native_child_sample> sample, size_t maximum_bytes)> on_native_child_capture{};
         opt_func<void(uint64_t address, uint16_t length, uint32_t component, uint32_t level)> on_debug_print{};
         opt_func<void(uint64_t address, std::string_view error)> on_debug_string_error{};
         utils::callback_list<void(const mapped_module& mod, const mapped_section& section, uint64_t address)> on_section_first_execution{};
@@ -189,7 +197,6 @@ namespace sogen
         bool setup_completed_{false};
 
       public:
-
         // LEANDIAG block trace (SOGEN_LEANDIAG_BLOCKTRACE=1, diagnosis only): last executed
         // guest block addresses per guest thread, so a failing DllMain(THREAD_ATTACH) on a
         // syscall-less fresh thread can be attributed to its module at the raise.
@@ -317,6 +324,10 @@ namespace sogen
             return this->kernel_lock_.is_held_by_current_thread() && this->dispatch_vcpu_;
         }
 
+        void observe_native_child_marker(const detail::native_marker_snapshot& marker) noexcept;
+        bool shutdown_native_child_capture() noexcept;
+        void synchronize_native_child_capture(const std::function<void()>& operation, bool require_snapshot_safe = false);
+
         // Run fn as a dispatched handler for the CPU that triggered a hook: takes the kernel lock and
         // marks that vCPU as the dispatching one, so active_cpu()/current_thread() resolve to it. Meant
         // for hooks installed outside setup_hooks (e.g. the analyzer's cpuid hook) which otherwise run
@@ -396,8 +407,16 @@ namespace sogen
 
         void record_exception_trace(exception_trace_entry entry, x86_64_cpu& cpu);
         [[nodiscard]] std::vector<exception_trace_entry> exception_trace_snapshot() const;
-        [[nodiscard]] uint64_t exception_trace_non_debug_count() const { return this->exception_trace_index_; }
-        [[nodiscard]] uint64_t exception_trace_debug_count() const { return this->debug_exception_trace_index_; }
+
+        [[nodiscard]] uint64_t exception_trace_non_debug_count() const
+        {
+            return this->exception_trace_index_;
+        }
+
+        [[nodiscard]] uint64_t exception_trace_debug_count() const
+        {
+            return this->debug_exception_trace_index_;
+        }
 
         void dump_exception_trace();
 
@@ -416,8 +435,7 @@ namespace sogen
             // Lean, stop-safe backends have no instruction or block hook. Their own retired
             // count is the live delta; executed_instructions_ is the checkpoint base after
             // restore (the regular backend restore resets Icicle's volatile icount).
-            if (!this->instruction_precision_ && this->emu_->is_stop_thread_safe() &&
-                this->emu_->has_deterministic_instruction_count())
+            if (!this->instruction_precision_ && this->emu_->is_stop_thread_safe() && this->emu_->has_deterministic_instruction_count())
             {
                 return this->executed_instructions_ + this->emu_->executed_instructions_total();
             }
@@ -521,6 +539,10 @@ namespace sogen
         bool activate_thread(vcpu_context& vcpu, uint32_t id);
 
       private:
+        friend struct native_child_capture_test_access;
+        bool shutdown_native_child_capture_impl(const std::function<void()>& on_kernel_wait) noexcept;
+        void synchronize_native_child_capture_impl(const std::function<void()>& operation, bool require_snapshot_safe,
+                                                   const std::function<void()>& on_kernel_wait);
         bool use_relative_time_{false}; // TODO: Get rid of that
         bool instruction_precision_{true};
         uint32_t vcpu_count_{1};
@@ -583,6 +605,8 @@ namespace sogen
 #endif
         std::function<void()> clock_probe_expire_{};
         std::shared_ptr<destiny_startup_capture> startup_capture_{};
+        std::shared_ptr<native_child_capture> native_child_capture_{};
+        bool native_child_capture_stopped_{};
         std::chrono::steady_clock::time_point activity_status_last_{};
         std::vector<uint64_t> activity_status_prev_instructions_{};
         std::vector<x86_64_emulator::smp_profile_snapshot> activity_status_prev_smp_profile_{};
@@ -590,7 +614,6 @@ namespace sogen
 
         // Use the configured guest clock for both timestamp instructions and other guest time sources.
         uint64_t timestamp_counter_for_guest();
-
 
         bool uses_section_first_execution_hooks() const;
         void clear_section_first_execution_hooks();

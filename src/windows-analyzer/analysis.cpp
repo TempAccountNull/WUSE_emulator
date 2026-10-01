@@ -386,8 +386,7 @@ namespace sogen
             constexpr char hex[] = "0123456789abcdef";
             const auto rip = cpu.reg(x86_register::rip);
             const auto code_base = rip >= bytes_before ? rip - bytes_before : 0;
-            const auto capture_code = [&](const uint64_t base, const size_t length, std::string& bytes,
-                                          uint32_t& readable) {
+            const auto capture_code = [&](const uint64_t base, const size_t length, std::string& bytes, uint32_t& readable) {
                 bytes.reserve(length * 2);
                 for (size_t i = 0; i < length; ++i)
                 {
@@ -452,32 +451,27 @@ namespace sogen
             constexpr uint64_t destiny_cookie_rva = 0x20a9a88;
             const bool known_cookie_fail = fail_code == 2 && main_image && main_image->name == "destiny2.exe" &&
                                            main_image->contains(rip) && rip - main_image->image_base == destiny_fail_rva;
-            const auto cookie_address = known_cookie_fail &&
-                                        main_image->size_of_image >= destiny_cookie_rva + sizeof(uint64_t) &&
-                                        main_image->image_base <= UINT64_MAX - destiny_cookie_rva
+            const auto cookie_address = known_cookie_fail && main_image->size_of_image >= destiny_cookie_rva + sizeof(uint64_t) &&
+                                                main_image->image_base <= UINT64_MAX - destiny_cookie_rva
                                             ? main_image->image_base + destiny_cookie_rva
                                             : 0;
             uint64_t expected_cookie{};
-            const bool expected_cookie_read = cookie_address != 0 &&
-                                              cpu.try_read_memory(cookie_address, &expected_cookie, sizeof(expected_cookie));
+            const bool expected_cookie_read =
+                cookie_address != 0 && cpu.try_read_memory(cookie_address, &expected_cookie, sizeof(expected_cookie));
             const bool supplied_cookie_read = known_cookie_fail && stack_words.size() > 8;
             const auto supplied_cookie = supplied_cookie_read ? stack_words[8] : 0;
 
             const std::array<uint64_t, 16> gprs{
-                cpu.reg(x86_register::rax), cpu.reg(x86_register::rbx), cpu.reg(x86_register::rcx),
-                cpu.reg(x86_register::rdx), cpu.reg(x86_register::rsi), cpu.reg(x86_register::rdi),
-                cpu.reg(x86_register::rbp), stack_pointer,
-                cpu.reg(x86_register::r8), cpu.reg(x86_register::r9), cpu.reg(x86_register::r10),
-                cpu.reg(x86_register::r11), cpu.reg(x86_register::r12), cpu.reg(x86_register::r13),
-                cpu.reg(x86_register::r14), cpu.reg(x86_register::r15),
+                cpu.reg(x86_register::rax), cpu.reg(x86_register::rbx), cpu.reg(x86_register::rcx), cpu.reg(x86_register::rdx),
+                cpu.reg(x86_register::rsi), cpu.reg(x86_register::rdi), cpu.reg(x86_register::rbp), stack_pointer,
+                cpu.reg(x86_register::r8),  cpu.reg(x86_register::r9),  cpu.reg(x86_register::r10), cpu.reg(x86_register::r11),
+                cpu.reg(x86_register::r12), cpu.reg(x86_register::r13), cpu.reg(x86_register::r14), cpu.reg(x86_register::r15),
             };
             const auto gs_base = cpu.get_segment_base(x86_register::gs);
             uint64_t teb_self{};
             uint64_t teb_peb{};
-            const bool teb_self_read = gs_base <= UINT64_MAX - 0x60 &&
-                                       cpu.try_read_memory(gs_base + 0x30, &teb_self, sizeof(teb_self));
-            const bool teb_peb_read = gs_base <= UINT64_MAX - 0x60 &&
-                                      cpu.try_read_memory(gs_base + 0x60, &teb_peb, sizeof(teb_peb));
+            const bool teb_self_read = gs_base <= UINT64_MAX - 0x60 && cpu.try_read_memory(gs_base + 0x30, &teb_self, sizeof(teb_self));
+            const bool teb_peb_read = gs_base <= UINT64_MAX - 0x60 && cpu.try_read_memory(gs_base + 0x60, &teb_peb, sizeof(teb_peb));
             c.emit_observation<fast_fail_event>([&](auto& event) {
                 event.fail_code = fail_code;
                 event.rip_module_name = rip_module ? rip_module->name : "<unmapped>";
@@ -494,8 +488,7 @@ namespace sogen
                 event.expected_security_cookie_read = expected_cookie_read;
                 event.supplied_security_cookie = supplied_cookie;
                 event.supplied_security_cookie_read = supplied_cookie_read;
-                event.security_cookie_mismatch = expected_cookie_read && supplied_cookie_read &&
-                                                 expected_cookie != supplied_cookie;
+                event.security_cookie_mismatch = expected_cookie_read && supplied_cookie_read && expected_cookie != supplied_cookie;
                 event.gprs = gprs;
                 event.gs_base = gs_base;
                 event.teb_self = teb_self;
@@ -1231,6 +1224,27 @@ namespace sogen
 
         cb.on_instruction = make_callback(c, handle_instruction);
         cb.on_debug_string.add(make_callback(c, handle_debug_string));
+        cb.on_native_child_capture = [&c](std::shared_ptr<const detail::native_child_sample> sample, const size_t maximum_bytes) {
+            if (!sample)
+            {
+                return size_t{0};
+            }
+            debug_string_event event{};
+            event.header = c.make_event_header();
+            event.execution.thread_id = sample->registers.actual_tid;
+            event.execution.rip = sample->registers.context.rip;
+            event.execution.rip_module = sample->registers.context.rip ? "destiny2.exe" : "<N/A>";
+            event.transport = "native_child_probe";
+            event.details = "Bounded native resource3 child observation";
+            event.native_child_capture = std::move(sample);
+            const auto charged = serialized_analysis_event_bytes(event);
+            if (charged > maximum_bytes)
+            {
+                return size_t{0};
+            }
+            c.emit_event(event);
+            return charged;
+        };
         cb.on_debug_string_error = [&c](const uint64_t address, const std::string_view error) {
             c.emit_observation<debug_string_event>([&](auto& event) {
                 event.transport = "dbwin";

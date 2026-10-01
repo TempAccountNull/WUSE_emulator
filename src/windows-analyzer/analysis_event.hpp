@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "../windows-emulator/native_marker_snapshot.hpp"
+#include "../windows-emulator/native_child_sample.hpp"
 
 namespace sogen
 {
@@ -158,6 +159,7 @@ namespace sogen
         std::vector<uint64_t> origin_calls{};
         std::optional<debug_string_cpu_snapshot> cpu_snapshot{};
         std::optional<detail::native_marker_snapshot> native_marker_capture{};
+        std::shared_ptr<const detail::native_child_sample> native_child_capture{};
         uint64_t data_address{};
         uint64_t byte_length{};
         std::string encoding{};
@@ -393,7 +395,7 @@ namespace sogen
         uint64_t elapsed_milliseconds{};
         uint64_t instructions_per_second{};
         std::optional<uint64_t> module_rva{};
-        std::optional<double> percent{};  // 0..100 high-water mark through the main image (.text coverage proxy)
+        std::optional<double> percent{}; // 0..100 high-water mark through the main image (.text coverage proxy)
     };
 
     struct rdtsc_event : observation_event
@@ -486,14 +488,13 @@ namespace sogen
     };
 
     using analysis_event =
-        std::variant<run_started_event, run_finished_event, run_failed_event, guest_exception_event,
-                     instruction_summary_event, buffered_stdout_event,
-                     stdout_chunk_event, suspicious_activity_event, debug_print_call_event, debug_string_event, generic_activity_event,
-                     generic_access_event, memory_allocate_event, memory_protect_event, memory_violation_event, io_control_event,
-                     thread_create_event, thread_terminated_event, thread_set_name_event, thread_switch_event, module_load_event,
-                     module_unload_event, import_read_event, import_write_event, object_access_event, environment_access_event,
-                     function_execution_event, entry_point_execution_event, foreign_code_transition_event, section_first_execute_event,
-                     execution_progress_event, rdtsc_event, rdtscp_event, cpuid_event, syscall_event, foreign_module_read_event,
-                     executable_read_event, executable_write_event, fast_fail_event>;
+        std::variant<run_started_event, run_finished_event, run_failed_event, guest_exception_event, instruction_summary_event,
+                     buffered_stdout_event, stdout_chunk_event, suspicious_activity_event, debug_print_call_event, debug_string_event,
+                     generic_activity_event, generic_access_event, memory_allocate_event, memory_protect_event, memory_violation_event,
+                     io_control_event, thread_create_event, thread_terminated_event, thread_set_name_event, thread_switch_event,
+                     module_load_event, module_unload_event, import_read_event, import_write_event, object_access_event,
+                     environment_access_event, function_execution_event, entry_point_execution_event, foreign_code_transition_event,
+                     section_first_execute_event, execution_progress_event, rdtsc_event, rdtscp_event, cpuid_event, syscall_event,
+                     foreign_module_read_event, executable_read_event, executable_write_event, fast_fail_event>;
 
 } // namespace sogen

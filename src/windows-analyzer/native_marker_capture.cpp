@@ -202,6 +202,7 @@ namespace sogen
             sample.complete = sample.complete && sample.completion.accepted && sample.completion.complete;
             sample.counts = state_.counts();
             sample.request_pool = std::move(pool);
+            win.observe_native_child_marker(sample);
             return result;
         }
         catch (...)

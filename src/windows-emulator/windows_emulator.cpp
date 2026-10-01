@@ -1,4 +1,5 @@
 #include "std_include.hpp"
+#include "native_child_capture.hpp"
 #include "windows_emulator.hpp"
 #include "destiny_startup_capture.hpp"
 #include "guest_thread_affinity.hpp"
@@ -1037,6 +1038,7 @@ namespace sogen
 
     windows_emulator::~windows_emulator()
     {
+        shutdown_native_child_capture();
         if (this->startup_capture_)
         {
             this->startup_capture_->shutdown();
@@ -1060,6 +1062,106 @@ namespace sogen
                                static_cast<void*>(quarantined_backend));
             }
         }
+    }
+
+    void windows_emulator::observe_native_child_marker(const detail::native_marker_snapshot& marker) noexcept
+    {
+        try
+        {
+            if (!this->native_child_capture_stopped_ && !this->native_child_capture_ && native_child_capture::enabled() &&
+                this->has_active_dispatch_context() && marker.reservation.event == detail::native_marker_event::cleanup_entry)
+            {
+                this->native_child_capture_ = native_child_capture::create(*this, this->kernel_lock_, marker);
+            }
+        }
+        catch (...)
+        {
+        }
+    }
+
+    bool windows_emulator::shutdown_native_child_capture() noexcept
+    {
+        return shutdown_native_child_capture_impl({});
+    }
+
+    bool windows_emulator::shutdown_native_child_capture_impl(const std::function<void()>& on_kernel_wait) noexcept
+    {
+        try
+        {
+            std::shared_ptr<native_child_capture> capture;
+            {
+                std::unique_lock guard(this->kernel_lock_, std::defer_lock);
+                if (!this->kernel_lock_.is_held_by_current_thread())
+                {
+                    if (on_kernel_wait)
+                    {
+                        if (!guard.try_lock())
+                        {
+                            on_kernel_wait();
+                            guard.lock();
+                        }
+                    }
+                    else
+                    {
+                        guard.lock();
+                    }
+                }
+                this->native_child_capture_stopped_ = true;
+                capture = this->native_child_capture_;
+            }
+            const auto complete = !capture || capture->shutdown();
+            {
+                std::unique_lock guard(this->kernel_lock_, std::defer_lock);
+                if (!this->kernel_lock_.is_held_by_current_thread())
+                {
+                    guard.lock();
+                }
+                if (!capture || capture->reporting_stopped())
+                {
+                    this->callbacks.on_native_child_capture = decltype(this->callbacks.on_native_child_capture){};
+                }
+                if (complete && this->native_child_capture_ == capture)
+                {
+                    this->native_child_capture_.reset();
+                }
+            }
+            return complete;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    void windows_emulator::synchronize_native_child_capture(const std::function<void()>& operation, const bool require_snapshot_safe)
+    {
+        synchronize_native_child_capture_impl(operation, require_snapshot_safe, {});
+    }
+
+    void windows_emulator::synchronize_native_child_capture_impl(const std::function<void()>& operation, const bool require_snapshot_safe,
+                                                                 const std::function<void()>& on_kernel_wait)
+    {
+        std::unique_lock guard(this->kernel_lock_, std::defer_lock);
+        if (!this->kernel_lock_.is_held_by_current_thread())
+        {
+            if (on_kernel_wait)
+            {
+                if (!guard.try_lock())
+                {
+                    on_kernel_wait();
+                    guard.lock();
+                }
+            }
+            else
+            {
+                guard.lock();
+            }
+        }
+        if (require_snapshot_safe && this->native_child_capture_ && !this->native_child_capture_->snapshot_safe())
+        {
+            throw std::runtime_error("Snapshot declined while native child execution hooks remain registered");
+        }
+        operation();
     }
 
     void windows_emulator::setup_process_if_necessary()
