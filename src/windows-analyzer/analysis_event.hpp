@@ -8,6 +8,8 @@
 #include <variant>
 #include <vector>
 
+#include "../windows-emulator/native_marker_snapshot.hpp"
+
 namespace sogen
 {
 
@@ -155,6 +157,7 @@ namespace sogen
         std::string transport{};
         std::vector<uint64_t> origin_calls{};
         std::optional<debug_string_cpu_snapshot> cpu_snapshot{};
+        std::optional<detail::native_marker_snapshot> native_marker_capture{};
         uint64_t data_address{};
         uint64_t byte_length{};
         std::string encoding{};

@@ -1,3 +1,7 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include "../windows-emulator/telemetry_shared_memory.hpp"
 #include "../windows-analyzer/analysis_reporter.hpp"
 #include "../windows-analyzer/jsonl_reporter.hpp"

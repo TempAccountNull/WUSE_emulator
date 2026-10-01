@@ -878,6 +878,207 @@ namespace sogen
                 });
             }
 
+            static void write_native_marker_snapshot(json_object_builder& object, const detail::native_marker_snapshot& snapshot)
+            {
+                object.field("schema_version", 1U);
+                const auto marker = snapshot.reservation.event == detail::native_marker_event::investment_entry ? "investment_entry"
+                                    : snapshot.reservation.event == detail::native_marker_event::cleanup_entry  ? "cleanup_entry"
+                                                                                                                : "none";
+                object.field("marker", marker);
+                object.field("marker_sequence", snapshot.reservation.sequence);
+                object.field("sample_steady_ns", snapshot.reservation.sample_steady_ns);
+                object.field("ended_steady_ns", snapshot.ended_steady_ns);
+                object.field("sample_boundary", "NtSetEvent_DBWIN_DATA_READY");
+                object.field("actual_cpu", snapshot.registers.actual_cpu);
+                object.field("actual_tid", snapshot.registers.actual_tid);
+                object.field("atomic", false);
+                object.field("complete", snapshot.complete);
+                object.field("complete_scope", "five_plain_roots_gpr_rip_stack");
+                const auto error = std::string_view(snapshot.error);
+                auto error_text_bytes = (std::min)(error.size(), size_t{512});
+                while (error_text_bytes < error.size() && error_text_bytes &&
+                       (static_cast<unsigned char>(error[error_text_bytes]) & 0xc0) == 0x80)
+                {
+                    --error_text_bytes;
+                }
+                object.field("error", error.substr(0, error_text_bytes));
+                object.field("error_bytes_hex",
+                             detail::native_marker_raw_hex(std::as_bytes(std::span{error.data(), (std::min)(error.size(), size_t{512})})));
+                object.field("error_source_bytes", static_cast<uint64_t>(snapshot.error.size()));
+                object.field("error_truncated", snapshot.error.size() > 512);
+                object.object_field("identity", [&](auto& item) {
+                    item.field("pid", snapshot.identity.pid);
+                    item.field("birth", snapshot.identity.birth);
+                    item.field("generation", snapshot.identity.generation);
+                    item.field("generation_scope", "marker_capture_lifetime");
+                    item.hex_field("module_base", snapshot.identity.module_base);
+                    item.field("module_size", snapshot.identity.module_size);
+                });
+                object.object_field("layout_qualification", [&](auto& item) {
+                    item.field("qualified", snapshot.layout_qualified);
+                    item.field("available_mask", static_cast<uint32_t>(snapshot.qualification_available));
+                    item.field("unavailable_mask", static_cast<uint32_t>((~snapshot.qualification_available) & 3));
+                    item.field("reads", snapshot.qualification_reads);
+                    item.field("bytes", snapshot.qualification_bytes);
+                    item.field("max_reads", 2U);
+                    item.field("max_bytes", 8U);
+                    item.array_field("checks", [&](const auto& append) {
+                        for (uint32_t index = 0; index < 2; ++index)
+                        {
+                            append([&](std::string& output) {
+                                json_object_builder entry(output);
+                                const bool available = (snapshot.qualification_available & (uint8_t{1} << index)) != 0;
+                                entry.field("index", index);
+                                entry.field("width_bytes", 4U);
+                                entry.field("available", available);
+                                if (available)
+                                {
+                                    entry.field("raw_bytes_hex",
+                                                detail::native_marker_raw_hex(
+                                                    std::as_bytes(std::span{snapshot.layout_signature}).subspan(index * 4, 4)));
+                                }
+                            });
+                        }
+                    });
+                });
+                const auto masks = [](auto& item, const std::string_view name, const std::array<uint64_t, 2>& values) {
+                    item.array_field(name, [&](const auto& append) {
+                        for (const auto value : values)
+                        {
+                            append([&](std::string& output) {
+                                output += "\"0x";
+                                append_unsigned(output, value, 16);
+                                output += '"';
+                            });
+                        }
+                    });
+                };
+                const auto& registers = snapshot.registers;
+                const auto& context = registers.context;
+                object.object_field("register_context", [&](auto& item) {
+                    item.field("register_count", context.register_count);
+                    item.field("flags_view", context.flags_view);
+                    masks(item, "available_masks", context.available);
+                    masks(item, "read_error_masks", context.read_errors);
+                    item.array_field("fields", [&](const auto& append) {
+                        detail::for_each_native_marker_register(registers, [&](const detail::native_marker_register_view field) {
+                            append([&](std::string& output) {
+                                json_object_builder entry(output);
+                                entry.field("index", field.index);
+                                entry.field("name", field.name);
+                                entry.field("width_bytes", static_cast<uint32_t>(field.width));
+                                entry.field("available", field.available);
+                                entry.field("read_error", field.read_error);
+                                if (field.available)
+                                {
+                                    entry.field("raw_bytes_hex", detail::native_marker_raw_hex(field.raw));
+                                }
+                            });
+                        });
+                    });
+                });
+                object.object_field("raw_stack", [&](auto& item) {
+                    item.field("word_bytes", 8U);
+                    item.field("requested_words", context.stack_requested_words);
+                    item.field("emitted_words", (std::min)(context.stack_requested_words, detail::native_marker_stack_words));
+                    item.hex_field("stack_base", context.stack_base);
+                    item.field("status", context.stack_status);
+                    masks(item, "success_masks", context.stack_success);
+                    item.array_field("words", [&](const auto& append) {
+                        detail::for_each_native_marker_stack_word(registers, [&](const detail::native_marker_stack_view word) {
+                            append([&](std::string& output) {
+                                json_object_builder entry(output);
+                                entry.field("index", word.index);
+                                entry.field("address_available", word.address_available);
+                                if (word.address_available)
+                                {
+                                    entry.hex_field("address", word.address);
+                                }
+                                entry.field("available", word.available);
+                                if (word.available)
+                                {
+                                    entry.field("raw_bytes_hex", detail::native_marker_raw_hex(word.raw));
+                                }
+                            });
+                        });
+                    });
+                });
+                object.object_field("resources", [&](auto& item) {
+                    const auto& resources = snapshot.resources;
+                    const auto raw_value = [&]<size_t Size>(const std::string_view name,
+                                                            const detail::native_marker_raw_value<Size>& value) {
+                        item.object_field(name, [&](auto& entry) {
+                            const bool available = value.bytes.has_value() && value.status == detail::native_marker_read_status::complete;
+                            entry.field("width_bytes", static_cast<uint32_t>(Size));
+                            entry.field("status", static_cast<uint32_t>(value.status));
+                            entry.field("available", available);
+                            if (available)
+                            {
+                                entry.field("raw_bytes_hex", detail::native_marker_raw_hex(std::as_bytes(std::span{*value.bytes})));
+                            }
+                        });
+                    };
+                    raw_value("resource3", resources.resource3);
+                    raw_value("resource6", resources.resource6);
+                    raw_value("outstanding", resources.outstanding);
+                    raw_value("active_pointer", resources.active_pointer);
+                    raw_value("registry_pointer", resources.registry_pointer);
+                    raw_value("registry_vtable", resources.registry_vtable);
+                    raw_value("registry_object", resources.registry_object);
+                    item.field("available_mask", resources.available_mask);
+                    item.field("unavailable_mask", resources.unavailable_mask);
+                    item.field("reads", resources.resource_reads);
+                    item.field("bytes", resources.resource_bytes);
+                    item.field("atomic", resources.atomic);
+                    item.field("registry_layout", static_cast<uint32_t>(resources.registry_layout));
+                    if (resources.registry_layout == detail::native_marker_registry_layout::matched)
+                    {
+                        if (resources.registry_mode)
+                        {
+                            item.field("registry_mode", *resources.registry_mode);
+                        }
+                        if (resources.registry_content_handle)
+                        {
+                            item.field("registry_content_handle", *resources.registry_content_handle);
+                        }
+                    }
+                });
+                object.object_field("budget", [&](auto& item) {
+                    const auto& budget = snapshot.budget;
+                    item.field("scope", "Core stack and resource reads; layout qualification is separate");
+                    item.field("started_ns", budget.started_ns);
+                    item.field("reads", budget.reads);
+                    item.field("bytes", budget.bytes);
+                    item.field("max_reads", detail::native_marker_read_budget::max_reads);
+                    item.field("max_bytes", detail::native_marker_read_budget::max_bytes);
+                    item.field("max_elapsed_ns", detail::native_marker_read_budget::max_elapsed_ns);
+                    item.field("time_exhausted", budget.time_exhausted);
+                    item.field("clock_invalid", budget.clock_invalid);
+                    item.field("read_exhausted", budget.read_exhausted);
+                    item.field("byte_exhausted", budget.byte_exhausted);
+                    item.field("total_memory_reads", uint64_t{budget.reads} + snapshot.qualification_reads);
+                    item.field("total_memory_bytes", uint64_t{budget.bytes} + snapshot.qualification_bytes);
+                    item.field("max_total_memory_reads", 25U);
+                    item.field("max_total_memory_bytes", 204U);
+                });
+                object.object_field("counts", [&](auto& item) {
+                    const auto& counts = snapshot.counts;
+                    item.field("observations", counts.observations);
+                    item.field("capture_attempts", counts.capture_attempts);
+                    item.field("finished_attempts", counts.finished_attempts);
+                    item.field("complete_captures", counts.complete_captures);
+                    item.field("partial_captures", counts.partial_captures);
+                    item.field("duplicate_markers", counts.duplicate_markers);
+                    item.field("cleanup_before_entry", counts.cleanup_before_entry);
+                    item.field("collection_ns", counts.collection_ns);
+                });
+                object.object_field("completion", [&](auto& item) {
+                    item.field("accepted", snapshot.completion.accepted);
+                    item.field("complete", snapshot.completion.complete);
+                    item.field("reason", static_cast<uint32_t>(snapshot.completion.reason));
+                });
+            }
+
             static void write_fields(json_object_builder& object, const debug_string_event& event)
             {
                 object.field("details", event.details);
@@ -887,6 +1088,11 @@ namespace sogen
                 object.field("encoding", event.encoding);
                 object.field("bytes_hex", event.bytes_hex);
                 object.field("error", event.error);
+                if (event.native_marker_capture)
+                {
+                    object.object_field("native_marker_capture",
+                                        [&](auto& item) { write_native_marker_snapshot(item, *event.native_marker_capture); });
+                }
                 if (event.cpu_snapshot)
                 {
                     const auto& snapshot = *event.cpu_snapshot;
@@ -1477,6 +1683,12 @@ namespace sogen
 
     uint64_t event_content_hash(const analysis_event& event)
     {
+        if (const auto* print = std::get_if<debug_string_event>(&event); print && print->native_marker_capture)
+        {
+            auto legacy = *print;
+            legacy.native_marker_capture.reset();
+            return jsonl_analysis_reporter::content_hash(legacy);
+        }
         return jsonl_analysis_reporter::content_hash(event);
     }
 

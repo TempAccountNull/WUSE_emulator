@@ -14,6 +14,7 @@
 #include <vector>
 #include "analysis_event.hpp"
 #include "analysis_hook_profile.hpp"
+#include "native_marker_capture.hpp"
 #include "disassembler.hpp"
 
 namespace sogen
@@ -119,6 +120,7 @@ namespace sogen
         mutable analysis_event_overlap_probe event_overlap_probe{};
 
         std::unordered_map<uint32_t, std::vector<debug_print_frame>> debug_print_calls{};
+        native_marker_observer marker_observer{};
         std::string output{};
         bool has_reached_main{false};
 

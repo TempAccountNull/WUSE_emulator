@@ -312,6 +312,11 @@ namespace sogen
             return (this->dispatch_vcpu_ ? this->dispatch_vcpu_ : this->vcpus_[0].get())->cpu;
         }
 
+        bool has_active_dispatch_context() const noexcept
+        {
+            return this->kernel_lock_.is_held_by_current_thread() && this->dispatch_vcpu_;
+        }
+
         // Run fn as a dispatched handler for the CPU that triggered a hook: takes the kernel lock and
         // marks that vCPU as the dispatching one, so active_cpu()/current_thread() resolve to it. Meant
         // for hooks installed outside setup_hooks (e.g. the analyzer's cpuid hook) which otherwise run

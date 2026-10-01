@@ -183,7 +183,7 @@ namespace sogen
         void emit_output(analysis_context& c, const std::string_view transport, const uint64_t address, const size_t length,
                          const bool wide, const bool remove_terminator, const std::optional<std::string_view> supplied = std::nullopt,
                          const uint32_t component = 0, const uint32_t level = 0, const uint64_t fallback_address = 0,
-                         const size_t fallback_length = 0)
+                         const size_t fallback_length = 0, std::optional<detail::native_marker_snapshot> captured_marker = std::nullopt)
         {
             std::string error;
             auto bytes = supplied ? std::string(*supplied) : read_bytes(c, address, length, wide, error);
@@ -200,6 +200,7 @@ namespace sogen
                 event.details = display_bytes(text_bytes, wide);
                 event.transport = transport;
                 event.origin_calls = origins(c);
+                event.native_marker_capture = std::move(captured_marker);
                 if (transport == "dbwin" && text_bytes.starts_with("OODLE ERROR"))
                 {
                     auto& snapshot = event.cpu_snapshot.emplace();
@@ -570,8 +571,9 @@ namespace sogen
 
     void observe_debug_string(analysis_context& c, const std::string_view bytes)
     {
+        auto marker = c.marker_observer.capture(*c.win_emu, bytes);
         emit_output(c, "dbwin", c.win_emu->process.dbwin_buffer ? c.win_emu->process.dbwin_buffer + 4 : 0, bytes.size(), false, false,
-                    bytes);
+                    bytes, 0, 0, 0, 0, std::move(marker));
     }
 
     void observe_debug_print_interrupt(analysis_context& c, const uint64_t address, const uint16_t length, const uint32_t component,
