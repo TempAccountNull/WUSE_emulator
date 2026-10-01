@@ -1,5 +1,6 @@
 #include <native_marker_request_pool.hpp>
 #include <native_marker_capture_state.hpp>
+#include <utils/function.hpp>
 #include <algorithm>
 #include <functional>
 #include <gtest/gtest.h>
@@ -807,4 +808,72 @@ TEST(NativeMarkerRequestPool, CycleAndDepthBoundSuppressTerminalParentStatus)
         EXPECT_FALSE(result.status_node);
         EXPECT_FALSE(result.detail_node);
     }
+}
+
+TEST(OptionalFunction, MutableAndConstCopiesPreserveIndependentCallableState)
+{
+    using function = sogen::utils::optional_function<int()>;
+    function original([value = 3]() mutable { return ++value; });
+    function mutable_copy(original);
+    const function immutable(original);
+    function const_copy(immutable);
+
+    EXPECT_EQ(mutable_copy(), 4);
+    EXPECT_EQ(original(), 4);
+    EXPECT_EQ(const_copy(), 4);
+    EXPECT_EQ(immutable(), 4);
+    EXPECT_EQ(mutable_copy(), 5);
+}
+
+TEST(OptionalFunction, CopyAssignmentAndEmptyWrappersPreserveValueSemantics)
+{
+    using function = sogen::utils::optional_function<int()>;
+    function original([value = 10]() mutable { return ++value; });
+    function assigned([] { return -1; });
+    assigned = original;
+    const function immutable(original);
+    function const_assigned;
+    const_assigned = immutable;
+    EXPECT_EQ(assigned(), 11);
+    EXPECT_EQ(original(), 11);
+    EXPECT_EQ(const_assigned(), 11);
+
+    auto& same = assigned;
+    assigned = same;
+    EXPECT_EQ(assigned(), 12);
+    function empty;
+    function empty_copy(empty);
+    assigned = empty;
+    EXPECT_FALSE(empty_copy);
+    EXPECT_FALSE(assigned);
+    EXPECT_EQ(assigned(), 0);
+    const function const_empty;
+    assigned = const_empty;
+    EXPECT_FALSE(assigned);
+}
+
+TEST(OptionalFunction, MovesAndOrdinaryCallablesRetainTheirExistingContracts)
+{
+    using function = sogen::utils::optional_function<int(int)>;
+    static_assert(std::is_nothrow_move_constructible_v<function>);
+    static_assert(std::is_nothrow_move_assignable_v<function>);
+    function source([](int value) { return value + 4; });
+    function moved(std::move(source));
+    EXPECT_EQ(moved(8), 12);
+    function assigned;
+    assigned = std::move(moved);
+    EXPECT_EQ(assigned(9), 13);
+
+    std::function<int(int)> typed = [](int value) { return value * 2; };
+    function converted(typed);
+    EXPECT_EQ(converted(6), 12);
+    converted = [](int value) { return value - 1; };
+    EXPECT_EQ(converted(6), 5);
+    sogen::utils::optional_function<void()> empty;
+    EXPECT_NO_THROW(empty());
+    int calls{};
+    sogen::utils::optional_function<void()> callback([&] { ++calls; });
+    auto copied = callback;
+    copied();
+    EXPECT_EQ(calls, 1);
 }

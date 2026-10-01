@@ -4,6 +4,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstddef>
+#include <type_traits>
 
 namespace sogen
 {
@@ -27,14 +28,14 @@ namespace sogen
             }
 
             template <typename F>
-                requires(std::is_invocable_r_v<Ret, F, Args...>)
+                requires(!std::is_same_v<std::remove_cvref_t<F>, optional_function> && std::is_invocable_r_v<Ret, F, Args...>)
             optional_function(F&& f)
                 : func(std::forward<F>(f))
             {
             }
 
             template <typename F>
-                requires(std::is_invocable_r_v<Ret, F, Args...>)
+                requires(!std::is_same_v<std::remove_cvref_t<F>, optional_function> && std::is_invocable_r_v<Ret, F, Args...>)
             optional_function& operator=(F&& f)
             {
                 func = std::forward<F>(f);
