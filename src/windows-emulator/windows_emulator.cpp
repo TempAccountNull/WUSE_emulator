@@ -7,6 +7,8 @@
 #include "telemetry_shared_memory.hpp"
 #include "exception_shared_memory.hpp"
 #include "guest_memory_shared_memory.hpp"
+#include "guest_inspection_shared_memory.hpp"
+#include "guest_inspection_query.hpp"
 
 #include <atomic>
 #include <cctype>
@@ -3507,6 +3509,8 @@ namespace sogen
             this->emu().sync_worker_context(vcpu.cpu.index());
             set_worker_lock_phase(worker_lock_phase::activity_publication);
 
+            this->service_guest_inspection(vcpu);
+
             // Progress meter: publish the per-vCPU activity snapshot (rate-limited inside). The
             // kernel lock is held here, so concurrent workers cannot interleave file writes.
             this->publish_activity_status();
@@ -3537,6 +3541,69 @@ namespace sogen
         // Retired instructions stop during waits and add up across active peers. Keep wall-clock
         // timestamp instructions on the configured guest clock on every vCPU.
         return this->clock_->timestamp_counter();
+    }
+
+    void windows_emulator::service_guest_inspection(vcpu_context& vcpu)
+    {
+#ifdef _WIN32
+        const char* configured = std::getenv("SOGEN_GUEST_MEMORY_SHM");
+        if (!configured || std::strcmp(configured, "1") != 0 || vcpu.running.load(std::memory_order_relaxed))
+        {
+            return;
+        }
+        if (!this->guest_inspection_)
+        {
+            this->guest_inspection_ = std::make_unique<detail::guest_inspection_shared_memory>();
+        }
+        const detail::inspection_owner owner{static_cast<uint32_t>(vcpu.cpu.index()), vcpu.active_thread ? vcpu.active_thread->id : 0,
+                                             vcpu.running.load(std::memory_order_relaxed),
+                                             vcpu.active_thread && vcpu.active_thread->is_terminated(), this->vcpu_count_};
+        this->guest_inspection_->service(owner, [this, &vcpu](detail::guest_inspection_packet& packet) {
+            switch (static_cast<detail::inspection_operation>(packet.operation))
+            {
+            case detail::inspection_operation::address: {
+                detail::inspection_address result{};
+                packet.status = static_cast<uint32_t>(detail::inspection_address_at(this->memory, this->mod_manager, packet.address, result)
+                                                          ? detail::inspection_status::complete
+                                                          : detail::inspection_status::invalid);
+                std::memcpy(packet.payload.data(), &result, sizeof(result));
+                break;
+            }
+            case detail::inspection_operation::regions: {
+                detail::inspection_region_page result{};
+                detail::inspection_regions(this->memory, packet.address, packet.limit, result, packet.next_cursor);
+                packet.status = static_cast<uint32_t>(detail::inspection_status::complete);
+                if (result.stop_reason == 3)
+                {
+                    packet.status = static_cast<uint32_t>(detail::inspection_status::unavailable);
+                }
+                else if (result.stop_reason == 2)
+                {
+                    packet.status = static_cast<uint32_t>(detail::inspection_status::partial);
+                }
+                std::memcpy(packet.payload.data(), &result, sizeof(result));
+                break;
+            }
+            case detail::inspection_operation::context: {
+                detail::inspection_context result{};
+                detail::inspection_registers(
+                    [&vcpu](const x86_register reg, void* value, const size_t width) { return vcpu.cpu.read_register(reg, value, width); },
+                    result);
+                detail::inspection_stack(
+                    this->memory,
+                    [this](const uint64_t address, void* value, const size_t width) {
+                        return this->memory.try_read_memory(address, value, width);
+                    },
+                    packet.limit, result);
+                packet.status = static_cast<uint32_t>(detail::inspection_status::complete);
+                std::memcpy(packet.payload.data(), &result, sizeof(result));
+                break;
+            }
+            }
+        });
+#else
+        (void)vcpu;
+#endif
     }
 
     void windows_emulator::publish_activity_status()
@@ -5818,6 +5885,7 @@ namespace sogen
             lock.lock();
 
             this->emu().sync_worker_context(vcpu.cpu.index());
+            this->service_guest_inspection(vcpu);
             this->publish_activity_status();
 
             if (!vcpu.switch_thread && !vcpu.cpu.has_violation())
@@ -6456,6 +6524,13 @@ namespace sogen
             throw std::runtime_error("Cannot restore over active native Vulkan presentation; use a fresh pre-GPU emulator");
         }
 
+#ifdef _WIN32
+        if (this->guest_inspection_)
+        {
+            this->guest_inspection_->advance_generation();
+        }
+#endif
+
         this->register_factories(buffer);
 
         buffer.read(this->application_settings_);
@@ -6553,6 +6628,13 @@ namespace sogen
         }
 
         utils::buffer_deserializer buffer{this->process_snapshot_};
+
+#ifdef _WIN32
+        if (this->guest_inspection_)
+        {
+            this->guest_inspection_->advance_generation();
+        }
+#endif
 
         this->register_factories(buffer);
 

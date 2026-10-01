@@ -1,4 +1,5 @@
 #pragma once
+#include "guest_sampling_admission.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -97,15 +98,14 @@ namespace sogen::detail
                 std::memset(packet.data, 0, sizeof(packet.data));
                 if (packet.length > 0 && packet.length <= guest_memory_packet::max_read && packet.address <= UINT64_MAX - packet.length)
                 {
-                    const auto now = std::chrono::steady_clock::now();
-                    if (this->last_service_ != std::chrono::steady_clock::time_point{} &&
-                        now - this->last_service_ < std::chrono::milliseconds(50))
+                    const auto now = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+                    if (!shared_guest_sampling_admission().try_admit(now))
                     {
                         packet.status = 4;
                     }
                     else
                     {
-                        this->last_service_ = now;
                         try
                         {
                             reader(packet.address, packet.length, packet);
@@ -145,7 +145,6 @@ namespace sogen::detail
         HANDLE mapping_{};
         HANDLE mutex_{};
         guest_memory_packet* packet_{};
-        std::chrono::steady_clock::time_point last_service_{};
     };
 #endif
 }

@@ -33,6 +33,13 @@ namespace sogen
     struct io_device;
     class destiny_startup_capture;
 
+#ifdef _WIN32
+    namespace detail
+    {
+        class guest_inspection_shared_memory;
+    }
+#endif
+
     struct emulator_callbacks : module_manager::callbacks, process_context::callbacks
     {
         template <typename T>
@@ -565,6 +572,10 @@ namespace sogen
         // emu-status.json into the SOGEN_GPU_STATUS_DIR telemetry directory (same channel the GPU
         // bridge uses). Lets a watcher tell "grinding through a silent decrypt" from "stopped".
         void publish_activity_status();
+        void service_guest_inspection(vcpu_context& vcpu);
+#ifdef _WIN32
+        std::unique_ptr<detail::guest_inspection_shared_memory> guest_inspection_{};
+#endif
         std::function<void()> clock_probe_expire_{};
         std::shared_ptr<destiny_startup_capture> startup_capture_{};
         std::chrono::steady_clock::time_point activity_status_last_{};
