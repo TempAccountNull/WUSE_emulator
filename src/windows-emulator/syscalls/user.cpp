@@ -3078,11 +3078,26 @@ namespace sogen
             return 0;
         }
 
+        // user32 answers GetClassLongPtr from the class object, never through a syscall, so it has to carry the
+        // registered values.
+        void mirror_class_fields(memory_manager& memory, const emulator_pointer class_object, const EMU_WNDCLASSEX& wnd_class)
+        {
+            emulator_object<USER_CLASS>{memory, class_object}.access([&](USER_CLASS& cls) {
+                cls.style = wnd_class.style;
+                cls.cbclsExtra = static_cast<uint32_t>(wnd_class.cbClsExtra);
+                cls.lpfnWndProc = wnd_class.lpfnWndProc;
+                cls.hIconSm = wnd_class.hIconSm;
+                cls.hModule = wnd_class.hInstance;
+                cls.hbrBackground = wnd_class.hbrBackground;
+                cls.cbwndExtra = static_cast<uint32_t>(wnd_class.cbWndExtra);
+            });
+        }
+
         uint16_t handle_NtUserRegisterClassExWOW(const syscall_context& c, const emulator_object<EMU_WNDCLASSEX> wnd_class_ex,
                                                  const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> class_name,
                                                  const emulator_object<UNICODE_STRING<EmulatorTraits<Emu64>>> /*class_version*/,
                                                  const emulator_object<CLSMENUNAME<EmulatorTraits<Emu64>>> class_menu_name,
-                                                 const DWORD /*function_id*/, const DWORD /*flags*/, const emulator_pointer /*wow*/)
+                                                 const DWORD function_id, const DWORD flags, const emulator_pointer /*wow*/)
         {
             if (!wnd_class_ex)
             {
@@ -3096,7 +3111,28 @@ namespace sogen
             const auto cls_ptr = process_context::allocate_user_class(c.win_emu.memory, class_name_str);
 
             const auto wnd_class = wnd_class_ex.read();
-            const auto entry = process_context::class_entry{cls_ptr, wnd_class, class_menu_name.read()};
+            const auto menu_name = class_menu_name.read();
+            const auto entry = process_context::class_entry{cls_ptr, wnd_class, menu_name};
+
+            // win32kfull takes the menu name from pusMenuName, not from the WNDCLASSEX, and marks only a non-empty string,
+            // with -1; user32's GetClassLongPtr(GCLP_MENUNAME) then returns its client copy of the name.
+            UNICODE_STRING<EmulatorTraits<Emu64>> menu_string{};
+            char16_t menu_first_char{};
+            const auto has_menu_string = c.win_emu.memory.try_read_memory(menu_name.pusMenuName, &menu_string, sizeof(menu_string)) &&
+                                         (menu_string.Buffer >> 16) != 0 &&
+                                         c.win_emu.memory.try_read_memory(menu_string.Buffer, &menu_first_char, sizeof(menu_first_char)) &&
+                                         menu_first_char != 0;
+
+            mirror_class_fields(c.win_emu.memory, cls_ptr, wnd_class);
+            emulator_object<USER_CLASS>{c.win_emu.memory, cls_ptr}.access([&](USER_CLASS& cls) {
+                cls.atomClassName = index;
+                cls.fnid = static_cast<uint16_t>(function_id);
+                // RegisterClassExWOW passes the CSF_* flags user32 computed; CSF_ANSIPROC marks an ANSI class procedure.
+                cls.CSF_flags = static_cast<uint16_t>(flags);
+                cls.lpszMenuName = has_menu_string ? ~0ull : 0;
+                cls.lpszClientAnsiMenuName = menu_name.pszClientAnsiMenuName;
+                cls.lpszClientUnicodeMenuName = menu_name.pwszClientUnicodeMenuName;
+            });
 
             if (c.win_emu.callbacks.on_generic_activity)
             {
@@ -5435,6 +5471,7 @@ namespace sogen
                 break;
             }
 
+            mirror_class_fields(c.win_emu.memory, entry->second.guest_obj_addr, cls);
             return old_value;
         }
 
