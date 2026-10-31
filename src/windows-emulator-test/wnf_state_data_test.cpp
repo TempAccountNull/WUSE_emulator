@@ -100,6 +100,30 @@ namespace sogen::test
         }
     }
 
+    TEST_F(WnfStateDataTest, PublishedStateReportsItsStampAndData)
+    {
+        this->emu->process.wnf_states[registered_name] = {.change_stamp = 7,
+                                                          .data = {std::byte{0x44}, std::byte{0x33}, std::byte{0x22}, std::byte{0x11}}};
+
+        const auto result = this->query(registered_name, 0x1000);
+        EXPECT_EQ(STATUS_SUCCESS, result.status);
+        EXPECT_EQ(7u, result.change_stamp);
+        EXPECT_EQ(4u, result.buffer_size);
+        EXPECT_EQ(0x11223344u, result.buffer_head);
+    }
+
+    TEST_F(WnfStateDataTest, ShortBufferReportsThePublishedSizeAndStamp)
+    {
+        this->emu->process.wnf_states[registered_name] = {.change_stamp = 7,
+                                                          .data = {std::byte{0x44}, std::byte{0x33}, std::byte{0x22}, std::byte{0x11}}};
+
+        const auto result = this->query(registered_name, 3);
+        EXPECT_EQ(STATUS_BUFFER_TOO_SMALL, result.status);
+        EXPECT_EQ(7u, result.change_stamp);
+        EXPECT_EQ(4u, result.buffer_size);
+        EXPECT_EQ(untouched, result.buffer_head);
+    }
+
     TEST_F(WnfStateDataTest, NullBufferIsAcceptedWhenItsSizeIsZero)
     {
         const auto result = this->query(registered_name, 0, {.buffer = false});
