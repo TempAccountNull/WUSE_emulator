@@ -1,0 +1,132 @@
+#include "emulation_test_utils.hpp"
+#include <io_device.hpp>
+
+namespace sogen::test
+{
+    namespace
+    {
+        constexpr ULONG ioctl_open_class_key = 0x470863;
+        constexpr uint32_t installer_class = 2;
+        constexpr uint32_t interface_class = 3;
+        constexpr uint32_t open_always = 1;
+        constexpr uint32_t open_existing = 2;
+
+        // The request cfgmgr32's InitializeInputRegistryData builds for CM_Open_Class_Key.
+        struct registry_input
+        {
+            uint32_t size{48};
+            uint32_t reserved1{};
+            uint32_t key_type{interface_class};
+            uint32_t reserved2{};
+            uint64_t class_name{};
+            uint32_t class_name_bytes{};
+            uint32_t desired_access{0x8};
+            uint32_t disposition{open_existing};
+            uint32_t reserved3{};
+            uint64_t result_size{16};
+        };
+
+        struct handle_result
+        {
+            uint32_t size;
+            NTSTATUS status;
+            uint64_t handle;
+        };
+
+        class DeviceApiTest : public testing::Test
+        {
+          protected:
+            void SetUp() override
+            {
+                this->storage = this->emu.memory.allocate_memory(0x1000, memory_permission::read_write);
+            }
+
+            NTSTATUS open_class_key(registry_input input, const std::u16string_view class_name = {})
+            {
+                if (!class_name.empty())
+                {
+                    const std::u16string terminated{class_name};
+                    this->emu.memory.write_memory(this->storage + 0x100, terminated.c_str(), (terminated.size() + 1) * sizeof(char16_t));
+                    input.class_name = this->storage + 0x100;
+                    input.class_name_bytes = static_cast<uint32_t>((terminated.size() + 1) * sizeof(char16_t));
+                }
+
+                this->emu.memory.write_memory(this->storage, &input, sizeof(input));
+
+                this->context.io_control_code = ioctl_open_class_key;
+                this->context.io_status_block.set_address(this->storage + 0x300);
+                this->context.input_buffer = this->storage;
+                this->context.input_buffer_length = sizeof(input);
+                this->context.output_buffer = this->storage + 0x200;
+                this->context.output_buffer_length = sizeof(handle_result);
+
+                io_device_container device{u"DeviceApi\\CMApi", this->emu, {}};
+                return device.execute_ioctl(this->emu, this->context);
+            }
+
+            handle_result result()
+            {
+                return this->emu.memory.read_memory<handle_result>(this->storage + 0x200);
+            }
+
+            std::string opened_path(const handle_result& reply)
+            {
+                const auto* key = this->emu.process.registry_keys.get(handle{.bits = reply.handle});
+                if (!key)
+                {
+                    return {};
+                }
+
+                const auto path = (key->hive.get() / key->path.get()).u8string();
+                std::string lowered(path.begin(), path.end());
+                std::ranges::transform(lowered, lowered.begin(), [](const char c) { return static_cast<char>(std::tolower(c)); });
+                return lowered;
+            }
+
+            windows_emulator emu = create_empty_emulator();
+            io_device_context context{this->emu.memory};
+            uint64_t storage{};
+        };
+    }
+
+    TEST_F(DeviceApiTest, OpensTheInterfaceClassRoot)
+    {
+        ASSERT_EQ(STATUS_SUCCESS, this->open_class_key({}));
+
+        const auto reply = this->result();
+        EXPECT_EQ(16u, reply.size);
+        ASSERT_EQ(STATUS_SUCCESS, reply.status);
+        EXPECT_TRUE(this->opened_path(reply).ends_with("\\control\\deviceclasses"));
+        EXPECT_EQ(16u, this->context.io_status_block.read().Information);
+    }
+
+    TEST_F(DeviceApiTest, OpensAnInstallerClassByGuid)
+    {
+        constexpr std::u16string_view display_class = u"{4d36e968-e325-11ce-bfc1-08002be10318}";
+        ASSERT_EQ(STATUS_SUCCESS, this->open_class_key({.key_type = installer_class}, display_class));
+
+        const auto reply = this->result();
+        ASSERT_EQ(STATUS_SUCCESS, reply.status);
+        EXPECT_TRUE(this->opened_path(reply).ends_with("\\control\\class\\{4d36e968-e325-11ce-bfc1-08002be10318}"));
+    }
+
+    TEST_F(DeviceApiTest, MissingClassDependsOnTheDisposition)
+    {
+        constexpr std::u16string_view missing_class = u"{00000000-0000-0000-0000-000000000000}";
+        ASSERT_EQ(STATUS_SUCCESS, this->open_class_key({}, missing_class));
+        EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, this->result().status);
+
+        ASSERT_EQ(STATUS_SUCCESS, this->open_class_key({.disposition = open_always}, missing_class));
+        EXPECT_EQ(STATUS_ACCESS_DENIED, this->result().status);
+        EXPECT_EQ(0u, this->result().handle);
+    }
+
+    TEST_F(DeviceApiTest, RejectsMalformedRequests)
+    {
+        EXPECT_EQ(STATUS_INVALID_PARAMETER, this->open_class_key({.size = 36}));
+
+        ASSERT_EQ(STATUS_SUCCESS, this->open_class_key({.key_type = 1}));
+        EXPECT_EQ(STATUS_INVALID_PARAMETER, this->result().status);
+        EXPECT_EQ(0u, this->result().handle);
+    }
+}
