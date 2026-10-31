@@ -9,6 +9,8 @@ namespace sogen::test
     {
         constexpr std::array<uint8_t, 16> mmdevice_interface_20348{0x1f, 0x17, 0xbe, 0xa3, 0x25, 0xa5, 0xa3, 0x47,
                                                                    0xb7, 0x5a, 0x93, 0xda, 0x9d, 0x64, 0x5d, 0x1c};
+        constexpr std::array<uint8_t, 16> mmdevice_interface_19041{0x79, 0xbd, 0x71, 0x8b, 0xbb, 0xcc, 0xab, 0x47,
+                                                                   0xba, 0x09, 0x97, 0xca, 0x52, 0xc8, 0x1d, 0xa9};
         constexpr std::array<uint8_t, 16> audio_client_interface_20348{0x41, 0xc1, 0xb2, 0x98, 0xa2, 0xec, 0x19, 0x49,
                                                                        0x98, 0xb4, 0xa1, 0x98, 0x0d, 0x00, 0xd2, 0x34};
         constexpr std::array<uint8_t, 16> audio_client_interface_26100{0x11, 0xd1, 0x74, 0xd5, 0x26, 0x61, 0xd7, 0x49,
@@ -175,6 +177,22 @@ namespace sogen::test
         ASSERT_TRUE(reply.payload.has_value());
         EXPECT_EQ(0u, read<uint64_t>(*reply.payload, reply_header_size));
         EXPECT_EQ(0u, trailing_hresult(*reply.payload));
+    }
+
+    TEST_F(AudioServiceTest, ServesWindows10DefaultEndpointLikeServer2022)
+    {
+        // NDR64 AudiosrvGetDefaultAudioEndpoint(eRender, eConsole).
+        const std::vector<uint8_t> render_console(8);
+
+        this->bind(u"\\RPC Control\\Audiosrv", mmdevice_interface_20348, 8);
+        const auto expected = this->call(25, render_console);
+
+        this->bind(u"\\RPC Control\\Audiosrv", mmdevice_interface_19041, 8);
+        const auto reply = this->call(25, render_console);
+
+        EXPECT_NE(STATUS_NOT_SUPPORTED, reply.status);
+        EXPECT_EQ(expected.status, reply.status);
+        EXPECT_EQ(expected.payload, reply.payload);
     }
 
     TEST_F(AudioServiceTest, ReadsServer2022IsFormatSupportedFormat)
