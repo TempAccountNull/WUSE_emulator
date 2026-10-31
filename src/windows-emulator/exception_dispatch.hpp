@@ -5,6 +5,8 @@
 #include <platform/traits.hpp>
 #include <platform/primitives.hpp>
 
+#include <span>
+
 //
 // DebugService Control Types
 //
@@ -36,6 +38,9 @@ namespace sogen
     void dispatch_access_violation(windows_emulator& win_emu, vcpu_context& vcpu, uint64_t address, memory_operation operation);
     void dispatch_guard_page_violation(windows_emulator& win_emu, vcpu_context& vcpu, uint64_t address, memory_operation operation);
     void dispatch_illegal_instruction_violation(windows_emulator& win_emu, vcpu_context& vcpu);
+    // The status Windows raises for a user-mode #GP at this instruction (KiPreprocessFault and KiOpDecode).
+    NTSTATUS get_general_protection_fault_status(std::span<const uint8_t> instruction, bool is_32bit);
+    void dispatch_general_protection_fault(windows_emulator& win_emu, vcpu_context& vcpu);
     void dispatch_integer_division_by_zero(windows_emulator& win_emu, vcpu_context& vcpu);
     void dispatch_single_step(windows_emulator& win_emu, vcpu_context& vcpu);
     void dispatch_breakpoint(windows_emulator& win_emu, vcpu_context& vcpu);
