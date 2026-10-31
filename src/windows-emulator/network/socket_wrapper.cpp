@@ -16,7 +16,8 @@ namespace sogen
         }
 
         socket_wrapper::socket_wrapper(const int af, const int type, const int protocol)
-            : socket_(af, type, protocol), socket_type_(type)
+            : socket_(af, type, protocol),
+              socket_type_(type)
         {
         }
 
@@ -117,6 +118,7 @@ namespace sogen
                 uint32_t disconnect_mode;
                 int64_t timeout;
             };
+
             static_assert(sizeof(request) == 16);
             const request input{mode, timeout};
             uint64_t information{};
@@ -157,6 +159,23 @@ namespace sogen
                                                    const std::span<const std::byte> parameters)
         {
             return socket_information(this->socket_.get_socket(), false, information_class, value, parameters);
+        }
+
+        uint32_t socket_wrapper::query_receive_information(receive_information& value)
+        {
+            receive_information result{};
+            uint64_t information{};
+            const auto status =
+                socket_control(this->socket_.get_socket(), 0x12033, {}, std::as_writable_bytes(std::span(&result, 1)), information);
+            if (status == 0)
+            {
+                if (information != sizeof(result))
+                {
+                    return 0xc000000d;
+                }
+                value = result;
+            }
+            return status;
         }
 
         uint32_t socket_wrapper::set_information(const uint32_t information_class, uint64_t value)
@@ -224,11 +243,12 @@ namespace sogen
                 const void* nested_input{};
                 uintptr_t nested_length{};
             };
+
             static_assert(sizeof(transport_request) == 32);
             const transport_request request{.nested_input = input.data(), .nested_length = length};
             uint64_t information{};
-            const auto status = socket_control(this->socket_.get_socket(), 0x120bf,
-                                               std::as_bytes(std::span(&request, 1)), output, information);
+            const auto status =
+                socket_control(this->socket_.get_socket(), 0x120bf, std::as_bytes(std::span(&request, 1)), output, information);
             if (status != 0)
             {
                 return status;
@@ -444,7 +464,7 @@ namespace sogen
                             &destination.get_addr(), destination.get_size());
         }
 
-        sent_size socket_wrapper::recv(std::span<std::byte> data)
+        sent_size socket_wrapper::recv(std::span<std::byte> data, const bool peek)
         {
 #ifndef _WIN32
             if (this->disconnect_mode_ & 4)
@@ -459,10 +479,11 @@ namespace sogen
             }
             this->synthetic_error_ = 0;
 #endif
-            return ::recv(this->socket_.get_socket(), reinterpret_cast<char*>(data.data()), static_cast<send_size>(data.size()), 0);
+            return ::recv(this->socket_.get_socket(), reinterpret_cast<char*>(data.data()), static_cast<send_size>(data.size()),
+                          peek ? MSG_PEEK : 0);
         }
 
-        sent_size socket_wrapper::recvfrom(address& source, std::span<std::byte> data)
+        sent_size socket_wrapper::recvfrom(address& source, std::span<std::byte> data, const bool peek)
         {
 #ifndef _WIN32
             if (this->socket_type_ != SOCK_DGRAM && (this->disconnect_mode_ & 4))
@@ -474,7 +495,7 @@ namespace sogen
 #endif
             auto source_length = source.get_max_size();
             const auto res = ::recvfrom(this->socket_.get_socket(), reinterpret_cast<char*>(data.data()),
-                                        static_cast<send_size>(data.size()), 0, &source.get_addr(), &source_length);
+                                        static_cast<send_size>(data.size()), peek ? MSG_PEEK : 0, &source.get_addr(), &source_length);
 
             assert(res < 0 || source.get_size() == source_length);
 

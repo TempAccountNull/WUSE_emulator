@@ -24,39 +24,94 @@ namespace sogen::test
 
         struct remote_test_socket final : network::i_socket
         {
-            explicit remote_test_socket(std::shared_ptr<remote_socket_state> value) : state(std::move(value)) {}
+            explicit remote_test_socket(std::shared_ptr<remote_socket_state> value)
+                : state(std::move(value))
+            {
+            }
 
-            void set_blocking(bool) override {}
-            int get_last_error() override { return SERR(EWOULDBLOCK); }
-            uint32_t partial_disconnect(uint32_t, int64_t) override { return 0; }
-            bool is_ready(bool) override { return true; }
-            bool is_listening() override { return state->listening; }
-            bool is_connected() override { return state->connected; }
-            std::optional<network::address> get_local_address() override { return {}; }
-            bool bind(const network::address&) override { return true; }
+            void set_blocking(bool) override
+            {
+            }
+
+            int get_last_error() override
+            {
+                return SERR(EWOULDBLOCK);
+            }
+
+            uint32_t partial_disconnect(uint32_t, int64_t) override
+            {
+                return 0;
+            }
+
+            bool is_ready(bool) override
+            {
+                return true;
+            }
+
+            bool is_listening() override
+            {
+                return state->listening;
+            }
+
+            bool is_connected() override
+            {
+                return state->connected;
+            }
+
+            std::optional<network::address> get_local_address() override
+            {
+                return {};
+            }
+
+            bool bind(const network::address&) override
+            {
+                return true;
+            }
+
             bool connect(const network::address&) override
             {
                 state->connected = true;
                 return true;
             }
+
             bool listen(int) override
             {
                 state->listening = true;
                 return true;
             }
+
             std::unique_ptr<network::i_socket> accept(network::address& remote) override
             {
-                if (!state->accepted_remote) return {};
+                if (!state->accepted_remote)
+                {
+                    return {};
+                }
                 remote = *state->accepted_remote;
                 state->accepted_remote.reset();
                 auto accepted = std::make_shared<remote_socket_state>();
                 accepted->connected = true;
                 return std::make_unique<remote_test_socket>(std::move(accepted));
             }
-            sent_size send(std::span<const std::byte>) override { return -1; }
-            sent_size sendto(const network::address&, std::span<const std::byte>) override { return -1; }
-            sent_size recv(std::span<std::byte>) override { return -1; }
-            sent_size recvfrom(network::address&, std::span<std::byte>) override { return -1; }
+
+            sent_size send(std::span<const std::byte>) override
+            {
+                return -1;
+            }
+
+            sent_size sendto(const network::address&, std::span<const std::byte>) override
+            {
+                return -1;
+            }
+
+            sent_size recv(std::span<std::byte>, bool = false) override
+            {
+                return -1;
+            }
+
+            sent_size recvfrom(network::address&, std::span<std::byte>, bool = false) override
+            {
+                return -1;
+            }
 
             std::shared_ptr<remote_socket_state> state;
         };
@@ -71,7 +126,11 @@ namespace sogen::test
                 created.push_back(state);
                 return std::make_unique<remote_test_socket>(std::move(state));
             }
-            int poll_sockets(std::span<network::poll_entry>) override { return 0; }
+
+            int poll_sockets(std::span<network::poll_entry>) override
+            {
+                return 0;
+            }
         };
     }
 
@@ -109,8 +168,7 @@ namespace sogen::test
             return endpoint;
         }
 
-        NTSTATUS invoke(io_device& endpoint, uint32_t code, uint64_t in, uint32_t in_length,
-                        uint64_t out, uint32_t out_length)
+        NTSTATUS invoke(io_device& endpoint, uint32_t code, uint64_t in, uint32_t in_length, uint64_t out, uint32_t out_length)
         {
             io_device_context request{emu.memory};
             request.io_control_code = code;
@@ -142,12 +200,14 @@ namespace sogen::test
             return bytes;
         }
 
-        void set_context(io_device& endpoint, const std::vector<std::byte>& bytes,
-                         uint64_t alias = 0, uint32_t alias_length = 0)
+        void set_context(io_device& endpoint, const std::vector<std::byte>& bytes, uint64_t alias = 0, uint32_t alias_length = 0)
         {
-            if (!bytes.empty()) emu.memory.write_memory(input, bytes.data(), bytes.size());
-            ASSERT_EQ(invoke(endpoint, 0x12047, bytes.empty() ? 0 : input,
-                             static_cast<uint32_t>(bytes.size()), alias, alias_length), STATUS_SUCCESS);
+            if (!bytes.empty())
+            {
+                emu.memory.write_memory(input, bytes.data(), bytes.size());
+            }
+            ASSERT_EQ(invoke(endpoint, 0x12047, bytes.empty() ? 0 : input, static_cast<uint32_t>(bytes.size()), alias, alias_length),
+                      STATUS_SUCCESS);
         }
 
         std::vector<std::byte> remote_sockaddr(uint32_t family) const
@@ -162,7 +222,10 @@ namespace sogen::test
                 result[4] = std::byte{127};
                 result[7] = std::byte{1};
             }
-            else result[23] = std::byte{1};
+            else
+            {
+                result[23] = std::byte{1};
+            }
             return result;
         }
 
@@ -262,8 +325,8 @@ namespace sogen::test
 
         const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
         emu.memory.write_memory(memory, creation.data(), sizeof(creation));
-        const auto target_handle = emu.process.devices.store(
-            io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        const auto target_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
         auto* target = emu.process.devices.get(target_handle);
         ASSERT_NE(target, nullptr);
         set_context(*target, context);
@@ -321,8 +384,7 @@ namespace sogen::test
         ASSERT_EQ(invoke(*device, 0x12043, 0, 0, output, static_cast<uint32_t>(after.size())), STATUS_SUCCESS);
         after = emu.memory.read_memory(output, after.size());
         EXPECT_TRUE(std::equal(remote.begin(), remote.end(), after.begin() + 144));
-        EXPECT_TRUE(std::all_of(after.begin() + 64, after.begin() + 64 + remote.size(),
-                                [](auto byte) { return byte == std::byte{0}; }));
+        EXPECT_TRUE(std::all_of(after.begin() + 64, after.begin() + 64 + remote.size(), [](auto byte) { return byte == std::byte{0}; }));
     }
 
     INSTANTIATE_TEST_SUITE_P(GuestBitness, AfdRemoteAddressTest, testing::Values(false, true));

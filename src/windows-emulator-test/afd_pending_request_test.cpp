@@ -7,12 +7,14 @@
 #include <utils/finally.hpp>
 #include <syscall_utils.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -129,6 +131,9 @@ namespace sogen::test
             uint32_t transport_status{};
             size_t transport_calls{};
             int last_error{};
+            int receive_error{};
+            bool receive_eof{};
+            size_t socket_creations{};
         };
 
         struct pending_test_socket final : network::i_socket
@@ -231,6 +236,7 @@ namespace sogen::test
                 remote = *state->next_accepted_remote;
                 state->next_accepted_remote.reset();
                 state->last_error = 0;
+                ++state->socket_creations;
                 return std::make_unique<pending_test_socket>(state);
             }
 
@@ -261,8 +267,18 @@ namespace sogen::test
                 return send(bytes);
             }
 
-            sent_size recv(std::span<std::byte> bytes) override
+            sent_size recv(std::span<std::byte> bytes, const bool peek = false) override
             {
+                if (state->receive_error)
+                {
+                    state->last_error = state->receive_error;
+                    return -1;
+                }
+                if (state->incoming.empty() && state->receive_eof)
+                {
+                    state->last_error = 0;
+                    return 0;
+                }
                 if (state->incoming.empty())
                 {
                     state->last_error = SERR(EWOULDBLOCK);
@@ -272,15 +288,18 @@ namespace sogen::test
                 const auto count = std::min(bytes.size(), state->incoming.size());
                 for (size_t index = 0; index < count; ++index)
                 {
-                    bytes[index] = state->incoming.front();
-                    state->incoming.pop_front();
+                    bytes[index] = peek ? state->incoming[index] : state->incoming.front();
+                    if (!peek)
+                    {
+                        state->incoming.pop_front();
+                    }
                 }
                 return static_cast<sent_size>(count);
             }
 
-            sent_size recvfrom(network::address&, std::span<std::byte> bytes) override
+            sent_size recvfrom(network::address&, std::span<std::byte> bytes, const bool peek = false) override
             {
-                return recv(bytes);
+                return recv(bytes, peek);
             }
 
             std::shared_ptr<pending_socket_state> state;
@@ -295,6 +314,7 @@ namespace sogen::test
 
             std::unique_ptr<network::i_socket> create_socket(int, int, int) override
             {
+                ++state->socket_creations;
                 return std::make_unique<pending_test_socket>(state);
             }
 
@@ -694,8 +714,8 @@ namespace sogen::test
             EXPECT_EQ(full_iosb.Information, size);
             const auto full_bytes = emu.memory.read_memory(output, size + 8);
             EXPECT_TRUE(std::equal(payload.begin(), payload.end(), full_bytes.begin()));
-            EXPECT_TRUE(std::all_of(full_bytes.begin() + size, full_bytes.end(),
-                                    [](const std::byte byte) { return byte == std::byte{0xa5}; }));
+            EXPECT_TRUE(
+                std::all_of(full_bytes.begin() + size, full_bytes.end(), [](const std::byte byte) { return byte == std::byte{0xa5}; }));
         }
 
         // The native USHORT alias bounds are enforced before replacing context.
@@ -709,8 +729,7 @@ namespace sogen::test
         EXPECT_NE(preserved.front(), replacement.front());
         EXPECT_EQ(set(32, input + 4, 8), STATUS_SUCCESS);
         EXPECT_EQ(get(*device, 32), STATUS_SUCCESS);
-        EXPECT_EQ(emu.memory.read_memory(output, 32),
-                  (std::vector<std::byte>(replacement.begin(), replacement.end())));
+        EXPECT_EQ(emu.memory.read_memory(output, 32), (std::vector<std::byte>(replacement.begin(), replacement.end())));
 
         utils::buffer_serializer saved{};
         device->serialize(saved);
@@ -721,8 +740,7 @@ namespace sogen::test
         auto restored = create_afd_endpoint({.is_32_bit = GetParam()});
         restored->deserialize(saved_input);
         EXPECT_EQ(get(*restored, 32), STATUS_SUCCESS);
-        EXPECT_EQ(emu.memory.read_memory(output, 32),
-                  (std::vector<std::byte>(replacement.begin(), replacement.end())));
+        EXPECT_EQ(emu.memory.read_memory(output, 32), (std::vector<std::byte>(replacement.begin(), replacement.end())));
     }
 
     TEST_P(AfdPendingRequestTest, TransportType1OptionsMatchNativeStatusAndCompletion)
@@ -862,8 +880,7 @@ namespace sogen::test
         ASSERT_EQ(tcp.set_transport_option(IPPROTO_TCP, TCP_NODELAY, one), STATUS_SUCCESS);
         int nodelay{};
         int nodelay_length = sizeof(nodelay);
-        ASSERT_EQ(getsockopt(tcp.get().get_socket(), IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char*>(&nodelay),
-                             &nodelay_length), 0);
+        ASSERT_EQ(getsockopt(tcp.get().get_socket(), IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char*>(&nodelay), &nodelay_length), 0);
         EXPECT_EQ(nodelay, 1);
         ASSERT_EQ(udp.set_transport_option(SOL_SOCKET, SO_BROADCAST, one), STATUS_SUCCESS);
         int broadcast{};
@@ -1522,18 +1539,239 @@ namespace sogen::test
         }
     }
 
-    TEST_P(AfdPendingRequestTest, UnsupportedStreamPeekDoesNotConsumeInput)
+    TEST_P(AfdPendingRequestTest, StreamPeekReadsRepeatedlyWithoutConsumingInput)
     {
         for (const char value : std::string_view{"abc"})
         {
             socket->incoming.push_back(static_cast<std::byte>(value));
         }
-        EXPECT_EQ(transfer(false, 0x80), STATUS_NOT_SUPPORTED);
-        EXPECT_EQ(socket->incoming.size(), 3u);
-        EXPECT_EQ(transfer(false), STATUS_SUCCESS);
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            emu.memory.set_memory(memory + 0x400, 0xa5, 8);
+            emu.process.events.get(receive_event)->signaled = false;
+            ASSERT_EQ(transfer(false, 0xa0), STATUS_SUCCESS);
+            EXPECT_EQ(socket->incoming.size(), 3u);
+            EXPECT_EQ((emu.memory.read_memory<std::array<char, 3>>(memory + 0x400)), (std::array{'a', 'b', 'c'}));
+            EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x403), 0xa5);
+            EXPECT_EQ(status(false).Information, 3u);
+            EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+        }
+        ASSERT_EQ(transfer(false, 0x20), STATUS_SUCCESS);
         EXPECT_TRUE(socket->incoming.empty());
-        const auto received = emu.memory.read_memory(memory + 0x400, 3);
-        EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(received.data()), received.size()), "abc");
+        EXPECT_EQ((emu.memory.read_memory<std::array<char, 3>>(memory + 0x400)), (std::array{'a', 'b', 'c'}));
+        emu.memory.set_memory(memory + 0x400, 0xa5, 8);
+        ASSERT_EQ(transfer(false, 0xa0, nullptr, {}, 0, 0, 0, 4), STATUS_DEVICE_NOT_READY);
+        EXPECT_EQ(status(false).Information, 0u);
+        EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x400), 0xa5);
+        EXPECT_TRUE(socket->incoming.empty());
+    }
+
+    TEST_P(AfdPendingRequestTest, StreamPeekRejectsInvalidSelectorAndUnsupportedOtherReceivePolicies)
+    {
+        for (const char value : std::string_view{"abc"})
+        {
+            socket->incoming.push_back(static_cast<std::byte>(value));
+        }
+        for (const auto flags : {0x80u, 0xe0u})
+        {
+            EXPECT_EQ(transfer(false, flags), STATUS_INVALID_PARAMETER);
+            EXPECT_EQ(socket->incoming.size(), 3u);
+            EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x400), 0xa5);
+        }
+        for (const auto flags : {0xc0u, 0xa1u, 0xb0u, 0x40a0u})
+        {
+            EXPECT_EQ(transfer(false, flags), STATUS_NOT_SUPPORTED);
+            EXPECT_EQ(socket->incoming.size(), 3u);
+            EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x400), 0xa5);
+        }
+        ASSERT_EQ(transfer(false, 0xa0), STATUS_SUCCESS);
+        EXPECT_EQ(socket->incoming.size(), 3u);
+    }
+
+    TEST_P(AfdPendingRequestTest, EmptyNonblockingStreamPeekPreservesPayloadAndErrorMappings)
+    {
+        ASSERT_EQ(transfer(false, 0xa0, nullptr, {}, 0, 0, 0, 4), STATUS_DEVICE_NOT_READY);
+        EXPECT_EQ(status(false).Information, 0u);
+        EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x400), 0xa5);
+        const std::array errors{std::pair<int, NTSTATUS>{SERR(ESHUTDOWN), STATUS_PIPE_DISCONNECTED},
+                                std::pair<int, NTSTATUS>{SERR(ECONNABORTED), STATUS_LOCAL_DISCONNECT},
+                                std::pair<int, NTSTATUS>{SERR(ECONNRESET), STATUS_CONNECTION_RESET},
+                                std::pair<int, NTSTATUS>{SERR(EINVAL), STATUS_UNSUCCESSFUL}};
+        for (const auto [error, expected] : errors)
+        {
+            socket->receive_error = error;
+            EXPECT_EQ(transfer(false, 0xa0), expected);
+            EXPECT_EQ(status(false).Information, 0u);
+            EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x400), 0xa5);
+        }
+        socket->receive_error = 0;
+        socket->receive_eof = true;
+        EXPECT_EQ(transfer(false, 0xa0), STATUS_SUCCESS);
+        EXPECT_EQ(status(false).Information, 0u);
+        EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x400), 0xa5);
+    }
+
+    TEST_P(AfdPendingRequestTest, PendingStreamPeekKeepsDescriptorsPolicyAndIocpContext)
+    {
+        emu.process.is_wow64_process = GetParam();
+        const std::array<uint32_t, 12> creation{0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 6, 0};
+        const auto endpoint_handle =
+            emu.process.devices.store(io_device_container{u"Afd\\Endpoint", emu, {.buffer = memory, .length = sizeof(creation)}});
+        auto* endpoint = emu.process.devices.get(endpoint_handle);
+        ASSERT_NE(endpoint, nullptr);
+        const auto port_handle = emu.process.io_completions.store(io_completion{});
+        endpoint->completion_port = port_handle;
+        endpoint->completion_key = 0x1234;
+        auto* port = emu.process.io_completions.get(port_handle);
+        ASSERT_NE(port, nullptr);
+        ASSERT_EQ(transfer(false, 0xa0, endpoint, endpoint_handle, 0x1234, 0, 0x5678, 2), STATUS_PENDING);
+        const auto original_iosb = emu.memory.read_memory(memory + 0x100, 16);
+        EXPECT_EQ(emu.process.events.get(receive_event)->ref_count, 2u);
+        emu.memory.set_memory(memory + 0x200, 0, 0x30);
+        emu.memory.set_memory(memory + 0x300, 0, 0x10);
+        endpoint->work(emu);
+        EXPECT_EQ(emu.memory.read_memory(memory + 0x100, 16), original_iosb);
+        EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+        EXPECT_TRUE(port->queue.empty());
+        EXPECT_EQ(emu.process.events.get(receive_event)->ref_count, 2u);
+        for (const char value : std::string_view{"abc"})
+        {
+            socket->incoming.push_back(static_cast<std::byte>(value));
+        }
+        endpoint->work(emu);
+        EXPECT_EQ(status(false).Status, STATUS_SUCCESS);
+        EXPECT_EQ(status(false).Information, 3u);
+        EXPECT_EQ((emu.memory.read_memory<std::array<char, 3>>(memory + 0x400)), (std::array{'a', 'b', 'c'}));
+        EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x403), 0xa5);
+        EXPECT_EQ(socket->incoming.size(), 3u);
+        EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+        EXPECT_EQ(emu.process.events.get(receive_event)->ref_count, 1u);
+        ASSERT_EQ(port->queue.size(), 1u);
+        EXPECT_EQ(port->queue.front().key_context, 0x1234u);
+        EXPECT_EQ(port->queue.front().apc_context, 0x5678u);
+        EXPECT_EQ(port->queue.front().io_status_block.Status, STATUS_SUCCESS);
+        EXPECT_EQ(port->queue.front().io_status_block.Information, 3u);
+        port->queue.clear();
+        endpoint->work(emu);
+        EXPECT_TRUE(port->queue.empty());
+        ASSERT_EQ(transfer(false, 0x20, endpoint, endpoint_handle), STATUS_SUCCESS);
+        EXPECT_TRUE(socket->incoming.empty());
+        EXPECT_TRUE(port->queue.empty());
+    }
+
+    TEST_P(AfdPendingRequestTest, PendingStreamPeekQueuesOneApcOnItsIssuingThread)
+    {
+        emulator_thread issuer{emu.memory};
+        issuer.id = 0x1234;
+        const auto thread_handle = emu.process.threads.store(std::move(issuer));
+        emu.process.thread_handles_by_id.emplace(0x1234, thread_handle);
+        ASSERT_EQ(transfer(false, 0xa0, nullptr, {}, 0x1234, 0x567800, 0xfeed, 3), STATUS_PENDING);
+        for (const char value : std::string_view{"abc"})
+        {
+            socket->incoming.push_back(static_cast<std::byte>(value));
+        }
+        device->work(emu);
+        const auto* target = emu.process.threads.get(thread_handle);
+        ASSERT_NE(target, nullptr);
+        ASSERT_EQ(target->pending_apcs.size(), 1u);
+        EXPECT_EQ(target->pending_apcs.front().apc_routine, 0x567800u);
+        EXPECT_EQ(target->pending_apcs.front().apc_argument1, 0xfeedu);
+        EXPECT_EQ(target->pending_apcs.front().apc_argument2, memory + 0x100);
+        EXPECT_EQ(status(false).Status, STATUS_SUCCESS);
+        EXPECT_EQ(status(false).Information, 3u);
+        EXPECT_EQ(socket->incoming.size(), 3u);
+        device->work(emu);
+        EXPECT_EQ(target->pending_apcs.size(), 1u);
+    }
+
+    TEST_P(AfdPendingRequestTest, PendingStreamPeekSnapshotRetainsPolicyAndReleasesItsEventHold)
+    {
+        ASSERT_EQ(transfer(false, 0xa0, nullptr, {}, 0, 0, 0x5678, 2), STATUS_PENDING);
+        const auto original_iosb = emu.memory.read_memory(memory + 0x100, 16);
+        emu.memory.set_memory(memory + 0x200, 0, 0x30);
+        emu.memory.set_memory(memory + 0x300, 0, 0x10);
+        utils::buffer_serializer saved{};
+        device->serialize(saved);
+        utils::buffer_deserializer input{saved};
+        input.register_factory<memory_manager_wrapper>([this] { return memory_manager_wrapper{emu.memory}; });
+        input.register_factory<x64_emulator_wrapper>([this] { return x64_emulator_wrapper{emu.emu()}; });
+        input.register_factory<windows_emulator_wrapper>([this] { return windows_emulator_wrapper{emu}; });
+        input.register_factory<socket_factory_wrapper>([this] { return socket_factory_wrapper{emu.socket_factory()}; });
+        auto restored = create_afd_endpoint({.is_32_bit = GetParam()});
+        restored->deserialize(input);
+        utils::buffer_serializer resaved{};
+        restored->serialize(resaved);
+        EXPECT_EQ(saved.get_buffer(), resaved.get_buffer());
+        EXPECT_EQ(emu.process.events.get(receive_event)->ref_count, 3u);
+        device.reset();
+        EXPECT_EQ(emu.process.events.get(receive_event)->ref_count, 2u);
+        restored->work(emu);
+        EXPECT_EQ(emu.memory.read_memory(memory + 0x100, 16), original_iosb);
+        EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
+        for (const char value : std::string_view{"abc"})
+        {
+            socket->incoming.push_back(static_cast<std::byte>(value));
+        }
+        restored->work(emu);
+        EXPECT_EQ(status(false).Status, STATUS_SUCCESS);
+        EXPECT_EQ(status(false).Information, 3u);
+        EXPECT_EQ((emu.memory.read_memory<std::array<char, 3>>(memory + 0x400)), (std::array{'a', 'b', 'c'}));
+        EXPECT_EQ(socket->incoming.size(), 3u);
+        EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+        EXPECT_EQ(emu.process.events.get(receive_event)->ref_count, 1u);
+        ASSERT_EQ(transfer(false, 0x20, restored.get()), STATUS_SUCCESS);
+        EXPECT_TRUE(socket->incoming.empty());
+    }
+
+    TEST_P(AfdPendingRequestTest, CancellingPendingStreamPeekDoesNotConsumeLaterData)
+    {
+        ASSERT_EQ(transfer(false, 0xa0, nullptr, {}, 0x1234, 0, 0x5678, 2), STATUS_PENDING);
+        EXPECT_EQ(emu.process.events.get(receive_event)->ref_count, 2u);
+        for (const char value : std::string_view{"abc"})
+        {
+            socket->incoming.push_back(static_cast<std::byte>(value));
+        }
+        EXPECT_EQ(device->cancel_pending_io(emu, memory + 0x100, 0x9999), 0u);
+        EXPECT_EQ(device->cancel_pending_io(emu, memory + 0x100, 0x1234), 1u);
+        EXPECT_EQ(status(false).Status, STATUS_CANCELLED);
+        EXPECT_EQ(status(false).Information, 0u);
+        EXPECT_TRUE(emu.process.events.get(receive_event)->signaled);
+        EXPECT_EQ(emu.process.events.get(receive_event)->ref_count, 1u);
+        device->work(emu);
+        EXPECT_EQ(socket->incoming.size(), 3u);
+        EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x400), 0xa5);
+        ASSERT_EQ(transfer(false, 0x20), STATUS_SUCCESS);
+        EXPECT_TRUE(socket->incoming.empty());
+    }
+
+    TEST_P(AfdPendingRequestTest, ReceiveSnapshotEncodingRefusesPredecessorEndpointFields)
+    {
+        ASSERT_EQ(transfer(false, 0xa0, nullptr, {}, 0, 0, 0x5678, 2), STATUS_PENDING);
+        utils::buffer_serializer saved{};
+        device->serialize(saved);
+        utils::buffer_serializer marker{};
+        marker.write<uint64_t>(0x324b454550444641ull);
+        auto predecessor = saved.get_buffer();
+        const auto position = std::search(predecessor.begin(), predecessor.end(), marker.get_buffer().begin(), marker.get_buffer().end());
+        ASSERT_NE(position, predecessor.end());
+        ASSERT_EQ(
+            std::search(position + marker.get_buffer().size(), predecessor.end(), marker.get_buffer().begin(), marker.get_buffer().end()),
+            predecessor.end());
+        // Remove the endpoint marker to expose the predecessor field prefix.
+        // This synthetic device refusal does not claim an intact outer-process restore.
+        predecessor.erase(position, position + marker.get_buffer().size());
+        const auto before_socket_creations = socket->socket_creations;
+        const auto before_event_references = emu.process.events.get(receive_event)->ref_count;
+        utils::buffer_deserializer input{predecessor};
+        input.register_factory<memory_manager_wrapper>([this] { return memory_manager_wrapper{emu.memory}; });
+        input.register_factory<x64_emulator_wrapper>([this] { return x64_emulator_wrapper{emu.emu()}; });
+        input.register_factory<windows_emulator_wrapper>([this] { return windows_emulator_wrapper{emu}; });
+        input.register_factory<socket_factory_wrapper>([this] { return socket_factory_wrapper{emu.socket_factory()}; });
+        auto restored = create_afd_endpoint({.is_32_bit = GetParam()});
+        EXPECT_THROW(restored->deserialize(input), std::runtime_error);
+        EXPECT_EQ(socket->socket_creations, before_socket_creations);
+        EXPECT_EQ(emu.process.events.get(receive_event)->ref_count, before_event_references);
+        EXPECT_FALSE(emu.process.events.get(receive_event)->signaled);
     }
 
     TEST_P(AfdPendingRequestTest, PendingTaggedEventSurvivesWholeProcessSnapshotRestore)
@@ -2767,6 +3005,241 @@ namespace sogen::test
         network::address source{};
         EXPECT_EQ(local->recvfrom(source, received), 1);
         EXPECT_EQ(received[0], payload[0]);
+    }
+
+    TEST(AfdPeekStaticTest, StreamRepeatedPeeksKeepReadinessAndOrdinaryReceiveConsumesPrefix)
+    {
+        auto factory = network::create_static_socket_factory();
+        auto listener = factory->create_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        const network::address local{"127.0.0.1", uint16_t{21001}};
+        ASSERT_TRUE(listener->bind(local));
+        ASSERT_TRUE(listener->listen(1));
+        auto client = factory->create_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        ASSERT_TRUE(client->connect(local));
+        network::address peer{};
+        auto accepted = listener->accept(peer);
+        ASSERT_NE(accepted, nullptr);
+        std::array<std::byte, 4> received{};
+        EXPECT_EQ(accepted->recv(received, true), -1);
+        EXPECT_EQ(accepted->get_last_error(), SERR(EWOULDBLOCK));
+        const std::array payload{std::byte{'a'}, std::byte{'b'}, std::byte{'c'}};
+        ASSERT_EQ(client->send(payload), 3);
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            received.fill(std::byte{0xa5});
+            ASSERT_EQ(accepted->recv(received, true), 3);
+            EXPECT_EQ(received[0], payload[0]);
+            EXPECT_EQ(received[1], payload[1]);
+            EXPECT_EQ(received[2], payload[2]);
+            EXPECT_EQ(received[3], std::byte{0xa5});
+            network::poll_entry entry{accepted.get(), POLLIN, 0};
+            EXPECT_EQ(factory->poll_sockets(std::span(&entry, 1)), 1);
+            EXPECT_NE(entry.revents & POLLIN, 0);
+        }
+        ASSERT_EQ(accepted->recv(std::span(received).first(2)), 2);
+        EXPECT_EQ(received[0], payload[0]);
+        EXPECT_EQ(received[1], payload[1]);
+        ASSERT_EQ(accepted->recv(received, true), 1);
+        EXPECT_EQ(received[0], payload[2]);
+        ASSERT_EQ(accepted->recv(received), 1);
+        EXPECT_EQ(received[0], payload[2]);
+        EXPECT_EQ(accepted->recv(received, true), -1);
+        EXPECT_EQ(accepted->get_last_error(), SERR(EWOULDBLOCK));
+        client.reset();
+        EXPECT_EQ(accepted->recv(received, true), 0);
+        EXPECT_EQ(accepted->recv(received), 0);
+    }
+
+    TEST(AfdPeekStaticTest, DatagramShortAndZeroLengthPeeksRetainPacketAndSource)
+    {
+        auto factory = network::create_static_socket_factory();
+        auto local = factory->create_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        auto peer = factory->create_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        const auto local_address = *local->get_local_address();
+        const auto peer_address = *peer->get_local_address();
+        const std::array payload{std::byte{'a'}, std::byte{'b'}, std::byte{'c'}, std::byte{'d'}, std::byte{'e'}, std::byte{'f'}};
+        ASSERT_EQ(peer->sendto(local_address, payload), 6);
+        std::array<std::byte, 7> received{};
+        network::address source{};
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            received.fill(std::byte{0xa5});
+            // The offline backend reports the original datagram size, even for a short destination.
+            ASSERT_EQ(local->recvfrom(source, std::span(received).first(3), true), 6);
+            EXPECT_EQ(source, peer_address);
+            EXPECT_EQ(received[0], payload[0]);
+            EXPECT_EQ(received[1], payload[1]);
+            EXPECT_EQ(received[2], payload[2]);
+            EXPECT_EQ(received[3], std::byte{0xa5});
+        }
+        EXPECT_EQ(local->recvfrom(source, {}, true), 6);
+        EXPECT_EQ(source, peer_address);
+        ASSERT_EQ(local->recvfrom(source, received), 6);
+        EXPECT_EQ(source, peer_address);
+        EXPECT_TRUE(std::equal(payload.begin(), payload.end(), received.begin()));
+        EXPECT_EQ(local->recvfrom(source, received, true), -1);
+        EXPECT_EQ(local->get_last_error(), SERR(EWOULDBLOCK));
+        ASSERT_EQ(peer->sendto(local_address, {}), 0);
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            received.fill(std::byte{0xa5});
+            EXPECT_EQ(local->recvfrom(source, received, true), 0);
+            EXPECT_EQ(source, peer_address);
+            EXPECT_EQ(received[0], std::byte{0xa5});
+            EXPECT_EQ(local->recvfrom(source, {}, true), 0);
+            EXPECT_EQ(source, peer_address);
+        }
+        EXPECT_EQ(local->recvfrom(source, {}, false), 0);
+        EXPECT_EQ(local->recvfrom(source, received, true), -1);
+        EXPECT_EQ(local->get_last_error(), SERR(EWOULDBLOCK));
+        ASSERT_EQ(peer->sendto(local_address, payload), 6);
+        EXPECT_EQ(local->recvfrom(source, {}, true), 6);
+        EXPECT_EQ(local->recvfrom(source, {}, false), 6);
+        EXPECT_EQ(source, peer_address);
+        EXPECT_EQ(local->recvfrom(source, {}, true), -1);
+        EXPECT_EQ(local->get_last_error(), SERR(EWOULDBLOCK));
+    }
+
+    TEST(AfdReceiveInformationStaticTest, StreamQueriesPreserveBothDirectionsAndTrackPartialConsumption)
+    {
+        auto factory = network::create_static_socket_factory();
+        auto listener = factory->create_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        const network::address local{"127.0.0.1", uint16_t{21011}};
+        ASSERT_TRUE(listener->bind(local));
+        ASSERT_TRUE(listener->listen(1));
+        auto client = factory->create_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        ASSERT_TRUE(client->connect(local));
+        network::address peer{};
+        auto accepted = listener->accept(peer);
+        ASSERT_NE(accepted, nullptr);
+        network::receive_information value{0xcccccccc, 0xdddddddd};
+        ASSERT_EQ(accepted->query_receive_information(value), 0u);
+        EXPECT_EQ(value.normal_bytes, 0u);
+        EXPECT_EQ(value.expedited_bytes, 0u);
+        const std::array payload{std::byte{'a'}, std::byte{'b'}, std::byte{'c'}, std::byte{'d'},
+                                 std::byte{'e'}, std::byte{'f'}, std::byte{'g'}};
+        const std::array response{std::byte{'X'}, std::byte{'Y'}};
+        ASSERT_EQ(client->send(payload), 7);
+        ASSERT_EQ(accepted->send(response), 2);
+        std::array<std::byte, 8> received{};
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            ASSERT_EQ(accepted->query_receive_information(value), 0u);
+            EXPECT_EQ(value.normal_bytes, 7u);
+            EXPECT_EQ(value.expedited_bytes, 0u);
+            ASSERT_EQ(accepted->recv(received, true), 7);
+            EXPECT_TRUE(std::equal(payload.begin(), payload.end(), received.begin()));
+            ASSERT_EQ(client->query_receive_information(value), 0u);
+            EXPECT_EQ(value.normal_bytes, 2u);
+        }
+        ASSERT_EQ(accepted->recv(std::span(received).first(3)), 3);
+        EXPECT_TRUE(std::equal(payload.begin(), payload.begin() + 3, received.begin()));
+        ASSERT_EQ(accepted->query_receive_information(value), 0u);
+        EXPECT_EQ(value.normal_bytes, 4u);
+        ASSERT_EQ(accepted->recv(received), 4);
+        EXPECT_TRUE(std::equal(payload.begin() + 3, payload.end(), received.begin()));
+        ASSERT_EQ(accepted->query_receive_information(value), 0u);
+        EXPECT_EQ(value.normal_bytes, 0u);
+        ASSERT_EQ(client->recv(received), 2);
+        EXPECT_TRUE(std::equal(response.begin(), response.end(), received.begin()));
+        client.reset();
+        ASSERT_EQ(accepted->query_receive_information(value), 0u);
+        EXPECT_EQ(value.normal_bytes, 0u);
+        EXPECT_EQ(accepted->recv(received), 0);
+    }
+
+    TEST(AfdReceiveInformationStaticTest, DatagramQueryCountsAllPayloadsAndPreservesPacketBoundariesAndSender)
+    {
+        auto factory = network::create_static_socket_factory();
+        auto local = factory->create_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        auto peer = factory->create_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        const auto destination = *local->get_local_address();
+        const auto sender = *peer->get_local_address();
+        const std::array first{std::byte{'a'}, std::byte{'b'}, std::byte{'c'}, std::byte{'d'},
+                               std::byte{'e'}, std::byte{'f'}, std::byte{'g'}};
+        const std::array second{std::byte{'X'}, std::byte{'Y'}, std::byte{'Z'}};
+        ASSERT_EQ(peer->sendto(destination, first), 7);
+        ASSERT_EQ(peer->sendto(destination, second), 3);
+        network::receive_information value{};
+        network::address source{};
+        std::array<std::byte, 8> received{};
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            ASSERT_EQ(local->query_receive_information(value), 0u);
+            EXPECT_EQ(value.normal_bytes, 10u);
+            EXPECT_EQ(value.expedited_bytes, 0u);
+            ASSERT_EQ(local->recvfrom(source, received, true), 7);
+            EXPECT_EQ(source, sender);
+            EXPECT_TRUE(std::equal(first.begin(), first.end(), received.begin()));
+        }
+        ASSERT_EQ(local->recvfrom(source, received), 7);
+        EXPECT_EQ(source, sender);
+        EXPECT_TRUE(std::equal(first.begin(), first.end(), received.begin()));
+        ASSERT_EQ(local->query_receive_information(value), 0u);
+        EXPECT_EQ(value.normal_bytes, 3u);
+        ASSERT_EQ(local->recvfrom(source, received), 3);
+        EXPECT_EQ(source, sender);
+        EXPECT_TRUE(std::equal(second.begin(), second.end(), received.begin()));
+        ASSERT_EQ(local->query_receive_information(value), 0u);
+        EXPECT_EQ(value.normal_bytes, 0u);
+        EXPECT_EQ(value.expedited_bytes, 0u);
+    }
+
+    TEST(AfdReceiveInformationStaticTest, ZeroLengthDatagramsRemainVisibleUntilEachIsConsumed)
+    {
+        auto factory = network::create_static_socket_factory();
+        auto local = factory->create_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        auto peer = factory->create_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        const auto destination = *local->get_local_address();
+        const auto sender = *peer->get_local_address();
+        ASSERT_EQ(peer->sendto(destination, {}), 0);
+        ASSERT_EQ(peer->sendto(destination, {}), 0);
+        network::receive_information value{};
+        network::address source{};
+        for (int remaining = 2; remaining != 0; --remaining)
+        {
+            ASSERT_EQ(local->query_receive_information(value), 0u);
+            EXPECT_EQ(value.normal_bytes, 1u);
+            EXPECT_EQ(value.expedited_bytes, 0u);
+            EXPECT_EQ(local->recvfrom(source, {}, true), 0);
+            EXPECT_EQ(source, sender);
+            ASSERT_EQ(local->query_receive_information(value), 0u);
+            EXPECT_EQ(value.normal_bytes, 1u);
+            EXPECT_EQ(local->recvfrom(source, {}), 0);
+        }
+        ASSERT_EQ(local->query_receive_information(value), 0u);
+        EXPECT_EQ(value.normal_bytes, 0u);
+        const std::array payload{std::byte{'a'}, std::byte{'b'}, std::byte{'c'}};
+        ASSERT_EQ(peer->sendto(destination, {}), 0);
+        ASSERT_EQ(peer->sendto(destination, payload), 3);
+        ASSERT_EQ(local->query_receive_information(value), 0u);
+        EXPECT_EQ(value.normal_bytes, 3u);
+        EXPECT_EQ(local->recvfrom(source, {}), 0);
+        ASSERT_EQ(local->query_receive_information(value), 0u);
+        EXPECT_EQ(value.normal_bytes, 3u);
+        std::array<std::byte, 3> received{};
+        ASSERT_EQ(local->recvfrom(source, received), 3);
+        EXPECT_EQ(source, sender);
+        EXPECT_EQ(received, payload);
+        ASSERT_EQ(local->query_receive_information(value), 0u);
+        EXPECT_EQ(value.normal_bytes, 0u);
+    }
+
+    TEST(AfdReceiveInformationStaticTest, FreshAndListeningSocketsReportNoReceivePayload)
+    {
+        auto factory = network::create_static_socket_factory();
+        auto stream = factory->create_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        network::receive_information value{0xcccccccc, 0xdddddddd};
+        ASSERT_EQ(stream->query_receive_information(value), 0u);
+        EXPECT_EQ(value.normal_bytes, 0u);
+        EXPECT_EQ(value.expedited_bytes, 0u);
+        ASSERT_TRUE(stream->listen(1));
+        ASSERT_EQ(stream->query_receive_information(value), 0u);
+        EXPECT_EQ(value.normal_bytes, 0u);
+        auto datagram = factory->create_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        ASSERT_EQ(datagram->query_receive_information(value), 0u);
+        EXPECT_EQ(value.normal_bytes, 0u);
+        EXPECT_EQ(value.expedited_bytes, 0u);
     }
 
     INSTANTIATE_TEST_SUITE_P(GuestBitness, AfdPendingRequestTest, testing::Bool());

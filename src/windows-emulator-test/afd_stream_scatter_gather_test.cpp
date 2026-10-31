@@ -17,6 +17,9 @@ namespace sogen::test
             size_t send_limit{std::numeric_limits<size_t>::max()};
             size_t receive_limit{std::numeric_limits<size_t>::max()};
             int last_error{};
+            uint32_t query_status{};
+            uint32_t expedited_bytes{};
+            size_t query_calls{};
         };
 
         struct test_stream_socket final : network::i_socket
@@ -33,6 +36,18 @@ namespace sogen::test
             int get_last_error() override
             {
                 return state->last_error;
+            }
+
+            uint32_t query_receive_information(network::receive_information& value) override
+            {
+                ++state->query_calls;
+                if (state->query_status != 0)
+                {
+                    return state->query_status;
+                }
+                value.normal_bytes = static_cast<uint32_t>(state->incoming.size());
+                value.expedited_bytes = state->expedited_bytes;
+                return 0;
             }
 
             uint32_t partial_disconnect(uint32_t, int64_t) override
@@ -87,7 +102,7 @@ namespace sogen::test
                 return send(data);
             }
 
-            sent_size recv(std::span<std::byte> data) override
+            sent_size recv(std::span<std::byte> data, const bool peek = false) override
             {
                 if (state->incoming.empty())
                 {
@@ -98,15 +113,18 @@ namespace sogen::test
                 const auto count = std::min({data.size(), state->receive_limit, state->incoming.size()});
                 for (size_t index = 0; index < count; ++index)
                 {
-                    data[index] = state->incoming.front();
-                    state->incoming.pop_front();
+                    data[index] = peek ? state->incoming[index] : state->incoming.front();
+                    if (!peek)
+                    {
+                        state->incoming.pop_front();
+                    }
                 }
                 return static_cast<sent_size>(count);
             }
 
-            sent_size recvfrom(network::address&, std::span<std::byte> data) override
+            sent_size recvfrom(network::address&, std::span<std::byte> data, const bool peek = false) override
             {
-                return recv(data);
+                return recv(data, peek);
             }
 
             std::shared_ptr<stream_state> state;
@@ -193,7 +211,7 @@ namespace sogen::test
         }
 
         template <typename Guest>
-        NTSTATUS transfer(bool is_send, ULONG count, uint64_t array)
+        NTSTATUS transfer(bool is_send, ULONG count, uint64_t array, ULONG tdi_flags = 0)
         {
             using Traits = EmulatorTraits<Guest>;
             io_device_context context{emu.memory};
@@ -210,9 +228,26 @@ namespace sogen::test
             }
             else
             {
-                const AFD_RECV_INFO<Traits> request{.BufferArray = static_cast<typename Traits::PVOID>(array), .BufferCount = count};
+                const AFD_RECV_INFO<Traits> request{
+                    .BufferArray = static_cast<typename Traits::PVOID>(array), .BufferCount = count, .TdiFlags = tdi_flags};
                 emu.memory.write_memory(context.input_buffer, &request, sizeof(request));
             }
+            return device->execute_ioctl(emu, context);
+        }
+
+        NTSTATUS query_receive_information(uint64_t output = memory + 0x500, uint32_t length = 8, uint64_t input = 0,
+                                           uint32_t input_length = 0)
+        {
+            io_device_context context{emu.memory};
+            context.io_control_code = 0x12033;
+            context.io_status_block = {emu.memory, memory + 0x80};
+            context.event = completion;
+            context.input_buffer = input;
+            context.input_buffer_length = input_length;
+            context.output_buffer = output;
+            context.output_buffer_length = length;
+            emu.memory.set_memory(memory + 0x80, 0xa5, 16);
+            emu.process.events.get(completion)->signaled = false;
             return device->execute_ioctl(emu, context);
         }
 
@@ -221,9 +256,9 @@ namespace sogen::test
             return GetParam() ? transfer<Emu32>(true, count, array) : transfer<Emu64>(true, count, array);
         }
 
-        NTSTATUS receive(ULONG count, uint64_t array = memory + 0x200)
+        NTSTATUS receive(ULONG count, uint64_t array = memory + 0x200, ULONG tdi_flags = 0)
         {
-            return GetParam() ? transfer<Emu32>(false, count, array) : transfer<Emu64>(false, count, array);
+            return GetParam() ? transfer<Emu32>(false, count, array, tdi_flags) : transfer<Emu64>(false, count, array, tdi_flags);
         }
 
         void write(uint64_t address, std::string_view data)
@@ -242,6 +277,35 @@ namespace sogen::test
             return emu.memory.read_memory<uint64_t>(memory + 0x88);
         }
     };
+
+    TEST_P(AfdStreamScatterGatherTest, StreamPeekScattersOnlyItsPrefixAndRetainsAllQueuedBytes)
+    {
+        for (const char value : std::string_view{"abcdefg"})
+        {
+            stream->incoming.push_back(static_cast<std::byte>(value));
+        }
+        buffers({{2, memory + 0x300}, {0, 0}, {3, memory + 0x320}});
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            emu.memory.set_memory(memory + 0x300, 0xa5, 16);
+            emu.memory.set_memory(memory + 0x320, 0xa5, 16);
+            ASSERT_EQ(receive(3, memory + 0x200, 0xa0), STATUS_SUCCESS);
+            EXPECT_EQ(read(memory + 0x300, 2), "ab");
+            EXPECT_EQ(read(memory + 0x320, 3), "cde");
+            EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x323), 0xa5);
+            EXPECT_EQ(information(), 5u);
+            EXPECT_EQ(stream->incoming.size(), 7u);
+        }
+        ASSERT_EQ(receive(3), STATUS_SUCCESS);
+        EXPECT_EQ(read(memory + 0x300, 2), "ab");
+        EXPECT_EQ(read(memory + 0x320, 3), "cde");
+        EXPECT_EQ(information(), 5u);
+        EXPECT_EQ(stream->incoming.size(), 2u);
+        ASSERT_EQ(receive(3), STATUS_SUCCESS);
+        EXPECT_EQ(read(memory + 0x300, 2), "fg");
+        EXPECT_EQ(information(), 2u);
+        EXPECT_TRUE(stream->incoming.empty());
+    }
 
     TEST_P(AfdStreamScatterGatherTest, SendGathersInOrderAcrossEmptyMember)
     {
@@ -376,6 +440,131 @@ namespace sogen::test
         EXPECT_EQ(read(memory + 0x300, 2), "ab");
         EXPECT_EQ(read(memory + 0x320, 3), "cde");
         EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x380), 0xa5);
+        EXPECT_TRUE(stream->incoming.empty());
+    }
+
+    TEST_P(AfdStreamScatterGatherTest, ReceiveInformationWritesTwoCountersAndExactlyEightBytes)
+    {
+        emu.memory.set_memory(memory + 0x500, 0xcc, 24);
+        ASSERT_EQ(query_receive_information(), STATUS_SUCCESS);
+        const auto empty = emu.memory.read_memory<network::receive_information>(memory + 0x500);
+        EXPECT_EQ(empty.normal_bytes, 0u);
+        EXPECT_EQ(empty.expedited_bytes, 0u);
+        EXPECT_EQ(information(), 8u);
+        EXPECT_TRUE(emu.process.events.get(completion)->signaled);
+        for (const char value : std::string_view{"abcdefg"})
+        {
+            stream->incoming.push_back(static_cast<std::byte>(value));
+        }
+        stream->expedited_bytes = 3;
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            emu.memory.set_memory(memory + 0x500, 0xcc, 24);
+            ASSERT_EQ(query_receive_information(memory + 0x501, 16), STATUS_SUCCESS);
+            EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x500), 0xcc);
+            const auto counts = emu.memory.read_memory<network::receive_information>(memory + 0x501);
+            EXPECT_EQ(counts.normal_bytes, 7u);
+            EXPECT_EQ(counts.expedited_bytes, 3u);
+            EXPECT_EQ(information(), 8u);
+            EXPECT_EQ(stream->incoming.size(), 7u);
+            EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x509), 0xcc);
+            EXPECT_EQ(emu.memory.read_memory<uint8_t>(memory + 0x517), 0xcc);
+        }
+        EXPECT_EQ(stream->query_calls, 3u);
+    }
+
+    TEST_P(AfdStreamScatterGatherTest, ReceiveInformationTracksPeekThenPartialAndFullConsume)
+    {
+        for (const char value : std::string_view{"abcdefg"})
+        {
+            stream->incoming.push_back(static_cast<std::byte>(value));
+        }
+        buffers({{3, memory + 0x300}});
+        ASSERT_EQ(query_receive_information(), STATUS_SUCCESS);
+        EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x500), 7u);
+        ASSERT_EQ(receive(1, memory + 0x200, 0xa0), STATUS_SUCCESS);
+        EXPECT_EQ(read(memory + 0x300, 3), "abc");
+        ASSERT_EQ(query_receive_information(), STATUS_SUCCESS);
+        EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x500), 7u);
+        ASSERT_EQ(receive(1), STATUS_SUCCESS);
+        EXPECT_EQ(read(memory + 0x300, 3), "abc");
+        ASSERT_EQ(query_receive_information(), STATUS_SUCCESS);
+        EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x500), 4u);
+        buffers({{4, memory + 0x300}});
+        ASSERT_EQ(receive(1), STATUS_SUCCESS);
+        EXPECT_EQ(read(memory + 0x300, 4), "defg");
+        ASSERT_EQ(query_receive_information(), STATUS_SUCCESS);
+        EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x500), 0u);
+        EXPECT_TRUE(stream->incoming.empty());
+    }
+
+    TEST_P(AfdStreamScatterGatherTest, ReceiveInformationRejectsShortAndInvalidOutputsWithoutConsuming)
+    {
+        for (const char value : std::string_view{"abc"})
+        {
+            stream->incoming.push_back(static_cast<std::byte>(value));
+        }
+        for (uint32_t length = 0; length < 8; ++length)
+        {
+            emu.memory.set_memory(memory + 0x500, 0xcc, 16);
+            EXPECT_EQ(query_receive_information(memory + 0x500, length), STATUS_BUFFER_TOO_SMALL);
+            EXPECT_EQ(stream->query_calls, 0u);
+            EXPECT_EQ(emu.memory.read_memory<uint64_t>(memory + 0x500), 0xccccccccccccccccULL);
+            EXPECT_EQ(information(), 0u);
+            EXPECT_EQ(stream->incoming.size(), 3u);
+        }
+        EXPECT_EQ(query_receive_information(0, 8), STATUS_ACCESS_VIOLATION);
+        EXPECT_EQ(information(), 0u);
+        EXPECT_EQ(stream->incoming.size(), 3u);
+        EXPECT_EQ(query_receive_information(memory + 0x2000, 8), STATUS_ACCESS_VIOLATION);
+        EXPECT_EQ(information(), 0u);
+        EXPECT_EQ(stream->incoming.size(), 3u);
+        ASSERT_EQ(query_receive_information(), STATUS_SUCCESS);
+        EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x500), 3u);
+    }
+
+    TEST_P(AfdStreamScatterGatherTest, ReceiveInformationPropagatesBackendFailureWithoutOutputOrQueueMutation)
+    {
+        stream->incoming.push_back(std::byte{'a'});
+        for (const auto status : std::array{static_cast<NTSTATUS>(STATUS_NOT_SUPPORTED), static_cast<NTSTATUS>(STATUS_INVALID_PARAMETER)})
+        {
+            stream->query_status = static_cast<uint32_t>(status);
+            emu.memory.set_memory(memory + 0x500, 0xcc, 16);
+            EXPECT_EQ(query_receive_information(), status);
+            EXPECT_EQ(emu.memory.read_memory<uint64_t>(memory + 0x500), 0xccccccccccccccccULL);
+            EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x80), static_cast<uint32_t>(status));
+            EXPECT_EQ(information(), 0u);
+            EXPECT_TRUE(emu.process.events.get(completion)->signaled);
+            EXPECT_EQ(stream->incoming.size(), 1u);
+        }
+        EXPECT_EQ(stream->query_calls, 2u);
+        stream->query_status = 0;
+        ASSERT_EQ(query_receive_information(), STATUS_SUCCESS);
+        EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x500), 1u);
+    }
+
+    TEST_P(AfdStreamScatterGatherTest, ReceiveInformationDoesNotReadOrValidateCallerInput)
+    {
+        stream->incoming.push_back(std::byte{'z'});
+        // This calls the endpoint handler; syscall-layer input probing is a separate boundary.
+        ASSERT_EQ(query_receive_information(memory + 0x500, 8, 0xdeadbeef, 0xffffffff), STATUS_SUCCESS);
+        EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x500), 1u);
+        EXPECT_EQ(emu.memory.read_memory<uint32_t>(memory + 0x504), 0u);
+        EXPECT_EQ(information(), 8u);
+        EXPECT_EQ(stream->incoming.size(), 1u);
+    }
+
+    TEST_P(AfdStreamScatterGatherTest, EmptyReceiveInformationCompletesWithoutRetainingPendingWork)
+    {
+        ASSERT_EQ(query_receive_information(), STATUS_SUCCESS);
+        EXPECT_EQ(information(), 8u);
+        EXPECT_EQ(emu.memory.read_memory<uint64_t>(memory + 0x500), 0u);
+        EXPECT_TRUE(emu.process.events.get(completion)->signaled);
+        emu.process.events.get(completion)->signaled = false;
+        const auto calls = stream->query_calls;
+        device->work(emu);
+        EXPECT_EQ(stream->query_calls, calls);
+        EXPECT_FALSE(emu.process.events.get(completion)->signaled);
         EXPECT_TRUE(stream->incoming.empty());
     }
 

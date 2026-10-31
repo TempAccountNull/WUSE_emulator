@@ -49,7 +49,20 @@ namespace sogen
             {
                 using packet_data = std::vector<std::byte>;
                 using packet = std::pair<address, packet_data>;
-                using packet_queue = std::queue<packet>;
+
+                struct packet_queue : std::queue<packet>
+                {
+                    uint32_t payload_bytes() const
+                    {
+                        uint32_t bytes{};
+                        for (const auto& queued_packet : this->c)
+                        {
+                            bytes += static_cast<uint32_t>(queued_packet.second.size());
+                        }
+                        return bytes;
+                    }
+                };
+
                 using packet_mapping = std::unordered_map<address, packet_queue>;
                 using listen_mapping = std::unordered_map<address, std::deque<pending_connection>>;
 
@@ -70,20 +83,22 @@ namespace sogen
                     // DNS_ERROR_NO_DNS_SERVERS (9852) - measured on the sample probe.
                     constexpr uint64_t adapter_index = 7;
                     static constexpr std::array<uint8_t, 0xB8> adapter_parameter = {
-                        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02,
-                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00, 0x00, 0x30, 0x75, 0x00, 0x00, 0xE8, 0x03, 0x00, 0x00, 0xC0, 0x27,
-                        0x09, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x64, 0x19, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00,
-                        0x00, 0x07, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-                        0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-                        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xDC, 0x05, 0x00, 0x00, 0x40, 0x00,
-                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x07, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x35, 0x97, 0x98, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+                        0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00, 0x00, 0x30, 0x75, 0x00, 0x00, 0xE8, 0x03,
+                        0x00, 0x00, 0xC0, 0x27, 0x09, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x64, 0x19, 0x00, 0x00, 0x07,
+                        0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+                        0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+                        0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xDC, 0x05, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x08, 0x07, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x35, 0x97, 0x98, 0x00, 0x00, 0x00, 0x00, 0x00,
                     };
 
                     const auto fill_row = [&](network_store_buffer& buffer) {
                         const auto bytes_to_write = std::min<size_t>(buffer.bytes.size(), adapter_parameter.size());
-                        buffer.bytes.assign(adapter_parameter.begin(), adapter_parameter.begin() + static_cast<std::ptrdiff_t>(bytes_to_write));
+                        buffer.bytes.assign(adapter_parameter.begin(),
+                                            adapter_parameter.begin() + static_cast<std::ptrdiff_t>(bytes_to_write));
                     };
                     const auto fill_zero = [](network_store_buffer& buffer) {
                         std::fill(buffer.bytes.begin(), buffer.bytes.end(), uint8_t{0});
@@ -157,7 +172,8 @@ namespace sogen
                     }
 
                     static_socket(static_socket_factory_impl& f, const int af, const int type)
-                        : factory(&f), socket_type(type)
+                        : factory(&f),
+                          socket_type(type)
                     {
                         if (af == AF_INET)
                         {
@@ -201,6 +217,31 @@ namespace sogen
                         {
                             throw std::runtime_error("Blocking sockets not supported yet!");
                         }
+                    }
+
+                    uint32_t query_receive_information(receive_information& value) override
+                    {
+                        receive_information result{};
+                        if (this->socket_type == SOCK_DGRAM)
+                        {
+                            const auto entry = this->factory->state->packets.find(this->a);
+                            if (entry != this->factory->state->packets.end())
+                            {
+                                const auto& packets = entry->second;
+                                const auto bytes = packets.payload_bytes();
+                                // Native AFD reports all queued payload bytes, or one for a
+                                // nonempty queue whose aggregate payload count is zero.
+                                result.normal_bytes = bytes != 0 ? bytes : static_cast<uint32_t>(!packets.empty());
+                            }
+                        }
+                        else if (this->pipe && !this->listening)
+                        {
+                            const auto& bytes = this->is_server_side ? this->pipe->client_to_server : this->pipe->server_to_client;
+                            result.normal_bytes = static_cast<uint32_t>(bytes.size());
+                        }
+                        // This offline backend does not implement an expedited/OOB queue.
+                        value = result;
+                        return 0;
                     }
 
                     uint32_t query_information(const uint32_t information_class, uint64_t& value, std::span<const std::byte>) override
@@ -282,6 +323,7 @@ namespace sogen
                     {
                         return this->listening;
                     }
+
                     bool is_connected() override
                     {
                         return this->pipe != nullptr;
@@ -408,7 +450,7 @@ namespace sogen
                         return static_cast<sent_size>(data.size());
                     }
 
-                    sent_size recv(std::span<std::byte> data) override
+                    sent_size recv(std::span<std::byte> data, const bool peek = false) override
                     {
                         if (this->disconnect_mode & 4)
                         {
@@ -423,7 +465,7 @@ namespace sogen
                         if (this->socket_type == SOCK_DGRAM)
                         {
                             address source{};
-                            return this->recvfrom(source, data);
+                            return this->recvfrom(source, data, peek);
                         }
                         if (this->pipe && (this->is_server_side ? this->pipe->client_reset : this->pipe->server_reset))
                         {
@@ -452,14 +494,17 @@ namespace sogen
                         const size_t n = std::min(data.size(), q.size());
                         for (size_t i = 0; i < n; ++i)
                         {
-                            data[i] = q.front();
-                            q.pop_front();
+                            data[i] = peek ? q[i] : q.front();
+                            if (!peek)
+                            {
+                                q.pop_front();
+                            }
                         }
                         this->error = 0;
                         return static_cast<sent_size>(n);
                     }
 
-                    sent_size recvfrom(address& source, std::span<std::byte> data) override
+                    sent_size recvfrom(address& source, std::span<std::byte> data, const bool peek = false) override
                     {
                         if (this->socket_type != SOCK_DGRAM && (this->disconnect_mode & 4))
                         {
@@ -476,13 +521,19 @@ namespace sogen
                             return -1;
                         }
 
-                        const auto p = std::move(q.front());
-                        q.pop();
-
-                        memcpy(data.data(), p.second.data(), std::min(data.size(), p.second.size()));
-
+                        const auto& p = q.front();
+                        const auto size = p.second.size();
+                        const auto copy_size = std::min(data.size(), size);
+                        if (copy_size != 0)
+                        {
+                            memcpy(data.data(), p.second.data(), copy_size);
+                        }
                         source = p.first;
-                        return static_cast<sent_size>(p.second.size());
+                        if (!peek)
+                        {
+                            q.pop();
+                        }
+                        return static_cast<sent_size>(size);
                     }
                 };
 

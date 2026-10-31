@@ -44,6 +44,7 @@ namespace sogen
         default_completion,
         afd_stream_no_fast_io,
         afd_stream_callback,
+        afd_datagram_irp,
     };
 
     struct io_device_context
@@ -52,9 +53,14 @@ namespace sogen
         uint32_t issuer_thread_id{};
         uint64_t network_request_id{};
         bool completing_pending{};
-        // Per-dispatch publication policy; recomputed from captured stream flags
+        // Per-dispatch publication policy; recomputed from captured receive flags
         // on delayed dispatch and deliberately not serialized.
         device_ioctl_completion_mode completion_mode{device_ioctl_completion_mode::default_completion};
+        // Confirmed receive Information publication; never serialized.
+        mutable bool completed_receive_information_valid{};
+        // Native IRPs can complete during dispatch after marking pending. This transient
+        // flag separates their initial return from the terminal IOSB and is not serialized.
+        mutable bool completed_request_marked_pending{};
         handle event{};
         bool event_reference_captured{};
         std::shared_ptr<referenced_io_event> event_reference{};

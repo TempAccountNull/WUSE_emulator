@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <span>
 #include <vector>
 #include <network/socket.hpp>
@@ -15,6 +16,14 @@ namespace sogen
             uint32_t source_index{};
         };
 
+        struct receive_information
+        {
+            uint32_t normal_bytes{};
+            uint32_t expedited_bytes{};
+        };
+
+        static_assert(sizeof(receive_information) == 8);
+
         struct i_socket
         {
             virtual ~i_socket() = default;
@@ -24,6 +33,13 @@ namespace sogen
             virtual int get_last_error() = 0;
 
             virtual uint32_t query_information(uint32_t, uint64_t&, std::span<const std::byte> = {})
+            {
+                return 0xc00000bb;
+            }
+
+            // Read the two native AFD receive counters without consuming queued data.
+            // Backends without this capability report failure and leave the value unchanged.
+            virtual uint32_t query_receive_information(receive_information&)
             {
                 return 0xc00000bb;
             }
@@ -56,7 +72,11 @@ namespace sogen
 
             virtual bool is_ready(bool in_poll) = 0;
             virtual bool is_listening() = 0;
-            virtual bool is_connected() { return false; }
+
+            virtual bool is_connected()
+            {
+                return false;
+            }
 
             virtual std::optional<address> get_local_address() = 0;
 
@@ -68,8 +88,9 @@ namespace sogen
             virtual sent_size send(std::span<const std::byte> data) = 0;
             virtual sent_size sendto(const address& destination, std::span<const std::byte> data) = 0;
 
-            virtual sent_size recv(std::span<std::byte> data) = 0;
-            virtual sent_size recvfrom(address& source, std::span<std::byte> data) = 0;
+            // Peek copies the same receive prefix without consuming stream bytes or a datagram.
+            virtual sent_size recv(std::span<std::byte> data, bool peek = false) = 0;
+            virtual sent_size recvfrom(address& source, std::span<std::byte> data, bool peek = false) = 0;
         };
     }
 

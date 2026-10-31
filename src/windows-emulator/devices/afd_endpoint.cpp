@@ -270,7 +270,11 @@ namespace sogen
         constexpr size_t max_datagram_bytes = 0x10000;
         // Windows SDK shared/tdi.h defines TDI_RECEIVE_NORMAL; tdi.h needs kernel-only types.
         constexpr ULONG tdi_receive_normal = 0x20;
+        constexpr ULONG tdi_receive_expedited = 0x40;
         constexpr ULONG tdi_receive_peek = 0x80;
+        // Older receive-policy snapshots do not contain a captured source-address capacity.
+        // An outer process restore that encounters an older endpoint must be discarded.
+        constexpr uint64_t afd_receive_policy_encoding_marker = 0x324B454550444641ULL;
 
         bool is_writable_guest_range(memory_manager& memory, uint64_t address, uint64_t size)
         {
@@ -485,12 +489,14 @@ namespace sogen
                 std::optional<afd_profile::operation> profile_operation{};
                 std::vector<EMU_WSABUF<Traits>> stream_buffers{};
                 ULONG stream_afd_flags{};
+                ULONG stream_tdi_flags{};
                 std::vector<EMU_WSABUF<Traits>> datagram_buffers{};
                 std::vector<std::byte> datagram_target{};
                 ULONG datagram_afd_flags{};
                 ULONG datagram_tdi_flags{};
                 uint64_t datagram_address{};
                 uint64_t datagram_address_length{};
+                ULONG datagram_address_capacity{};
                 std::vector<std::byte> connect_input{};
                 std::vector<AFD_POLL_HANDLE_INFO<Traits>> poll_handles{};
                 bool poll_captured{};
@@ -518,12 +524,14 @@ namespace sogen
                     buffer.write_optional(profile_operation);
                     buffer.write_vector(stream_buffers);
                     buffer.write(stream_afd_flags);
+                    buffer.write(stream_tdi_flags);
                     buffer.write_vector(datagram_buffers);
                     buffer.write_vector(datagram_target);
                     buffer.write(datagram_afd_flags);
                     buffer.write(datagram_tdi_flags);
                     buffer.write(datagram_address);
                     buffer.write(datagram_address_length);
+                    buffer.write(datagram_address_capacity);
                     buffer.write_vector(connect_input);
                     buffer.write_vector(poll_handles);
                     buffer.write(poll_captured);
@@ -542,12 +550,14 @@ namespace sogen
                     buffer.read_optional(profile_operation);
                     buffer.read_vector(stream_buffers);
                     buffer.read(stream_afd_flags);
+                    buffer.read(stream_tdi_flags);
                     buffer.read_vector(datagram_buffers);
                     buffer.read_vector(datagram_target);
                     buffer.read(datagram_afd_flags);
                     buffer.read(datagram_tdi_flags);
                     buffer.read(datagram_address);
                     buffer.read(datagram_address_length);
+                    buffer.read(datagram_address_capacity);
                     buffer.read_vector(connect_input);
                     buffer.read_vector(poll_handles);
                     buffer.read(poll_captured);
@@ -581,7 +591,12 @@ namespace sogen
             // explicitly set empty context from an endpoint with no context.
             std::optional<std::vector<std::byte>> socket_context_{};
 
-            enum class remote_connection_role : uint8_t { open, outgoing, accepted };
+            enum class remote_connection_role : uint8_t
+            {
+                open,
+                outgoing,
+                accepted
+            };
             remote_connection_role remote_role_{remote_connection_role::open};
             // The modern mswsock remote sockaddr slot survives later context
             // replacements, including short or empty replacement blobs.
@@ -666,9 +681,8 @@ namespace sogen
                 // Native AFD permits a second output pointer only when it names a
                 // subrange of the input buffer (used by AcceptEx socket contexts).
                 if (c.output_buffer &&
-                    (!c.input_buffer || c.output_buffer < c.input_buffer ||
-                     c.output_buffer - c.input_buffer > UINT16_MAX || c.output_buffer_length > UINT16_MAX ||
-                     c.output_buffer_length > c.input_buffer_length ||
+                    (!c.input_buffer || c.output_buffer < c.input_buffer || c.output_buffer - c.input_buffer > UINT16_MAX ||
+                     c.output_buffer_length > UINT16_MAX || c.output_buffer_length > c.input_buffer_length ||
                      c.output_buffer - c.input_buffer > c.input_buffer_length - c.output_buffer_length))
                 {
                     return STATUS_INVALID_PARAMETER;
@@ -694,8 +708,7 @@ namespace sogen
                         const auto ipv6 = this->creation_data->address_family == 23;
                         const auto address_size = ipv6 ? sizeof(win_sockaddr_in6) : sizeof(win_sockaddr_in);
                         const auto expected_size = (ipv6 ? 196u : 164u) + (sizeof(typename Traits::PVOID) == 4 ? 0u : 4u);
-                        if ((this->creation_data->address_family == 2 || ipv6) &&
-                            this->socket_context_->size() == expected_size &&
+                        if ((this->creation_data->address_family == 2 || ipv6) && this->socket_context_->size() == expected_size &&
                             this->socket_context_->size() >= 24)
                         {
                             const auto read_u32 = [this](size_t offset) {
@@ -703,9 +716,8 @@ namespace sogen
                                 memcpy(&value, this->socket_context_->data() + offset, sizeof(value));
                                 return value;
                             };
-                            if (read_u32(4) == static_cast<uint32_t>(this->creation_data->address_family) &&
-                                read_u32(8) == 1 && read_u32(12) == 6 && read_u32(16) == address_size &&
-                                read_u32(20) == address_size)
+                            if (read_u32(4) == static_cast<uint32_t>(this->creation_data->address_family) && read_u32(8) == 1 &&
+                                read_u32(12) == 6 && read_u32(16) == address_size && read_u32(20) == address_size)
                             {
                                 this->remote_offset_ = ipv6 ? 160 : 144;
                                 this->remote_length_ = static_cast<uint16_t>(address_size);
@@ -754,16 +766,14 @@ namespace sogen
 
             NTSTATUS ioctl_get_remote_address(windows_emulator& win_emu, const io_device_context& c) const
             {
-                if (!this->socket_context_ || this->remote_role_ == remote_connection_role::open ||
-                    !this->s_)
+                if (!this->socket_context_ || this->remote_role_ == remote_connection_role::open || !this->s_)
                 {
                     return STATUS_INVALID_CONNECTION;
                 }
                 const auto& context = *this->socket_context_;
                 if (this->remote_role_ == remote_connection_role::outgoing)
                 {
-                    if (!this->remote_length_ ||
-                        static_cast<size_t>(this->remote_offset_) + this->remote_length_ > context.size())
+                    if (!this->remote_length_ || static_cast<size_t>(this->remote_offset_) + this->remote_length_ > context.size())
                     {
                         return STATUS_INVALID_CONNECTION;
                     }
@@ -773,8 +783,7 @@ namespace sogen
                     {
                         return STATUS_BUFFER_TOO_SMALL;
                     }
-                    if (!win_emu.memory.try_write_memory(c.output_buffer,
-                                                         context.data() + this->remote_offset_, this->remote_length_))
+                    if (!win_emu.memory.try_write_memory(c.output_buffer, context.data() + this->remote_offset_, this->remote_length_))
                     {
                         return STATUS_ACCESS_VIOLATION;
                     }
@@ -820,8 +829,22 @@ namespace sogen
                         continue;
                     }
 
-                    write_io_status(request.context.io_status_block, STATUS_CANCELLED, true);
-                    complete_device_ioctl(win_emu, request.context, STATUS_CANCELLED, false);
+                    const bool datagram_irp =
+                        !request.datagram_buffers.empty() &&
+                        this->qualifies_datagram_irp(request.context, request.datagram_afd_flags, request.datagram_tdi_flags,
+                                                     request.datagram_address, request.datagram_address_length);
+                    if (datagram_irp)
+                    {
+                        write_irp_io_information(request.context.io_status_block, 0);
+                        write_irp_io_status(request.context.io_status_block, STATUS_CANCELLED);
+                    }
+                    else
+                    {
+                        write_io_status(request.context.io_status_block, STATUS_CANCELLED, true);
+                    }
+                    complete_device_ioctl(win_emu, request.context, STATUS_CANCELLED, false,
+                                          datagram_irp ? device_ioctl_completion_mode::afd_datagram_irp
+                                                       : device_ioctl_completion_mode::default_completion);
                     if (request.profile_since && request.profile_operation)
                     {
                         const auto elapsed = std::chrono::steady_clock::now() - *request.profile_since;
@@ -880,10 +903,44 @@ namespace sogen
                     }
                 }
 
+                const auto is_datagram_read = [this](const pending_request& request) {
+                    const auto code = _AFD_REQUEST(request.context.io_control_code);
+                    return (code == AFD_RECEIVE_DATAGRAM && !request.datagram_buffers.empty()) ||
+                           (code == AFD_RECEIVE && this->creation_data && this->creation_data->type == 2 &&
+                            !request.stream_buffers.empty());
+                };
+                std::vector<size_t> work_order;
+                std::vector<size_t> datagram_order;
+                work_order.reserve(this->pending_requests_.size());
+                for (size_t index = 0; index < this->pending_requests_.size(); ++index)
+                {
+                    work_order.push_back(index);
+                    if (is_datagram_read(this->pending_requests_[index]))
+                    {
+                        datagram_order.push_back(index);
+                    }
+                }
+                // Native UDP arrivals serve ordinary receive waiters before peek waiters.
+                // Reorder only work indices; captured requests and their serialized order stay intact.
+                std::stable_partition(datagram_order.begin(), datagram_order.end(), [this](const size_t index) {
+                    const auto& request = this->pending_requests_[index];
+                    const auto flags = _AFD_REQUEST(request.context.io_control_code) == AFD_RECEIVE ? request.stream_tdi_flags
+                                                                                                    : request.datagram_tdi_flags;
+                    return (flags & tdi_receive_peek) == 0;
+                });
+                auto next_datagram = datagram_order.begin();
+                for (auto& index : work_order)
+                {
+                    if (is_datagram_read(this->pending_requests_[index]))
+                    {
+                        index = *next_datagram++;
+                    }
+                }
                 bool blocked_read = false;
                 bool blocked_write = false;
-                for (size_t index = 0; index < this->pending_requests_.size();)
+                for (size_t position = 0; position < work_order.size(); ++position)
                 {
+                    const auto index = work_order[position];
                     auto& request = this->pending_requests_[index];
                     const bool expired = request.timeout && *request.timeout <= win_emu.clock().steady_now();
                     bool ready = true;
@@ -902,7 +959,6 @@ namespace sogen
                             {
                                 blocked_write = true;
                             }
-                            ++index;
                             continue;
                         }
                     }
@@ -932,7 +988,6 @@ namespace sogen
                                 blocked_write = true;
                             }
                         }
-                        ++index;
                         continue;
                     }
                     if (status == STATUS_PENDING)
@@ -961,11 +1016,22 @@ namespace sogen
                     this->active_pending_ = nullptr;
                     this->executing_delayed_ioctl_ = false;
                     this->pending_requests_.erase(this->pending_requests_.begin() + static_cast<ptrdiff_t>(index));
+                    for (size_t remaining = position + 1; remaining < work_order.size(); ++remaining)
+                    {
+                        if (work_order[remaining] > index)
+                        {
+                            --work_order[remaining];
+                        }
+                    }
                 }
             }
 
             void deserialize_object(utils::buffer_deserializer& buffer) override
             {
+                if (buffer.read<uint64_t>() != afd_receive_policy_encoding_marker)
+                {
+                    throw std::runtime_error("Unsupported serialized AFD receive policy encoding");
+                }
                 buffer.read_optional(this->creation_data);
                 this->setup(buffer.read<socket_factory_wrapper>());
                 buffer.read(this->non_blocking_);
@@ -1009,6 +1075,7 @@ namespace sogen
 
             void serialize_object(utils::buffer_serializer& buffer) const override
             {
+                buffer.write(afd_receive_policy_encoding_marker);
                 buffer.write_optional(this->creation_data);
                 buffer.write(this->non_blocking_);
                 buffer.write(this->socket_context_.has_value());
@@ -1070,6 +1137,21 @@ namespace sogen
                 }
             }
 
+            bool qualifies_datagram_irp(const io_device_context& c, const ULONG afd_flags, const ULONG tdi_flags, const uint64_t address,
+                                        const uint64_t address_length) const
+            {
+                if constexpr (!std::is_same_v<Traits, EmulatorTraits<Emu64>>)
+                {
+                    return false;
+                }
+                else
+                {
+                    return c.io_control_code == 0x1201b && this->creation_data && this->creation_data->type == 2 &&
+                           c.input_buffer_length >= sizeof(AFD_RECV_DATAGRAM_INFO<Traits>) && afd_flags == 2 &&
+                           tdi_flags == (tdi_receive_normal | tdi_receive_peek) && address && address_length;
+                }
+            }
+
             device_ioctl_completion_mode capture_completion_mode(windows_emulator& win_emu, const io_device_context& c) const override
             {
                 if constexpr (!std::is_same_v<Traits, EmulatorTraits<Emu64>>)
@@ -1077,7 +1159,36 @@ namespace sogen
                     return device_ioctl_completion_mode::default_completion;
                 }
                 const auto request = _AFD_REQUEST(c.io_control_code);
-                if (_AFD_BASE(c.io_control_code) != FSCTL_AFD_BASE || (request != AFD_SEND && request != AFD_RECEIVE))
+                if (_AFD_BASE(c.io_control_code) != FSCTL_AFD_BASE)
+                {
+                    return device_ioctl_completion_mode::default_completion;
+                }
+                if (request == AFD_RECEIVE_DATAGRAM)
+                {
+                    if (c.io_control_code != 0x1201b || !this->creation_data || this->creation_data->type != 2 ||
+                        c.input_buffer_length < sizeof(AFD_RECV_DATAGRAM_INFO<Traits>))
+                    {
+                        return device_ioctl_completion_mode::default_completion;
+                    }
+                    AFD_RECV_DATAGRAM_INFO<Traits> info{};
+                    if (this->active_pending_ && !this->active_pending_->datagram_buffers.empty())
+                    {
+                        info.AfdFlags = this->active_pending_->datagram_afd_flags;
+                        info.TdiFlags = this->active_pending_->datagram_tdi_flags;
+                        info.Address = static_cast<typename Traits::PVOID>(this->active_pending_->datagram_address);
+                        info.AddressLength = static_cast<typename Traits::PVOID>(this->active_pending_->datagram_address_length);
+                    }
+                    else if (!win_emu.memory.try_read_memory(c.input_buffer, &info, sizeof(info)))
+                    {
+                        return device_ioctl_completion_mode::default_completion;
+                    }
+                    if (this->qualifies_datagram_irp(c, info.AfdFlags, info.TdiFlags, info.Address, info.AddressLength))
+                    {
+                        return device_ioctl_completion_mode::afd_datagram_irp;
+                    }
+                    return device_ioctl_completion_mode::default_completion;
+                }
+                if (request != AFD_SEND && request != AFD_RECEIVE)
                 {
                     return device_ioctl_completion_mode::default_completion;
                 }
@@ -1117,6 +1228,7 @@ namespace sogen
             {
                 switch (_AFD_REQUEST(c.io_control_code))
                 {
+                case AFD_QUERY_RECEIVE_INFO:
                 case AFD_QUERY_HANDLES:
                 case AFD_ENUM_NETWORK_EVENTS:
                 case AFD_PARTIAL_DISCONNECT:
@@ -1132,8 +1244,7 @@ namespace sogen
                 return (request == AFD_SEND && (status == STATUS_PIPE_DISCONNECTED || status == STATUS_LOCAL_DISCONNECT)) ||
                        (request == AFD_WAIT_FOR_LISTEN && status == STATUS_BUFFER_TOO_SMALL) ||
                        (request == AFD_ACCEPT && status == STATUS_INVALID_HANDLE) ||
-                       (request == AFD_TRANSPORT_IOCTL &&
-                        (status == STATUS_NOT_SUPPORTED || status == STATUS_BUFFER_TOO_SMALL));
+                       (request == AFD_TRANSPORT_IOCTL && (status == STATUS_NOT_SUPPORTED || status == STATUS_BUFFER_TOO_SMALL));
             }
 
             NTSTATUS dispatch_ioctl(windows_emulator& win_emu, const io_device_context& c, const ULONG request)
@@ -1174,6 +1285,8 @@ namespace sogen
                     return this->ioctl_get_context(win_emu, c);
                 case AFD_SET_CONTEXT:
                     return this->ioctl_set_context(win_emu, c);
+                case AFD_QUERY_RECEIVE_INFO:
+                    return this->ioctl_query_receive_information(win_emu, c);
                 case AFD_GET_INFORMATION:
                     return this->ioctl_information(win_emu, c, false);
                 case AFD_SET_INFORMATION:
@@ -1264,8 +1377,8 @@ namespace sogen
                                        wrapper.InputBufferLength == 4;
                 const bool reuse_port = wrapper.Reserved == 0xffff && wrapper.ControlCode == 0x3007 && endpoint.address_family == 2 &&
                                         (wrapper.InputBufferLength == 1 || wrapper.InputBufferLength == 4);
-                const bool tcp_nodelay = wrapper.Reserved == IPPROTO_TCP && wrapper.ControlCode == TCP_NODELAY &&
-                                         wrapper.InputBufferLength <= 4;
+                const bool tcp_nodelay =
+                    wrapper.Reserved == IPPROTO_TCP && wrapper.ControlCode == TCP_NODELAY && wrapper.InputBufferLength <= 4;
                 if (tcp_nodelay && wrapper.InputBufferLength == 0)
                 {
                     return STATUS_BUFFER_TOO_SMALL;
@@ -1516,6 +1629,36 @@ namespace sogen
                 win_emu.log.info("AFD address list: family %u, %u addresses, %zu/%zu bytes, status 0x%08X\n", family, count, copied,
                                  data.size(), static_cast<uint32_t>(status));
                 return status;
+            }
+
+            NTSTATUS ioctl_query_receive_information(windows_emulator& win_emu, const io_device_context& c) const
+            {
+                if (c.output_buffer_length < sizeof(network::receive_information))
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+                if (!this->s_)
+                {
+                    return STATUS_INVALID_HANDLE;
+                }
+
+                network::receive_information information{};
+                const auto status = static_cast<NTSTATUS>(this->s_->query_receive_information(information));
+                if (status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+                // AFD snapshots the counters and writes exactly eight output bytes.
+                // No caller input is read and no receive queue or pending owner is changed.
+                if (!win_emu.memory.try_write_memory(c.output_buffer, &information, sizeof(information)))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+                if (c.io_status_block)
+                {
+                    c.io_status_block.access([](status_block& block) { block.Information = sizeof(network::receive_information); });
+                }
+                return STATUS_SUCCESS;
             }
 
             NTSTATUS ioctl_information(windows_emulator& win_emu, const io_device_context& c, const bool set)
@@ -1815,6 +1958,12 @@ namespace sogen
 
             NTSTATUS ioctl_receive(windows_emulator& win_emu, const io_device_context& c)
             {
+                if (this->creation_data && this->creation_data->type == 2)
+                {
+                    // WSPRecv (including WSPRecvFrom with no source outputs) uses the common
+                    // receive header for UDP; native AFD routes it through datagram receive.
+                    return this->ioctl_receive_datagram(win_emu, c, false);
+                }
                 if (!this->s_)
                 {
                     throw std::runtime_error("Invalid AFD endpoint socket!");
@@ -1832,18 +1981,28 @@ namespace sogen
                 if (use_captured)
                 {
                     receive_info.AfdFlags = this->active_pending_->stream_afd_flags;
+                    receive_info.TdiFlags = this->active_pending_->stream_tdi_flags;
                 }
                 else
                 {
                     receive_info = emu.read_memory<AFD_RECV_INFO<Traits>>(c.input_buffer);
-                    // TDI_RECEIVE_PEEK must not consume the packet; host i_socket has no peek operation.
-                    if ((receive_info.TdiFlags & tdi_receive_peek) != 0)
-                    {
-                        return STATUS_NOT_SUPPORTED;
-                    }
                     if (!this->executing_delayed_ioctl_)
                     {
                         win_emu.afd_diagnostics.record_buffer_count(afd_profile::operation::receive, receive_info.BufferCount);
+                    }
+                }
+                const bool peek = (receive_info.TdiFlags & tdi_receive_peek) != 0;
+                if (peek)
+                {
+                    const auto receive_kind = receive_info.TdiFlags & (tdi_receive_normal | tdi_receive_expedited);
+                    if (receive_kind != tdi_receive_normal && receive_kind != tdi_receive_expedited)
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    // Expedited/partial/wait-all semantics need distinct host support.
+                    if (receive_info.TdiFlags != (tdi_receive_normal | tdi_receive_peek))
+                    {
+                        return STATUS_NOT_SUPPORTED;
                     }
                 }
                 if (!use_captured)
@@ -1867,7 +2026,7 @@ namespace sogen
                     return STATUS_INSUFFICIENT_RESOURCES;
                 }
 
-                const auto bytes_received = this->s_->recv(host_buffer);
+                const auto bytes_received = this->s_->recv(host_buffer, peek);
                 if (bytes_received < 0)
                 {
                     const auto error = this->s_->get_last_error();
@@ -1879,6 +2038,7 @@ namespace sogen
                             auto& pending = this->pending_requests_.back();
                             pending.stream_buffers = buffers;
                             pending.stream_afd_flags = receive_info.AfdFlags;
+                            pending.stream_tdi_flags = receive_info.TdiFlags;
                         }
                         return status;
                     }
@@ -2209,37 +2369,65 @@ namespace sogen
                 return queued;
             }
 
-            NTSTATUS ioctl_receive_datagram(windows_emulator& win_emu, const io_device_context& c)
+            NTSTATUS ioctl_receive_datagram(windows_emulator& win_emu, const io_device_context& c, const bool receive_source_address = true)
             {
                 if (!this->s_)
                 {
                     throw std::runtime_error("Invalid AFD endpoint socket!");
                 }
-                if (c.input_buffer_length < sizeof(AFD_RECV_DATAGRAM_INFO<Traits>))
+                const auto input_size = receive_source_address ? sizeof(AFD_RECV_DATAGRAM_INFO<Traits>) : sizeof(AFD_RECV_INFO<Traits>);
+                if (c.input_buffer_length < input_size)
                 {
                     return STATUS_BUFFER_TOO_SMALL;
                 }
 
                 auto& memory = win_emu.memory;
+                const auto operation = receive_source_address ? afd_profile::operation::receive_datagram : afd_profile::operation::receive;
                 std::vector<EMU_WSABUF<Traits>> loaded_buffers;
-                const bool use_captured = this->active_pending_ && !this->active_pending_->datagram_buffers.empty();
+                const bool use_captured =
+                    this->active_pending_ &&
+                    !(receive_source_address ? this->active_pending_->datagram_buffers : this->active_pending_->stream_buffers).empty();
                 AFD_RECV_DATAGRAM_INFO<Traits> info{};
                 if (use_captured)
                 {
-                    info.AfdFlags = this->active_pending_->datagram_afd_flags;
-                    info.TdiFlags = this->active_pending_->datagram_tdi_flags;
-                    info.Address = static_cast<typename Traits::PVOID>(this->active_pending_->datagram_address);
-                    info.AddressLength = static_cast<typename Traits::PVOID>(this->active_pending_->datagram_address_length);
+                    if (receive_source_address)
+                    {
+                        info.AfdFlags = this->active_pending_->datagram_afd_flags;
+                        info.TdiFlags = this->active_pending_->datagram_tdi_flags;
+                        info.Address = static_cast<typename Traits::PVOID>(this->active_pending_->datagram_address);
+                        info.AddressLength = static_cast<typename Traits::PVOID>(this->active_pending_->datagram_address_length);
+                    }
+                    else
+                    {
+                        // Completion-mode retries continue to use the captured common-header flags.
+                        info.AfdFlags = this->active_pending_->stream_afd_flags;
+                        info.TdiFlags = this->active_pending_->stream_tdi_flags;
+                    }
                 }
                 else
                 {
-                    if (!memory.try_read_memory(c.input_buffer, &info, sizeof(info)))
+                    if (receive_source_address)
                     {
-                        return STATUS_ACCESS_VIOLATION;
+                        if (!memory.try_read_memory(c.input_buffer, &info, sizeof(info)))
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                    }
+                    else
+                    {
+                        AFD_RECV_INFO<Traits> common{};
+                        if (!memory.try_read_memory(c.input_buffer, &common, sizeof(common)))
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        info.BufferArray = common.BufferArray;
+                        info.BufferCount = common.BufferCount;
+                        info.AfdFlags = common.AfdFlags;
+                        info.TdiFlags = common.TdiFlags;
                     }
                     if (!this->executing_delayed_ioctl_)
                     {
-                        win_emu.afd_diagnostics.record_buffer_count(afd_profile::operation::receive_datagram, info.BufferCount);
+                        win_emu.afd_diagnostics.record_buffer_count(operation, info.BufferCount);
                     }
                     const auto status = load_stream_buffers<Traits>(memory, info.BufferArray, info.BufferCount, loaded_buffers);
                     if (status != STATUS_SUCCESS)
@@ -2247,11 +2435,26 @@ namespace sogen
                         return status;
                     }
                 }
-                if (info.TdiFlags != tdi_receive_normal)
+                if (!receive_source_address)
+                {
+                    const auto selector = info.TdiFlags & (tdi_receive_normal | tdi_receive_expedited);
+                    if (selector == 0 || selector == (tdi_receive_normal | tdi_receive_expedited))
+                    {
+                        // AfdReceive rejects these selectors before its UDP delegation.
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                }
+                if (info.TdiFlags != tdi_receive_normal && info.TdiFlags != (tdi_receive_normal | tdi_receive_peek))
                 {
                     return STATUS_NOT_SUPPORTED;
                 }
-                const auto& buffers = use_captured ? this->active_pending_->datagram_buffers : loaded_buffers;
+                const auto* selected_buffers = &loaded_buffers;
+                if (use_captured)
+                {
+                    selected_buffers =
+                        receive_source_address ? &this->active_pending_->datagram_buffers : &this->active_pending_->stream_buffers;
+                }
+                const auto& buffers = *selected_buffers;
 
                 // Probe the entire possible output prefix before recvfrom consumes a datagram.
                 size_t remaining = max_datagram_bytes;
@@ -2272,11 +2475,11 @@ namespace sogen
                 {
                     return STATUS_ACCESS_VIOLATION;
                 }
-                ULONG address_capacity{};
+                ULONG address_capacity = use_captured && receive_source_address ? this->active_pending_->datagram_address_capacity : 0;
                 if (info.Address && info.AddressLength)
                 {
                     if (!is_writable_guest_range(memory, info.AddressLength, sizeof(address_capacity)) ||
-                        !memory.try_read_memory(info.AddressLength, &address_capacity, sizeof(address_capacity)))
+                        (!use_captured && !memory.try_read_memory(info.AddressLength, &address_capacity, sizeof(address_capacity))))
                     {
                         return STATUS_ACCESS_VIOLATION;
                     }
@@ -2300,7 +2503,7 @@ namespace sogen
                     return STATUS_INSUFFICIENT_RESOURCES;
                 }
                 network::address from{};
-                const auto received = this->s_->recvfrom(from, data);
+                const auto received = this->s_->recvfrom(from, data, (info.TdiFlags & tdi_receive_peek) != 0);
                 if (received < 0)
                 {
                     const auto error = this->s_->get_last_error();
@@ -2310,11 +2513,21 @@ namespace sogen
                         if (status == STATUS_PENDING && !this->executing_delayed_ioctl_)
                         {
                             auto& pending = this->pending_requests_.back();
-                            pending.datagram_buffers = std::move(loaded_buffers);
-                            pending.datagram_afd_flags = info.AfdFlags;
-                            pending.datagram_tdi_flags = info.TdiFlags;
-                            pending.datagram_address = info.Address;
-                            pending.datagram_address_length = info.AddressLength;
+                            if (receive_source_address)
+                            {
+                                pending.datagram_buffers = std::move(loaded_buffers);
+                                pending.datagram_afd_flags = info.AfdFlags;
+                                pending.datagram_tdi_flags = info.TdiFlags;
+                                pending.datagram_address = info.Address;
+                                pending.datagram_address_length = info.AddressLength;
+                                pending.datagram_address_capacity = address_capacity;
+                            }
+                            else
+                            {
+                                pending.stream_buffers = std::move(loaded_buffers);
+                                pending.stream_afd_flags = info.AfdFlags;
+                                pending.stream_tdi_flags = info.TdiFlags;
+                            }
                         }
                         return status;
                     }
@@ -2356,30 +2569,65 @@ namespace sogen
                         break;
                     }
                 }
-                win_emu.afd_diagnostics.record_transfer(afd_profile::operation::receive_datagram, copied);
+                win_emu.afd_diagnostics.record_transfer(operation, copied);
+                if (!receive_source_address)
+                {
+                    // Preserve common receive payload logging, bounded to the delivered prefix.
+                    win_emu.network_debug.host_stream_transfer(c, "receive", std::span<const std::byte>{data.data(), copied}, copied);
+                }
+                auto final_status = copied == payload_size ? STATUS_SUCCESS : STATUS_BUFFER_OVERFLOW;
 
                 if (info.Address && info.AddressLength)
                 {
                     const auto win_from = convert_to_win_address(win_emu, from);
-                    const auto address_size = std::min<size_t>(win_from.size(), address_capacity);
-                    if (address_size && !memory.try_write_memory(info.Address, win_from.data(), address_size))
+                    if (win_from.size() > address_capacity)
                     {
-                        return STATUS_ACCESS_VIOLATION;
+                        // Native AfdSetupReceiveDatagramIrp publishes the payload count but
+                        // copies no address prefix and stores no address length on this error.
+                        final_status = STATUS_BUFFER_TOO_SMALL;
                     }
-                    const auto written_length = static_cast<ULONG>(address_size);
-                    if (!memory.try_write_memory(info.AddressLength, &written_length, sizeof(written_length)))
+                    else
                     {
-                        return STATUS_ACCESS_VIOLATION;
+                        if (!win_from.empty() && !memory.try_write_memory(info.Address, win_from.data(), win_from.size()))
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        const auto written_length = static_cast<ULONG>(win_from.size());
+                        if (!memory.try_write_memory(info.AddressLength, &written_length, sizeof(written_length)))
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
                     }
                 }
 
                 if (c.io_status_block)
                 {
-                    status_block block{};
-                    block.Information = copied;
-                    c.io_status_block.write(block);
+                    if ((!receive_source_address && c.completion_mode != device_ioctl_completion_mode::default_completion) ||
+                        c.completion_mode == device_ioctl_completion_mode::afd_datagram_irp)
+                    {
+                        write_irp_io_information(c.io_status_block, static_cast<uint64_t>(copied));
+                    }
+                    else
+                    {
+                        status_block block{};
+                        block.Information = copied;
+                        c.io_status_block.write(block);
+                    }
                 }
-                return copied == payload_size ? STATUS_SUCCESS : STATUS_BUFFER_OVERFLOW;
+                if (c.io_status_block &&
+                    (c.completion_mode == device_ioctl_completion_mode::afd_datagram_irp ||
+                     (!receive_source_address && c.completion_mode != device_ioctl_completion_mode::default_completion &&
+                      final_status == STATUS_BUFFER_OVERFLOW)))
+                {
+                    c.completed_receive_information_valid = true;
+                }
+                if (receive_source_address && !c.completing_pending && _AFD_REQUEST(c.io_control_code) == AFD_RECEIVE_DATAGRAM &&
+                    this->creation_data && this->creation_data->type == 2 && final_status == STATUS_BUFFER_OVERFLOW &&
+                    info.TdiFlags == (tdi_receive_normal | tdi_receive_peek) && (info.AfdFlags & 2u) != 0)
+                {
+                    c.completed_request_marked_pending = true;
+                }
+                return final_status;
             }
 
             NTSTATUS ioctl_send_datagram(windows_emulator& win_emu, const io_device_context& c)

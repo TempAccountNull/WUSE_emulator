@@ -19,6 +19,7 @@ namespace sogen
             int get_last_error() override;
             uint32_t query_information(uint32_t information_class, uint64_t& value, std::span<const std::byte> parameters = {}) override;
             uint32_t set_information(uint32_t information_class, uint64_t value) override;
+            uint32_t query_receive_information(receive_information& value) override;
 
             uint32_t query_address_list(uint16_t family, std::vector<std::byte>& data) override;
             uint32_t sort_address_list(std::vector<address_sort_entry>& addresses) override;
@@ -39,8 +40,8 @@ namespace sogen
             sent_size send(std::span<const std::byte> data) override;
             sent_size sendto(const address& destination, std::span<const std::byte> data) override;
 
-            sent_size recv(std::span<std::byte> data) override;
-            sent_size recvfrom(address& source, std::span<std::byte> data) override;
+            sent_size recv(std::span<std::byte> data, bool peek = false) override;
+            sent_size recvfrom(address& source, std::span<std::byte> data, bool peek = false) override;
 
             bool is_aborted() const
             {

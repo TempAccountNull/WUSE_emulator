@@ -295,6 +295,8 @@ namespace sogen
                 return "afd_stream_no_fast_io";
             case device_ioctl_completion_mode::afd_stream_callback:
                 return "afd_stream_callback";
+            case device_ioctl_completion_mode::afd_datagram_irp:
+                return "afd_datagram_irp";
             }
             return "unknown_mode";
         }();
@@ -385,6 +387,7 @@ namespace sogen
     NTSTATUS io_device::execute_ioctl(windows_emulator& win_emu, const io_device_context& c)
     {
         auto dispatch_context = c;
+        dispatch_context.completed_request_marked_pending = false;
         dispatch_context.capture_event_reference(win_emu.process, !c.completing_pending);
         const auto completion_mode = this->capture_completion_mode(win_emu, c);
         const auto original_io_status = this->may_return_pending() && c.io_status_block
@@ -396,6 +399,7 @@ namespace sogen
         }
 
         dispatch_context.completion_mode = completion_mode;
+        dispatch_context.completed_receive_information_valid = false;
         const auto result = this->io_control(win_emu, dispatch_context);
         if (result == STATUS_PENDING)
         {
@@ -435,7 +439,8 @@ namespace sogen
                                             : completion_mode == device_ioctl_completion_mode::afd_stream_callback ? "afd_stream_callback"
                                             : completion_mode == device_ioctl_completion_mode::afd_stream_no_fast_io
                                                 ? "afd_stream_no_fast_io"
-                                                : "unknown_mode",
+                                            : completion_mode == device_ioctl_completion_mode::afd_datagram_irp ? "afd_datagram_irp"
+                                                                                                                : "unknown_mode",
                                             false);
             return result;
         }
@@ -446,20 +451,26 @@ namespace sogen
         }
         else
         {
-            if (result != STATUS_SUCCESS)
+            const bool copied_receive_information =
+                dispatch_context.completed_receive_information_valid &&
+                (result == STATUS_BUFFER_OVERFLOW ||
+                 (completion_mode == device_ioctl_completion_mode::afd_datagram_irp && result == STATUS_BUFFER_TOO_SMALL));
+            if (result != STATUS_SUCCESS && !copied_receive_information)
             {
                 write_irp_io_information(c.io_status_block, 0);
             }
-            // Qualified stream success writes its payload and Information first.
+            // Copied UDP bytes remain reported when the source-address capacity is too small.
             // Publish only DWORD Status; never overwrite the union's upper DWORD.
             write_irp_io_status(c.io_status_block, result);
         }
+        const bool completed_with_pending_return = !c.completing_pending && dispatch_context.completed_request_marked_pending;
+        const auto initial_result = completed_with_pending_return ? STATUS_PENDING : result;
         if (!c.completing_pending)
         {
-            win_emu.network_debug.afd_result(win_emu, c, static_cast<int32_t>(result));
+            win_emu.network_debug.afd_result(win_emu, c, static_cast<int32_t>(initial_result));
         }
-        complete_device_ioctl(win_emu, dispatch_context, result, !c.completing_pending, completion_mode);
-        return result;
+        complete_device_ioctl(win_emu, dispatch_context, result, !c.completing_pending && !completed_with_pending_return, completion_mode);
+        return initial_result;
     }
 
     bool io_device_container::may_return_pending() const
