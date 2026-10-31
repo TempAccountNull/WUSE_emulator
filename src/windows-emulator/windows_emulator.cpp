@@ -1921,6 +1921,18 @@ namespace sogen
                 owner->set_active_window(window);
             }
         }
+
+        // Mirror the foreground window into the shared SERVERINFO so the guest's client-side
+        // GetForegroundWindow (which reads gpsi directly, never syscalling) returns the active window.
+        // Fall back to the desktop window when no app window is active: real Windows always has a
+        // foreground window, and code that needs a valid HWND (e.g. DirectSound's SetCooperativeLevel,
+        // which Miles feeds from GetForegroundWindow) breaks on a null one.
+        const auto foreground = window != 0 ? window : this->process.default_desktop_window_handle.bits;
+        this->process.user_handles.get_server_info().access([&](USER_SERVERINFO& server_info) {
+            server_info.foregroundWindow = foreground; //
+        });
+
+        this->apply_cursor_capture();
     }
 
     void windows_emulator::handle_ui_event(const ui_event& event)
@@ -2308,8 +2320,6 @@ namespace sogen
             return;
         }
 
-        const auto previous_foreground = this->process.foreground_window;
-
         msg m{};
         m.window = event.window;
         m.message = event.message;
@@ -2390,17 +2400,6 @@ namespace sogen
             this->set_foreground_window(0);
         }
 
-        // Mirror the foreground window into the shared SERVERINFO so the guest's client-side
-        // GetForegroundWindow (which reads gpsi directly, never syscalling) returns the active window.
-        // Fall back to the desktop window when no app window is active: real Windows always has a
-        // foreground window, and code that needs a valid HWND (e.g. DirectSound's SetCooperativeLevel,
-        // which Miles feeds from GetForegroundWindow) breaks on a null one.
-        const auto foreground =
-            this->process.foreground_window != 0 ? this->process.foreground_window : this->process.default_desktop_window_handle.bits;
-        this->process.user_handles.get_server_info().access([&](USER_SERVERINFO& server_info) {
-            server_info.foregroundWindow = foreground; //
-        });
-
         // Maintain the polled key state from key and mouse-button transitions. GetKeyState reports the high
         // down bit; GetAsyncKeyState also reports a low edge bit that is set once when a key transitions from
         // up to down and cleared by the next GetAsyncKeyState query for that virtual key.
@@ -2465,11 +2464,6 @@ namespace sogen
             is_mouse_button_message(event.message) || is_mouse_wheel_message(event.message))
         {
             this->wake_thread(*thread);
-        }
-
-        if (this->process.foreground_window != previous_foreground)
-        {
-            this->apply_cursor_capture();
         }
     }
 
