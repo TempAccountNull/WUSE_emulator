@@ -5936,7 +5936,10 @@ namespace sogen
                 internal_path.sourceWidth = c.proc.display_width;
                 internal_path.sourceHeight = c.proc.display_height;
 
-                c.emu.write_memory(path_array, &internal_path, sizeof(internal_path));
+                // On 19041-19045 DISPLAYCONFIG_PATH_INFO_INTERNAL is 200 bytes: user32 allocates and win32kbase copies
+                // 200 bytes per path. The fields above keep their offsets there; only the struct is shorter.
+                const auto path_size = c.win_emu.version.is_build_within(19041, 19046) ? size_t{200} : sizeof(internal_path);
+                c.emu.write_memory(path_array, &internal_path, path_size);
             }
 
             return STATUS_SUCCESS;
