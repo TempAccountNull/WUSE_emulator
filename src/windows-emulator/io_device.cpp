@@ -37,8 +37,8 @@ namespace sogen
             }
         };
 
-        // \Device\DeviceApi\CMApi, which cfgmgr32 asks for device lists, class keys and properties. Device ID lists
-        // come back empty, i.e. no device matches the filter. Succeeding without writing the reply made
+        // \Device\DeviceApi\CMApi, which cfgmgr32 asks for device and interface lists, class keys and properties. Device ID
+        // lists come back empty, i.e. no device matches the filter. Succeeding without writing the reply made
         // CM_Get_Device_ID_List_Size fail, so SetupDiGetClassDevs returned INVALID_HANDLE_VALUE, on which Unreal
         // Engine 4 enumerates monitors forever. Other requests keep succeeding without data.
         struct device_api_device : stateless_device
@@ -46,12 +46,15 @@ namespace sogen
             NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& c) override
             {
                 constexpr ULONG ioctl_get_device_id_list = 0x470803;
+                constexpr ULONG ioctl_get_device_interface_list = 0x470807;
                 constexpr ULONG ioctl_open_class_key = 0x470863;
 
                 switch (c.io_control_code)
                 {
                 case ioctl_get_device_id_list:
                     return get_device_id_list(win_emu, c);
+                case ioctl_get_device_interface_list:
+                    return get_device_interface_list(win_emu, c);
                 case ioctl_open_class_key:
                     return open_class_key(win_emu, c);
                 default:
@@ -60,6 +63,130 @@ namespace sogen
             }
 
           private:
+            // The interface list request CM_Get_Device_Interface_List and its size query send. WoW64 callers send a 36-byte
+            // layout with a 32-bit device ID pointer, which PiCMCaptureInterfaceListInputData widens to this one.
+            struct interface_list_input
+            {
+                uint32_t size;
+                uint32_t flags;
+                std::array<uint8_t, 16> interface_class;
+                uint64_t device_id;
+                uint32_t device_id_bytes;
+                uint32_t result_size;
+            };
+
+            static_assert(sizeof(interface_list_input) == 40);
+
+            struct interface_list_input32
+            {
+                uint32_t size;
+                uint32_t flags;
+                std::array<uint8_t, 16> interface_class;
+                uint32_t device_id;
+                uint32_t device_id_bytes;
+                uint32_t result_size;
+            };
+
+            static_assert(sizeof(interface_list_input32) == 36);
+
+            // PiCMCaptureInterfaceListInputData
+            static NTSTATUS capture_interface_list_input(windows_emulator& win_emu, const io_device_context& c, interface_list_input& input)
+            {
+                if (!c.input_buffer || c.input_buffer_length == 0)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                if (win_emu.process.is_wow64_process)
+                {
+                    interface_list_input32 input32{};
+                    if (c.input_buffer_length < sizeof(input32) ||
+                        !win_emu.memory.try_read_memory(c.input_buffer, &input32, sizeof(input32)) || input32.size != sizeof(input32))
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+
+                    input = {
+                        .size = sizeof(input),
+                        .flags = input32.flags,
+                        .interface_class = input32.interface_class,
+                        .device_id = input32.device_id,
+                        .device_id_bytes = input32.device_id_bytes,
+                        .result_size = input32.result_size,
+                    };
+                }
+                else if (c.input_buffer_length < sizeof(input) || !win_emu.memory.try_read_memory(c.input_buffer, &input, sizeof(input)) ||
+                         input.size != sizeof(input))
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                if (input.device_id ? input.device_id_bytes < sizeof(char16_t) : input.device_id_bytes != 0)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                std::vector<uint8_t> device_id(input.device_id_bytes);
+                if (input.device_id && !win_emu.memory.try_read_memory(input.device_id, device_id.data(), device_id.size()))
+                {
+                    return STATUS_ACCESS_VIOLATION;
+                }
+
+                return STATUS_SUCCESS;
+            }
+
+            // PiCMReturnBufferResultData: a 20-byte header, the request's status and the data's size, then the data, which
+            // is only copied on success. A reply that does not fit fails the ioctl itself.
+            static NTSTATUS return_buffer_result(windows_emulator& win_emu, const io_device_context& c, const NTSTATUS status,
+                                                 const uint32_t data_bytes, const std::span<const uint8_t> data, const uint32_t result_size)
+            {
+                constexpr uint32_t header_size = 20;
+                if (result_size != header_size || !c.output_buffer || c.output_buffer_length < data.size() + header_size)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+
+                const std::array<uint32_t, 5> header{header_size, static_cast<uint32_t>(status), data_bytes, 0, 0};
+                win_emu.memory.write_memory(c.output_buffer, header.data(), sizeof(header));
+                win_emu.memory.write_memory(c.output_buffer + 16, data.data(), data.size());
+                if (c.io_status_block)
+                {
+                    c.io_status_block.access(
+                        [&](IO_STATUS_BLOCK<EmulatorTraits<Emu64>>& block) { block.Information = data.size() + header_size; });
+                }
+
+                return STATUS_SUCCESS;
+            }
+
+            // PiCMGetDeviceInterfaceList. The emulator has no device interfaces, just as it has no devices, so every class
+            // gets the list IopGetDeviceInterfaces builds when nothing matches: a lone terminator. A size query's 20-byte
+            // buffer has no room for it, so it learns the size from a STATUS_BUFFER_TOO_SMALL reply.
+            static NTSTATUS get_device_interface_list(windows_emulator& win_emu, const io_device_context& c)
+            {
+                constexpr uint32_t present_only = 0x10000;
+                constexpr uint32_t header_size = 20;
+                constexpr std::array<uint8_t, sizeof(char16_t)> empty_list{};
+                constexpr auto empty_list_bytes = static_cast<uint32_t>(empty_list.size());
+
+                interface_list_input input{};
+                if (const auto status = capture_interface_list_input(win_emu, c, input); status != STATUS_SUCCESS)
+                {
+                    return status;
+                }
+
+                if (!c.output_buffer || c.output_buffer_length < header_size || (input.flags & ~present_only) != 0)
+                {
+                    return return_buffer_result(win_emu, c, STATUS_INVALID_PARAMETER, 0, {}, input.result_size);
+                }
+
+                if (c.output_buffer_length - header_size < empty_list_bytes)
+                {
+                    return return_buffer_result(win_emu, c, STATUS_BUFFER_TOO_SMALL, empty_list_bytes, {}, input.result_size);
+                }
+
+                return return_buffer_result(win_emu, c, STATUS_SUCCESS, empty_list_bytes, empty_list, input.result_size);
+            }
+
             // The class key request cfgmgr32's InitializeInputRegistryData builds. WoW64 callers send a 36-byte layout
             // with 32-bit fields, which PiCMCaptureRegistryInputData widens to this one.
             struct registry_input

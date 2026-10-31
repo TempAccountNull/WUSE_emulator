@@ -33,6 +33,30 @@ namespace sogen::test
             uint64_t handle;
         };
 
+        constexpr ULONG ioctl_get_device_interface_list = 0x470807;
+        constexpr std::array<uint8_t, 16> audio_interface_class{0x04, 0xad, 0x94, 0x69, 0xef, 0x93, 0xd0, 0x11,
+                                                                0xa3, 0xcc, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96};
+
+        // The request cfgmgr32 builds for CM_Get_Device_Interface_List, here for present KSCATEGORY_AUDIO interfaces.
+        struct interface_list_input
+        {
+            uint32_t size{40};
+            uint32_t flags{0x10000};
+            std::array<uint8_t, 16> interface_class{audio_interface_class};
+            uint64_t device_id{};
+            uint32_t device_id_bytes{};
+            uint32_t result_size{20};
+        };
+
+        struct buffer_result
+        {
+            uint32_t size;
+            NTSTATUS status;
+            uint32_t data_bytes;
+            uint32_t reserved;
+            uint16_t first_char;
+        };
+
         class DeviceApiTest : public testing::Test
         {
           protected:
@@ -69,6 +93,27 @@ namespace sogen::test
                 return this->emu.memory.read_memory<handle_result>(this->storage + 0x200);
             }
 
+            NTSTATUS get_interface_list(const interface_list_input& input, const ULONG output_length)
+            {
+                this->emu.memory.write_memory(this->storage, &input, sizeof(input));
+                this->emu.memory.set_memory(this->storage + 0x200, 0xCC, 0x40);
+
+                this->context.io_control_code = ioctl_get_device_interface_list;
+                this->context.io_status_block.set_address(this->storage + 0x300);
+                this->context.input_buffer = this->storage;
+                this->context.input_buffer_length = sizeof(input);
+                this->context.output_buffer = this->storage + 0x200;
+                this->context.output_buffer_length = output_length;
+
+                io_device_container device{u"DeviceApi\\CMApi", this->emu, {}};
+                return device.execute_ioctl(this->emu, this->context);
+            }
+
+            buffer_result list_result()
+            {
+                return this->emu.memory.read_memory<buffer_result>(this->storage + 0x200);
+            }
+
             std::string opened_path(const handle_result& reply)
             {
                 const auto* key = this->emu.process.registry_keys.get(handle{.bits = reply.handle});
@@ -87,6 +132,38 @@ namespace sogen::test
             io_device_context context{this->emu.memory};
             uint64_t storage{};
         };
+    }
+
+    TEST_F(DeviceApiTest, InterfaceListSizeQueryReportsTheTerminator)
+    {
+        ASSERT_EQ(STATUS_SUCCESS, this->get_interface_list({}, 20));
+
+        const auto reply = this->list_result();
+        EXPECT_EQ(20u, reply.size);
+        EXPECT_EQ(STATUS_BUFFER_TOO_SMALL, reply.status);
+        EXPECT_EQ(2u, reply.data_bytes);
+        EXPECT_EQ(20u, this->context.io_status_block.read().Information);
+    }
+
+    TEST_F(DeviceApiTest, InterfaceListIsEmpty)
+    {
+        ASSERT_EQ(STATUS_SUCCESS, this->get_interface_list({}, 22));
+
+        const auto reply = this->list_result();
+        EXPECT_EQ(STATUS_SUCCESS, reply.status);
+        EXPECT_EQ(2u, reply.data_bytes);
+        EXPECT_EQ(0u, reply.first_char);
+        EXPECT_EQ(22u, this->context.io_status_block.read().Information);
+    }
+
+    TEST_F(DeviceApiTest, InterfaceListRejectsBadRequests)
+    {
+        ASSERT_EQ(STATUS_SUCCESS, this->get_interface_list({.flags = 1}, 22));
+        EXPECT_EQ(STATUS_INVALID_PARAMETER, this->list_result().status);
+        EXPECT_EQ(0u, this->list_result().data_bytes);
+
+        EXPECT_EQ(STATUS_INVALID_PARAMETER, this->get_interface_list({.size = 36}, 22));
+        EXPECT_EQ(STATUS_INVALID_PARAMETER, this->get_interface_list({.result_size = 16}, 22));
     }
 
     TEST_F(DeviceApiTest, OpensTheInterfaceClassRoot)
