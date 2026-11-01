@@ -25,6 +25,10 @@
 #include <unistd.h>
 #endif
 
+#ifndef OS_WINDOWS
+#include <sys/resource.h>
+#endif
+
 namespace sogen
 {
 
@@ -46,9 +50,32 @@ namespace sogen
                 return STATUS_ACCESS_DENIED;
             case EISDIR:
                 return STATUS_FILE_IS_A_DIRECTORY;
+            case EMFILE:
+            case ENFILE:
+                return STATUS_TOO_MANY_OPENED_FILES;
             default:
                 return STATUS_NOT_SUPPORTED;
             }
+        }
+
+        // Every open guest file holds a host stream, and the C runtime starts with 512 of them. Windows gives a process
+        // millions of handles, so raise the host limit as far as it goes (Destiny 2 keeps over 2,000 packages open).
+        void raise_open_file_limit()
+        {
+            static const bool raised = [] {
+#ifdef OS_WINDOWS
+                return _setmaxstdio(8192) != -1;
+#else
+                rlimit limit{};
+                if (getrlimit(RLIMIT_NOFILE, &limit) != 0)
+                {
+                    return false;
+                }
+                limit.rlim_cur = limit.rlim_max;
+                return setrlimit(RLIMIT_NOFILE, &limit) == 0;
+#endif
+            }();
+            (void)raised;
         }
 
         std::optional<std::filesystem::path> find_entry_ignoring_case(const std::filesystem::path& directory,
@@ -273,6 +300,7 @@ namespace sogen
         : target_(std::move(target)),
           lookup_ignores_case_(host_lookup_ignores_case(this->target_))
     {
+        raise_open_file_limit();
     }
 
     std::optional<std::filesystem::path> host_directory_provider::get_host_path(const windows_path& path) const
