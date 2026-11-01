@@ -119,6 +119,24 @@ namespace sogen::test
         }
     }
 
+    TEST_F(RpcAccountTest, Windows10SspiGetsUserNameAsProcedure14)
+    {
+        this->emu->version.set_windows_build_number(19041);
+        this->bind(u"\\RPC Control\\lsasspirpc", sspi_interface);
+        std::array<uint8_t, 0x2c> request{};
+        const uint32_t format = 2;
+        std::memcpy(request.data() + 0x28, &format, sizeof(format));
+        const auto result = this->call(14, request);
+        ASSERT_EQ(STATUS_SUCCESS, result.status);
+        ASSERT_TRUE(result.payload.has_value());
+        const auto expected =
+            registry_utils::get_account_domain(this->emu->registry) + u"\\" + registry_utils::get_user_name(this->emu->registry);
+        EXPECT_EQ(expected.size() * sizeof(char16_t), read<uint16_t>(*result.payload, 24));
+        const auto length = expected.size() * sizeof(char16_t);
+        ASSERT_GE(result.payload->size(), 64 + length);
+        EXPECT_EQ(0, std::memcmp(result.payload->data() + 64, expected.data(), length));
+    }
+
     TEST_F(RpcAccountTest, UnsupportedNameFormatReturnsAWellFormedError)
     {
         this->bind(u"\\RPC Control\\lsasspirpc", sspi_interface);

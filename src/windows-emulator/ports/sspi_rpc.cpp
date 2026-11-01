@@ -65,6 +65,12 @@ namespace sogen
                     return STATUS_NOT_SUPPORTED;
                 }
 
+                // On 19041-19045 sspicli calls SspirGetUserName as procedure 14 (15 fetches the in-process dispatch table).
+                if (procedure_id == (win_emu.version.is_build_within(19041, 19046) ? 14u : 15u))
+                {
+                    return handle_get_user_name(win_emu, c, writer);
+                }
+
                 switch (procedure_id)
                 {
                 case 0:
@@ -79,8 +85,6 @@ namespace sogen
                     return handle_process_security_context(win_emu, c, writer);
                 case 7:
                     return handle_delete_security_context(win_emu, c, writer);
-                case 15:
-                    return handle_get_user_name(win_emu, c, writer);
                 default:
                     return STATUS_NOT_SUPPORTED;
                 }
