@@ -1158,13 +1158,32 @@ namespace sogen
                 return SDL_CreateWindow(title.c_str(), width, height, flags);
             }
 
+            // A guest window at the top of its screen would put the host title bar above the display, where it cannot be
+            // grabbed. Keep the host frame inside the display's usable area, a little below its top edge.
+            static void place_host_window(SDL_Window* window, int x, int y)
+            {
+                constexpr int top_margin = 20;
+                const SDL_Point point{x, y};
+                SDL_Rect usable{};
+                int border_top{};
+                int border_left{};
+                if (SDL_GetDisplayUsableBounds(SDL_GetDisplayForPoint(&point), &usable) &&
+                    SDL_GetWindowBordersSize(window, &border_top, &border_left, nullptr, nullptr))
+                {
+                    x = std::max(x, usable.x + border_left);
+                    y = std::max(y, usable.y + top_margin + border_top);
+                }
+
+                SDL_SetWindowPosition(window, x, y);
+            }
+
             static void finish_host_window(SDL_Window* window, const int x, const int y, const Uint64 flags)
             {
 #ifdef _WIN32
                 apply_application_icon(window);
 #endif
 
-                SDL_SetWindowPosition(window, x, y);
+                place_host_window(window, x, y);
                 SDL_StartTextInput(window);
                 if ((flags & SDL_WINDOW_HIDDEN) == 0)
                 {
@@ -1246,7 +1265,7 @@ namespace sogen
                         if (state->desc.top_level)
                         {
                             const auto& insets = state->desc.client_insets;
-                            SDL_SetWindowPosition(state->window, rect.left, rect.top);
+                            place_host_window(state->window, rect.left, rect.top);
                             SDL_SetWindowSize(state->window, std::max<int>(1, (rect.right - rect.left) - insets.left - insets.right),
                                               std::max<int>(1, (rect.bottom - rect.top) - insets.top - insets.bottom));
                         }
