@@ -27,8 +27,9 @@ namespace sogen
         void release_storage(uint64_t storage_id);
         size_t storage_size(uint64_t storage_id) const;
 
+        // A non-zero address places the view exactly there; it fails when that range is not free.
         uint64_t map_view(memory_manager& memory, uint64_t storage_id, uint64_t offset, size_t size, nt_memory_permission permissions,
-                          uint64_t highest_address);
+                          uint64_t highest_address, uint64_t address = 0);
         bool unmap_view(memory_manager& memory, uint64_t address);
         bool contains(uint64_t address, uint64_t size) const;
 

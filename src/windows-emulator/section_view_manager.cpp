@@ -35,7 +35,7 @@ namespace sogen
     }
 
     uint64_t section_view_manager::map_view(memory_manager& memory, const uint64_t storage_id, const uint64_t offset, const size_t size,
-                                            const nt_memory_permission permissions, const uint64_t highest_address)
+                                            const nt_memory_permission permissions, const uint64_t highest_address, uint64_t address)
     {
         const auto entry = this->storages_.find(storage_id);
         if (entry == this->storages_.end() || size == 0 || offset > entry->second.memory.size() ||
@@ -44,7 +44,16 @@ namespace sogen
             return 0;
         }
 
-        const auto address = memory.allocate_host_memory(size, entry->second.memory.data() + offset, permissions, highest_address);
+        auto* host_memory = entry->second.memory.data() + offset;
+        if (address == 0)
+        {
+            address = memory.allocate_host_memory(size, host_memory, permissions, highest_address);
+        }
+        else if (!memory.allocate_host_memory_at(address, size, host_memory, permissions))
+        {
+            address = 0;
+        }
+
         if (address == 0)
         {
             return 0;

@@ -218,7 +218,7 @@ namespace sogen
 
             NTSTATUS map_section_storage_view(const syscall_context& c, const section& section_entry, const uint64_t offset,
                                               const nt_memory_permission protection, const uint64_t highest_address,
-                                              const emulator_object<uint64_t> base_address,
+                                              const uint64_t requested_address, const emulator_object<uint64_t> base_address,
                                               const emulator_object<EMULATOR_CAST(EmulatorTraits<Emu64>::SIZE_T, SIZE_T)> view_size)
             {
                 const auto storage_size = c.proc.section_views.storage_size(section_entry.view_storage_id);
@@ -238,11 +238,17 @@ namespace sogen
                     size = page_align_up(offset + requested_size) - aligned_offset;
                 }
 
-                const auto address = c.proc.section_views.map_view(c.win_emu.memory, section_entry.view_storage_id, aligned_offset,
-                                                                   static_cast<size_t>(size), protection, highest_address);
+                if (requested_address != 0 && requested_address + size - 1 > highest_address)
+                {
+                    return STATUS_CONFLICTING_ADDRESSES;
+                }
+
+                const auto address =
+                    c.proc.section_views.map_view(c.win_emu.memory, section_entry.view_storage_id, aligned_offset,
+                                                  static_cast<size_t>(size), protection, highest_address, requested_address);
                 if (address == 0)
                 {
-                    return STATUS_NO_MEMORY;
+                    return requested_address != 0 ? STATUS_CONFLICTING_ADDRESSES : STATUS_NO_MEMORY;
                 }
 
                 if (view_size)
@@ -598,6 +604,14 @@ namespace sogen
             // Views of host-backed sections otherwise go above 4 GiB, where 32-bit code cannot reach them.
             const auto highest_address = std::min(highest_address_for_zero_bits(zero_bits), c.win_emu.highest_user_address());
 
+            // A view the caller places goes exactly there, rounded down to the allocation granularity: Windows fails the
+            // mapping rather than move it, and callers that map one section twice in a row rely on that.
+            const auto requested_address = base_address.read() & ~(ALLOCATION_GRANULARITY - 1);
+            if (requested_address > highest_address)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
             if (section_entry->file_name.empty())
             {
                 const auto backing_size = static_cast<size_t>(page_align_up(section_entry->maximum_size));
@@ -622,7 +636,7 @@ namespace sogen
                 if (section_entry->view_storage_id != 0)
                 {
                     return map_section_storage_view(c, *section_entry, static_cast<uint64_t>(offset), protection, highest_address,
-                                                    base_address, view_size);
+                                                    requested_address, base_address, view_size);
                 }
 
                 // Without host memory that can be aliased anywhere, all views share ONE persistent guest backing
@@ -677,11 +691,24 @@ namespace sogen
             const auto size = static_cast<size_t>(file_data.size() - offset);
             const auto aligned_size = static_cast<size_t>(page_align_up(size));
             const auto reserve_only = section_entry->allocation_attributes == SEC_RESERVE;
-            const auto address = c.win_emu.memory.allocate_memory(aligned_size, protection, reserve_only, 0,
-                                                                  memory_region_kind::file_section_view, highest_address);
-            if (!address)
+            auto address = requested_address;
+            if (address != 0)
             {
-                return STATUS_NO_MEMORY;
+                if (address + aligned_size - 1 > highest_address ||
+                    !c.win_emu.memory.allocate_memory(address, aligned_size, protection, reserve_only,
+                                                      memory_region_kind::file_section_view))
+                {
+                    return STATUS_CONFLICTING_ADDRESSES;
+                }
+            }
+            else
+            {
+                address = c.win_emu.memory.allocate_memory(aligned_size, protection, reserve_only, 0, memory_region_kind::file_section_view,
+                                                           highest_address);
+                if (!address)
+                {
+                    return STATUS_NO_MEMORY;
+                }
             }
             c.win_emu.memory.set_region_mapped_filename(address, section_entry->file_name);
 
