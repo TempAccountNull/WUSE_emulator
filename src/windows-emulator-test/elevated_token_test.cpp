@@ -54,7 +54,14 @@ namespace sogen::test
         constexpr uint8_t object_inherit_ace = 0x1;
         constexpr ACCESS_MASK generic_read = 0x80000000;
         constexpr ACCESS_MASK generic_all = 0x10000000;
+        constexpr ACCESS_MASK maximum_allowed = 0x02000000;
+        constexpr ACCESS_MASK access_system_security = 0x01000000;
+        constexpr ACCESS_MASK read_control = 0x00020000;
+        constexpr ACCESS_MASK write_dac = 0x00040000;
+        constexpr ACCESS_MASK file_read_data = 0x1;
+        constexpr ACCESS_MASK file_write_data = 0x2;
         constexpr ACCESS_MASK file_generic_read = 0x00120089;
+        constexpr std::array<uint8_t, 12> owner_rights_sid{1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0}; // S-1-3-4
         constexpr EMU_GENERIC_MAPPING file_generic_mapping{
             .GenericRead = file_generic_read,
             .GenericWrite = 0x00120116,
@@ -68,6 +75,22 @@ namespace sogen::test
             uint8_t flags{};
             ACCESS_MASK mask{};
             std::span<const uint8_t> sid{};
+        };
+
+        struct descriptor_layout
+        {
+            std::span<const uint8_t> owner{local_system_sid};
+            std::span<const uint8_t> group{local_system_sid};
+            bool has_dacl{true};
+        };
+
+        struct access_reply
+        {
+            NTSTATUS result;
+            NTSTATUS status;
+            ACCESS_MASK granted;
+            ULONG privilege_set_length;
+            uint64_t privilege_set_head;
         };
 
         class ElevatedTokenTest : public testing::TestWithParam<bool>
@@ -145,49 +168,60 @@ namespace sogen::test
                 return sid;
             }
 
-            // A self-relative descriptor owned by LocalSystem whose DACL holds the ACEs in order.
-            uint64_t build_descriptor(const std::initializer_list<test_ace> aces)
+            // A self-relative descriptor with the layout's owner and group, an empty one left out, and a DACL that holds the
+            // ACEs in order.
+            uint64_t build_descriptor(const std::initializer_list<test_ace> aces, const descriptor_layout& layout)
             {
                 const auto descriptor_address = this->storage + 0x1000;
-                const auto owner_offset = static_cast<uint32_t>(sizeof(SECURITY_DESCRIPTOR_RELATIVE));
-                const auto group_offset = owner_offset + static_cast<uint32_t>(local_system_sid.size());
-                const auto dacl_offset = group_offset + static_cast<uint32_t>(local_system_sid.size());
+                auto offset = static_cast<uint32_t>(sizeof(SECURITY_DESCRIPTOR_RELATIVE));
+                const auto place = [&](const std::span<const uint8_t> sid) {
+                    if (sid.empty())
+                    {
+                        return DWORD{0};
+                    }
+
+                    const auto sid_offset = offset;
+                    this->emu->memory.write_memory(descriptor_address + sid_offset, sid.data(), sid.size());
+                    offset += static_cast<uint32_t>(sid.size());
+                    return DWORD{sid_offset};
+                };
 
                 SECURITY_DESCRIPTOR_RELATIVE descriptor{};
                 descriptor.Revision = 1;
-                descriptor.Control = SE_SELF_RELATIVE | SE_DACL_PRESENT;
-                descriptor.Owner = owner_offset;
-                descriptor.Group = group_offset;
-                descriptor.Dacl = dacl_offset;
-                emulator_object<SECURITY_DESCRIPTOR_RELATIVE>{this->emu->memory, descriptor_address}.write(descriptor);
-                this->emu->memory.write_memory(descriptor_address + owner_offset, local_system_sid.data(), local_system_sid.size());
-                this->emu->memory.write_memory(descriptor_address + group_offset, local_system_sid.data(), local_system_sid.size());
-
-                auto ace_address = descriptor_address + dacl_offset + sizeof(ACL);
-                for (const auto& entry : aces)
+                descriptor.Control = SE_SELF_RELATIVE | (layout.has_dacl ? SE_DACL_PRESENT : 0);
+                descriptor.Owner = place(layout.owner);
+                descriptor.Group = place(layout.group);
+                if (layout.has_dacl)
                 {
-                    ACCESS_ALLOWED_ACE ace{};
-                    ace.Header.AceType = entry.type;
-                    ace.Header.AceFlags = entry.flags;
-                    ace.Header.AceSize = static_cast<uint16_t>(offsetof(ACCESS_ALLOWED_ACE, SidStart) + entry.sid.size());
-                    ace.Mask = entry.mask;
-                    emulator_object<ACCESS_ALLOWED_ACE>{this->emu->memory, ace_address}.write(ace);
-                    this->emu->memory.write_memory(ace_address + offsetof(ACCESS_ALLOWED_ACE, SidStart), entry.sid.data(),
-                                                   entry.sid.size());
-                    ace_address += ace.Header.AceSize;
+                    descriptor.Dacl = offset;
+                    auto ace_address = descriptor_address + offset + sizeof(ACL);
+                    for (const auto& entry : aces)
+                    {
+                        ACCESS_ALLOWED_ACE ace{};
+                        ace.Header.AceType = entry.type;
+                        ace.Header.AceFlags = entry.flags;
+                        ace.Header.AceSize = static_cast<uint16_t>(offsetof(ACCESS_ALLOWED_ACE, SidStart) + entry.sid.size());
+                        ace.Mask = entry.mask;
+                        emulator_object<ACCESS_ALLOWED_ACE>{this->emu->memory, ace_address}.write(ace);
+                        this->emu->memory.write_memory(ace_address + offsetof(ACCESS_ALLOWED_ACE, SidStart), entry.sid.data(),
+                                                       entry.sid.size());
+                        ace_address += ace.Header.AceSize;
+                    }
+
+                    ACL acl{};
+                    acl.AclRevision = 2;
+                    acl.AclSize = static_cast<uint16_t>(ace_address - (descriptor_address + offset));
+                    acl.AceCount = static_cast<uint16_t>(aces.size());
+                    emulator_object<ACL>{this->emu->memory, descriptor_address + offset}.write(acl);
                 }
 
-                ACL acl{};
-                acl.AclRevision = 2;
-                acl.AclSize = static_cast<uint16_t>(ace_address - (descriptor_address + dacl_offset));
-                acl.AceCount = static_cast<uint16_t>(aces.size());
-                emulator_object<ACL>{this->emu->memory, descriptor_address + dacl_offset}.write(acl);
-
+                emulator_object<SECURITY_DESCRIPTOR_RELATIVE>{this->emu->memory, descriptor_address}.write(descriptor);
                 return descriptor_address;
             }
 
-            // NtAccessCheck's own status; the access status it writes stays at storage + 0x840.
-            NTSTATUS call_access_check(const handle token, const uint64_t descriptor, const ACCESS_MASK desired_access)
+            // NtAccessCheck on a descriptor, with a privilege set of privilege_set_size bytes.
+            access_reply call_access_check(const handle token, const uint64_t descriptor, const ACCESS_MASK desired_access,
+                                           const ULONG privilege_set_size = 0x40)
             {
                 const emulator_object<EMU_GENERIC_MAPPING> mapping{this->emu->memory, this->storage + 0x800};
                 mapping.write(file_generic_mapping);
@@ -195,14 +229,39 @@ namespace sogen::test
                 const emulator_object<ULONG> privilege_set_length{this->emu->memory, this->storage + 0x820};
                 const emulator_object<ACCESS_MASK> granted{this->emu->memory, this->storage + 0x830};
                 const emulator_object<NTSTATUS> status{this->emu->memory, this->storage + 0x840};
-                return syscalls::handle_NtAccessCheck(this->context(), descriptor, token, desired_access, mapping, 0, privilege_set_length,
-                                                      granted, status);
+                const auto privilege_set = this->storage + 0x880;
+                privilege_set_length.write(privilege_set_size);
+                this->emu->memory.set_memory(privilege_set, 0xCC, 0x40);
+
+                const auto result = syscalls::handle_NtAccessCheck(this->context(), descriptor, token, desired_access, mapping,
+                                                                   privilege_set, privilege_set_length, granted, status);
+                return {.result = result,
+                        .status = status.read(),
+                        .granted = granted.read(),
+                        .privilege_set_length = privilege_set_length.read(),
+                        .privilege_set_head = this->emu->memory.read_memory<uint64_t>(privilege_set)};
+            }
+
+            access_reply access_check(const handle token, const std::initializer_list<test_ace> aces, const ACCESS_MASK desired_access,
+                                      const descriptor_layout& layout = {}, const ULONG privilege_set_size = 0x40)
+            {
+                return this->call_access_check(token, this->build_descriptor(aces, layout), desired_access, privilege_set_size);
+            }
+
+            void expect_access(const std::initializer_list<test_ace> aces, const ACCESS_MASK desired_access, const NTSTATUS status,
+                               const ACCESS_MASK granted, const descriptor_layout& layout = {})
+            {
+                const auto reply = this->access_check(CURRENT_PROCESS_TOKEN, aces, desired_access, layout);
+                ASSERT_EQ(STATUS_SUCCESS, reply.result);
+                EXPECT_EQ(status, reply.status);
+                EXPECT_EQ(granted, reply.granted);
             }
 
             NTSTATUS check_access(const handle token, const std::initializer_list<test_ace> aces, const ACCESS_MASK desired_access)
             {
-                EXPECT_EQ(STATUS_SUCCESS, this->call_access_check(token, this->build_descriptor(aces), desired_access));
-                return emulator_object<NTSTATUS>{this->emu->memory, this->storage + 0x840}.read();
+                const auto reply = this->access_check(token, aces, desired_access);
+                EXPECT_EQ(STATUS_SUCCESS, reply.result);
+                return reply.status;
             }
 
             NTSTATUS check_access(const handle token, const std::span<const uint8_t> sid, const ACCESS_MASK mask)
@@ -345,7 +404,7 @@ namespace sogen::test
         constexpr std::array<uint16_t, 2> ace_sizes{16, 12};
         for (const auto ace_size : ace_sizes)
         {
-            const auto descriptor = this->build_descriptor({});
+            const auto descriptor = this->build_descriptor({}, {});
             const auto dacl = descriptor + emulator_object<SECURITY_DESCRIPTOR_RELATIVE>{this->emu->memory, descriptor}.read().Dacl;
 
             ACCESS_ALLOWED_ACE ace{};
@@ -362,7 +421,7 @@ namespace sogen::test
             acl.AceCount = 1;
             emulator_object<ACL>{this->emu->memory, dacl}.write(acl);
 
-            EXPECT_EQ(STATUS_INVALID_ACL, this->call_access_check(CURRENT_PROCESS_TOKEN, descriptor, file_generic_read)) << ace_size;
+            EXPECT_EQ(STATUS_INVALID_ACL, this->call_access_check(CURRENT_PROCESS_TOKEN, descriptor, file_generic_read).result) << ace_size;
         }
     }
 
@@ -375,6 +434,75 @@ namespace sogen::test
                                                      {{.type = unknown_ace_type, .mask = file_generic_read},
                                                       {.mask = file_generic_read, .sid = interactive_sid}},
                                                      file_generic_read));
+    }
+
+    TEST_P(ElevatedTokenTest, RequestsWithGenericRightsAreNotMapped)
+    {
+        const auto reply = this->access_check(CURRENT_PROCESS_TOKEN, {{.mask = file_generic_read, .sid = interactive_sid}}, generic_read);
+        EXPECT_EQ(STATUS_GENERIC_NOT_MAPPED, reply.result);
+    }
+
+    TEST_P(ElevatedTokenTest, DeniedRequestsGrantNothing)
+    {
+        this->expect_access({{.mask = file_read_data, .sid = interactive_sid}}, file_read_data | file_write_data, STATUS_ACCESS_DENIED, 0);
+    }
+
+    TEST_P(ElevatedTokenTest, MaximumAllowedGrantsWhatTheDaclAllows)
+    {
+        const test_ace allow_read{.mask = file_generic_read, .sid = interactive_sid};
+        const test_ace deny_read_data{.type = ACCESS_DENIED_ACE_TYPE, .mask = file_read_data, .sid = interactive_sid};
+
+        this->expect_access({allow_read}, maximum_allowed, STATUS_SUCCESS, file_generic_read);
+        this->expect_access({allow_read, {.mask = write_dac, .sid = interactive_sid}}, maximum_allowed, STATUS_SUCCESS,
+                            file_generic_read | write_dac);
+        this->expect_access({deny_read_data, allow_read}, maximum_allowed, STATUS_SUCCESS, file_generic_read & ~file_read_data);
+        this->expect_access({allow_read, deny_read_data}, maximum_allowed, STATUS_SUCCESS, file_generic_read);
+        this->expect_access({allow_read}, maximum_allowed | file_write_data, STATUS_ACCESS_DENIED, 0);
+        this->expect_access({{.mask = generic_all, .sid = local_system_sid}}, maximum_allowed, STATUS_ACCESS_DENIED, 0);
+        this->expect_access({}, maximum_allowed, STATUS_SUCCESS, file_generic_mapping.GenericAll, {.has_dacl = false});
+        this->expect_access({}, maximum_allowed, STATUS_ACCESS_DENIED, 0);
+    }
+
+    TEST_P(ElevatedTokenTest, OwnersHoldReadControlAndWriteDacUnlessAnOwnerRightsAceSaysOtherwise)
+    {
+        this->emu->process.sid = local_user_sid;
+        const descriptor_layout owned{.owner = local_user_sid};
+        const test_ace system_only{.mask = generic_all, .sid = local_system_sid};
+        const test_ace owner_reads{.mask = file_read_data, .sid = owner_rights_sid};
+
+        this->expect_access({system_only}, read_control, STATUS_SUCCESS, read_control, owned);
+        this->expect_access({system_only}, read_control | write_dac, STATUS_SUCCESS, read_control | write_dac, owned);
+        this->expect_access({system_only}, maximum_allowed, STATUS_SUCCESS, read_control | write_dac, owned);
+        this->expect_access({system_only}, read_control | file_read_data, STATUS_ACCESS_DENIED, 0, owned);
+        this->expect_access({}, read_control, STATUS_SUCCESS, read_control, owned);
+        this->expect_access({owner_reads}, read_control, STATUS_ACCESS_DENIED, 0, owned);
+        this->expect_access({owner_reads}, file_read_data, STATUS_SUCCESS, file_read_data, owned);
+        this->expect_access({owner_reads}, file_read_data, STATUS_ACCESS_DENIED, 0);
+    }
+
+    TEST_P(ElevatedTokenTest, DescriptorsNeedAnOwnerAndAGroupAndThePrivilegeSetRoomForOne)
+    {
+        const test_ace allow_read{.mask = file_generic_read, .sid = interactive_sid};
+        EXPECT_EQ(STATUS_INVALID_SECURITY_DESCR,
+                  this->access_check(CURRENT_PROCESS_TOKEN, {allow_read}, file_generic_read, {.owner = {}}).result);
+        EXPECT_EQ(STATUS_INVALID_SECURITY_DESCR,
+                  this->access_check(CURRENT_PROCESS_TOKEN, {allow_read}, file_generic_read, {.group = {}}).result);
+
+        const auto short_set = this->access_check(CURRENT_PROCESS_TOKEN, {allow_read}, file_generic_read, {}, 19);
+        EXPECT_EQ(STATUS_BUFFER_TOO_SMALL, short_set.result);
+        EXPECT_EQ(20u, short_set.privilege_set_length);
+
+        const auto fitting = this->access_check(CURRENT_PROCESS_TOKEN, {allow_read}, file_generic_read, {}, 20);
+        ASSERT_EQ(STATUS_SUCCESS, fitting.result);
+        EXPECT_EQ(STATUS_SUCCESS, fitting.status);
+        EXPECT_EQ(20u, fitting.privilege_set_length);
+        EXPECT_EQ(0u, fitting.privilege_set_head);
+    }
+
+    TEST_P(ElevatedTokenTest, SystemSecurityAccessNeedsAPrivilegeTheTokenLacks)
+    {
+        this->expect_access({{.mask = file_generic_mapping.GenericAll | access_system_security, .sid = interactive_sid}},
+                            access_system_security, STATUS_PRIVILEGE_NOT_HELD, 0);
     }
 
     INSTANTIATE_TEST_SUITE_P(Elevation, ElevatedTokenTest, testing::Values(false, true),

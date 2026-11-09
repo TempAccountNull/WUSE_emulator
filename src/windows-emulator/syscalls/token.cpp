@@ -186,30 +186,222 @@ namespace sogen
                 return sid;
             }
 
-            ACCESS_MASK map_generic_access(ACCESS_MASK access, const EMU_GENERIC_MAPPING& mapping)
+            // A SID outside an ACE, such as a descriptor's owner.
+            std::vector<uint8_t> read_sid(const memory_manager& memory, const uint64_t address)
             {
-                constexpr ACCESS_MASK generic_read = 0x80000000;
-                constexpr ACCESS_MASK generic_write = 0x40000000;
-                constexpr ACCESS_MASK generic_execute = 0x20000000;
-                constexpr ACCESS_MASK generic_all = 0x10000000;
+                SID header{};
+                memory.read_memory(address, &header, offsetof(SID, SubAuthority));
 
-                if (access & generic_read)
+                std::vector<uint8_t> sid(offsetof(SID, SubAuthority) + (header.SubAuthorityCount * sizeof(DWORD)));
+                memory.read_memory(address, sid.data(), sid.size());
+                return sid;
+            }
+
+            constexpr ACCESS_MASK generic_rights = 0xF0000000; // GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL
+            constexpr ACCESS_MASK maximum_allowed = 0x02000000;
+            constexpr ACCESS_MASK access_system_security = 0x01000000;
+            constexpr ACCESS_MASK owner_implicit_rights = 0x00060000; // READ_CONTROL | WRITE_DAC
+
+            // A PRIVILEGE_SET with room for one LUID_AND_ATTRIBUTES, the least NtAccessCheck takes.
+            constexpr ULONG minimum_privilege_set_size = 20;
+
+            constexpr std::array<uint8_t, 12> owner_rights_sid{1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0}; // S-1-3-4
+
+            // SECURITY_DESCRIPTOR as a 64-bit process lays out its absolute form.
+            struct security_descriptor64
+            {
+                BYTE Revision;
+                BYTE Sbz1;
+                SECURITY_DESCRIPTOR_CONTROL Control;
+                uint64_t Owner;
+                uint64_t Group;
+                uint64_t Sacl;
+                uint64_t Dacl;
+            };
+
+            struct descriptor_parts
+            {
+                uint64_t owner{};
+                uint64_t group{};
+                uint64_t dacl{};
+            };
+
+            descriptor_parts read_descriptor_parts(const syscall_context& c, const uint64_t descriptor)
+            {
+                const auto control =
+                    emulator_object<SECURITY_DESCRIPTOR_CONTROL>{c.emu, descriptor + offsetof(SECURITY_DESCRIPTOR_RELATIVE, Control)}
+                        .read();
+
+                descriptor_parts parts{};
+                if (control & SE_SELF_RELATIVE)
                 {
-                    access = (access & ~generic_read) | mapping.GenericRead;
+                    const auto relative = emulator_object<SECURITY_DESCRIPTOR_RELATIVE>{c.emu, descriptor}.read();
+                    const auto at = [&](const DWORD offset) { return offset == 0 ? uint64_t{0} : descriptor + offset; };
+                    parts = {.owner = at(relative.Owner), .group = at(relative.Group), .dacl = at(relative.Dacl)};
                 }
-                if (access & generic_write)
+                else
                 {
-                    access = (access & ~generic_write) | mapping.GenericWrite;
+                    const auto absolute = emulator_object<security_descriptor64>{c.emu, descriptor}.read();
+                    parts = {.owner = absolute.Owner, .group = absolute.Group, .dacl = absolute.Dacl};
                 }
-                if (access & generic_execute)
+
+                if ((control & SE_DACL_PRESENT) == 0)
                 {
-                    access = (access & ~generic_execute) | mapping.GenericExecute;
+                    parts.dacl = 0;
                 }
-                if (access & generic_all)
+
+                return parts;
+            }
+
+            struct dacl_ace
+            {
+                uint8_t type{};
+                uint8_t flags{};
+                ACCESS_MASK mask{};
+                std::vector<uint8_t> sid{};
+            };
+
+            // The ACEs of a DACL with the SIDs of its allow and deny ACEs, or nothing when one of those does not hold its SID.
+            std::optional<std::vector<dacl_ace>> read_dacl(const syscall_context& c, const uint64_t dacl)
+            {
+                const auto acl = emulator_object<ACL>{c.emu, dacl}.read();
+                std::vector<dacl_ace> aces{};
+                auto ace_address = dacl + sizeof(ACL);
+                for (USHORT index = 0; index < acl.AceCount; ++index)
                 {
-                    access = (access & ~generic_all) | mapping.GenericAll;
+                    const auto ace = emulator_object<ACCESS_ALLOWED_ACE>{c.emu, ace_address}.read();
+                    auto& entry = aces.emplace_back(dacl_ace{.type = ace.Header.AceType, .flags = ace.Header.AceFlags, .mask = ace.Mask});
+                    if (entry.type == ACCESS_ALLOWED_ACE_TYPE || entry.type == ACCESS_DENIED_ACE_TYPE)
+                    {
+                        auto sid = read_ace_sid(c.emu.memory(), ace_address, ace.Header.AceSize);
+                        if (!sid)
+                        {
+                            return std::nullopt;
+                        }
+
+                        entry.sid = std::move(*sid);
+                    }
+
+                    ace_address += ace.Header.AceSize;
                 }
-                return access;
+
+                return aces;
+            }
+
+            struct access_check_result
+            {
+                NTSTATUS status;
+                ACCESS_MASK granted;
+            };
+
+            // SeAccessCheckByType's owner rights, then SepAccessCheck, for a token that holds no privileges. A missing DACL
+            // grants everything, MAXIMUM_ALLOWED in the mapping's GenericAll.
+            access_check_result check_access(const windows_emulator& win_emu, const handle token,
+                                             const std::optional<std::vector<dacl_ace>>& dacl, const bool is_owner, ACCESS_MASK desired,
+                                             const ACCESS_MASK generic_all)
+            {
+                // SepNormalAccessCheck skips inherit-only ACEs and compares the masks as stored: an ACE's generic bits are
+                // not mapped, so they match no specific right. An OWNER RIGHTS ACE stands for the owner.
+                const auto applies = [&](const dacl_ace& ace) {
+                    return (ace.flags & INHERIT_ONLY_ACE) == 0 && !ace.sid.empty() &&
+                           (token_holds_sid(win_emu, token, ace.sid) || (is_owner && std::ranges::equal(ace.sid, owner_rights_sid)));
+                };
+
+                // RtlpOwnerAcesPresent: an OWNER RIGHTS ACE replaces the owner's implicit READ_CONTROL and WRITE_DAC.
+                const auto has_owner_rights_ace =
+                    dacl && std::ranges::any_of(*dacl, [](const dacl_ace& ace) {
+                        return (ace.flags & INHERIT_ONLY_ACE) == 0 && std::ranges::equal(ace.sid, owner_rights_sid);
+                    });
+
+                ACCESS_MASK granted = 0;
+                if (is_owner && !has_owner_rights_ace && (desired & (maximum_allowed | owner_implicit_rights)) != 0)
+                {
+                    granted = (desired & maximum_allowed) != 0 ? owner_implicit_rights : desired & owner_implicit_rights;
+                    desired &= ~owner_implicit_rights;
+                }
+
+                if (desired == 0)
+                {
+                    return {.status = STATUS_SUCCESS, .granted = granted};
+                }
+
+                if ((desired & access_system_security) != 0)
+                {
+                    return {.status = STATUS_PRIVILEGE_NOT_HELD, .granted = 0};
+                }
+
+                if (!dacl)
+                {
+                    granted |= desired;
+                    if ((desired & maximum_allowed) != 0)
+                    {
+                        granted = (granted & ~maximum_allowed) | generic_all;
+                    }
+
+                    return {.status = STATUS_SUCCESS, .granted = granted};
+                }
+
+                if ((desired & maximum_allowed) != 0)
+                {
+                    // SepMaximumAccessCheck: each ACE grants or refuses only what the ACEs before it left open.
+                    ACCESS_MASK allowed = 0;
+                    ACCESS_MASK refused = 0;
+                    for (const auto& ace : *dacl)
+                    {
+                        if (!applies(ace))
+                        {
+                            continue;
+                        }
+
+                        if (ace.type == ACCESS_ALLOWED_ACE_TYPE)
+                        {
+                            allowed |= ace.mask & ~refused;
+                        }
+                        else
+                        {
+                            refused |= ace.mask & ~allowed;
+                        }
+                    }
+
+                    granted |= allowed;
+                    if ((desired & ~(allowed | maximum_allowed)) != 0 || granted == 0)
+                    {
+                        return {.status = STATUS_ACCESS_DENIED, .granted = 0};
+                    }
+
+                    return {.status = STATUS_SUCCESS, .granted = granted};
+                }
+
+                auto remaining = desired;
+                for (const auto& ace : *dacl)
+                {
+                    if (remaining == 0)
+                    {
+                        break;
+                    }
+
+                    if (!applies(ace))
+                    {
+                        continue;
+                    }
+
+                    if (ace.type == ACCESS_DENIED_ACE_TYPE && (ace.mask & remaining) != 0)
+                    {
+                        return {.status = STATUS_ACCESS_DENIED, .granted = 0};
+                    }
+
+                    if (ace.type == ACCESS_ALLOWED_ACE_TYPE)
+                    {
+                        remaining &= ~ace.mask;
+                    }
+                }
+
+                if (remaining != 0)
+                {
+                    return {.status = STATUS_ACCESS_DENIED, .granted = 0};
+                }
+
+                return {.status = STATUS_SUCCESS, .granted = granted | desired};
             }
         }
 
@@ -708,9 +900,23 @@ namespace sogen
 
         NTSTATUS handle_NtAccessCheck(const syscall_context& c, const uint64_t security_descriptor, const handle requested_token,
                                       const ACCESS_MASK desired_access, const emulator_object<EMU_GENERIC_MAPPING> generic_mapping,
-                                      const uint64_t /*privilege_set*/, const emulator_object<ULONG> privilege_set_length,
+                                      const uint64_t privilege_set, const emulator_object<ULONG> privilege_set_length,
                                       const emulator_object<ACCESS_MASK> granted_access, const emulator_object<NTSTATUS> access_status)
         {
+            // SeAccessCheckByTypeWithAdminlessChecks clears a privilege set that has room for one before it checks anything.
+            const auto set_length = privilege_set_length.read();
+            constexpr ULONG no_privileges = 0;
+            if (privilege_set && set_length >= minimum_privilege_set_size &&
+                !c.emu.try_write_memory(privilege_set, &no_privileges, sizeof(no_privileges)))
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+
+            if ((desired_access & generic_rights) != 0)
+            {
+                return STATUS_GENERIC_NOT_MAPPED;
+            }
+
             const auto client_token = resolve_token(c, requested_token);
             if (client_token != CURRENT_PROCESS_TOKEN && client_token != CURRENT_THREAD_TOKEN &&
                 client_token != CURRENT_THREAD_EFFECTIVE_TOKEN && client_token != DUMMY_IMPERSONATION_TOKEN &&
@@ -719,73 +925,38 @@ namespace sogen
                 return STATUS_INVALID_HANDLE;
             }
 
-            const auto control = emulator_object<SECURITY_DESCRIPTOR_CONTROL>{c.emu, security_descriptor + 2}.read();
-            uint64_t dacl_address = 0;
-            if (control & SE_SELF_RELATIVE)
+            const auto parts = read_descriptor_parts(c, security_descriptor);
+            if (parts.owner == 0 || parts.group == 0)
             {
-                const auto descriptor = emulator_object<SECURITY_DESCRIPTOR_RELATIVE>{c.emu, security_descriptor}.read();
-                dacl_address = descriptor.Dacl == 0 ? 0 : security_descriptor + descriptor.Dacl;
-            }
-            else
-            {
-                dacl_address = emulator_object<uint64_t>{c.emu, security_descriptor + 32}.read();
+                return STATUS_INVALID_SECURITY_DESCR;
             }
 
-            const auto mapping = generic_mapping.read();
-            const auto requested = map_generic_access(desired_access, mapping);
-            ACCESS_MASK remaining = requested;
-            ACCESS_MASK granted = 0;
-            bool denied = false;
-
-            if (!(control & SE_DACL_PRESENT) || dacl_address == 0)
+            if (set_length < minimum_privilege_set_size)
             {
-                granted = requested;
-                remaining = 0;
+                privilege_set_length.write(minimum_privilege_set_size);
+                return STATUS_BUFFER_TOO_SMALL;
             }
-            else
+
+            constexpr uint64_t empty_privilege_set = 0; // PrivilegeCount and Control
+            if (!c.emu.try_write_memory(privilege_set, &empty_privilege_set, sizeof(empty_privilege_set)))
             {
-                const auto acl = emulator_object<ACL>{c.emu, dacl_address}.read();
-                auto ace_address = dacl_address + sizeof(ACL);
-                for (USHORT i = 0; i < acl.AceCount; ++i)
+                return STATUS_ACCESS_VIOLATION;
+            }
+
+            std::optional<std::vector<dacl_ace>> dacl{};
+            if (parts.dacl != 0)
+            {
+                dacl = read_dacl(c, parts.dacl);
+                if (!dacl)
                 {
-                    const auto ace = emulator_object<ACCESS_ALLOWED_ACE>{c.emu, ace_address}.read();
-
-                    // Only allow and deny ACEs take part. An ACE of another kind needs no SID: 19041 passes over one that is
-                    // only a header.
-                    if (ace.Header.AceType != ACCESS_ALLOWED_ACE_TYPE && ace.Header.AceType != ACCESS_DENIED_ACE_TYPE)
-                    {
-                        ace_address += ace.Header.AceSize;
-                        continue;
-                    }
-
-                    const auto ace_sid = read_ace_sid(c.emu.memory(), ace_address, ace.Header.AceSize);
-                    if (!ace_sid)
-                    {
-                        return STATUS_INVALID_ACL;
-                    }
-
-                    // SepNormalAccessCheck skips inherit-only ACEs and compares the masks as stored: an ACE's generic bits are
-                    // not mapped, so they match no specific right.
-                    const auto applies =
-                        (ace.Header.AceFlags & INHERIT_ONLY_ACE) == 0 && token_holds_sid(c.win_emu, client_token, *ace_sid);
-                    if (applies && ace.Header.AceType == ACCESS_DENIED_ACE_TYPE && (ace.Mask & remaining) != 0)
-                    {
-                        denied = true;
-                        break;
-                    }
-                    if (applies && ace.Header.AceType == ACCESS_ALLOWED_ACE_TYPE)
-                    {
-                        const auto allowed = ace.Mask & remaining;
-                        granted |= allowed;
-                        remaining &= ~allowed;
-                    }
-                    ace_address += ace.Header.AceSize;
+                    return STATUS_INVALID_ACL;
                 }
             }
 
-            privilege_set_length.write(0);
-            granted_access.write(granted);
-            access_status.write(!denied && remaining == 0 ? STATUS_SUCCESS : STATUS_ACCESS_DENIED);
+            const auto is_owner = token_holds_sid(c.win_emu, client_token, read_sid(c.emu.memory(), parts.owner));
+            const auto result = check_access(c.win_emu, client_token, dacl, is_owner, desired_access, generic_mapping.read().GenericAll);
+            granted_access.write(result.granted);
+            access_status.write(result.status);
             return STATUS_SUCCESS;
         }
 
