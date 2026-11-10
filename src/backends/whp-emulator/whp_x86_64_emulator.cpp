@@ -930,6 +930,7 @@ namespace sogen::whp
         {
             std::optional<uint64_t> page_base{};
             std::optional<uint64_t> patched_breakpoint{};
+            uint64_t rip{}; // the instruction the step runs
             uint64_t dr6{};
             bool had_trap_flag{};
             bool stop_after_step{};
@@ -3032,6 +3033,7 @@ namespace sogen::whp
                     auto rflags = vcpu.get_register(WHvX64RegisterRflags);
                     pending_execution_step state{};
                     state.page_base = page_base;
+                    state.rip = vcpu.read_instruction_pointer();
                     state.had_trap_flag = (rflags.Reg64 & trap_flag_bit) != 0;
                     state.dr6 = save_debug_status(vcpu, state.had_trap_flag);
                     state.stop_after_step = stop_after_step;
@@ -3135,6 +3137,20 @@ namespace sogen::whp
                 dr6.Reg64 = hits != 0 ? (saved_dr6 & ~dr6_breakpoint_hits) | hits : saved_dr6;
                 vcpu.set_register(WHvX64RegisterDr6, dr6);
                 return hits != 0;
+            }
+
+            // An instruction at rip that the hypervisor or the emulator performed itself (an RDTSC, RDTSCP or CPUID exit, a
+            // software interrupt, an invalid opcode a hook skipped): the processor raises no single-step trap for it, so a step
+            // of sogen's own over it ends here, as its #DB would end it. The caller does not hold partition_mutex_.
+            void end_step_of_performed_instruction(whp_vcpu& vcpu, const uint64_t rip)
+            {
+                if (!vcpu.pending_execution_step_ || vcpu.pending_execution_step_->rip != rip)
+                {
+                    return;
+                }
+
+                std::unique_lock lock(this->partition_mutex_);
+                (void)this->complete_execution_step(vcpu);
             }
 
             // Assumes partition_mutex_ is held.
@@ -3891,6 +3907,7 @@ namespace sogen::whp
                 }
 
                 vcpu.advance_rip(instruction_size);
+                this->end_step_of_performed_instruction(vcpu, exit_context.VpContext.Rip);
 
                 return handled || type == x86_hookable_instructions::cpuid || type == x86_hookable_instructions::rdtsc ||
                        type == x86_hookable_instructions::rdtscp;
@@ -3909,6 +3926,7 @@ namespace sogen::whp
                             vcpu.advance_rip(2);
                         }
 
+                        this->end_step_of_performed_instruction(vcpu, rip);
                         return true;
                     }
                 }
@@ -3953,6 +3971,7 @@ namespace sogen::whp
 
                     if (consumed)
                     {
+                        this->end_step_of_performed_instruction(vcpu, rip);
                         return true;
                     }
 
@@ -4356,6 +4375,7 @@ namespace sogen::whp
 
                     if (consumed)
                     {
+                        this->end_step_of_performed_instruction(vcpu, rip);
                         return true;
                     }
                 }
